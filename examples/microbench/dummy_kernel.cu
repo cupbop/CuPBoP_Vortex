@@ -3,7 +3,8 @@
 __global__
 void saxpy(void)
 {
-printf("hello!\n");
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  printf("block_id:%d thread_id:%d \n", i);
 }
 
 int main(void)
@@ -25,7 +26,7 @@ int main(void)
   cudaMemcpy(d_y, y, N*sizeof(float), cudaMemcpyHostToDevice);
 
   // Perform SAXPY on 1M elements
-    saxpy<<<(1,1)>>>;
+    saxpy<<<1,1>>>();
 
   cudaMemcpy(y, d_y, N*sizeof(float), cudaMemcpyDeviceToHost);
 

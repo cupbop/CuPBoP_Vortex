@@ -1,9 +1,9 @@
 #include <stdio.h>
 
 __global__
-void saxpy(int N)
+void saxpy(void)
 {
-printf("hello!: %d\n", N);
+printf("hello!\n");
 }
 
 int main(void)
@@ -25,7 +25,7 @@ int main(void)
   cudaMemcpy(d_y, y, N*sizeof(float), cudaMemcpyHostToDevice);
 
   // Perform SAXPY on 1M elements
-    saxpy<<<(1,1)>>>(N);
+    saxpy<<<1,1>>>();
 
   cudaMemcpy(y, d_y, N*sizeof(float), cudaMemcpyDeviceToHost);
 
