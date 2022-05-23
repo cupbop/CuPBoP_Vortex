@@ -35,7 +35,7 @@ const char *cudaGetErrorName(cudaError_t error) { return "SUCCESS\n"; }
 cudaError_t cudaDeviceReset(void) { scheduler_uninit(); }
 cudaError_t cudaDeviceSynchronize(void) { cuSynchronizeBarrier(); }
 cudaError_t cudaThreadSynchronize(void) { cuSynchronizeBarrier(); }
-cudaError_t cudaFree(void *devPtr) { free(devPtr); }
+
 cudaError_t cudaFreeHost(void *devPtr) { free(devPtr); }
 bool VX_init(void); 
 
@@ -342,6 +342,16 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
   // return ne 0 skips the Pop
 }
 }
+
+
+cudaError_t cudaFree(void *devPtr) { 
+  
+  // free(devPtr); 
+  auto buf_data = (vx_buffer_data_t *)devPtr; 
+  vx_buf_release(buf_data->staging_buf);
+  
+  }
+
 
 /* initialize the Vortex device */ 
 
