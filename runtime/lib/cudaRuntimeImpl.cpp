@@ -9,6 +9,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vortex.h> 
+
+/* global data structure */ 
+bool g_dev_initialized = false; 
+typedef struct vx_device_data_t { 
+  vx_device_h vx_device;
+  size_t vx_print_buf_d;
+  vx_buffer_h vx_print_buf_h;
+  uint32_t printf_buffer;
+  uint32_t printf_buffer_position;   
+}vx_device_data_t;
+
+
+typedef struct vx_buffer_data_t {
+  vx_buffer_h staging_buf;
+  size_t dev_mem_addr;
+}vx_buffer_data_t;
+
+
+vx_device_data_t g_vx_device_data; 
+
 cudaError_t cudaGetDevice(int *devPtr) { *devPtr = 0; }
 const char *cudaGetErrorName(cudaError_t error) { return "SUCCESS\n"; }
 cudaError_t cudaDeviceReset(void) { scheduler_uninit(); }
@@ -16,6 +37,7 @@ cudaError_t cudaDeviceSynchronize(void) { cuSynchronizeBarrier(); }
 cudaError_t cudaThreadSynchronize(void) { cuSynchronizeBarrier(); }
 cudaError_t cudaFree(void *devPtr) { free(devPtr); }
 cudaError_t cudaFreeHost(void *devPtr) { free(devPtr); }
+bool VX_init(void); 
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem,
@@ -26,18 +48,76 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
   //     ", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z,
   //     sharedMem);
 
+  if (!g_dev_initialized) g_dev_initialized = VX_init(); 
   cu_kernel *ker =
       create_kernel(func, gridDim, blockDim, args, sharedMem, stream);
 
   int lstatus = cuLaunchKernel(&ker);
 
+
+
   // std::cout << "ret cudaLKernel" << std::endl;
 }
+
+
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
+  printf("g_dev_initialized:%d\n", g_dev_initialized);
+  if (!g_dev_initialized) g_dev_initialized = VX_init(); 
+  
+/*
+ auto d = (vx_device_data_t *)device->data;
+  void *b = NULL;
+  pocl_global_mem_t *mem = device->global_memory;
+  int err;
+
+*/
+
+  vx_buffer_h staging_buf;
+ 
+  int err; 
+  
+  err = vx_alloc_shared_mem(g_vx_device_data.vx_device, size, &staging_buf);
+  if (err != 0)
+    return cudaErrorMemoryAllocation;
+
+
+  size_t dev_mem_addr;
+  err = vx_alloc_dev_mem(g_vx_device_data.vx_device, size, &dev_mem_addr);
+  if (err != 0) {
+    vx_buf_release(staging_buf);
+    return cudaErrorMemoryAllocation;
+  }
+
+  auto buf_data = new vx_buffer_data_t();
+  buf_data->staging_buf = staging_buf;
+  buf_data->dev_mem_addr = dev_mem_addr;
+
+  *devPtr = buf_data; 
+
+   return cudaSuccess; 
+/*
+  if (flags & CL_MEM_COPY_HOST_PTR) {
+    auto buf_ptr = vx_host_ptr(staging_buf);
+    memcpy((void*)buf_ptr, host_ptr, size);
+    err = vx_copy_to_dev(staging_buf, dev_mem_addr, size, 0);
+    if (err != 0) {
+      vx_buf_release(staging_buf);
+      return nullptr;
+    }
+  }
+
+  auto buf_data = new vx_buffer_data_t();
+  buf_data->staging_buf = staging_buf;
+  buf_data->dev_mem_addr = dev_mem_addr;
+
+  return buf_data;
+*/
+  /*
   *devPtr = malloc(size);
   if (devPtr == NULL)
     return cudaErrorMemoryAllocation;
-  return cudaSuccess;
+  return cudaSuccess; 
+  */
 }
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
   memset(devPtr, value, count);
@@ -45,19 +125,38 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
                        cudaMemcpyKind kind) {
+  int vx_err; 
   if (kind == cudaMemcpyHostToHost) {
     memcpy(dst, src, count);
   } else if (kind == cudaMemcpyDeviceToHost) {
+    //// Copy bytes from buffer to device local memory
+// int vx_copy_to_dev(vx_buffer_h hbuffer, uint64_t dev_maddr, uint64_t size, uint64_t src_offset);
+
+// Copy bytes from device local memory to buffer
+// int vx_copy_from_dev(vx_buffer_h hbuffer, uint64_t dev_maddr, uint64_t size, uint64_t dst_offset);
+
+  auto buf_data = (vx_buffer_data_t *)src; 
+  int offset = 0; 
+    vx_err = vx_copy_from_dev(buf_data->staging_buf, buf_data->dev_mem_addr, count, 0);
+    assert (0 == vx_err); 
+    auto buf_ptr = vx_host_ptr(buf_data->staging_buf);
+    assert(buf_ptr);
+    memcpy(dst, (char *)buf_ptr + offset, count);
     // how does the code know which device accessing the memory
-    memcpy(dst, src, count);
+    // memcpy(dst, src, count);
+    printf("cdamemcpyDeviceToHost is called src:%p st %p buf_ptr:%p\n", src, dst, buf_data);
   } else if (kind == cudaMemcpyHostToDevice) {
     // how does the code know which device accessing the memory
-    memcpy(dst, src, count);
-  } else if (kind == cudaMemcpyDeviceToHost) {
-    // how does the code know which device accessing the memory
-    memcpy(dst, src, count);
+  int offset = 0; 
+    auto buf_data = (vx_buffer_data_t *)dst; 
+    auto buf_ptr =  vx_host_ptr(buf_data->staging_buf);
+    memcpy((char *)buf_ptr + offset, src, count);
+  auto vx_err = vx_copy_to_dev(buf_data->staging_buf, buf_data->dev_mem_addr, count, 0);
+  assert(0 == vx_err);
+    printf("cdamemcpyHostTodevice is called src:%p dst %p buf_ptr:%p\n", src, dst, buf_data);
+    // memcpy(dst, src, count)
   } else if (kind == cudaMemcpyDeviceToDevice) {
-
+// need to implement from device to host and then host to device 
     memcpy(dst, dst, count);
   } else if (kind == cudaMemcpyDefault) {
     memcpy(dst, src, count);
@@ -242,4 +341,32 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 
   // return ne 0 skips the Pop
 }
+}
+
+/* initialize the Vortex device */ 
+
+bool VX_init(void)
+{
+  
+  vx_device_h vx_device;
+  printf("vx_init\n");
+  int err = vx_dev_open(&vx_device);
+
+  if (err !=0)
+    return 0; 
+  printf("VX device is opened\n");
+
+  // probably need to allocate print buffer locations 
+
+
+  g_vx_device_data.vx_device = vx_device; 
+  /*
+  if (err != 0) {
+    free(d);
+    return CL_DEVICE_NOT_FOUND;
+  }
+  */
+// need to copy vx_device contents to a cuda device structure 
+return 1; 
+
 }

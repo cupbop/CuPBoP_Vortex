@@ -12,5 +12,6 @@ add_subdirectory(threadPool)
 # compile x86 runtime library
 include_directories(./include)
 include_directories(./threadPool/include)
+include_directories(/usr/local/hyesoon/vortex_public/vortex/driver/include)
 file(GLOB proj_SOURCES "lib/*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})
