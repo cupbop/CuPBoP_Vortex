@@ -40,6 +40,9 @@ int init_device() {
     Create Kernel
 
 */
+/*
+
+move to cudaRuntimeImpl.cpp 
 static int kernelIds = 0;
 cu_kernel *create_kernel(const void *func, dim3 gridDim, dim3 blockDim,
                          void **args, size_t sharedMem, cudaStream_t stream) {
@@ -73,7 +76,7 @@ cu_kernel *create_kernel(const void *func, dim3 gridDim, dim3 blockDim,
 
   return ker;
 }
-
+*/
 /*
     Create Kernel Queue
 */
@@ -187,6 +190,7 @@ int schedulerEnqueueKernel(cu_kernel **k) {
 /*
   Kernel Launch with numBlocks and numThreadsPerBlock
 */
+/* move to cudaRuntime 
 int cuLaunchKernel(cu_kernel **k) {
   if (!scheduler) {
     init_device();
@@ -199,7 +203,6 @@ int cuLaunchKernel(cu_kernel **k) {
   MUTEX_LOCK(scheduler->work_queue_lock);
   scheduler->num_kernel_queued += 1;
   MUTEX_UNLOCK(scheduler->work_queue_lock);
-  // stream == 0 add to the kernelQueue
   if (ker->stream == 0) {
     // float** t1 = (float**)*(ker->args + 0);
     // printf("cuLaunchKernel Test Args 1: %p \n ", (void *) &t1);
@@ -239,6 +242,7 @@ int cuLaunchKernel(cu_kernel **k) {
     }
   }
 }
+*/
 
 /*
     Get Work Item: get the kernel from the queue and increment blockId

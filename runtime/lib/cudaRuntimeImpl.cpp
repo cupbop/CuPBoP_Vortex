@@ -9,7 +9,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
 #include <vortex.h> 
+
+
+
+
+/* Maximum kernels occupancy */
+#define MAX_KERNELS 16
+
+/* default WG size in each dimension & total WG size.
+ * this should be reasonable for CPU */
+#define DEFAULT_WG_SIZE 4096
+
+#define CUDA_FILENAME_LENGTH 1024 
+
+
+// location is local memory where to store kernel parameters
+#define KERNEL_ARG_BASE_ADDR 0x7fff0000
+
+
+#define PRINT_BUFFER_SIZE (1024 * 1024)
+
 
 /* global data structure */ 
 bool g_dev_initialized = false; 
@@ -17,6 +39,7 @@ typedef struct vx_device_data_t {
   vx_device_h vx_device;
   size_t vx_print_buf_d;
   vx_buffer_h vx_print_buf_h;
+  cu_kernel *current_kernel;
   uint32_t printf_buffer;
   uint32_t printf_buffer_position;   
 }vx_device_data_t;
@@ -58,6 +81,9 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
 
   // std::cout << "ret cudaLKernel" << std::endl;
 }
+
+
+
 
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
@@ -379,4 +405,151 @@ bool VX_init(void)
 // need to copy vx_device contents to a cuda device structure 
 return 1; 
 
+}
+
+
+
+/*
+    Create Kernel
+
+*/
+static int kernelIds = 0;
+cu_kernel *create_kernel(const void *func, dim3 gridDim, dim3 blockDim,
+                         void **args, size_t sharedMem, cudaStream_t stream) {
+  cu_kernel *ker = (cu_kernel *)calloc(1, sizeof(cu_kernel));
+
+  // set the function pointer
+  ker->start_routine = (void *(*)(void *))func;
+
+  ker->args = args;
+
+  // exit(1);
+  ker->gridDim = gridDim;
+  ker->blockDim = blockDim;
+
+  ker->shared_mem = sharedMem;
+
+  // std::cout << "stream is null" << std::endl;
+  ker->stream = stream;
+  // std::cout << "stream is null" << std::endl;
+
+  ker->blockId = 0;
+
+  ker->totalBlocks = gridDim.x * gridDim.y * gridDim.z;
+
+  ker->N = blockDim.x * blockDim.y * blockDim.z;
+
+  ker->kernelId = kernelIds;
+  kernelIds += 1;
+
+  ker->blockSize = blockDim.x * blockDim.y * blockDim.z;
+
+  return ker;
+}
+
+
+int cuLaunchKernel(cu_kernel **k) {
+  int err; 
+  // if (!scheduler) {
+    // init_device();
+ //  }
+  // Calculate Block Size N/numBlocks
+
+  if (!g_dev_initialized) g_dev_initialized = VX_init(); 
+
+  struct vx_device_data_t *d = &g_vx_device_data; 
+
+  cu_kernel *kernel = *k;
+  int status = C_RUN;
+
+ 
+    // upload kernel to device
+    if (NULL == d->current_kernel 
+     || d->current_kernel != kernel) {    
+       d->current_kernel = kernel;
+       // char program_bin_path[CUDA_FILENAME_LENGTH];
+      char program_bin_path[15]="./a.out.vortex";
+     //  pocl_cache_final_binary_path (program_bin_path, program, dev_i, kernel, NULL, 0);
+      err = vx_upload_kernel_file(d->vx_device, program_bin_path);      
+      assert(0 == err);
+    }
+  
+  err = vx_start(d->vx_device);
+  assert(0 == err);
+
+  // wait for the execution to complete
+  err = vx_ready_wait(d->vx_device, -1);
+  assert(0 == err);
+
+
+  // flush print buffer 
+  {
+    auto print_ptr = (uint8_t*)vx_host_ptr(d->vx_print_buf_h);
+    err = vx_copy_from_dev(d->vx_print_buf_h, d->vx_print_buf_d + PRINT_BUFFER_SIZE, sizeof(uint32_t), PRINT_BUFFER_SIZE);
+    assert(0 == err);
+    uint32_t print_size = *(uint32_t*)(print_ptr + PRINT_BUFFER_SIZE);
+    if (print_size != 0) {
+      err = vx_copy_from_dev(d->vx_print_buf_h, d->vx_print_buf_d, print_size, 0);
+      assert(0 == err);      
+      
+      write (STDOUT_FILENO, print_ptr, print_size);
+      
+      memset(print_ptr + PRINT_BUFFER_SIZE, 0, sizeof(uint32_t));
+      err = vx_copy_to_dev(d->vx_print_buf_h, d->vx_print_buf_d, sizeof(uint32_t), PRINT_BUFFER_SIZE);
+      assert(0 == err);
+    }
+  }
+
+  /* insert the task to the scheduler queue */ 
+
+  /*
+  MUTEX_LOCK(scheduler->work_queue_lock);
+  scheduler->num_kernel_queued += 1;
+  MUTEX_UNLOCK(scheduler->work_queue_lock);
+  */
+
+
+// copy from void pocl_vortex_run(void *data, _cl_command_node *cmd) {
+  // stream == 0 add to the kernelQueue
+
+  /*
+  if (ker->stream == 0) {
+    // float** t1 = (float**)*(ker->args + 0);
+    // printf("cuLaunchKernel Test Args 1: %p \n ", (void *) &t1);
+    // printf("cuLaunchKernel Test Args 1: %p \n ", (void *) *(ker->args + 0));
+    // float* t2 = *(t1);
+    // printf("cuLaunchkernel G Test Args: %p, val: %f\n ",(void *) &t2, *t2);
+    schedulerEnqueueKernel(k);
+  } else {
+    // add to it's stream queue
+    // stream queue can be waiting or running with or without tasks
+    MUTEX_LOCK(((cstreamData *)(ker->stream))->stream_lock);
+    status = ((cstreamData *)(ker->stream))->ev.status;
+
+    // if stream queue status is run (first kernel) (enqueue to the kernel
+    // queue)
+    cstreamData *e = ((cstreamData *)(ker->stream));
+    // synchronized is called after no job in the queue so stream is stuck on
+    // synchronize
+    // printf("this way sync\n");
+    if (e->ev.status == C_SYNCHRONIZE) {
+      if ((e->kernelQueue->finish_count) == (e->kernelQueue->kernel_count)) {
+        e->ev.status = C_RUN;
+      }
+    }
+
+    if (e->ev.status == C_RUN) {
+      // change the status to wait
+      e->ev.status == C_WAIT;
+      MUTEX_UNLOCK(((cstreamData *)(ker->stream))->stream_lock);
+      // printf("this way enqueue\n");
+      schedulerEnqueueKernel(&ker);
+    } else {
+      // the status of stream queue is wait so just enqueue to the stream
+      // printf("this way enqwlijs\n");
+      enqueueKernel(&((cstreamData *)(ker->stream))->kernelQueue, &ker);
+      MUTEX_UNLOCK(((cstreamData *)(ker->stream))->stream_lock);
+    }
+  }
+  */
 }
