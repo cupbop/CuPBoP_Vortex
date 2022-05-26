@@ -66,10 +66,8 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem,
                              cudaStream_t stream) {
   // if scheduler is null init device
-  // printf(
-  //     "cudaLaunchKernel : Grid: x:%d y:%d z:%d Block: %d, %d, %d ShMem:%lu\n
-  //     ", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z,
-  //     sharedMem);
+   printf(
+       "cudaLaunchKernel : Grid: x:%d y:%d z:%d Block: %d, %d, %d ShMem:%lu\n", gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem);
 
   if (!g_dev_initialized) g_dev_initialized = VX_init(); 
   cu_kernel *ker =
@@ -472,6 +470,7 @@ int cuLaunchKernel(cu_kernel **k) {
      //  pocl_cache_final_binary_path (program_bin_path, program, dev_i, kernel, NULL, 0);
       err = vx_upload_kernel_file(d->vx_device, program_bin_path);      
       assert(0 == err);
+      printf("call vortex binary\n");
     }
   
   err = vx_start(d->vx_device);
@@ -483,6 +482,7 @@ int cuLaunchKernel(cu_kernel **k) {
 
 
   // flush print buffer 
+  /* need to fix this : Hyesoon 
   {
     auto print_ptr = (uint8_t*)vx_host_ptr(d->vx_print_buf_h);
     err = vx_copy_from_dev(d->vx_print_buf_h, d->vx_print_buf_d + PRINT_BUFFER_SIZE, sizeof(uint32_t), PRINT_BUFFER_SIZE);
@@ -499,7 +499,7 @@ int cuLaunchKernel(cu_kernel **k) {
       assert(0 == err);
     }
   }
-
+*/ 
   /* insert the task to the scheduler queue */ 
 
   /*
