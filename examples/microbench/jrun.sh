@@ -35,7 +35,7 @@ DEBUG_LEVEL=0
 
 DPRINT()
 {
-  if [ $DEBUG_LEVEL -neq 0 ]; then
+  if [ $DEBUG_LEVEL -eq 1 ]; then
       echo $@
   fi
 }
