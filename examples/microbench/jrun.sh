@@ -13,19 +13,19 @@ show_usage()
 
 if [ -z "$VORTEX_PATH" ]
 then
-    echo "You need to set $VORTEX_PATH environment variable"
+    echo "You need to set "\$VORTEX_PATH" environment variable"
     exit -1
 fi
 
 if [ -z "$CuPBoP_PATH" ]
 then
-    echo "You need to set $CuPBoP_PATH environment variable"
+    echo "You need to set "\$CuPBoP_PATH" environment variable"
     exit -1
 fi
 
 if [ -z "$RISCV_TOOLCHAIN" ]
 then
-    echo "You need to set $RISCV_TOOLCHAIN environment variable"
+    echo "You need to set "\$RISCV_TOOLCHAIN" environment variable"
     exit -1
 fi
 RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv32-unknown-elf-
