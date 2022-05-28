@@ -33,6 +33,7 @@
 #define PRINT_BUFFER_SIZE (1024 * 1024)
 
 
+
 /* global data structure */ 
 bool g_dev_initialized = false; 
 typedef struct vx_device_data_t { 
@@ -50,6 +51,25 @@ typedef struct vx_buffer_data_t {
   size_t dev_mem_addr;
 }vx_buffer_data_t;
 
+typedef struct context_t{
+  uint32_t num_groups[3];
+  uint32_t global_offset[3];
+  uint32_t local_size[3];
+  char * printf_buffer;
+  uint32_t *printf_buffer_position;
+  uint32_t printf_buffer_capacity;
+  uint32_t work_dim;
+}context_t;
+
+typedef void (*pfn_workgroup_func) (
+   const void * /* args */,
+   const struct context_t * /* context */,
+   uint32_t /* group_x */,
+   uint32_t /* group_y */,
+   uint32_t /* group_z */
+ );
+
+static size_t ALIGNED_CTX_SIZE = 4 * ((sizeof(context_t) + 3) / 4);
 
 vx_device_data_t g_vx_device_data; 
 
@@ -416,6 +436,7 @@ cu_kernel *create_kernel(const void *func, dim3 gridDim, dim3 blockDim,
                          void **args, size_t sharedMem, cudaStream_t stream) {
   cu_kernel *ker = (cu_kernel *)calloc(1, sizeof(cu_kernel));
 
+
   // set the function pointer
   ker->start_routine = (void *(*)(void *))func;
 
@@ -459,6 +480,43 @@ int cuLaunchKernel(cu_kernel **k) {
 
   cu_kernel *kernel = *k;
   int status = C_RUN;
+  
+     
+    // create data structure to pass device 
+    uint32_t args_base_addr = KERNEL_ARG_BASE_ADDR;
+    int abuf_size= sizeof(*(kernel->args)) + ALIGNED_CTX_SIZE; 
+
+    vx_buffer_h staging_buf;
+    err = vx_alloc_shared_mem(d->vx_device, abuf_size, &staging_buf);
+
+    auto abuf_ptr = (uint8_t*)vx_host_ptr(staging_buf);
+    assert(abuf_ptr);
+
+  // num args: 
+  // num locals 
+ // upload kernel arguments buffer
+ // create ctx data structor to pass the information into RT 
+      context_t ctx;
+
+  ctx.num_groups[0] = kernel->gridDim.x;
+  ctx.num_groups[1] = kernel->gridDim.y; 
+  ctx.num_groups[2] = kernel->gridDim.z; 
+
+
+  memset(abuf_ptr, 0, ALIGNED_CTX_SIZE);
+  memcpy(abuf_ptr, &ctx, sizeof(context_t));
+  
+
+  // write arguments 
+
+    memcpy(abuf_ptr + ALIGNED_CTX_SIZE, kernel->args, sizeof(*(kernel->args)));
+
+    assert(0 == err);
+
+printf("*** ctx=:%p size:%ld abuf_size:%d\n", abuf_ptr, ALIGNED_CTX_SIZE, abuf_size);
+
+    err = vx_copy_to_dev(staging_buf, args_base_addr, abuf_size, 0);
+    assert(0 == err);
 
  
     // upload kernel to device
