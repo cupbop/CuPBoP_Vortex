@@ -267,7 +267,7 @@ void replace_built_in_function(llvm::Module *M) {
       auto *Instr = dyn_cast<Instruction>(U.getUser());
       return Instr->getParent()->getParent()->getName().str() == func_name;
     });
-
+  printf(" replacing built-in functions\n");
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Load = dyn_cast<LoadInst>(BI)) {
@@ -347,6 +347,8 @@ void replace_built_in_function(llvm::Module *M) {
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
                        func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
                                     "builtin_xEv") {
+              /* replace this with what??? */  // hyesoon 
+              printf("block_Id-X is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -354,6 +356,7 @@ void replace_built_in_function(llvm::Module *M) {
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y") {
+               printf("block_Id-Y is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_y");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -361,6 +364,7 @@ void replace_built_in_function(llvm::Module *M) {
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
+              printf("block_Id-Z is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_z");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -419,7 +423,7 @@ void replace_built_in_function(llvm::Module *M) {
             auto callFn = Call->getCalledFunction();
             if (func_name == "vprintf") {
               /*
-               * replace CUDA's printf to C's printf
+               * replace CUDA's printf to Vortex's vx_printf (same as c's printf)
                * CUDA:
                * %0 = tail call i32 @vprintf(i8* getelementptr inbounds ([19 x
                * i8], [19 x i8]* @.str, i64 0, i64 0), i8* null)
@@ -433,7 +437,7 @@ void replace_built_in_function(llvm::Module *M) {
                   FunctionType::get(I32, args, true);
 
               llvm::FunctionCallee _f =
-                  M->getOrInsertFunction("printf", printfType);
+                  M->getOrInsertFunction("vx_printf", printfType);
               llvm::Function *func_printf =
                   llvm::cast<llvm::Function>(_f.getCallee());
               // construct argument(s)
