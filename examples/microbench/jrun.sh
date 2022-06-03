@@ -1,9 +1,9 @@
 #!/bin/bash
-
 ######################### Default Varaibles #################################
 DEVICE=simx
-KERNEL_CU=one_thread_kernel.cu
+KERNEL_CU=one_thread_kernel.cu    #change this part by taking in cu file / first input arg
 #############################################################################
+
 
 show_usage()
 {
@@ -102,11 +102,11 @@ then
 elif [ $DEVICE = "simx" ]
 then
     clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o 
-    ${RISCV_TOOLCHAIN_PREFIX}gcc -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw main.cc kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
+    ${RISCV_TOOLCHAIN_PREFIX}gcc -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw main_${KERNEL}.cc kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
     ${RISCV_TOOLCHAIN_PREFIX}objcopy -O binary kernel.elf kernel.bin
     ${RISCV_TOOLCHAIN_PREFIX}objdump -D kernel.elf > kernel.dump
     DPRINT "--- Run the kernel on simx"
-    ${VORTEX_PATH}/sim/simx/simx -r -c 1 -i kernel.bin -s
+    ${VORTEX_PATH}/sim/simx/simx -r -c 1 -i kernel.bin -s 
 else
     echo "$DEVICE is invalid"
     exit -1

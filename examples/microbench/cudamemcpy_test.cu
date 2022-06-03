@@ -1,5 +1,11 @@
 #include <stdio.h>
 
+__global__
+void saxpy(void)
+{
+printf("testing cudamemcpy!\n");
+}
+
 int main(void)
 {
   int N = 1<<20;
