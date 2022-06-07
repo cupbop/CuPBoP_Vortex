@@ -22,6 +22,13 @@ jobs:
         uses: KyleMayes/install-llvm-action@v1
         with:
           version: "10.0"
+      - name: Download vortex and build vortex
+        run: |
+          cd ${{ github.workspace }}
+          git clone --recursive https://github.com/vortexgpgpu/vortex.git
+          cd Vortex
+          ./ci/toolchain_install.sh -all
+          make -s
       - name: Download CUDA header files
         run: |
           cd ${{ github.workspace }}
@@ -35,6 +42,9 @@ jobs:
           tar -xzf 'cuda-10.1.tar.gz?dl=1'
       - name: Build project
         run: |
+          export CuPBoP_PATH=`pwd`
+          export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
+          export VORTEX_PATH=$CuPBoP_PATH/Vortex
           mkdir build
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
