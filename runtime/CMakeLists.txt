@@ -1,10 +1,17 @@
 cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
 project(
-  X86runtime
+  Vortexruntime
   DESCRIPTION "Implementation CUDA runtime API with vortex"
   LANGUAGES CXX)
-set(LIB_NAME Runtime)
+set(LIB_NAME vortexRuntime)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
-add_subdirectory(vortex)
-add_subdirectory(x86)
+# compile threadPool implementation
+add_subdirectory(threadPool)
+
+# compile vortex runtime library
+include_directories(./include)
+include_directories(./threadPool/include)
+include_directories($ENV{VORTEX_PATH}/driver/include)
+file(GLOB proj_SOURCES "./src/vortex/*.cpp")
+add_library(${LIB_NAME} SHARED ${proj_SOURCES})
