@@ -25,8 +25,10 @@ jobs:
       - name: Download vortex and build vortex
         run: |
           cd ${{ github.workspace }}
+          export RISCV_TOOLCHAIN_PATH=/opt/riscv-gnu-toolchain
+          export VERILATOR_ROOT=/opt/verilator
+          export PATH=$VERILATOR_ROOT/bin:$PATH
           git clone --recursive https://github.com/vortexgpgpu/vortex.git
-          
           cd vortex
           ./ci/toolchain_install.sh -all
           make -s
