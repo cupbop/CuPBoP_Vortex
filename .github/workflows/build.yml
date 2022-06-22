@@ -46,6 +46,8 @@ jobs:
       - name: Build project
         run: |
           cd ${{ github.workspace }}
+          ls -a
+          pwd
           export CuPBoP_PATH=`pwd`
           export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
           export VORTEX_PATH=$CuPBoP_PATH/Vortex
