@@ -50,7 +50,7 @@ jobs:
           pwd
           export CuPBoP_PATH=`pwd`
           export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
-          export VORTEX_PATH=$CuPBoP_PATH/Vortex
+          export VORTEX_PATH=$CuPBoP_PATH/vortex
           mkdir build
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
