@@ -6,3 +6,6 @@ rm *.ll
 rm *.s
 rm *.cui
 rm *.fatbin
+rm *.bin
+rm *.dump
+rm *.elf

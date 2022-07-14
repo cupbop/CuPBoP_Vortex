@@ -77,6 +77,7 @@ esac
 
 KERNEL=`basename $KERNEL_CU .cu` 
 
+echo "Kernal Name"$KERNEL
 DPRINT "--- Generate bitcode files(.bc) for host and device by using clang++"
 clang++ -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 
