@@ -119,31 +119,31 @@ void create_global_variable(llvm::Module *M) {
 
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "intra_warp_index", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "inter_warp_index", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_index_x", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);

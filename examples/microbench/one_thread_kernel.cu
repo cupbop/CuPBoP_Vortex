@@ -4,6 +4,7 @@ __global__
 void saxpy(void)
 {
 printf("one_thread!\n");
+printf("kernel--hello!\n");
 }
 
 int main(void)

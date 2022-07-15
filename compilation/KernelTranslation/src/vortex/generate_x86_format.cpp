@@ -122,7 +122,7 @@ void decode_input(llvm::Module *M) {
       // calculate addr
       Value *GEP = Builder.CreateGEP(input_arg, ConstantInt::get(Int32T, idx));
       // load corresponding int*
-      GEP = Builder.CreateLoad(GEP);
+      //GEP = Builder.CreateLoad(GEP);
       // bitcast
       GEP = Builder.CreateBitOrPointerCast(GEP, PointerType::get(ArgType, 0));
       Value *Arg = Builder.CreateLoad(GEP);

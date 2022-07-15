@@ -9,8 +9,8 @@ int __modsi3(){return 0;}
 int __mulsi3(){return 0;}
 int main()
 {
-    vx_printf("main--hello\n");
+    vx_printf("main--hello");
     saxpy();
-    vx_printf("main--end\n");
+    vx_printf("main--hello");
     return 0;
 }

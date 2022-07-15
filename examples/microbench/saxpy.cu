@@ -1,18 +1,18 @@
 #include <stdio.h>
+#include <algorithm>
 
 __global__
-void saxpy(int N)
+void saxpy(int n, float a, float *x, float *y)
 {
-//printf("hello!: %d\n", N);
-printf("hello!: N:%llx threadidx:%llx threadidy:%llx blockidx:%llx blockidy:%llx\n", 
-    N, threadIdx.x, threadIdx.y, blockIdx.x, blockIdx.y);
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = a * x[i] + y[i];
 }
-
 
 int main(void)
 {
-  //int N = 1<<20;
-  int N = 1<<1;
+  int N = 512;
+  int T = 16;
+
   float *x, *y, *d_x, *d_y;
   x = (float*)malloc(N*sizeof(float));
   y = (float*)malloc(N*sizeof(float));
@@ -29,13 +29,14 @@ int main(void)
   cudaMemcpy(d_y, y, N*sizeof(float), cudaMemcpyHostToDevice);
 
   // Perform SAXPY on 1M elements
-    saxpy<<<1,1>>>(N);
+  saxpy<<<(N/T), T>>>(N, 2.0f, d_x, d_y);
 
   cudaMemcpy(y, d_y, N*sizeof(float), cudaMemcpyDeviceToHost);
 
   float maxError = 0.0f;
-  for (int i = 0; i < N; i++)
-    maxError += (maxError, abs(y[i]-4.0f));
+  for (int i = 0; i < N; i++) {
+    maxError += std::max(maxError, abs(y[i]-4.0f));
+  }
   printf("Max error: %f\n", maxError);
 
   cudaFree(d_x);

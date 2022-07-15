@@ -525,6 +525,8 @@ AGAIN:
 */
 void cuSynchronizeBarrier() {
   // std::cout << "cuSynchronizeBarrier" << std::endl;
+  // Need to implement for vortex // Hyesoon Jun-30-2022: For now, just comment out the scheduler
+  /*
   MUTEX_LOCK(scheduler->work_queue_lock);
 
   if (scheduler->num_kernel_finished != scheduler->num_kernel_queued ||
@@ -533,4 +535,5 @@ void cuSynchronizeBarrier() {
     pthread_cond_wait(&(scheduler->wake_host), &(scheduler->work_queue_lock));
   }
   MUTEX_UNLOCK(scheduler->work_queue_lock);
+  */
 }
