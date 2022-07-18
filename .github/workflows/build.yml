@@ -58,7 +58,7 @@ jobs:
       - name: Run sample cuda function on vortex
         run: |
           cd ${{ github.workspace }}
-          cd exmaples/microbench
+          cd examples/microbench
           ./kjrun.sh
       - name: clone SC evaluation code
         run: |
