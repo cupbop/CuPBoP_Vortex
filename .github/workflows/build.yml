@@ -55,6 +55,11 @@ jobs:
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
           make -j8
+      - name: Run sample cuda function on vortex
+        run: |
+          cd ${{ github.workspace }}
+          cd exmaples/microbench
+          ./kjrun.sh
       - name: clone SC evaluation code
         run: |
           cd ${{ github.workspace }}
