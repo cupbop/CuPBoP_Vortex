@@ -65,7 +65,7 @@ jobs:
           cd ${{ github.workspace }}
           export CuPBoP_PATH=`pwd`
           export VORTEX_PATH=$CuPBoP_PATH/vortex
-          export RISCV_TOOLCHAIN = /opt/riscv-gnu-toolchain
+          export RISCV_TOOLCHAIN=/opt/riscv-gnu-toolchain
           cd examples/microbench
           ./kjrun.sh
       - name: clone SC evaluation code
