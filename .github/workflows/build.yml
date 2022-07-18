@@ -34,7 +34,7 @@ jobs:
           make -s
       - name: finding RISV_TOOLCHAIN
         run: |
-          cd opt
+          cd /opt
           ls -a
           cd ${{ github.workspace }}
           ls -a
