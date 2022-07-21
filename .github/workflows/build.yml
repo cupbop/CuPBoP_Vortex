@@ -32,6 +32,10 @@ jobs:
           cd vortex
           ./ci/toolchain_install.sh -all
           make -s
+      - name: finding RISV_TOOLCHAIN
+        run: |
+          cd /opt/riscv-gnu-toolchain
+          ls -a
       - name: Download CUDA header files
         run: |
           cd ${{ github.workspace }}
@@ -55,6 +59,15 @@ jobs:
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
           make -j8
+      
+      - name: Run sample cuda function on vortex
+        run: |
+          cd ${{ github.workspace }}
+          export CuPBoP_PATH=`pwd`
+          export VORTEX_PATH=$CuPBoP_PATH/vortex
+          export RISCV_TOOLCHAIN=/opt/riscv-gnu-toolchain/bin
+          cd examples/microbench
+          ./kjrun.sh
       - name: clone SC evaluation code
         run: |
           cd ${{ github.workspace }}
