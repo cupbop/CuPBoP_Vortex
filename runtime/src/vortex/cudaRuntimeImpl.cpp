@@ -26,7 +26,7 @@
 #define KERNEL_ARG_BASE_ADDR 0x7ffff000
 
 // kernel number of arguments
-#define SAXPY_NUM_ARGS 4
+//#define num_args 4
 
 struct alignas(4) context_t {
   uint32_t num_groups[3];
@@ -375,14 +375,18 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 }
 } // extern C
 
-cudaError_t cudaLaunchKernel(const void *func, 
+cudaError_t cudaLaunchKernel_vortex(
+                            const void *func, 
                              dim3 gridDim, 
                              dim3 blockDim,
                              void **args, 
                              size_t sharedMem,
-                             cudaStream_t stream) {
-  printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu\n",
-    gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem);
+                             cudaStream_t stream,
+                             const int num_args
+                             ) {
+
+  printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
+    gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
   auto DC = DeviceContext::instance();
   
@@ -392,7 +396,7 @@ cudaError_t cudaLaunchKernel(const void *func,
   RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.out"));
   
   // allocate staging buffer for kernel arguments
-  size_t abuf_size = sizeof(kernel_arg_t) + ((SAXPY_NUM_ARGS > 1) ? (sizeof(uint32_t) * (SAXPY_NUM_ARGS - 1)) : 0);
+  size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint32_t) * (num_args - 1)) : 0);
   auto staging_buf = DC->staging_alloc(abuf_size);
   auto abuf_ptr = (kernel_arg_t*)vx_host_ptr(staging_buf);
   assert(abuf_ptr);
@@ -415,7 +419,7 @@ cudaError_t cudaLaunchKernel(const void *func,
 
   // write arguments
 
-  for (int i = 0; i < SAXPY_NUM_ARGS; ++i) {    
+  for (int i = 0; i < num_args; ++i) {    
     memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t));
     printf("*** cuda kernel args[%d]=0x%x\n", i, (uint32_t)abuf_ptr->args[i]);
   }  

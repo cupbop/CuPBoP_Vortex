@@ -13,6 +13,9 @@ cudaError_t cudaFree(void *devPtr);
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem,
                              cudaStream_t stream);
+cudaError_t cudaLaunchKernel_vortex(const void *func, dim3 gridDim, dim3 blockDim,
+                             void **args, size_t sharedMem,
+                             cudaStream_t stream, const int num_args);
 cudaError_t cudaMalloc(void **devPtr, size_t size);
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
                        cudaMemcpyKind kind);

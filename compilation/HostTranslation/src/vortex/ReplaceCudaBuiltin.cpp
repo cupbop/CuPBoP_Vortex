@@ -5,8 +5,10 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <iostream>
+#include <fstream>
 #include <map>
 #include <set>
 
@@ -112,7 +114,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
   (float*, float*, float*, i32, i32, i32)* @_Z4Fan2PfS_S_iii to i8*), i8*
   getelementptr inbounds ([17 x i8], [17 x i8]* @1, i64 0, i64 0), i8*
   getelementptr inbounds ([17 x i8], [17 x i8]* @1, i64 0, i64 0), i32 -1, i8*
-  null, i8* null, i8* null, i8* null, i32* null) ret void
+  null, i8* null, i8* null, i8* null, i32* null) ret void 
     }
 
   */
@@ -149,7 +151,16 @@ void ReplaceKernelLaunch(llvm::Module *M) {
       }
     }
   }
-  bool host_changed = false;
+bool host_changed = false;
+
+// Create .txt file for number of arguments lookup table (temporary reason)
+  std::fstream outfile;
+  outfile.open("lookup.txt", std::ios::out);
+  outfile.close();
+//
+
+std::vector<llvm::Instruction *> need_remove_inst;
+
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
@@ -161,6 +172,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
         Instruction *inst = &(*i);
 
         if (llvm::CallBase *callInst = llvm::dyn_cast<llvm::CallBase>(inst)) {
+          llvm::CallInst *callInst_inst = llvm::dyn_cast<llvm::CallInst>(inst);
           if (Function *calledFunction = callInst->getCalledFunction()) {
 
             if (calledFunction->getName().startswith("cudaLaunchKernel")) {
@@ -182,6 +194,12 @@ void ReplaceKernelLaunch(llvm::Module *M) {
                           << ", cudaLaunchKernel Function: "
                           << functionOperand->getName().str() << ", args "
                           << functionOperand->arg_size() << std::endl;
+
+                // Saving the elements of the lookup table (temporary reason)
+                outfile.open("lookup.txt", std::ios::app);
+                outfile << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
+                outfile.close();
+                
                 auto rep = kernels.find(functionOperand->getName().str());
                 if (rep != kernels.end()) {
                   Function *FC = rep->second;
@@ -218,7 +236,36 @@ void ReplaceKernelLaunch(llvm::Module *M) {
                 BitCastInst *BC = new BitCastInst(F, I8, "", callInst);
                 callInst->setArgOperand(0, BC);
                 kernels.insert({functionOperand->getName().str(), F});
+
+                // Creating a new Integercaset for number of arguments 
+                Value *arg_num = dyn_cast<Value>(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), functionOperand->arg_size()));
+                CastInst *BC_argnum = CastInst::CreateIntegerCast(arg_num, llvm::Type::getInt32Ty(context), false, "", callInst_inst);
+
+                std::vector<Value*> ArgsT;
+                for (int oper_idx = 0; oper_idx <= 7; ++oper_idx) {
+                  ArgsT.push_back(callInst_inst->getArgOperand(oper_idx));}
+                ArgsT.push_back(BC_argnum);
+
+                std::vector<llvm::Type *> ArgTys;
+                for (Value *V : ArgsT)
+                  ArgTys.push_back(V->getType());
+
+                llvm::FunctionType *func_Type = FunctionType::get(llvm::Type::getInt32Ty(context), ArgTys, false);
+                
+                llvm::FunctionCallee _f = M->getOrInsertFunction("cudaLaunchKernel_vortex", func_Type);
+                llvm::Function *calledFunction_argnum = llvm::cast<llvm::Function>(_f.getCallee());
+                  //calledFunction_argnum->setDSOLocal(true);
+                  //calledFunction_argnum->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+
+                CallInst *CI_argnum = CallInst::Create(calledFunction_argnum, ArgsT, "", callInst_inst);
+                callInst_inst->replaceAllUsesWith(CI_argnum);
+                      //ReplaceInstWithInst(callInst_inst, NewCI);
+                CI_argnum->setCallingConv(callInst_inst->getCallingConv());
+                CI_argnum->setDebugLoc(callInst_inst->getDebugLoc());
+                need_remove_inst.push_back(callInst_inst);
               }
+            
+
             } else if (cuda_register_kernel_names.find(
                            calledFunction->getName()) !=
                        cuda_register_kernel_names.end()) {
@@ -237,6 +284,10 @@ void ReplaceKernelLaunch(llvm::Module *M) {
       }
     }
   }
+  for (auto inst : need_remove_inst) 
+    inst->eraseFromParent();
+  
+
 }
 
 void ReplaceMemcpyToSymbol(llvm::Module *M) {
@@ -275,6 +326,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
               // insert
               Call->replaceAllUsesWith(c_inst);
               need_remove.push_back(Call);
+              
             }
           }
         }
