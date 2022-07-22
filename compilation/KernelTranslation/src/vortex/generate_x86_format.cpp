@@ -20,6 +20,10 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <iostream>
 
+// Mark Jun 20 
+#include <sstream>
+#include <fstream>
+
 using namespace llvm;
 
 void set_meta_data(llvm::Module *M) {
@@ -166,6 +170,134 @@ void remove_useless_var(llvm::Module *M) {
   M->getGlobalVariable("inter_warp_index")->eraseFromParent();
 }
 
+std::string converttostring(const char* a)
+{
+  std::string s = a;
+  return s;
+}
+
+// Mark Jun 20
+void create_kernel_wrapper_function(llvm::Module *M){
+
+
+    auto ALIGNED_CTX_SIZE = 100;
+
+
+    std::string wrapper_name = "";
+
+    for (auto F = M->begin(); F != M->end(); ++F)
+      for (auto BB = F->begin(); BB != F->end(); ++BB) {
+        for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+          if (auto Call = dyn_cast<CallInst>(BI)) {
+            auto func_name = Call->getCalledFunction()->getName().str();
+            if (func_name.find("saxpyi") != std::string::npos)
+            {
+              std::cout << "FOUND IT!!!!!!!" << func_name << std::endl;
+              wrapper_name =func_name + "_wrapper";
+              
+            }
+          }
+        }
+      }
+
+    std::stringstream ss;
+
+    ss << "#include <stdint.h>\n"
+          "#include <vx_print.h>\n"
+          "#include <vx_intrinsics.h>\n"
+          "#include <vx_spawn.h>\n"
+          "#include <stdint.h>\n"
+          
+          "\n"
+
+          "#define KERNEL_ARG_BASE_ADDR 0x7ffff000\n"
+
+          "typedef struct {\n"
+            "context_t ctx; \n"
+            "uint64_t args[0]; \n"
+          "} kernel_arg_t; \n"
+          
+          "\n"
+
+          "int grid_size_x;\n"
+          "int grid_size_y;\n"
+          "int grid_size_z;\n"
+          "\n"
+
+          "int block_size_x;\n"
+          "int block_size_y;\n"
+          "int block_size_z;\n"
+          "\n"
+
+          "int block_size;\n"
+          "\n"
+
+          "int __thread block_index_x;\n"
+          "int __thread block_index_y;\n"
+
+          "extern  \"C\" {\n extern void *  "
+            << wrapper_name << "(void **args);}\n"
+
+          //"void " << pfn_workgroup_string << "(uint8_t* args, uint8_t*, uint32_t, uint32_t, uint32_t);\n" 
+
+          "void cuda_wrapper(\n"
+          "const void * args, \n"
+          "const context_t* /*context*/, \n"
+          "uint32_t group_x, \n"
+          "uint32_t group_y, \n"
+          "uint32_t /*group_z*/) { \n"
+
+          "block_index_x = group_x;\n"
+          "block_index_y = group_y;\n"
+          << wrapper_name << "((void **)args);\n}"
+
+          "\n"
+
+          "int main() {\n"
+          "  auto kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; \n"
+          "  auto ctx = &kernel_arg->ctx; \n"
+          "  auto args = (uint32_t*)kernel_arg->args; \n"
+
+          "  grid_size_x = ctx->num_groups[0];\n"
+          "  grid_size_y = ctx->num_groups[1];\n"
+          "  grid_size_z = ctx->num_groups[2];\n"
+
+          "\n"
+
+          "  block_size_x = ctx->local_size[0];\n"
+          "  block_size_y = ctx->local_size[1];\n"
+          "  block_size_z = ctx->local_size[2];\n"
+
+          "\n"
+
+          "  block_size = ctx->local_size[0] * ctx->local_size[1]; \n"
+
+          "  vx_printf( \"gridDim=(0x%x, 0x%x, 0x%x), blockDim=(0x%x, 0x%x, 0x%x), args=(0x%x, 0x%x, 0x%x, 0x%x) \" , \n"
+ 
+          "  ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
+          "  ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], \n"
+          "  args[0], args[1], args[2], args[3]); \n"
+
+          "  vx_spawn_kernel(ctx, (vx_spawn_kernel_cb)cuda_wrapper, args); \n"
+          
+          "  return 0;\n"
+          "}";
+
+    auto content = ss.str();
+
+    std::string save_path {"/data/ahnch/CuPBoP/examples/microbench"};
+    std::ofstream ofs;
+
+    ofs.open(save_path +"/../vortex_debug/kernel_wrapper.cpp");
+    ofs << ss.rdbuf();
+    ofs.close();
+
+    //std::ifstream inFile("kernel_wrapper_auto.cpp");
+    //std::cout << inFile.rdbuf();
+
+    return;
+
+}
 void generate_x86_format(llvm::Module *M) {
   // change metadata
   set_meta_data(M);
@@ -175,4 +307,6 @@ void generate_x86_format(llvm::Module *M) {
   remove_barrier(M);
   // remove useless func/variable
   remove_useless_var(M);
+  // create kernel wraper function  // Hyesoon 6-7-202 
+  create_kernel_wrapper_function(M);
 }
