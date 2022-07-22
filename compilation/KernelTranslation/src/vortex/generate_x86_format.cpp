@@ -19,8 +19,6 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <iostream>
-
-// Mark Jun 20 
 #include <sstream>
 #include <fstream>
 
@@ -176,12 +174,9 @@ std::string converttostring(const char* a)
   return s;
 }
 
-// Mark Jun 20
 void create_kernel_wrapper_function(llvm::Module *M){
 
-
     auto ALIGNED_CTX_SIZE = 100;
-
 
     std::string wrapper_name = "";
 
@@ -192,9 +187,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
             auto func_name = Call->getCalledFunction()->getName().str();
             if (func_name.find("saxpyi") != std::string::npos)
             {
-              std::cout << "FOUND IT!!!!!!!" << func_name << std::endl;
+              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << std::endl;
               wrapper_name =func_name + "_wrapper";
-              
             }
           }
         }
@@ -285,15 +279,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
     auto content = ss.str();
 
-    std::string save_path {"/data/ahnch/CuPBoP/examples/microbench"};
     std::ofstream ofs;
 
-    ofs.open(save_path +"/../vortex_debug/kernel_wrapper.cpp");
+    ofs.open("../vortex_debug/kernel_wrapper.cpp");
     ofs << ss.rdbuf();
     ofs.close();
-
-    //std::ifstream inFile("kernel_wrapper_auto.cpp");
-    //std::cout << inFile.rdbuf();
 
     return;
 
