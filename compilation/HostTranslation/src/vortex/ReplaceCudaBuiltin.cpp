@@ -160,6 +160,7 @@ bool host_changed = false;
 //
 
 std::vector<llvm::Instruction *> need_remove_inst;
+int kernel_idx = 0;
 
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
@@ -197,8 +198,9 @@ std::vector<llvm::Instruction *> need_remove_inst;
 
                 // Saving the elements of the lookup table (temporary reason)
                 outfile.open("lookup.txt", std::ios::app);
-                outfile << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
+                outfile << kernel_idx << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
                 outfile.close();
+                kernel_idx++;
                 
                 auto rep = kernels.find(functionOperand->getName().str());
                 if (rep != kernels.end()) {

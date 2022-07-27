@@ -21,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <fstream>
+#include <limits>
 
 using namespace llvm;
 
@@ -178,23 +179,52 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
     auto ALIGNED_CTX_SIZE = 100;
 
-    std::string wrapper_name = "";
+    std::string kernel_name_tmp;
+    int kernel_idx_tmp;
+    std::vector<std::string> wrapper_name;
+    std::vector<int> kernel_idx;
+    std::fstream readfile;
 
-    for (auto F = M->begin(); F != M->end(); ++F)
-      for (auto BB = F->begin(); BB != F->end(); ++BB) {
-        for (auto BI = BB->begin(); BI != BB->end(); BI++) {
-          if (auto Call = dyn_cast<CallInst>(BI)) {
-            auto func_name = Call->getCalledFunction()->getName().str();
-            if (func_name.find("saxpyi") != std::string::npos)
-            {
-              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << std::endl;
-              wrapper_name =func_name + "_wrapper";
+    readfile.open("lookup.txt", std::ios::in);
+    
+    while(readfile >> kernel_idx_tmp)
+    {
+      readfile >> kernel_name_tmp;
+      kernel_idx.push_back(kernel_idx_tmp);
+      std::cout << "looking for kernel neme" << kernel_name_tmp << std::endl;
+      readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+      // DOES IT REALLY NEED TO GO THRU HERE AGAIN?
+      /*
+        for (auto F = M->begin(); F != M->end(); ++F) {
+          for (auto BB = F->begin(); BB != F->end(); ++BB) {
+            for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+              if (auto Call = dyn_cast<CallInst>(BI)) {
+                auto func_name = Call->getCalledFunction()->getName().str();
+                if (func_name.find(kernel_name_tmp) != std::string::npos)
+                {
+                  std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << std::endl;
+                  wrapper_name.push_back(func_name + "_wrapper");
+                  break;
+                }
+              }
             }
           }
         }
-      }
+        */
+
+     wrapper_name.push_back(kernel_name_tmp + "_wrapper");
+    }
+
+    readfile.close();
 
     std::stringstream ss;
+    std::vector<std::string> wrapper_initializer;
+
+    for (auto f : wrapper_name)
+    { 
+          wrapper_initializer.push_back(" extern void *  " + f + "(void **args);\n");
+    }
 
     ss << "#include <stdint.h>\n"
           "#include <vx_print.h>\n"
@@ -204,12 +234,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
           
           "\n"
 
-          "#define KERNEL_ARG_BASE_ADDR 0x7ffff000\n"
+          "#define KERNEL_ARG_BASE_ADDR 0x7ffff000\n\n"
 
           "typedef struct {\n"
-            "context_t ctx; \n"
-            "uint64_t args[0]; \n"
-          "} kernel_arg_t; \n"
+            "   context_t ctx; \n"
+            "   uint64_t args[0]; \n"
+          "   } kernel_arg_t; \n"
           
           "\n"
 
@@ -227,55 +257,76 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n"
 
           "int __thread block_index_x;\n"
-          "int __thread block_index_y;\n"
+          "int __thread block_index_y;\n\n"
 
-          "extern  \"C\" {\n extern void *  "
-            << wrapper_name << "(void **args);}\n"
+          "extern  \"C\" {\n";
 
-          //"void " << pfn_workgroup_string << "(uint8_t* args, uint8_t*, uint32_t, uint32_t, uint32_t);\n" 
+    for (auto f : wrapper_initializer)
+    {
+      ss << f;
+    }
+    ss << "}\n\n";
+      //"void " << pfn_workgroup_string << "(uint8_t* args, uint8_t*, uint32_t, uint32_t, uint32_t);\n" 
 
-          "void cuda_wrapper(\n"
-          "const void * args, \n"
-          "const context_t* /*context*/, \n"
-          "uint32_t group_x, \n"
-          "uint32_t group_y, \n"
-          "uint32_t /*group_z*/) { \n"
+    for (auto f : wrapper_name)
+    {
+      ss <<  "void cuda_" << f << "(\n"
+          "   const void * args, \n"
+          "   const context_t* /*context*/, \n"
+          "   uint32_t group_x, \n"
+          "   uint32_t group_y, \n"
+          "   uint32_t /*group_z*/) { \n"
 
-          "block_index_x = group_x;\n"
-          "block_index_y = group_y;\n"
-          << wrapper_name << "((void **)args);\n}"
+          "     block_index_x = group_x;\n"
+          "     block_index_y = group_y;\n"
+          "     "
+          << f << "((void **)args);\n}"
+          "\n \n";
+    }
+
+        ss << "vx_spawn_kernel_cb callbacks[] = {\n ";
+
+      for (auto f : wrapper_name)
+        {
+          ss << "cuda_" << f << ", \n";
+        }
+        ss.seekp(-3, std::ios_base::end);
+
+        ss << "}; \n \n"
+
+          "   int main() {\n"
+          "   kernel_arg_t* kernel_arg; \n"
+          "   context_t* ctx; \n"
+          "   uint32_t* args; \n"
+
+          "   for (int i=0; i<" << std::to_string(wrapper_name.size()) << "; i++) { \n"
+
+          "     kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR + sizeof(kernel_arg_t*) * i; \n"
+          "     ctx = &kernel_arg->ctx; \n"
+          "     args = (uint32_t*)kernel_arg->args; \n"
+
+          "     grid_size_x = ctx->num_groups[0];\n"
+          "     grid_size_y = ctx->num_groups[1];\n"
+          "     grid_size_z = ctx->num_groups[2];\n"
 
           "\n"
 
-          "int main() {\n"
-          "  auto kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; \n"
-          "  auto ctx = &kernel_arg->ctx; \n"
-          "  auto args = (uint32_t*)kernel_arg->args; \n"
-
-          "  grid_size_x = ctx->num_groups[0];\n"
-          "  grid_size_y = ctx->num_groups[1];\n"
-          "  grid_size_z = ctx->num_groups[2];\n"
+          "     block_size_x = ctx->local_size[0];\n"
+          "     block_size_y = ctx->local_size[1];\n"
+          "     block_size_z = ctx->local_size[2];\n"
 
           "\n"
 
-          "  block_size_x = ctx->local_size[0];\n"
-          "  block_size_y = ctx->local_size[1];\n"
-          "  block_size_z = ctx->local_size[2];\n"
+          "     block_size = ctx->local_size[0] * ctx->local_size[1]; \n"
 
-          "\n"
-
-          "  block_size = ctx->local_size[0] * ctx->local_size[1]; \n"
-
-          "  vx_printf( \"gridDim=(0x%x, 0x%x, 0x%x), blockDim=(0x%x, 0x%x, 0x%x), args=(0x%x, 0x%x, 0x%x, 0x%x) \" , \n"
+          "     vx_printf( \"gridDim=(0x%x, 0x%x, 0x%x), blockDim=(0x%x, 0x%x, 0x%x), args=(0x%x, 0x%x, 0x%x, 0x%x) \" , \n"
  
-          "  ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
-          "  ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], \n"
-          "  args[0], args[1], args[2], args[3]); \n"
-
-          "  vx_spawn_kernel(ctx, (vx_spawn_kernel_cb)cuda_wrapper, args); \n"
+          "     ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
+          "     ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], \n"
+          "     args[0], args[1], args[2], args[3]); \n";
           
-          "  return 0;\n"
-          "}";
+          ss << "     vx_spawn_kernel(ctx, callbacks[i], args); \n } \n"
+                "  return 0;\n }";
 
     auto content = ss.str();
 
@@ -284,6 +335,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
     ofs.open("../vortex_debug/kernel_wrapper.cpp");
     ofs << ss.rdbuf();
     ofs.close();
+
+    
 
     return;
 
