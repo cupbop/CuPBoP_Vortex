@@ -180,43 +180,50 @@ void create_kernel_wrapper_function(llvm::Module *M){
     auto ALIGNED_CTX_SIZE = 100;
 
     std::string kernel_name_tmp;
-    int kernel_idx_tmp;
     std::vector<std::string> wrapper_name;
-    std::vector<int> kernel_idx;
-    std::fstream readfile;
+    //std::vector<int> kernel_idx;
 
-    readfile.open("lookup.txt", std::ios::in);
     
+    std::fstream outfile;
+    outfile.open("lookup.txt", std::ios::out);
+    outfile.close();
+    
+    ///////////////// Temporarily not using (.txt) //////////////////
+    /*
     while(readfile >> kernel_idx_tmp)
     {
       readfile >> kernel_name_tmp;
       kernel_idx.push_back(kernel_idx_tmp);
-      std::cout << "looking for kernel name " << kernel_name_tmp << std::endl;
+      std::cout << "looking for kernel name " << kernel_name_tmp << " with " << kernel_idx_tmp << std::endl;
       readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+      wrapper_name.push_back(kernel_name_tmp + "_wrapper");
+    }
+    readfile.close();
+    */
 
-      // DOES IT REALLY NEED TO GO THRU HERE AGAIN?
-      /*
-        for (auto F = M->begin(); F != M->end(); ++F) {
-          for (auto BB = F->begin(); BB != F->end(); ++BB) {
-            for (auto BI = BB->begin(); BI != BB->end(); BI++) {
-              if (auto Call = dyn_cast<CallInst>(BI)) {
-                auto func_name = Call->getCalledFunction()->getName().str();
-                if (func_name.find(kernel_name_tmp) != std::string::npos)
-                {
-                  std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << std::endl;
-                  wrapper_name.push_back(func_name + "_wrapper");
-                  break;
-                }
-              }
+    int kernel_idx = 0;
+
+    for (auto F = M->begin(); F != M->end(); ++F) {
+      for (auto BB = F->begin(); BB != F->end(); ++BB) {
+        for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+          if (auto Call = dyn_cast<CallInst>(BI)) {
+            auto func_name = Call->getCalledFunction()->getName().str();
+            auto func_arg_size = Call->getCalledFunction()->arg_size();
+            std::cout << "currently looking function is " << func_name << std::endl;
+
+            if (func_name.find("llvm") == std::string::npos)
+            {
+              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size <<std::endl;
+              wrapper_name.push_back(func_name + "_wrapper");
+              outfile.open("lookup.txt", std::ios::app);
+              outfile << kernel_idx << " " << func_name << " " << func_arg_size << "\n";
+              outfile.close();
+              kernel_idx++;
             }
           }
         }
-        */
-
-     wrapper_name.push_back(kernel_name_tmp + "_wrapper");
+      }
     }
-
-    readfile.close();
 
     std::stringstream ss;
     std::vector<std::string> wrapper_initializer;

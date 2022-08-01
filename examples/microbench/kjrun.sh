@@ -94,7 +94,6 @@ llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
 llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
 
 DPRINT "--- Translate the kernel bitcode by using CuPBoP's kernel translator"
-
 #$CuPBoP_PATH/build/compilation/kernelTranslator.x86 $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel_host.bc 
 $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc 
 llvm-dis kernel.bc
