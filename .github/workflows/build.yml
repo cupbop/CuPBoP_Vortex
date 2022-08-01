@@ -66,7 +66,6 @@ jobs:
           export CuPBoP_PATH=`pwd`
           export VORTEX_PATH=$CuPBoP_PATH/vortex
           export RISCV_TOOLCHAIN=/opt/riscv-gnu-toolchain/bin
-          vim examples/vortex_debug/kernel_wrapper.cpp
           cd examples/microbench
           ./kjrun.sh
       - name: clone SC evaluation code
