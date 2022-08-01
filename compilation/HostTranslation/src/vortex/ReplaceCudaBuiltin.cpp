@@ -198,7 +198,7 @@ int kernel_idx = 0;
 
                 // Saving the elements of the lookup table (temporary reason)
                 outfile.open("lookup.txt", std::ios::app);
-                outfile << kernel_idx << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
+                outfile << kernel_idx << " " << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
                 outfile.close();
                 kernel_idx++;
                 
