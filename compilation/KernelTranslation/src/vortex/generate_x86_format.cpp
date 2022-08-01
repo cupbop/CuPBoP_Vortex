@@ -191,7 +191,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
     {
       readfile >> kernel_name_tmp;
       kernel_idx.push_back(kernel_idx_tmp);
-      std::cout << "looking for kernel neme" << kernel_name_tmp << std::endl;
+      std::cout << "looking for kernel name " << kernel_name_tmp << std::endl;
       readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
       // DOES IT REALLY NEED TO GO THRU HERE AGAIN?
