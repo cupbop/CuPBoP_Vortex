@@ -275,9 +275,10 @@ void replace_built_in_function(llvm::Module *M) {
         } else if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
             auto func_name = Call->getCalledFunction()->getName().str();
-            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x" ||
-                func_name ==
-                    "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
+            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
+            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x" ){//||
+                //func_name ==
+                //    "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
               auto block_size_addr = M->getGlobalVariable("block_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -298,17 +299,44 @@ void replace_built_in_function(llvm::Module *M) {
               auto val = builder.CreateLoad(block_size_addr);
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x" ||
-                       func_name == "_ZN26__cuda_builtin_threadIdx_t17__fetch_"
-                                    "builtin_xEv") {
+            }
+            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
+             else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x" ){//||
+              //         func_name == "_ZN26__cuda_builtin_threadIdx_t17__fetch_"
+              //                      "builtin_xEv") {
               // replace it by warp_id
+
+              // Mark: printing out the warp_idx values
+              // printf("global_intra_warp_idx is : %d \n", global_intra_warp_idx);
+              // printf("global_inter_warp_idx is : %d \n", global_inter_warp_idx);
+
+                  auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
+                  errs() << block_size_x_tmp;
+                  
+                  Constant* const_intra_warp_idx = global_intra_warp_idx->getInitializer();
+                  Constant* const_inter_warp_idx = global_inter_warp_idx->getInitializer();
+                  //Constant* const_block_size_x = block_size_x_tmp->getInitializer();
+
+                  ConstantInt* con_intra_warp_idx = cast<ConstantInt>(const_intra_warp_idx);
+                  ConstantInt* con_inter_warp_idx = cast<ConstantInt>(const_inter_warp_idx);
+                  //ConstantInt* con_block_size_x = cast<ConstantInt>(const_block_size_x);
+
+                  int64_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue();
+                  int64_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
+                  //int64_t int_block_size_x = con_block_size_x->getSExtValue();
+
+                  printf("intra warp corresponding value is : %ld \n", int_intra_warp_idx);
+                  printf("inter warp corresponding value is : %ld \n", int_inter_warp_idx);
+                  //printf("block size x corresponding value is : %ld \n", int_block_size_x);
+
+              // Mark Debug: Until here (printing out warp_idx values)
 
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
 
               auto thread_idx = builder.CreateBinOp(
                   Instruction::Mul, builder.CreateLoad(local_inter_warp_idx),
-                  ConstantInt::get(I32, 32), "");
+                  ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
               thread_idx = builder.CreateBinOp(
                   Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
                   thread_idx, "thread_idx");
@@ -327,14 +355,14 @@ void replace_built_in_function(llvm::Module *M) {
 
               auto thread_idx = builder.CreateBinOp(
                   Instruction::Mul, builder.CreateLoad(local_inter_warp_idx),
-                  ConstantInt::get(I32, 32), "");
+                  ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
               thread_idx = builder.CreateBinOp(
                   Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
                   thread_idx, "thread_idx");
               // tidy = tid / block_dim.x
               thread_idx = builder.CreateBinOp(
                   Instruction::SDiv, thread_idx,
-                  builder.CreateLoad(M->getGlobalVariable("block_size_x")),
+                  builder.CreateLoad(M->getGlobalVariable("block_size_y")),
                   "thread_id_y");
               Call->replaceAllUsesWith(thread_idx);
               need_remove.push_back(Call);
@@ -344,9 +372,11 @@ void replace_built_in_function(llvm::Module *M) {
               auto zero = ConstantInt::get(I32, 0);
               Call->replaceAllUsesWith(zero);
               need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
-                       func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
-                                    "builtin_xEv") {
+            }
+            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex 
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ){//||
+                       //func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
+                       //             "builtin_xEv") {
               /* replace this with what??? */  // hyesoon 
               printf("block_Id-X is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_x");
@@ -371,9 +401,11 @@ void replace_built_in_function(llvm::Module *M) {
               auto block_idx = builder.CreateLoad(block_index_addr);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x" ||
-                       func_name == "_ZN24__cuda_builtin_gridDim_t17__fetch_"
-                                    "builtin_xEv") {
+            }
+            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
+             else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x" ){// ||
+                       //func_name == "_ZN24__cuda_builtin_gridDim_t17__fetch_"
+                       //             "builtin_xEv") {
               auto grid_size_addr = M->getGlobalVariable("grid_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -429,6 +461,8 @@ void replace_built_in_function(llvm::Module *M) {
                * i8], [19 x i8]* @.str, i64 0, i64 0), i8* null)
                * C: %call1 = call i32 (i8*, ...) @printf(i8* getelementptr
                * inbounds ([45 x i8], [45 x i8]* @.str.1, i64 0, i64 0))
+               * Vortex: %84 = call i32 (i8*, ...) @vx_printf(i8* getelementptr inbounds ([20 x i8], [20 x i8]* @.str.1, i64 0, i64 0), i32 %83), !dbg !159
+                       * %67 = call i32 (i8*, ...) @vx_printf(i8* getelementptr inbounds ([11 x i8], [11 x i8]* @.str, i64 0, i64 0), i32 %66)
                */
               // find/create C's printf function
               std::vector<llvm::Type *> args;

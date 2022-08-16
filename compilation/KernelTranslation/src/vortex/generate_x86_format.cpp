@@ -210,10 +210,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
             auto func_name = Call->getCalledFunction()->getName().str();
             auto func_arg_size = Call->getCalledFunction()->arg_size();
             std::cout << "currently looking function is " << func_name << std::endl;
-
-            if (func_name.find("llvm") == std::string::npos)
+            // Find the function name that is not printf, and llvm (TODO: need to come up with better ways to find kernel names later.)
+            if ((func_name.find("llvm") == std::string::npos) && (func_name.find("printf") == std::string::npos))
             {
-              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size <<std::endl;
+              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               wrapper_name.push_back(func_name + "_wrapper");
               outfile.open("lookup.txt", std::ios::app);
               outfile << kernel_idx << " " << func_name << " " << func_arg_size << "\n";
@@ -245,6 +245,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "typedef struct {\n"
             "   context_t ctx; \n"
+            "   int kernel_idx; \n"
             "   uint64_t args[0]; \n"
           "   } kernel_arg_t; \n"
           
@@ -286,6 +287,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "     block_index_x = group_x;\n"
           "     block_index_y = group_y;\n"
+          "     vx_printf(\"kernel_warpper block id x is %d, y is %d\", block_index_x, block_index_y);\n"
           "     "
           << f << "((void **)args);\n}"
           "\n \n";
@@ -306,9 +308,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "   context_t* ctx; \n"
           "   uint32_t* args; \n"
 
-          "   for (int i=0; i<" << std::to_string(wrapper_name.size()) << "; i++) { \n"
+          //"   for (int i=0; i<" << std::to_string(wrapper_name.size()) << "; i++) { \n"
 
-          "     kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR + sizeof(kernel_arg_t*) * i; \n"
+          "     kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; \n"
           "     ctx = &kernel_arg->ctx; \n"
           "     args = (uint32_t*)kernel_arg->args; \n"
 
@@ -327,12 +329,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "     block_size = ctx->local_size[0] * ctx->local_size[1]; \n"
 
           "     vx_printf( \"gridDim=(0x%x, 0x%x, 0x%x), blockDim=(0x%x, 0x%x, 0x%x), args=(0x%x, 0x%x, 0x%x, 0x%x) \" , \n"
- 
           "     ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
           "     ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], \n"
-          "     args[0], args[1], args[2], args[3]); \n";
+          "     args[0], args[1], args[2], args[3]); \n"
+          "     vx_printf( \"kernel index is %d \", kernel_arg->kernel_idx); \n";
           
-          ss << "     vx_spawn_kernel(ctx, callbacks[i], args); \n } \n"
+          ss << "     vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args); \n \n"
                 "  return 0;\n }";
 
     auto content = ss.str();

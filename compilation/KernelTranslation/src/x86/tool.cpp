@@ -437,7 +437,7 @@ void replace_built_in_function(llvm::Module *M) {
                   FunctionType::get(I32, args, true);
 
               llvm::FunctionCallee _f =
-                  M->getOrInsertFunction("vx_printf", printfType);
+                  M->getOrInsertFunction("printf", printfType);
               llvm::Function *func_printf =
                   llvm::cast<llvm::Function>(_f.getCallee());
               // construct argument(s)

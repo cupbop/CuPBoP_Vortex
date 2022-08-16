@@ -214,7 +214,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, 32)),
+                          ConstantInt::get(I32, 4)), // Mark temp (changed 32 -> 4)
       "thread_idx");
   gepArgs.push_back(thread_idx);
 
@@ -248,7 +248,7 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, 32)),
+                          ConstantInt::get(I32, 4)), // Mark temp (changed 32 -> 4)
       "thread_idx");
   gepArgs.push_back(thread_idx);
 
@@ -339,7 +339,7 @@ void handle_alloc(llvm::Function *F) {
       auto thread_idx = builder.CreateBinOp(
           Instruction::Add, intra_warp_index,
           builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                              ConstantInt::get(I32, 32)),
+                              ConstantInt::get(I32, 4)), //  Mark temp (changed 32 -> 4)
           "thread_idx");
 
       auto gep = builder.CreateGEP(Alloca, thread_idx);
@@ -475,7 +475,7 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
     auto block_size = M->getGlobalVariable("block_size");
     auto warp_cnt =
         builder.CreateBinOp(Instruction::SDiv, builder.CreateLoad(block_size),
-                            ConstantInt::get(I32, 32), "warp_number");
+                            ConstantInt::get(I32, 4), "warp_number"); // Mark temp (changed 32 -> 4)
 
     cmpResult =
         builder.CreateICmpULT(builder.CreateLoad(inter_warp_index), warp_cnt);
@@ -487,7 +487,7 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
                                         builder.CreateLoad(block_size));
     } else {
       cmpResult = builder.CreateICmpULT(builder.CreateLoad(intra_warp_index),
-                                        ConstantInt::get(I32, 32));
+                                        ConstantInt::get(I32, 4)); // Mark temp (changed 32 -> 4)
     }
   }
   builder.CreateCondBr(cmpResult, InsertCondBefore, LoopEnd);

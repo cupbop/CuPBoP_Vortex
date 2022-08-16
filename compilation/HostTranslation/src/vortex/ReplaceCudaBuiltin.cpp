@@ -153,13 +153,6 @@ void ReplaceKernelLaunch(llvm::Module *M) {
   }
 bool host_changed = false;
 
-
-/* Create .txt file for number of arguments lookup table (temporary reason)
-  std::fstream outfile;
-  outfile.open("lookup.txt", std::ios::out);
-  outfile.close();
-*/
-
 std::vector<llvm::Instruction *> need_remove_inst;
 int kernel_idx = 0;
 
@@ -196,13 +189,6 @@ int kernel_idx = 0;
                           << ", cudaLaunchKernel Function: "
                           << functionOperand->getName().str() << ", args "
                           << functionOperand->arg_size() << std::endl;
-
-                /* Saving the elements of the lookup table (temporary reason)
-                outfile.open("lookup.txt", std::ios::app);
-                outfile << kernel_idx << " " << functionOperand->getName().str() << " " << functionOperand->arg_size() << "\n";
-                outfile.close();
-                kernel_idx++;
-                */
                 
                 auto rep = kernels.find(functionOperand->getName().str());
                 if (rep != kernels.end()) {
@@ -227,23 +213,35 @@ int kernel_idx = 0;
                 std::string newName = oldName + "_wrapper";
                 if (func_name == oldName && host_changed &&
                     oldName.find("_host") != std::string::npos) {
-                  newName =
-                      oldName.substr(0, oldName.length() - 5) + "_wrapper";
+                  newName = oldName.substr(0, oldName.length() - 5) + "_wrapper";
                 }
                 std::cout << "Change Kernel Name to: " << newName << std::endl;
-
-                Function *F =
-                    Function::Create(FT, Function::ExternalLinkage, newName, M);
-                F->setDSOLocal(true);
-                F->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                
+                // FROM HERE
+                /* wrapper function, removed since vortex doesn't require wrapper function
+                Function *F = Function::Create(FT, Function::ExternalLinkage, newName, M);
+                  F->setDSOLocal(true);
+                  F->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
 
                 BitCastInst *BC = new BitCastInst(F, I8, "", callInst);
                 callInst->setArgOperand(0, BC);
                 kernels.insert({functionOperand->getName().str(), F});
+                // UNTIL here */
 
                 // Creating a new Integercaset for number of arguments 
                 Value *arg_num = dyn_cast<Value>(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), functionOperand->arg_size()));
                 CastInst *BC_argnum = CastInst::CreateIntegerCast(arg_num, llvm::Type::getInt32Ty(context), false, "", callInst_inst);
+
+                // Creating a new Cast for kernel name
+                IRBuilder<> Builder(inst);
+                llvm::Value *kernel_name_ptr = Builder.CreateGlobalStringPtr(newName.substr(0, newName.length() - 8));
+                callInst->setArgOperand(0, kernel_name_ptr);
+
+                //// For temporary reason, will delete it later.
+                //Value *kernel_name = llvm::ConstantArray::get(llvm::Type::getInt8PtrTy(context), functionOperand->getName());
+                //Value *kernel_name = llvm::ConstantDataArray::getString(context, functionOperand->getName(), true);
+                //Value *kernel_name = dyn_cast<Value>(Builder.CreateGlobalStringPtr(oldName));
+                //CastInst *BC_kernel_name = CastInst::CreatePointerCast(kernel_name, kernel_name->getPointerElementType(), "", BC_argnum);
 
                 std::vector<Value*> ArgsT;
                 for (int oper_idx = 0; oper_idx <= 7; ++oper_idx) {

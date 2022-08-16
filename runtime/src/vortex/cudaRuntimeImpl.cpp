@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <limits.h>
 #include <vortex.h>
+#include <fstream>
+#include <limits>
 
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
@@ -40,6 +42,7 @@ struct alignas(4) context_t {
 
 struct alignas(64) kernel_arg_t {
   context_t ctx;
+  int kernel_idx;
   uint64_t  args[0];
 };
 
@@ -375,8 +378,8 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 }
 } // extern C
 
-cudaError_t cudaLaunchKernel_vortex(
-                            const void *func, 
+cudaError_t cudaLaunchKernel_vortex(                          
+                             const char *func, //-> kernel_name
                              dim3 gridDim, 
                              dim3 blockDim,
                              void **args, 
@@ -384,6 +387,35 @@ cudaError_t cudaLaunchKernel_vortex(
                              cudaStream_t stream,
                              const int num_args
                              ) {
+
+//open the file lookup.txt and load the content in the memory
+//cpp hash table, look for the kernel name, and retrieve the kerenl index
+
+//DEBUG PURPOSE
+std::cout << "RUNTIME FUNCTION" << std::endl;
+std::cout << "kernel_name: " << func << std::endl;
+std::cout << "number of arguments: " << num_args << std::endl;
+
+//reading lookup.txt
+std::fstream readfile;
+readfile.open("lookup.txt", std::ios::in);
+std::string kernel_idx_tmp;
+std::string kernel_name_tmp;
+
+while(readfile >> kernel_idx_tmp)
+{
+  readfile >> kernel_name_tmp;
+  readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  std::cout << "debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl;
+  if(std::string(func) == kernel_name_tmp)
+  {
+    std::cout << "found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl;
+    break;
+  }
+  
+}
+readfile.close();                    
+                         
 
   printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
@@ -413,8 +445,20 @@ cudaError_t cudaLaunchKernel_vortex(
   ctx.local_size[0] = blockDim.x;
   ctx.local_size[1] = blockDim.y;
   ctx.local_size[2] = blockDim.z;
+  ctx.global_offset[0] = 0;
+  ctx.global_offset[1] = 0;
+  ctx.global_offset[2] = 0;
 
   memcpy(&abuf_ptr->ctx, &ctx, sizeof(context_t));
+  
+  // write the kerenel index here it retrives
+  abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
+
+  // Mark Debug Check 
+  //printf("address_check 0x%x, 0x%x, %d\n", &(ctx.num_groups[2]), &(ctx.global_offset[0]), &(ctx.global_offset[0])-&(ctx.num_groups[2]));
+  //printf("address_check 0x%x, 0x%x, %d\n", &(ctx.global_offset[1]), &(ctx.global_offset[2]), &(ctx.global_offset[0])-&(ctx.num_groups[2]));
+  //printf("global_offset 0x%x, 0x%x, %x\n", ctx.global_offset[0], ctx.global_offset[1], ctx.global_offset[2]);
+
   printf("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
 
   // write arguments
