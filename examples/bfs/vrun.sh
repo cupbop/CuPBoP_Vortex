@@ -33,6 +33,7 @@ then
 fi
 RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv32-unknown-elf-
 CUDA_PATH=$CuPBoP_PATH/cuda-10.1
+LLVM_PREFIX=/opt/llvm-riscv
 
 DEBUG_LEVEL=0
 
@@ -127,11 +128,12 @@ then
     ${VORTEX_PATH}/sim/simx/simx -r -c 1 -i kernel.bin -s
 elif [ $DEVICE = "vortex" ]
 then
-    clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
+    #clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
+    /opt/llvm-riscv/bin/clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f -Xclang -target-feature -Xclang +vortex kernel.bc -c -o kernel.o
     ${RISCV_TOOLCHAIN_PREFIX}g++ -o kernel_wrapper.o -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw -c ../vortex_debug/kernel_wrapper.cpp  -Wl,--gc-sections
     ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_wrapper.o kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
-    ${RISCV_TOOLCHAIN_PREFIX}objcopy -O binary kernel.elf kernel.out
-    ${RISCV_TOOLCHAIN_PREFIX}objdump -D kernel.elf > kernel.dump
+    ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out
+    ${LLVM_PREFIX}/bin/llvm-objdump -D kernel.elf > kernel.dump
     g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     DPRINT "--- Run the kernel on vortex"
     LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph1MW_6.txt
