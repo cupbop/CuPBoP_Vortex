@@ -7,10 +7,9 @@
 #define KERNEL_ARG_BASE_ADDR 0x7ffff000
 
 typedef struct {
-   context_t ctx; 
-   int kernel_idx; 
-   uint64_t args[0]; 
-   } kernel_arg_t; 
+  context_t ctx; 
+  uint64_t args[0]; 
+} kernel_arg_t; 
 
 int grid_size_x;
 int grid_size_y;
@@ -26,10 +25,13 @@ int __thread block_index_x;
 int __thread block_index_y;
 
 extern  "C" {
- extern void *  _Z14dynproc_kerneliPiS_S_iiii_wrapper(void **args);
+ extern void *  _Z4Fan1PfS_ii_wrapper(void **args);
+}
+extern  "C" {
+ extern void *  _Z4Fan2PfS_S_iii_wrapper(void **args);
 }
 
-void cuda__Z14dynproc_kerneliPiS_S_iiii_wrapper(
+void cuda__Z4Fan1PfS_ii_wrapper(
    const void * args, 
    const context_t* /*context*/, 
    uint32_t group_x, 
@@ -37,18 +39,30 @@ void cuda__Z14dynproc_kerneliPiS_S_iiii_wrapper(
    uint32_t /*group_z*/) { 
      block_index_x = group_x;
      block_index_y = group_y;
-     vx_printf("kernel_warpper block id x is %d, y is %d", block_index_x, block_index_y);
-     _Z14dynproc_kerneliPiS_S_iiii_wrapper((void **)args);
+     _Z4Fan1PfS_ii_wrapper((void **)args);
+}
+
+void cuda__Z4Fan2PfS_S_iii_wrapper(
+   const void * args, 
+   const context_t* /*context*/, 
+   uint32_t group_x, 
+   uint32_t group_y, 
+   uint32_t /*group_z*/) { 
+     block_index_x = group_x;
+     block_index_y = group_y;
+     _Z4Fan2PfS_S_iii_wrapper((void **)args);
 }
  
 vx_spawn_kernel_cb callbacks[] = {
- cuda__Z14dynproc_kerneliPiS_S_iiii_wrapper}; 
+ cuda__Z4Fan1PfS_ii_wrapper, cuda__Z4Fan2PfS_S_iii_wrapper}; 
+
  
-   int main() {
+int main() {
    kernel_arg_t* kernel_arg; 
    context_t* ctx; 
    uint32_t* args; 
-     kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; 
+   for (int i=0; i<1; i++) { 
+     kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR + sizeof(kernel_arg_t*) * i; 
      ctx = &kernel_arg->ctx; 
      args = (uint32_t*)kernel_arg->args; 
      grid_size_x = ctx->num_groups[0];
@@ -64,8 +78,9 @@ vx_spawn_kernel_cb callbacks[] = {
      ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], 
      ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], 
      args[0], args[1], args[2], args[3]); 
-     vx_printf( "kernel index is %d ", kernel_arg->kernel_idx); 
-     vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args); 
- 
+     //vx_printf("sth is wrong\n");
+     vx_spawn_kernel(ctx, callbacks[i], args); 
+     
+ } 
   return 0;
- }
+}

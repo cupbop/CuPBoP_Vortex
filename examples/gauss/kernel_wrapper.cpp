@@ -53,10 +53,9 @@ void cuda__Z4Fan2PfS_S_iii_wrapper(
      _Z4Fan2PfS_S_iii_wrapper((void **)args);
 }
  
-vx_spawn_kernel_cb callbacks1[] = {
- cuda__Z4Fan1PfS_ii_wrapper}; 
-vx_spawn_kernel_cb callbacks2[] = {
- cuda__Z4Fan2PfS_S_iii_wrapper}; 
+vx_spawn_kernel_cb callbacks[] = {
+ cuda__Z4Fan1PfS_ii_wrapper,cuda__Z4Fan2PfS_S_iii_wrapper}; 
+
 
 
  
@@ -82,8 +81,8 @@ int main() {
      ctx->local_size[0], ctx->local_size[1], ctx->local_size[2], 
      args[0], args[1], args[2], args[3]); 
      //vx_printf("sth is wrong\n");
-     vx_spawn_kernel(ctx, callbacks1[i], args); 
-     vx_spawn_kernel(ctx, callbacks2[i], args); 
+     vx_spawn_kernel(ctx, callbacks[i], args); 
+     
  } 
   return 0;
 }

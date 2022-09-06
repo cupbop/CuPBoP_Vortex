@@ -2,14 +2,14 @@
 set -e
 clang -c -emit-llvm util/timer/timer.c
 clang -c -emit-llvm util/num/num.c
-#clang -c -emit-llvm util/cuda/cuda.cu --cuda-gpu-arch=sm_61
-#clang -c -emit-llvm kernel/kernel_gpu_cuda_wrapper.cu --cuda-gpu-arch=sm_61
-#clang++ kernel/kernel_gpu_cuda_wrapper.cu  --cuda-path=/usr/local/cuda-10.1 --cuda-gpu-arch=sm_61 -L/usr/local/cuda-10.1/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v
-#clang++ kernel/kernel_gpu_cuda_wrapper_2.cu  --cuda-path=/usr/local/cuda-10.1 --cuda-gpu-arch=sm_61 -L/usr/local/cuda-10.1/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v
+clang -c -emit-llvm util/cuda/cuda.cu --cuda-gpu-arch=sm_50
+clang -c -emit-llvm kernel/kernel_gpu_cuda_wrapper.cu --cuda-gpu-arch=sm_50
+clang++ kernel/kernel_gpu_cuda_wrapper.cu  --cuda-path=/usr/local/cuda-10.1 --cuda-gpu-arch=sm_61 -L/usr/local/cuda-10.1/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v
+clang++ kernel/kernel_gpu_cuda_wrapper_2.cu  --cuda-path=/usr/local/cuda-10.1 --cuda-gpu-arch=sm_61 -L/usr/local/cuda-10.1/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v
 clang -c -emit-llvm main.c
 
-llvm-as kernel_gpu_cuda_wrapper-cuda-nvptx64-nvidia-cuda-sm_61.ll
-llvm-as kernel_gpu_cuda_wrapper_2-cuda-nvptx64-nvidia-cuda-sm_61.ll
+llvm-as kernel_gpu_cuda_wrapper-cuda-nvptx64-nvidia-cuda-sm_50.ll
+llvm-as kernel_gpu_cuda_wrapper_2-cuda-nvptx64-nvidia-cuda-sm_50.ll
 llvm-as kernel_gpu_cuda_wrapper-host-x86_64-unknown-linux-gnu.ll
 llvm-as kernel_gpu_cuda_wrapper_2-host-x86_64-unknown-linux-gnu.ll
 ../../build/compilation/kernelTranslator kernel_gpu_cuda_wrapper-cuda-nvptx64-nvidia-cuda-sm_61.bc kernel1.bc
