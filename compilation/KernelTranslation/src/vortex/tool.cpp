@@ -199,6 +199,8 @@ static void breakConstantExpressions(llvm::Value *Val, llvm::Function *Func) {
       // Convert this constant expression to an instruction.
       llvm::Instruction *I = CE->getAsInstruction();
       I->insertBefore(&*Func->begin()->begin());
+      printf("--------------------\n");
+      std::cout<<I<<std::endl;
       CE->replaceAllUsesWith(I);
       CE->destroyConstant();
     }
@@ -212,7 +214,7 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
       continue;
     for (Module::global_iterator i = M->global_begin(), e = M->global_end();
          i != e; ++i) {
-      breakConstantExpressions(&*i, F);
+        breakConstantExpressions(&*i, F);
     }
     auto dynamic_shared_memory_addr =
         M->getGlobalVariable("dynamic_shared_memory");
@@ -321,8 +323,8 @@ void replace_built_in_function(llvm::Module *M) {
                   ConstantInt* con_inter_warp_idx = cast<ConstantInt>(const_inter_warp_idx);
                   //ConstantInt* con_block_size_x = cast<ConstantInt>(const_block_size_x);
 
-                  int64_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue();
-                  int64_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
+                  int32_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue(); //changed to 32
+                  int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
                   //int64_t int_block_size_x = con_block_size_x->getSExtValue();
 
                   printf("intra warp corresponding value is : %ld \n", int_intra_warp_idx);

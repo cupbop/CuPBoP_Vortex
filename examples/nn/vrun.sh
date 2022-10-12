@@ -109,6 +109,8 @@ DPRINT "--- Copy  kernel bitcode  for host link"
 llc --relocation-model=pic --filetype=obj  kernel.bc
 g++ -g -O0 -o host_vortexrt.o -c host_vortexrt.cpp 
 
+
+
 DPRINT "--- Compile the translated bc code for $DEVICE"
 if [ $DEVICE = "x86" ]
 then
@@ -129,8 +131,15 @@ elif [ $DEVICE = "vortex" ]
 then
     echo "!!!!!" 
     clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
+   
+
     ${RISCV_TOOLCHAIN_PREFIX}g++ -o kernel_wrapper.o -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw -c kernel_wrapper.cpp  -Wl,--gc-sections
-    ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_wrapper.o kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
+
+      #linking kernel and CuPBoP kernel library
+    ${RISCV_TOOLCHAIN_PREFIX}gcc -r kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl.o -o kernel_link.o
+
+    ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_link.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
+    
     ${RISCV_TOOLCHAIN_PREFIX}objcopy -O binary kernel.elf kernel.out
     ${RISCV_TOOLCHAIN_PREFIX}objdump -D kernel.elf > kernel.dump
     echo "!!!!"
