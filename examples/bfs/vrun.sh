@@ -129,7 +129,7 @@ then
 elif [ $DEVICE = "vortex" ]
 then
     #clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
-    /opt/llvm-riscv/bin/clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f -Xclang -target-feature -Xclang +vortex kernel.bc -c -o kernel.o
+    ${LLVM_PREFIX}/bin/clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f -Xclang -target-feature -Xclang +vortex kernel.bc -c -o kernel.o
     ${RISCV_TOOLCHAIN_PREFIX}g++ -o kernel_wrapper.o -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw -c ../vortex_debug/kernel_wrapper.cpp  -Wl,--gc-sections
     ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_wrapper.o kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
     ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out
