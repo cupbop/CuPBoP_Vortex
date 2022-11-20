@@ -26,12 +26,12 @@ then
     exit -1
 fi
 
-if [ -z "$RISCV_TOOLCHAIN" ]
+if [ -z "$RISCV_TOOLCHAIN_PATH" ]
 then
-    echo "You need to set "\$RISCV_TOOLCHAIN" environment variable"
+    echo "You need to set "\$RISCV_TOOLCHAIN_PATH" environment variable"
     exit -1
 fi
-RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv32-unknown-elf-
+
 CUDA_PATH=$CuPBoP_PATH/cuda-10.1
 
 DEBUG_LEVEL=0
@@ -101,41 +101,47 @@ llvm-dis kernel.bc
 DPRINT "--- Translate the host bitcode by using CuPBoP's host translator"
 $CuPBoP_PATH/build/compilation/hostTranslator $KERNEL-host-x86_64-unknown-linux-gnu.bc host.bc
 llvm-dis host.bc 
-llc --relocation-model=pic --filetype=obj  host.bc
+llc --relocation-model=pic --filetype=obj host.bc -o host.o
 
-DPRINT "--- Copy  kernel bitcode  for host link"
-#llc --relocation-model=pic --filetype=obj  kernel_host.bc
-llc --relocation-model=pic --filetype=obj  kernel.bc
-g++ -g -O0 -o host_vortexrt.o -c host_vortexrt.cpp 
+#DPRINT "--- Copy  kernel bitcode for host link"
+#llc --relocation-model=pic --filetype=obj kernel_host.bc
+
+g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
 
 DPRINT "--- Compile the translated bc code for $DEVICE"
 if [ $DEVICE = "x86" ]
 then
-    llc --relocation-model=pic --filetype=obj  kernel.bc
-    llc --relocation-model=pic --filetype=obj  host.bc
+    llc --relocation-model=pic --filetype=obj kernel.bc
+    llc --relocation-model=pic --filetype=obj host.bc
     g++ -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/simx/ -o ${KERNEL}.out -fPIC -no-pie host.o kernel.o  -lc -lx86Runtime    -lvortex  -lthreadPool -lpthread 
     DPRINT "--- Run the executable file."
     ./${KERNEL}.out -q -v
 elif [ $DEVICE = "simx" ]
 then
     clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o 
-    ${RISCV_TOOLCHAIN_PREFIX}gcc -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw main.cc kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
-    ${RISCV_TOOLCHAIN_PREFIX}objcopy -O binary kernel.elf kernel.bin
-    ${RISCV_TOOLCHAIN_PREFIX}objdump -D kernel.elf > kernel.dump
+    $RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-gcc -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw main.cc kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
+    $RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-objcopy -O binary kernel.elf kernel.bin
+    $RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-objdump -D kernel.elf > kernel.dump
     DPRINT "--- Run the kernel on simx"
     ${VORTEX_PATH}/sim/simx/simx -r -c 1 -i kernel.bin -s
 elif [ $DEVICE = "vortex" ]
 then
+    VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
+    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw"
+    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a"
+    
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o    
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${VX_LDFLAGS} -o kernel.elf 
+    
+    #$RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-g++ ${VX_CFLAGS} hello_wrapper.cpp hello_kernel.cpp ${VX_LDFLAGS} -o kernel.elf
 
-    ${LLVM_PREFIX}/bin/clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f -Xclang -target-feature -Xclang +vortex kernel.bc -c -o kernel.o
-    ${RISCV_TOOLCHAIN_PREFIX}g++ -o kernel_wrapper.o -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw -c ../vortex_debug/kernel_wrapper.cpp  -Wl,--gc-sections
-    ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_wrapper.o kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
-    ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out
-    ${LLVM_PREFIX}/bin/llvm-objdump -D kernel.elf > kernel.dump
-    echo "!!!!"
+    ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
+    ${LLVM_PREFIX}/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
+    echo "--- Kernel compilation completed!"
     g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
-    DPRINT "--- Run the kernel on vortex"
+    echo "--- Host compilation completed!"
     LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
-    echo "$DEVICE is invalid"
+    echo "--- Execution completed!"
     exit -1
 fi

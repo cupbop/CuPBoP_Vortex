@@ -41,3 +41,7 @@ CMakeCache.txt
 
 # Log files
 *.log
+
+# exclude folders
+/cuda-10.1/**
+/build/**
