@@ -284,7 +284,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
               "    block_index_y = group_y;\n"
               "    block_index_z = 0;\n"
               "\n"
-              "    vx_printf(\"kernel_warpper: group_x=%d, group_y=%d\", group_x, group_y);\n"
+              "    vx_printf(\"kernel_warpper: group=(%d, %d)\\n\", group_x, group_y);\n"
               "\n"
               "    " << f << "((void **)args);\n"
             "}\n"
@@ -303,7 +303,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int main() {\n"
           "    auto kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; \n"
           "    auto ctx = &kernel_arg->ctx; \n"
-          "    auto args = (uint32_t*)kernel_arg->args;\n"
+          "    auto args = (uint64_t*)kernel_arg->args;\n"
           "\n"
 
           "    grid_size_x = ctx->num_groups[0];\n"
@@ -319,7 +319,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
 
-          "    vx_printf(\"kernel#%d: gridDim=(0x%x, 0x%x, 0x%x), blockDim=(0x%x, 0x%x, 0x%x), args=(0x%x, 0x%x, 0x%x, 0x%x) \", \n"
+          "    vx_printf(\"kernel#%d: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
           "        kernel_arg->kernel_idx, ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
           "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
           "        args[0], args[1], args[2], args[3]);\n"
