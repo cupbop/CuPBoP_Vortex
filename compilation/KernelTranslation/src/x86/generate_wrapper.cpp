@@ -1,4 +1,4 @@
-#include "generate_x86_format.h"
+#include "generate_wrapper.h"
 #include "tool.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -166,7 +166,7 @@ void remove_useless_var(llvm::Module *M) {
   M->getGlobalVariable("inter_warp_index")->eraseFromParent();
 }
 
-void generate_x86_format(llvm::Module *M) {
+void generate_wrapper(llvm::Module *M) {
   // change metadata
   set_meta_data(M);
   // decode argument

@@ -1,4 +1,4 @@
-#include "generate_x86_format.h"
+#include "generate_wrapper.h"
 #include "handle_sync.h"
 #include "init.h"
 #include "insert_sync.h"
@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
 
   // VerifyModule(program);
   std::cout << "generate\n" << std::flush;
-  generate_x86_format(program);
+  generate_wrapper(program);
 
   // VerifyModule(program);
 
