@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_THREADS_PER_BLOCK 512
+#define MAX_THREADS_PER_BLOCK 1
 
 int no_of_nodes;
 int edge_list_size;
@@ -159,7 +159,6 @@ void BFSGraph(int argc, char **argv) {
   dim3 grid(num_of_blocks, 1, 1);
   dim3 threads(num_of_threads_per_block, 1, 1);
 
-  int k = 0;
   printf("Start traversing the tree\n");
   bool stop;
   // Call the Kernel untill all the elements of Frontier are not false
@@ -181,18 +180,25 @@ void BFSGraph(int argc, char **argv) {
 
     cudaMemcpy(&stop, d_over, sizeof(bool), cudaMemcpyDeviceToHost);
 
-    k++;
   } while (stop);
 
-  printf("Kernel Executed %d times\n", k);
-
-  // copy result from device to host
+    // copy result from device to host
   cudaMemcpy(h_cost, d_cost, sizeof(int) * no_of_nodes, cudaMemcpyDeviceToHost);
 
+  cudaMemcpy(h_graph_mask, d_graph_mask, sizeof(bool) * no_of_nodes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_updating_graph_mask, d_updating_graph_mask, sizeof(bool) * no_of_nodes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_graph_visited, d_graph_visited, sizeof(bool) * no_of_nodes, cudaMemcpyDeviceToHost);
+
+  cudaMemcpy(h_graph_edges, d_graph_edges, sizeof(int) * edge_list_size, cudaMemcpyDeviceToHost);
+
+  cudaMemcpy(h_graph_nodes, d_graph_nodes, sizeof(Node) * no_of_nodes, cudaMemcpyDeviceToHost);
+  
   // Store the result into a file
-  FILE *fpo = fopen("result.txt", "w");
+  FILE *fpo = fopen("result_cuda.txt", "w");
   for (int i = 0; i < no_of_nodes; i++)
-    fprintf(fpo, "%d) cost:%d\n", i, h_cost[i]);
+    {fprintf(fpo, "%d) cost:%d, mask:%d, updatemask:%d, visited:%d, edges:%d, id/edge:%d %d\n",
+      i, h_cost[i], h_graph_mask[i], h_updating_graph_mask[i], h_graph_visited[i], h_graph_edges[i], h_graph_nodes[i].starting, h_graph_nodes[i].no_of_edges);
+    }
   fclose(fpo);
   printf("Result stored in result.txt\n");
 

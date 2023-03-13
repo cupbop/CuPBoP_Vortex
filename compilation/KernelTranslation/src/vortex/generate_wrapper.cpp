@@ -212,7 +212,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             auto func_arg_size = Call->getCalledFunction()->arg_size();
             std::cout << "currently looking function is " << func_name << std::endl;
             // Find the function name that is not printf, and llvm (TODO: need to come up with better ways to find kernel names later.)
-            if ((func_name.find("llvm") == std::string::npos) && (func_name.find("printf") == std::string::npos))
+            if (((func_name.find("sqrt") == std::string::npos)) && (func_name.find("llvm") == std::string::npos) && (func_name.find("printf") == std::string::npos))
             {
               std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               wrapper_name.push_back(func_name + "_wrapper");

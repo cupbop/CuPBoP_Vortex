@@ -31,10 +31,15 @@ then
     echo "You need to set "\$RISCV_TOOLCHAIN_PATH" environment variable"
     exit -1
 fi
-
+RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv32-unknown-elf-
 CUDA_PATH=$CuPBoP_PATH/cuda-10.1
 
 DEBUG_LEVEL=0
+
+#임시
+LLVM_PREFIX=/opt/llvm-vortex
+echo hihihi
+echo $LLVM_PREFIX
 
 DPRINT()
 {
@@ -127,21 +132,30 @@ then
 elif [ $DEVICE = "vortex" ]
 then
     VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
-    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw"
-    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a"
     
+    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+    
+    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+
+    echo "hello1"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
+    echo "hello2"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o    
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${VX_LDFLAGS} -o kernel.elf 
-    
-    #$RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-g++ ${VX_CFLAGS} hello_wrapper.cpp hello_kernel.cpp ${VX_LDFLAGS} -o kernel.elf
+    echo "hello3"
+    #${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${VX_LDFLAGS} -o kernel.elf 
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl.o -lm ${VX_LDFLAGS} -o kernel.elf 
+
+    echo "hello4"
+
 
     ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
     ${LLVM_PREFIX}/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
     echo "--- Kernel compilation completed!"
-    g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
+    #g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
+    g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
+    #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
     echo "--- Execution completed!"
     exit -1
 fi
