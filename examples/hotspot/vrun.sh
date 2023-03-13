@@ -37,10 +37,6 @@ CUDA_PATH=$CuPBoP_PATH/cuda-10.1
 
 DEBUG_LEVEL=0
 
-#임시
-LLVM_PREFIX=/data/ahnch/vortex_dev_tools/llvm-vortex
-echo hihihi
-echo $LLVM_PREFIX
 
 DPRINT()
 {

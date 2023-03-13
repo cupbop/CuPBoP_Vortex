@@ -36,11 +36,6 @@ CUDA_PATH=$CuPBoP_PATH/cuda-10.1
 
 DEBUG_LEVEL=0
 
-#임시
-LLVM_PREFIX=/opt/llvm-vortex
-echo hihihi
-echo $LLVM_PREFIX
-
 DPRINT()
 {
   if [ $DEBUG_LEVEL -eq 1 ]; then
