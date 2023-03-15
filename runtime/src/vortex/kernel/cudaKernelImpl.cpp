@@ -14,6 +14,6 @@ float __nv_fast_powf(float base, float exp) { return pow(base, exp); }
 float __nv_fmodf(float x, float y) { return fmod(x, y); }
 int __nv_isnanf(float v) { return isnan(v); }
 int __nv_isinff(float v) { return isinf(v); }
-float __nv_fabsf(float v) { return abs(v); }
+float __nv_fabsf(float v) { return fabs(v); }
 int __nvvm_mul24_i(int a, int b) { return a * b; }
 double _ZL3expd(double base) { return exp(base); }

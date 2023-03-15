@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <vector>
-#include <iostream>
 
 #ifdef TIMING
 #include "timing.h"
@@ -24,7 +23,7 @@ float init_time = 0, mem_alloc_time = 0, h2d_time = 0, kernel_time = 0,
 #define print(x) printf(#x ": %lu\n", (unsigned long)x)
 #define DEBUG false
 
-#define DEFAULT_THREADS_PER_BLOCK 8
+#define DEFAULT_THREADS_PER_BLOCK 128
 
 #define MAX_ARGS 10
 #define REC_LENGTH 53 // size of a record in db
@@ -56,17 +55,18 @@ int parseCommandline(int argc, char *argv[], char *filename, int *r, float *lat,
  * Calculates the Euclidean distance from each record in the database to the
  * target position
  */
-__global__ void euclid(LatLong *d_locations, float *d_distances, int numRecords,float lat, float lng)
-{
-	//int globalId = gridDim.x * blockDim.x * blockIdx.y + blockDim.x * blockIdx.x + threadIdx.x;
-	int globalId = blockDim.x * ( gridDim.x * blockIdx.y + blockIdx.x ) + threadIdx.x; // more efficient
-    LatLong *latLong = d_locations+globalId;
-    if (globalId < numRecords) {
-        float *dist=d_distances+globalId;
-        *dist = (float)sqrt((lat - latLong->lat) * (lat - latLong->lat) +
-        (lng - latLong->lng) * (lng - latLong->lng));
-        //*dist = (lat-latLong->lat)*(lat-latLong->lat)+(lng-latLong->lng)*(lng-latLong->lng);
-	}
+__global__ void euclid(LatLong *d_locations, float *d_distances, int numRecords,
+                       float lat, float lng) {
+  // int globalId = gridDim.x * blockDim.x * blockIdx.y + blockDim.x *
+  // blockIdx.x + threadIdx.x;
+  int globalId = blockDim.x * (gridDim.x * blockIdx.y + blockIdx.x) +
+                 threadIdx.x; // more efficient
+  LatLong *latLong = d_locations + globalId;
+  if (globalId < numRecords) {
+    float *dist = d_distances + globalId;
+    *dist = (float)sqrt((lat - latLong->lat) * (lat - latLong->lat) +
+                        (lng - latLong->lng) * (lng - latLong->lng));
+  }
 }
 
 /**
@@ -103,12 +103,11 @@ int main(int argc, char *argv[]) {
   float *d_distances;
 
   // Scaling calculations - added by Sam Kauffman
-  // cudaDeviceProp deviceProp;
-  // cudaGetDeviceProperties(&deviceProp, 0);
-  // cudaDeviceSynchronize();
-  // unsigned long maxGridX = deviceProp.maxGridSize[0];
-  unsigned long maxGridX = 1;
-  unsigned long threadsPerBlock = 8;
+  cudaDeviceProp deviceProp;
+  cudaGetDeviceProperties(&deviceProp, 0);
+  cudaDeviceSynchronize();
+  unsigned long maxGridX = deviceProp.maxGridSize[0];
+  unsigned long threadsPerBlock = 128;
   size_t totalDeviceMemory;
   size_t freeDeviceMemory;
   unsigned long blocks =
@@ -116,7 +115,7 @@ int main(int argc, char *argv[]) {
   unsigned long gridY = ceilDiv(blocks, maxGridX);
   unsigned long gridX = ceilDiv(blocks, gridY);
   // There will be no more than (gridY - 1) extra blocks
-  dim3 gridDim(gridY, gridX);
+  dim3 gridDim(gridX, gridY);
 
   /**
    * Allocate memory on host and device
@@ -131,14 +130,12 @@ int main(int argc, char *argv[]) {
   cudaMemcpy(d_locations, &locations[0], sizeof(LatLong) * numRecords,
              cudaMemcpyHostToDevice);
 
-  std::cout << locations[9].lat <<"hello\n";
-  std::cout << locations[10].lat <<"hello\n";
-  std::cout << locations[1].lat <<"hello\n";
   /**
    * Execute kernel
    */
   printf("before call\n");
-  euclid<<<gridDim , threadsPerBlock >>>(d_locations,d_distances,numRecords,lat,lng);
+  euclid<<<gridDim, threadsPerBlock>>>(d_locations, d_distances, numRecords,
+                                       lat, lng);
   cudaDeviceSynchronize();
   printf("after call\n");
   // Copy data from device memory to host memory
@@ -212,7 +209,6 @@ int loadData(char *filename, std::vector<Record> &records,
       latLong.lng = atof(substr);
 
       locations.push_back(latLong);
-      std::cout << latLong.lat << latLong.lng << "\n";
       records.push_back(record);
       recNum++;
     }
