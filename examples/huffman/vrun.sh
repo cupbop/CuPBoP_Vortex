@@ -82,12 +82,18 @@ case $DEVICE in
 esac
 
 # delete all generated files
-rm -f *.out *.o *.dump *.log *.ll *.bc *.elf
+rm -f *.out *.dump *.log *.ll *.bc *.elf
 
 KERNEL=`basename $KERNEL_CU .cu` 
 
 DPRINT "--- Generate bitcode files(.bc) for host and device by using clang++"
+
+echo "hello1"
+
+
 clang++ -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+
+echo "hello2"
 
 DPRINT "--- Generate LLVM IR files(.ll) for host and device"
 llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
@@ -96,18 +102,21 @@ llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
 DPRINT "--- Translate the kernel bitcode by using CuPBoP's kernel translator"
 
 #$CuPBoP_PATH/build/compilation/kernelTranslator.x86 $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel_host.bc 
+
+
 $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc 
 llvm-dis kernel.bc
 
 DPRINT "--- Translate the host bitcode by using CuPBoP's host translator"
 $CuPBoP_PATH/build/compilation/hostTranslator $KERNEL-host-x86_64-unknown-linux-gnu.bc host.bc
 llvm-dis host.bc 
-llc --relocation-model=pic --filetype=obj  host.bc
+#llc --relocation-model=pic --filetype=obj  host.bc
 
 DPRINT "--- Copy  kernel bitcode  for host link"
 #llc --relocation-model=pic --filetype=obj  kernel_host.bc
-llc --relocation-model=pic --filetype=obj  kernel.bc
-g++ -g -O0 -o host_vortexrt.o -c host_vortexrt.cpp 
+#llc --relocation-model=pic --filetype=obj  kernel.bc
+#g++ -g -O0 -o host_vortexrt.o -c host_vortexrt.cpp 
+
 
 DPRINT "--- Compile the translated bc code for $DEVICE"
 if [ $DEVICE = "x86" ]
@@ -127,17 +136,26 @@ then
     ${VORTEX_PATH}/sim/simx/simx -r -c 1 -i kernel.bin -s
 elif [ $DEVICE = "vortex" ]
 then
-    echo "!!!!!" 
-    clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
-    ${RISCV_TOOLCHAIN_PREFIX}g++ -o kernel_wrapper.o -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw -c kernel_wrapper.cpp  -Wl,--gc-sections
-    ${RISCV_TOOLCHAIN_PREFIX}g++ -march=rv32imf -mabi=ilp32f -Wstack-usage=1024 -mcmodel=medany -ffreestanding -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/runtime/include -I${VORTEX_PATH}/runtime/../hw kernel_wrapper.o kernel.o -lm -Wl,-Bstatic,-T,${VORTEX_PATH}/runtime/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/runtime/libvortexrt.a -o kernel.elf 
-    ${RISCV_TOOLCHAIN_PREFIX}objcopy -O binary kernel.elf kernel.out
-    ${RISCV_TOOLCHAIN_PREFIX}objdump -D kernel.elf > kernel.dump
-    echo "!!!!"
-    g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
+    VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
+    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+    #clang++ -std=c++11 --target=riscv32 -march=rv32imf -mabi=ilp32f kernel.bc -c -o kernel.o
+    echo "hello1" 
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1
+    echo"hello2"
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o 
+
+    echo "hello3"
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o cpuencode.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl.o -lm ${VX_LDFLAGS} -o kernel.elf > res.txt
+         echo "!!!"
+
+    ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
+    ${LLVM_PREFIX}/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
+    echo "--- Kernel compilation completed!"
+    g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o pavle -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     DPRINT "--- Run the kernel on vortex"
     LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} 
-    ./host.out -f ../../data/rodinia-data/gaussian/matrix4.txt
+    ./pavle ../../data/huffman/test1024_H2.206587175259.in
     #./host.out -q -v
     
     echo "finished"
