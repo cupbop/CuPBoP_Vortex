@@ -91,6 +91,7 @@ DPRINT "--- Generate bitcode files(.bc) for host and device by using clang++"
 #clang++ -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 
 DPRINT "--- Generate LLVM IR files(.ll) for host and device"
+
 llvm-dis lud_kernel-cuda-nvptx64-nvidia-cuda-sm_50.bc
 llvm-dis lud-host-x86_64-unknown-linux-gnu.bc
 
