@@ -9,6 +9,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <assert.h>
+#include "tool.h"
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -28,11 +29,14 @@ void mem_share2global(llvm::Module *M) {
   std::set<GlobalVariable *> need_remove_share_memory;
 
   // find all share memory and generate corresponding global memory
+  
   for (auto I = M->global_begin(), E = M->global_end(); I != E; ++I) {
     if (GlobalVariable *share_memory = dyn_cast<GlobalVariable>(I)) {
       if (auto PT = dyn_cast<PointerType>(I->getType())) {
         unsigned AS = PT->getAddressSpace();
-        if (AS == 3) { // find a share memory
+        if (AS == 3) {
+        // find a share memory
+        //printIR(M);
           need_remove_share_memory.insert(share_memory);
           // generate the corresponding global memory variable
           auto new_name = "wrapper_global_" + share_memory->getName().str();
@@ -56,10 +60,14 @@ void mem_share2global(llvm::Module *M) {
                   std::pair<GlobalVariable *, GlobalVariable *>(share_memory,
                                                                 global_ptr));
             } else {
+              //llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
+              //    *M, array_type, false, llvm::GlobalValue::ExternalLinkage,
+              //    NULL, new_name, NULL,
+              //    llvm::GlobalValue::GeneralDynamicTLSModel, 1);
               llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
                   *M, array_type, false, llvm::GlobalValue::ExternalLinkage,
                   NULL, new_name, NULL,
-                  llvm::GlobalValue::GeneralDynamicTLSModel, 1);
+                  llvm::GlobalValue::LocalExecTLSModel, 1);
               ConstantAggregateZero *const_array =
                   ConstantAggregateZero::get(array_type);
               global_memory->setInitializer(const_array);
@@ -89,6 +97,7 @@ void mem_share2global(llvm::Module *M) {
           } else {
             assert(0 && "The required Share Memory Type is not supported\n");
           }
+          //printIR(M);
         }
       }
     }
