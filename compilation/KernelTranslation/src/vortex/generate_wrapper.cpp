@@ -211,8 +211,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
             auto func_name = Call->getCalledFunction()->getName().str();
             auto func_arg_size = Call->getCalledFunction()->arg_size();
             std::cout << "currently looking function is " << func_name << std::endl;
-            // Find the function name that is not printf, and llvm (TODO: need to come up with better ways to find kernel names later.)
-            if (((func_name.find("sqrt") == std::string::npos)) && (func_name.find("llvm") == std::string::npos) && (func_name.find("printf") == std::string::npos) && (func_name.find("atomicAdd") == std::string::npos) && (func_name.find("_uAtomicAdd") == std::string::npos) && (func_name.find("atomicOrP") == std::string::npos) && (func_name.find("uAtomicOrP") == std::string::npos)&& (func_name.find("_mul24") == std::string::npos) && (func_name.find("printf") == std::string::npos))
+
+            // Find the kernel function name
+            if(isKernelFunction(M, Call->getCalledFunction()) && std::find(wrapper_name.begin(), wrapper_name.end(), func_name+"_wrapper") == wrapper_name.end())
             {
               std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               wrapper_name.push_back(func_name + "_wrapper");
