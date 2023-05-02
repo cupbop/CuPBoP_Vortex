@@ -262,9 +262,17 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread block_index_x;\n"
           "int __thread block_index_y;\n"
           "int __thread block_index_z;\n"
-          "\n"
+          "\n";
 
-          "extern \"C\" {\n";
+    std::fstream infile;
+    std::string line;
+    infile.open ("lookup_constant.txt");      
+    while (std::getline(infile, line))
+    {
+      ss << line << ";\n";
+    }
+    infile.close();
+    ss <<  "\n extern \"C\" {\n";
 
     for (auto f : wrapper_name) {
         ss << "    extern void " + f + "(void *args);\n";
