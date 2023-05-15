@@ -695,6 +695,16 @@ bool find_barrier_in_region(llvm::BasicBlock *start, llvm::BasicBlock *end) {
 }
 
 /*
+  Print IR Module for Debugging Purposes
+*/
+void printIR(llvm::Module *module_) {
+ std::string module_str;
+ llvm::raw_string_ostream ostream{module_str};
+ module_->print(ostream, nullptr, false);
+ std::cout << module_str << std::endl;
+}
+
+/*
   Print IR to String Output for Debugging Purposes
 */
 // void printModule(llvm::Module *M) {
