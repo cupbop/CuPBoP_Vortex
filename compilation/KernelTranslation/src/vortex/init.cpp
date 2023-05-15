@@ -367,6 +367,7 @@ void replace_cuda_math_built_in(llvm::Module *M) {
   }
 }
 
+
 void init_block(llvm::Module *M, std::ofstream &fout) {
   // using official llvm preprocess
   llvm_preprocess(M);
@@ -402,6 +403,8 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   mem_constant2global(M, fout);
   // replace asm Inline
   replace_asm_call(M);
+
+
   // replace dynamic shared memory
   //replace_dynamic_shared_memory(M);
 }
