@@ -152,7 +152,17 @@ cudaError_t cudaFree(void *devPtr) {
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {  
-  memset(devPtr, value, count);
+  void* tmp_ptr;
+  tmp_ptr = (void *) malloc(count);
+  memset(tmp_ptr, value, count);
+  auto DC = DeviceContext::instance();
+  auto staging_buf = DC->staging_alloc(count);
+  auto host_ptr = vx_host_ptr(staging_buf);
+  memcpy((char *)host_ptr, tmp_ptr, count);
+  uint64_t mem_addr = (uint64_t)devPtr;
+  RT_CHECK(vx_copy_to_dev(staging_buf, mem_addr, count, 0));
+  printf("cudaMemset: value=%d, dst=%lu, count=%ld\n", value, mem_addr, count);
+  free(tmp_ptr);
   return cudaSuccess;
 }
 
