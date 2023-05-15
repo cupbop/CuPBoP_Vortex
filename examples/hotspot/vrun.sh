@@ -5,7 +5,7 @@ set -e
 
 ######################### Default Varaibles #################################
 DEVICE=vortex
-KERNEL_CU=hotspot_mark.cu
+KERNEL_CU=hotspot.cu
 #############################################################################
 
 show_usage()
@@ -33,7 +33,7 @@ then
 fi
 RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN_PATH/bin/riscv32-unknown-elf-
 CUDA_PATH=$CuPBoP_PATH/cuda-10.1
-#LLVM_PREFIX=/opt/llvm-riscv
+LLVM_14=/opt/LLVM_14
 
 DEBUG_LEVEL=0
 
@@ -108,7 +108,7 @@ llc --relocation-model=pic --filetype=obj  host.bc
 
 DPRINT "--- Copy  kernel bitcode  for host link"
 #llc --relocation-model=pic --filetype=obj  kernel_host.bc
-llc --relocation-model=pic --filetype=obj  kernel.bc
+#llc --relocation-model=pic --filetype=obj  kernel.bc
 g++ -g -O0 -o host_vortexrt.o -c host_vortexrt.cpp 
 
 DPRINT "--- Compile the translated bc code for $DEVICE"
@@ -131,11 +131,16 @@ elif [ $DEVICE = "vortex" ]
 then
     VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
     
-    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+    #VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+
+    VX_CFLAGS="-v -O3 -std=c++11 -target riscv32 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+
     VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
 
     echo "hello1"
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
+    echo $LLVM_14
+    echo ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o 
+    ${LLVM_14}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o #> kernel.log 2>&1    
     echo "hello2"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o    
     echo "hello3"
@@ -143,15 +148,17 @@ then
 
     echo "hello4"
 
-
+    #${LLVM_14}/bin/llvm-objcopy --remove-section .rela.got kernel.elf
     ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
     ${LLVM_PREFIX}/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
+    #${LLVM_14}/bin/llvm-objdump -D kernel.elf > kernel_LLVM14.dump
     echo "--- Kernel compilation completed!"
     #g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out 512 2 2 ../../data/hotspot/temp_512 ../../data/hotspot/power_512 output.out
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out 16 2 2 ../../data/hotspot/temp_16 ../../data/hotspot/power_16 output.out
+    #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --args ./host.out 64 2 2 ../../data/hotspot/temp_64 ../../data/hotspot/power_64 output.out
     echo "--- Execution completed!"
     exit -1
 fi
