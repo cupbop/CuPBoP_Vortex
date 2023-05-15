@@ -154,7 +154,9 @@ then
     echo "--- Kernel compilation completed!"
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out filelist.txt -r 10 -lat 30 -lng 90 >> res.log
+    #simx performance counter settings
+    export PERF_CLASS=2
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out filelist.txt -r 10 -lat 30 -lng 90 #>> res.log
     echo "--- Execution completed!"
     exit -1
 fi
