@@ -130,15 +130,29 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
   std::set<llvm::Instruction *> need_remove;
   std::set<GlobalVariable *> need_remove_constant_memory;
 
+  std::fstream outfile;
+  outfile.open("lookup_constant.txt", std::ios::out);
+  outfile.close();
+
   // find all constant memory and generate corresponding global memory
   for (auto I = M->global_begin(), E = M->global_end(); I != E; ++I) {
     if (GlobalVariable *constant_memory = dyn_cast<GlobalVariable>(I)) {
       if (auto PT = dyn_cast<PointerType>(I->getType())) {
         unsigned AS = PT->getAddressSpace();
-        if (AS == 4) { // find a share memory
+        if (AS == 4) { // find a constant memory
           need_remove_constant_memory.insert(constant_memory);
           // generate the corresponding global memory variable
           auto new_name = "wrapper_global_" + constant_memory->getName().str();
+
+          outfile.open("lookup_constant.txt", std::ios::app);
+          if (constant_memory->getType()->isPointerTy()){
+            outfile << "void *" << new_name << "\n";
+          }
+          else{
+            outfile << "void " << new_name << "\n";
+          }
+          outfile.close();
+          
           auto element_type = PT->getElementType();
           if (auto array_type = dyn_cast<ArrayType>(element_type)) {
             if (constant_memory->hasExternalLinkage() &&
