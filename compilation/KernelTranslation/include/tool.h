@@ -22,4 +22,5 @@ bool has_barrier(llvm::BasicBlock *B);
 bool has_block_barrier(llvm::BasicBlock *B);
 bool has_barrier(llvm::Function *F);
 void replace_dynamic_shared_memory(llvm::Module *M);
+void printIR(llvm::Module *module_);
 #endif
