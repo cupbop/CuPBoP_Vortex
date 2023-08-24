@@ -6,6 +6,7 @@ set -e
 ######################### Default Varaibles #################################
 DEVICE=vortex
 KERNEL_CU=saxpy.cu
+
 #############################################################################
 
 show_usage()
@@ -86,19 +87,20 @@ rm -f *.out *.o *.dump *.log *.ll *.bc *.elf
 
 KERNEL=`basename $KERNEL_CU .cu` 
 
-DPRINT "--- Generate bitcode files(.bc) for host and device by using clang++"
-clang++ -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+# Possible to put -O3 here to generate simpler code
+echo "--- Generate bitcode files(.bc) for host and device by using clang++"
+clang++ -O3 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 
-DPRINT "--- Generate LLVM IR files(.ll) for host and device"
+echo "--- Generate LLVM IR files(.ll) for host and device"
 llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
 llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
 
-DPRINT "--- Translate the kernel bitcode by using CuPBoP's kernel translator"
+echo "--- Translate the kernel bitcode by using CuPBoP's kernel translator"
 #$CuPBoP_PATH/build/compilation/kernelTranslator.x86 $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel_host.bc 
 $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc 
 llvm-dis kernel.bc
 
-DPRINT "--- Translate the host bitcode by using CuPBoP's host translator"
+echo "--- Translate the host bitcode by using CuPBoP's host translator"
 $CuPBoP_PATH/build/compilation/hostTranslator $KERNEL-host-x86_64-unknown-linux-gnu.bc host.bc
 llvm-dis host.bc 
 llc --relocation-model=pic --filetype=obj host.bc -o host.o
@@ -108,7 +110,7 @@ llc --relocation-model=pic --filetype=obj host.bc -o host.o
 
 g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
 
-DPRINT "--- Compile the translated bc code for $DEVICE"
+echo "--- Compile the translated bc code for $DEVICE"
 if [ $DEVICE = "x86" ]
 then
     llc --relocation-model=pic --filetype=obj kernel.bc
@@ -128,29 +130,44 @@ elif [ $DEVICE = "vortex" ]
 then
     VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
     
-    VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
-    
-    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+    #VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+
+    #VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+    VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+
+
+    #VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+
+    VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x180000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+
+    RISCV_TOOLCHAIN_PATH_64="/opt/riscv64-gnu-toolchain"
 
     echo "hello1"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
     echo "hello2"
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o    
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH_64} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o    
+    ${LLVM_PREFIX}/bin/llvm-objdump -D kernel_wrapper.o > kernel_wrapper.dump
+
     echo "hello3"
-    #${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${VX_LDFLAGS} -o kernel.elf 
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH} kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl.o -lm ${VX_LDFLAGS} -o kernel.elf 
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH_64} kernel_wrapper.o kernel.o ${VX_LDFLAGS} -o kernel.elf 
+    #${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_PATH_64} kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl.o -lm ${VX_LDFLAGS} -o kernel.elf 
 
     echo "hello4"
 
 
     ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
-    ${LLVM_PREFIX}/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
+    ${LLVM_PREFIX}/bin/llvm-objdump -D kernel.elf > kernel.dump
+    #/opt/llvm-vortex/bin/llvm-objdump -mattr=+m,+f,+vortex -D kernel.elf > kernel.dump
+
     echo "--- Kernel compilation completed!"
     #g++ -g -O0 -Wall -L../../build/runtime  -L../../build/runtime/threadPool  -L${VORTEX_PATH}/driver/stub -I${VORTEX_PATH}/runtime/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
+    #simx performance counter settings
+    export PERF_CLASS=2
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/driver/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v
+    #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v # > host_out.dump
     echo "--- Execution completed!"
     exit -1
 fi

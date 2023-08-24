@@ -3,6 +3,7 @@
 #include "cudaStatus.h"
 #include "structures.h"
 #include <stdint.h>
+
 extern "C" {
 cudaError_t cudaGetDevice(int *devPtr);
 const char *cudaGetErrorname(cudaError_t);

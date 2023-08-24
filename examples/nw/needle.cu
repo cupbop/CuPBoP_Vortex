@@ -227,7 +227,7 @@ void runTest(int argc, char **argv) {
 
   //#define TRACEBACK
 
-  FILE *fpo = fopen("result.txt", "w");
+  FILE *fpo = fopen("result_vortex.txt", "w");
   fprintf(fpo, "print traceback value GPU:\n");
 
   for (int i = max_rows - 2, j = max_rows - 2; i >= 0, j >= 0;) {

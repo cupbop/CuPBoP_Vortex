@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#include "common.h"
+#include "../common/common.h"
 
 #ifdef TIMING
 #include "timing.h"

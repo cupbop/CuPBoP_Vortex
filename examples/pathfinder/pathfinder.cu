@@ -17,7 +17,7 @@ float init_time = 0, mem_alloc_time = 0, h2d_time = 0, kernel_time = 0,
       d2h_time = 0, close_time = 0, total_time = 0;
 #endif
 
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 64
 #define STR_SIZE 256
 #define DEVICE 0
 #define HALO                                                                   \
@@ -55,6 +55,7 @@ void init(int argc, char **argv) {
   for (int i = 0; i < rows; i++) {
     for (int j = 0; j < cols; j++) {
       wall[i][j] = rand() % 10;
+      printf("%d ", wall[i][j]);
     }
   }
 #ifdef BENCH_PRINT
@@ -87,7 +88,6 @@ __global__ void dynproc_kernel(int iteration, int *gpuWall, int *gpuSrc,
   // after N iterations.
   // it is the non-overlapping small blocks that cover
   // all the input data
-
   // calculate the small block size
   int small_block_cols = BLOCK_SIZE - iteration * HALO * 2;
 
@@ -95,6 +95,8 @@ __global__ void dynproc_kernel(int iteration, int *gpuWall, int *gpuSrc,
   // the boundary of its small block
   int blkX = small_block_cols * bx - border;
   int blkXmax = blkX + BLOCK_SIZE - 1;
+  //printf("sma %d, blkx %d, blkxm %d\n", small_block_cols, blkX, blkXmax);
+  //printf("%d %d %d\n", BLOCK_SIZE, iteration, HALO);
 
   // calculate the global thread coordination
   int xidx = blkX + tx;
@@ -102,9 +104,16 @@ __global__ void dynproc_kernel(int iteration, int *gpuWall, int *gpuSrc,
   // effective range within this block that falls within
   // the valid range of the input data
   // used to rule out computation outside the boundary.
-  int validXmin = (blkX < 0) ? -blkX : 0;
-  int validXmax = (blkXmax > cols - 1) ? BLOCK_SIZE - 1 - (blkXmax - cols + 1)
-                                       : BLOCK_SIZE - 1;
+  //int validXmin = (blkX < 0) ? -blkX : 0;
+
+  int validXmin;
+  if(blkX < 0)
+      validXmin = -blkX;
+  else
+      validXmin = 0;
+
+   int validXmax = (blkXmax > cols - 1) ? BLOCK_SIZE - 1 - (blkXmax - cols + 1)
+                                       : BLOCK_SIZE - 1; 
 
   int W = tx - 1;
   int E = tx + 1;
@@ -113,6 +122,7 @@ __global__ void dynproc_kernel(int iteration, int *gpuWall, int *gpuSrc,
   E = (E > validXmax) ? validXmax : E;
 
   bool isValid = IN_RANGE(tx, validXmin, validXmax);
+  //printf("validmin %d, validmax %d \n", validXmin, validXmax);
 
   if (IN_RANGE(xidx, 0, cols - 1)) {
     prev[tx] = gpuSrc[xidx];
@@ -160,6 +170,7 @@ int calc_path(int *gpuWall, int *gpuResult[2], int rows, int cols,
     int temp = src;
     src = dst;
     dst = temp;
+    //printf("iteration %d\n", MIN(pyramid_height, rows - t - 1));
     dynproc_kernel<<<dimGrid, dimBlock>>>(
         MIN(pyramid_height, rows - t - 1), gpuWall, gpuResult[src],
         gpuResult[dst], cols, rows, t, borderCols);
@@ -193,6 +204,7 @@ void run(int argc, char **argv) {
 
   int *gpuWall, *gpuResult[2];
   int size = rows * cols;
+  printf("total_size: %d", size);
 
   cudaMalloc((void **)&gpuResult[0], sizeof(int) * cols);
   cudaMalloc((void **)&gpuResult[1], sizeof(int) * cols);

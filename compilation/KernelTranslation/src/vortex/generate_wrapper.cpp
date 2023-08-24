@@ -1,4 +1,5 @@
 #include "generate_wrapper.h"
+#include "base_address.h"
 #include "tool.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -236,7 +237,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "#include <stdint.h>\n"          
           "\n"
 
-          "#define KERNEL_ARG_BASE_ADDR 0x7ffff000\n"
+          "#define KERNEL_ARG_BASE_ADDR "
+          << KERNEL_ARG_BASE_ADDR <<
+          "\n"
           "\n"
 
           "typedef struct {\n"
@@ -327,9 +330,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
-
-          "    vx_printf(\"kernel#%d: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
-          "        kernel_arg->kernel_idx, ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
+          //"    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
+          "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
+          "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
+          "        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
           "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
           "        args[0], args[1], args[2], args[3]);\n"
           "\n"

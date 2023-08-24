@@ -26,7 +26,7 @@ using namespace std;
     }                                                                          \
   } while (0)
 
-#define THREADS_PER_BLOCK 512
+#define THREADS_PER_BLOCK 128
 #define MAXBLOCKS 65536
 
 // host memory

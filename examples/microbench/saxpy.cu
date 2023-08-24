@@ -17,7 +17,7 @@ void saxpy(int n, bool* x, float* y, int* z_first, int* z_second)
     //for (int k = x[i]; k<x[i]+1; k++)
     {
       //printf("zfirst: %d\n", z_first[i]);
-      z_second[i] = z_first[i] - 2;
+      z_second[i] = z_first[i] - 2.0f;
     }
     //if( i % 2 == 0)
     //  x[i] = true;
@@ -30,8 +30,8 @@ void saxpy(int n, bool* x, float* y, int* z_first, int* z_second)
 
 int main(void)
 {
-  int N = 10000;
-  int T = 128;
+  int N = 512;
+  int T = 32;
   // changes to for loop 
   // 4 blocks -> 4threads
   // 32 threads -> 1 for loop

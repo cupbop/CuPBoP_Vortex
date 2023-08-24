@@ -3,15 +3,15 @@
 #include <stdlib.h>
 #include <time.h>
 
-#ifdef RD_WG_SIZE_0_0
-#define BLOCK_SIZE RD_WG_SIZE_0_0
-#elif defined(RD_WG_SIZE_0)
-#define BLOCK_SIZE RD_WG_SIZE_0
-#elif defined(RD_WG_SIZE)
-#define BLOCK_SIZE RD_WG_SIZE
-#else
-#define BLOCK_SIZE 16
-#endif
+//#ifdef RD_WG_SIZE_0_0
+//#define BLOCK_SIZE RD_WG_SIZE_0_0
+//#elif defined(RD_WG_SIZE_0)
+//#define BLOCK_SIZE RD_WG_SIZE_0
+//#elif defined(RD_WG_SIZE)
+//#define BLOCK_SIZE RD_WG_SIZE
+//#else
+#define BLOCK_SIZE 8
+//#endif
 
 #define STR_SIZE 256
 
@@ -105,6 +105,8 @@ __global__ void calculate_temp(int iteration,   // number of iteration
   __shared__ float power_on_cuda[BLOCK_SIZE][BLOCK_SIZE];
   __shared__ float temp_t[BLOCK_SIZE]
                          [BLOCK_SIZE]; // saving temparary temperature result
+
+  //printf("hello");
 
   float amb_temp = 80.0;
   float step_div_Cap;
@@ -328,6 +330,7 @@ void run(int argc, char **argv) {
   readinput(FilesavingPower, grid_rows, grid_cols, pfile);
 
   float *MatrixTemp[2], *MatrixPower;
+  printf("size is %d", size);
   cudaMalloc((void **)&MatrixTemp[0], sizeof(float) * size);
   cudaMalloc((void **)&MatrixTemp[1], sizeof(float) * size);
   cudaMemcpy(MatrixTemp[0], FilesavingTemp, sizeof(float) * size,

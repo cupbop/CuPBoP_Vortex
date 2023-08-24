@@ -31,7 +31,7 @@
 #elif defined(RD_WG_SIZE)
 #define BLOCK_SIZE_0 RD_WG_SIZE
 #else
-#define BLOCK_SIZE_0 192
+#define BLOCK_SIZE_0 128
 #endif
 
 #ifdef RD_WG_SIZE_1_0
@@ -41,7 +41,7 @@
 #elif defined(RD_WG_SIZE)
 #define BLOCK_SIZE_1 RD_WG_SIZE
 #else
-#define BLOCK_SIZE_1 192
+#define BLOCK_SIZE_1 128
 #endif
 
 #ifdef RD_WG_SIZE_2_0
@@ -51,7 +51,7 @@
 #elif defined(RD_WG_SIZE)
 #define BLOCK_SIZE_2 RD_WG_SIZE
 #else
-#define BLOCK_SIZE_2 192
+#define BLOCK_SIZE_2 64
 #endif
 
 #ifdef RD_WG_SIZE_3_0
@@ -61,7 +61,7 @@
 #elif defined(RD_WG_SIZE)
 #define BLOCK_SIZE_3 RD_WG_SIZE
 #else
-#define BLOCK_SIZE_3 192
+#define BLOCK_SIZE_3 64
 #endif
 
 #ifdef RD_WG_SIZE_4_0
@@ -135,6 +135,7 @@ void dump(float *variables, int nel, int nelr) {
   {
     std::ofstream file("density_energy");
     file << nel << " " << nelr << std::endl;
+    std::cout << "nelr" <<nelr <<std::endl;
     for (int i = 0; i < nel; i++)
       file << h_variables[i + VAR_DENSITY_ENERGY * nelr] << std::endl;
   }

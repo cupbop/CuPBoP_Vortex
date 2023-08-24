@@ -149,6 +149,7 @@ then
     echo "--- Kernel compilation completed!"
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/stub -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
+    export PERF_CLASS=2
     LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph8192.txt
     echo "--- Execution completed!"
     exit -1

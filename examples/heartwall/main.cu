@@ -12,8 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <avilib.h>
-#include <avimod.h>
+#include "avilib.h"
+#include "avimod.h"
 #include <cuda.h>
 
 //======================================================================================================================================================

@@ -23,7 +23,7 @@ float init_time = 0, mem_alloc_time = 0, h2d_time = 0, kernel_time = 0,
 #define print(x) printf(#x ": %lu\n", (unsigned long)x)
 #define DEBUG false
 
-#define DEFAULT_THREADS_PER_BLOCK 128
+#define DEFAULT_THREADS_PER_BLOCK 64
 
 #define MAX_ARGS 10
 #define REC_LENGTH 53 // size of a record in db
@@ -107,7 +107,7 @@ int main(int argc, char *argv[]) {
   cudaGetDeviceProperties(&deviceProp, 0);
   cudaDeviceSynchronize();
   unsigned long maxGridX = deviceProp.maxGridSize[0];
-  unsigned long threadsPerBlock = 128;
+  unsigned long threadsPerBlock = 64;
   size_t totalDeviceMemory;
   size_t freeDeviceMemory;
   unsigned long blocks =
@@ -129,7 +129,7 @@ int main(int argc, char *argv[]) {
    */
   cudaMemcpy(d_locations, &locations[0], sizeof(LatLong) * numRecords,
              cudaMemcpyHostToDevice);
-
+  printf("size check %lu %lu %d\n", sizeof(LatLong),sizeof(int), numRecords);
   /**
    * Execute kernel
    */

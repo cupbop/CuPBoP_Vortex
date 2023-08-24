@@ -63,7 +63,7 @@ void BFSGraph(int argc, char **argv) {
   int num_of_threads_per_block = no_of_nodes;
 
   // Make execution Parameters according to the number of nodes
-  // Distribute threads across multiple Blocks if necessary
+  // Distribute threads across multiple Blocks if necessary)
   if (no_of_nodes > MAX_THREADS_PER_BLOCK) {
     num_of_blocks = (int)ceil(no_of_nodes / (double)MAX_THREADS_PER_BLOCK);
     num_of_threads_per_block = MAX_THREADS_PER_BLOCK;
@@ -108,7 +108,7 @@ void BFSGraph(int argc, char **argv) {
     fclose(fp);
 
   printf("Read File\n");
-
+  printf("noof len %d %d", no_of_nodes, edge_list_size);
   // Copy the Node list to device memory
   Node *d_graph_nodes;
   cudaMalloc((void **)&d_graph_nodes, sizeof(Node) * no_of_nodes);
@@ -194,7 +194,7 @@ void BFSGraph(int argc, char **argv) {
   cudaMemcpy(h_graph_nodes, d_graph_nodes, sizeof(Node) * no_of_nodes, cudaMemcpyDeviceToHost);
   
   // Store the result into a file
-  FILE *fpo = fopen("result_cuda.txt", "w");
+  FILE *fpo = fopen("result_vortex.txt", "w");
   for (int i = 0; i < no_of_nodes; i++)
     {fprintf(fpo, "%d) cost:%d, mask:%d, updatemask:%d, visited:%d, edges:%d, id/edge:%d %d\n",
       i, h_cost[i], h_graph_mask[i], h_updating_graph_mask[i], h_graph_visited[i], h_graph_edges[i], h_graph_nodes[i].starting, h_graph_nodes[i].no_of_edges);

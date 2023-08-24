@@ -12,6 +12,8 @@ add_subdirectory(threadPool)
 # compile vortex runtime library
 include_directories(./include)
 include_directories(./threadPool/include)
+include_directories(./../compilation/KernelTranslation/include)
+
 include_directories($ENV{VORTEX_PATH}/driver/include)
 file(GLOB proj_SOURCES "./src/vortex/host/*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})

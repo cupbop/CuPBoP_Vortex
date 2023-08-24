@@ -51,6 +51,7 @@ void runTest(int argc, char **argv) {
 
 #ifdef GPU
 
+  printf("GPU is on!!!");
   float *J_cuda;
   float *C_cuda;
   float *E_C, *W_C, *N_C, *S_C;
@@ -80,6 +81,7 @@ void runTest(int argc, char **argv) {
 
   size_I = cols * rows;
   size_R = (r2 - r1 + 1) * (c2 - c1 + 1);
+  printf("size_I, size_R %d %d", size_I, size_R);
 
   I = (float *)malloc(size_I * sizeof(float));
   J = (float *)malloc(size_I * sizeof(float));
@@ -273,7 +275,8 @@ void random_matrix(float *I, int rows, int cols) {
 
   for (int i = 0; i < rows; i++) {
     for (int j = 0; j < cols; j++) {
-      I[i * cols + j] = rand() / (float)RAND_MAX;
+      //I[i * cols + j] = rand() / (float)RAND_MAX;
+      I[i * cols + j] = (i * cols + j)/(float)(rows*cols);
     }
   }
 }

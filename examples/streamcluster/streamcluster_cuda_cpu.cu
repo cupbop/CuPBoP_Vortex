@@ -343,6 +343,7 @@ float pFL(Points *points, int *feasible, int numfeasible, float z, long *k,
 
     for (i = 0; i < iter; i++) {
       x = i % numfeasible;
+      printf("iter index %d\n", i, iter);
       change +=
           pgain(feasible[x], points, z, k, kmax, is_center, center_table,
                 switch_membership, isCoordChanged, &serial_t, &cpu_to_gpu_t,

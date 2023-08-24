@@ -1,4 +1,5 @@
 #include "cudaRuntimeImpl.h"
+#include "base_address.h"
 #include "api.h"
 #include "cuda_runtime.h"
 #include "def.h"
@@ -24,17 +25,15 @@
      std::abort();                                              \
    } while (false)
 
-// location is local memory where to store kernel parameters
-#define KERNEL_ARG_BASE_ADDR 0x7ffff000
-
 // kernel number of arguments
 //#define num_args 4
 
 struct alignas(4) context_t {
+//struct context_t {
   uint32_t num_groups[3];
   uint32_t global_offset[3];
   uint32_t local_size[3];
-  uint32_t printf_buffer;
+  char * printf_buffer;
   uint32_t printf_buffer_position;
   uint32_t printf_buffer_capacity;
   uint32_t work_dim;
@@ -446,7 +445,6 @@ readfile.close();
   printf("*** kernel arg=%p, size=%ld\n", abuf_ptr, abuf_size);
 
   // write context
-
   context_t ctx;
   memset(&ctx, 0, sizeof(ctx));
   ctx.num_groups[0] = gridDim.x;
@@ -463,8 +461,10 @@ readfile.close();
   
   // write the kerenel index here it retrives
   abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
+  
 
   // Mark Debug Check 
+  //printf("test:: kernel_idx %d sizes: %d %d \n", abuf_ptr->kernel_idx, sizeof(kernel_arg_t), sizeof(context_t));
   //printf("address_check 0x%x, 0x%x, %d\n", &(ctx.num_groups[2]), &(ctx.global_offset[0]), &(ctx.global_offset[0])-&(ctx.num_groups[2]));
   //printf("address_check 0x%x, 0x%x, %d\n", &(ctx.global_offset[1]), &(ctx.global_offset[2]), &(ctx.global_offset[0])-&(ctx.num_groups[2]));
   //printf("global_offset 0x%x, 0x%x, %x\n", ctx.global_offset[0], ctx.global_offset[1], ctx.global_offset[2]);
@@ -474,7 +474,7 @@ readfile.close();
   // write arguments
 
   for (int i = 0; i < num_args; ++i) {    
-    memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t));
+    memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
     printf("*** cuda kernel args[%d]=0x%x\n", i, (uint32_t)abuf_ptr->args[i]);
   }  
  
@@ -485,7 +485,7 @@ readfile.close();
   RT_CHECK(vx_start(DC->device()));
 
   // wait for the execution to complete
-  RT_CHECK(vx_ready_wait(DC->device(), -1));
+  RT_CHECK(vx_ready_wait(DC->device(), 24*60*60*1000));
 
   return cudaSuccess;
 }
