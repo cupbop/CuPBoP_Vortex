@@ -1,0 +1,1 @@
+#define KERNEL_ARG_BASE_ADDR 0x17ffff000
