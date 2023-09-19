@@ -14,7 +14,7 @@ set(CMAKE_BUILD_TYPE Debug)
 
 include_directories(./../../include)
 include_directories(./../../threadPool/include)
-include_directories($ENV{VORTEX_PATH}/driver/include)
+include_directories($ENV{VORTEX_PATH}/runtime/include)
 file(GLOB proj_SOURCES "./host/*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})
 

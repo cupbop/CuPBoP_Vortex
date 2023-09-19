@@ -15,7 +15,7 @@ set(CMAKE_CXX_COMPILER ${RISCV_TOOLCHAIN}/riscv32-unknown-elf-g++)
 
 include_directories(./../../../include)
 include_directories(./../../../threadPool/include)
-include_directories($ENV{VORTEX_PATH}/driver/include)
+include_directories($ENV{VORTEX_PATH}/runtime/include)
 file(GLOB proj_SOURCES "*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})
 
