@@ -37,6 +37,8 @@
 
 using namespace llvm;
 
+#define SW_WARP_SIZE (32)
+
 struct ParallelRegion {
   std::set<llvm::BasicBlock *> wrapped_block;
   llvm::BasicBlock *successor_block;
@@ -66,6 +68,7 @@ std::map<llvm::Instruction *, unsigned> tempInstructionIds;
 std::map<std::string, llvm::Instruction *> contextArrays;
 int tempInstructionIndex = 0;
 int need_nested_loop;
+
 
 // adding multiple kenerl in file support
 
@@ -214,7 +217,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, 4)), // Mark temp (changed 32 -> 4)
+                          ConstantInt::get(I32, SW_WARP_SIZE)), 
       "thread_idx");
   gepArgs.push_back(thread_idx);
 
@@ -248,7 +251,7 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, 4)), // Mark temp (changed 32 -> 4)
+                          ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx");
   gepArgs.push_back(thread_idx);
 
@@ -339,7 +342,7 @@ void handle_alloc(llvm::Function *F) {
       auto thread_idx = builder.CreateBinOp(
           Instruction::Add, intra_warp_index,
           builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                              ConstantInt::get(I32, 4)), //  Mark temp (changed 32 -> 4)
+                              ConstantInt::get(I32, SW_WARP_SIZE)),
           "thread_idx");
 
       auto gep = builder.CreateGEP(Alloca, thread_idx);
@@ -435,6 +438,101 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs) {
   }
 }
 
+// Schedule 1, 
+// 1. !nested loop
+//    for (int i = hw_tid + hw_wid * hw_nt; i < sw_block_size; i += hw_nt * hw_nw)
+//      id = i;
+//      doWork()
+// 2. nested loop
+//    sw_warp_size = 32 // TODO : change to the CUDA function 
+//    for (int i = hw_wid; i < (sw_block_size + sw_warp_size -1) / sw_warp_size; i += hw_nw)
+//        for(int j = tid; j < sw_warp_size; j += hw_nt)
+//          id = i * sw_warp_size + j
+//          if(id < block_size)
+//            doWork()
+//        barrier()
+
+
+struct ScheduleInfo {
+  llvm::Value* inner_loop_init;
+  llvm::Value* inner_loop_inc;
+  llvm::Value* inner_loop_cond;
+
+  llvm::Value* outer_loop_init;
+  llvm::Value* outer_loop_inc;
+  llvm::Value* outer_loop_cond;
+};
+ScheduleInfo sche_data;
+
+
+void add_mapping_variable(llvm::Function* F, bool intra_warp_loop, 
+      bool need_nested_loop, int schedule_flag)
+{
+  // Define perform once in the outermost loop
+  if (need_nested_loop && intra_warp_loop)
+    return;
+
+  IRBuilder<> builder(&*(F->getEntryBlock().getFirstInsertionPt()));
+  auto M = F->getParent();
+
+  // Generate function definition for getting VX functions
+  LLVMContext& context = M->getContext();
+  FunctionType* nTTy = FunctionType::get(IntegerType::getInt32Ty(context), true);
+
+  // Load basic software info
+  auto sw_block_size = builder.CreateLoad(M->getGlobalVariable("block_size"));
+  auto sw_warp_size = builder.getInt32(SW_WARP_SIZE);
+
+  if (schedule_flag == 1) {
+      // Get hardware information
+      FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
+      FunctionCallee nHWC = M->getOrInsertFunction("vx_num_warps", nTTy);
+      FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
+      FunctionCallee widC = M->getOrInsertFunction("vx_warp_id", nTTy);
+
+      auto tid = builder.CreateCall(tidC, {}, "hw_tid");
+      auto wid = builder.CreateCall(widC, {}, "hw_wid");
+      auto nHT = builder.CreateCall(nHTC, {}, "nHT");
+      auto nHW = builder.CreateCall(nHWC, {}, "nHW"); 
+
+    if(! need_nested_loop){
+      sche_data.inner_loop_init = builder.CreateAdd(tid, builder.CreateMul(wid, nHT, "hw_"), "hw_tlid"); 
+      sche_data.inner_loop_inc = builder.CreateMul(nHT, nHW, "hw_tpc");
+      sche_data.inner_loop_cond = sw_block_size;
+    } else{
+      //sche_data.inner_loop_init = M->getGlobalVariable("intra_warp_index");
+      sche_data.inner_loop_init = tid;
+      sche_data.inner_loop_inc = nHT;
+      sche_data.inner_loop_cond = sw_warp_size;
+
+      sche_data.outer_loop_init = wid;
+      sche_data.outer_loop_inc = nHW;
+      sche_data.outer_loop_cond = builder.CreateSDiv(
+          builder.CreateSub(
+            builder.CreateAdd(sw_block_size, sw_warp_size), 
+              builder.getInt32(1)), sw_warp_size, "warp_number");
+    }
+  } else { // Schedule 0 
+    if(! need_nested_loop){
+      sche_data.inner_loop_init = builder.getInt32(0);
+      sche_data.inner_loop_inc = builder.getInt32(1);
+      sche_data.inner_loop_cond = sw_block_size;
+    }else{
+      sche_data.inner_loop_init = builder.getInt32(0);
+      sche_data.inner_loop_inc = builder.getInt32(1);
+      sche_data.inner_loop_cond = sw_warp_size;
+
+      sche_data.outer_loop_init = builder.getInt32(0);
+      sche_data.outer_loop_inc = builder.getInt32(1);
+      sche_data.outer_loop_cond = builder.CreateSDiv(
+          sw_block_size, sw_warp_size, "warp_number");
+    } 
+  }
+
+  return;
+}
+
+
 BasicBlock *insert_loop_init(llvm::BasicBlock *InsertInitBefore,
                              bool intra_warp_loop) {
   llvm::Module *M = InsertInitBefore->getParent()->getParent();
@@ -442,17 +540,21 @@ BasicBlock *insert_loop_init(llvm::BasicBlock *InsertInitBefore,
   auto I32 = llvm::Type::getInt32Ty(context);
   std::string block_name =
       (intra_warp_loop) ? "intra_warp_init" : "inter_warp_init";
+
   BasicBlock *loop_init = BasicBlock::Create(
       context, block_name, InsertInitBefore->getParent(), InsertInitBefore);
+
   IRBuilder<> builder(context);
   builder.SetInsertPoint(loop_init);
-  if (intra_warp_loop) { // intra warp
-    auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
-    builder.CreateStore(ConstantInt::get(I32, 0), intra_warp_index);
-  } else { // inter warp
+
+  if(!intra_warp_loop) { // inter warp
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
-    builder.CreateStore(ConstantInt::get(I32, 0), inter_warp_index);
+    builder.CreateStore(sche_data.outer_loop_init, inter_warp_index);
+  }else{ // intra warp
+    auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
+    builder.CreateStore(sche_data.inner_loop_init, intra_warp_index);
   }
+
   builder.CreateBr(InsertInitBefore);
   return loop_init;
 }
@@ -472,24 +574,14 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
   llvm::Value *cmpResult = NULL;
   if (!intra_warp_loop) {
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
-    auto block_size = M->getGlobalVariable("block_size");
-    auto warp_cnt =
-        builder.CreateBinOp(Instruction::SDiv, builder.CreateLoad(block_size),
-                            ConstantInt::get(I32, 4), "warp_number"); // Mark temp (changed 32 -> 4)
-
-    cmpResult =
-        builder.CreateICmpULT(builder.CreateLoad(inter_warp_index), warp_cnt);
+    cmpResult = builder.CreateICmpULT(
+      builder.CreateLoad(inter_warp_index), sche_data.outer_loop_cond);
   } else {
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
-    auto block_size = M->getGlobalVariable("block_size");
-    if (!need_nested_loop) {
-      cmpResult = builder.CreateICmpULT(builder.CreateLoad(intra_warp_index),
-                                        builder.CreateLoad(block_size));
-    } else {
-      cmpResult = builder.CreateICmpULT(builder.CreateLoad(intra_warp_index),
-                                        ConstantInt::get(I32, 4)); // Mark temp (changed 32 -> 4)
-    }
+    cmpResult = builder.CreateICmpULT(
+            builder.CreateLoad(intra_warp_index), sche_data.inner_loop_cond); 
   }
+
   builder.CreateCondBr(cmpResult, InsertCondBefore, LoopEnd);
   return loop_cond;
 }
@@ -503,21 +595,24 @@ BasicBlock *insert_loop_inc(llvm::BasicBlock *InsertIncBefore,
       (intra_warp_loop) ? "intra_warp_inc" : "inter_warp_inc";
   BasicBlock *loop_inc = BasicBlock::Create(
       context, block_name, InsertIncBefore->getParent(), InsertIncBefore);
+
   IRBuilder<> builder(context);
   builder.SetInsertPoint(loop_inc);
-  if (intra_warp_loop) { // intra warp
-    auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
-    auto new_index = builder.CreateBinOp(
-        Instruction::Add, builder.CreateLoad(intra_warp_index),
-        ConstantInt::get(I32, 1), "intra_warp_index_increment");
-    builder.CreateStore(new_index, intra_warp_index);
-  } else { // inter warp
+
+  if(!intra_warp_loop){ // inter warp
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
     auto new_index = builder.CreateBinOp(
         Instruction::Add, builder.CreateLoad(inter_warp_index),
-        ConstantInt::get(I32, 1), "inter_warp_index_increment");
+        sche_data.outer_loop_inc, "inter_warp_index_increment");
     builder.CreateStore(new_index, inter_warp_index);
-  }
+  }else { // intra warp
+    auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
+      auto new_index = builder.CreateBinOp(
+          Instruction::Add, builder.CreateLoad(intra_warp_index),
+          sche_data.inner_loop_inc, "intra_warp_index_increment");
+      builder.CreateStore(new_index, intra_warp_index);
+  } 
+
   builder.CreateBr(InsertIncBefore);
   return loop_inc;
 }
@@ -559,6 +654,7 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     }
     builder.CreateBr(next_block);
     loop_cond->getTerminator()->replaceUsesOfWith(next_block, reset_index);
+
     // add metadata
     MDNode *Dummy =
         MDNode::getTemporary(context, ArrayRef<Metadata *>()).release();
@@ -606,8 +702,10 @@ void print_parallel_region(std::vector<ParallelRegion> parallel_regions) {
   }
 }
 
-void remove_barrier(llvm::Function *F, bool intra_warp_loop) {
-  std::vector<Instruction *> need_remove;
+void remove_barrier(llvm::Function *F, bool intra_warp_loop, int schedule_flag) {
+  
+  std::vector<Instruction *> barriers;
+
   for (auto BB = F->begin(); BB != F->end(); ++BB) {
     for (auto BI = BB->begin(); BI != BB->end(); BI++) {
       if (auto Call = dyn_cast<CallInst>(BI)) {
@@ -615,18 +713,41 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop) {
           continue;
         auto func_name = Call->getCalledFunction()->getName().str();
         if (func_name == "llvm.nvvm.bar.warp.sync") {
-          need_remove.push_back(Call);
+          barriers.push_back(Call);
         }
         if (!intra_warp_loop && (func_name == "llvm.nvvm.barrier0" ||
                                  func_name == "llvm.nvvm.barrier.sync")) {
-          need_remove.push_back(Call);
+          barriers.push_back(Call);
         }
       }
     }
   }
-  for (auto inst : need_remove) {
-    inst->eraseFromParent();
+
+  if(schedule_flag == 1 && barriers.size() > 1){
+    auto M = F->getParent();
+    LLVMContext& context = M->getContext();
+
+    // Generate function def for getting VX Warp Size
+    FunctionType* nTTy = FunctionType::get(IntegerType::getInt32Ty(context), true);
+    FunctionCallee nWC = M->getOrInsertFunction("vx_num_warps", nTTy);
+
+    // Generate function def for VX Barrier
+    ArrayRef<Type*> VXBParams = { IntegerType::getInt32Ty(context), IntegerType::getInt32Ty(context) };
+    FunctionType* VXBarTy = FunctionType::get(Type::getVoidTy(context), VXBParams, false);
+    FunctionCallee VXBarC = M->getOrInsertFunction("vx_barrier", VXBarTy);
+    
+    int curBNum_ = 1;
+    for (auto B = barriers.begin() + 1; B != barriers.end(); ++B) {
+      IRBuilder<> builder(*B);
+      CallInst* nW = builder.CreateCall(nWC);
+      auto cnt = builder.getInt32(curBNum_++);
+      //builder.CreateCall(VXBarC, {cnt, nW});
+    } 
   }
+
+  for (auto inst : barriers) {
+    inst->eraseFromParent();
+  }  
 }
 
 class InsertWarpLoopPass : public llvm::FunctionPass {
@@ -634,11 +755,12 @@ class InsertWarpLoopPass : public llvm::FunctionPass {
 public:
   static char ID;
   bool intra_warp_loop;
+  int schedule_flag; 
   DominatorTree *DT;
   PostDominatorTree *PDT;
 
-  InsertWarpLoopPass(bool intra_warp = 0)
-      : FunctionPass(ID), intra_warp_loop(intra_warp) {}
+  InsertWarpLoopPass(bool intra_warp = 0, int schedule = 0)
+      : FunctionPass(ID), intra_warp_loop(intra_warp), schedule_flag(schedule) {}
 
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const {
     AU.addRequired<DominatorTreeWrapperPass>();
@@ -822,6 +944,8 @@ public:
     if (!isKernelFunction(F.getParent(), &F))
       return 0;
 
+    add_mapping_variable(&F, intra_warp_loop, need_nested_loop, schedule_flag);
+
     auto func_name = (&F)->getName().str();
     // clear context array, temp variables for new kernel function
     contextArrays.clear();
@@ -840,7 +964,7 @@ public:
       handle_local_variable_intra_warp(parallel_regions);
     }
     add_warp_loop(parallel_regions, intra_warp_loop);
-    remove_barrier(&F, intra_warp_loop);
+    remove_barrier(&F, intra_warp_loop, schedule_flag);
     return 1;
   }
 };
@@ -872,20 +996,22 @@ bool has_warp_barrier(llvm::Module *M) {
 void insert_warp_loop(llvm::Module *M) {
   llvm::legacy::PassManager Passes;
   need_nested_loop = has_warp_barrier(M);
+  int schedule = std::stoi(std::string(std::getenv("VORTEX_SCHEDULE_FLAG")));
+
   // use nested loop only when there are warp-level barrier
   if (need_nested_loop) {
     bool intra_warp = true;
-    Passes.add(new InsertWarpLoopPass(intra_warp));
+    Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
     // insert inter warp loop
-    Passes.add(new InsertWarpLoopPass(!intra_warp));
+    Passes.add(new InsertWarpLoopPass(!intra_warp, schedule));
     Passes.run(*M);
   } else {
     bool intra_warp = true;
     // only need a single loop, with size=block_size
-    Passes.add(new InsertWarpLoopPass(intra_warp));
+    Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
     Passes.run(*M);
   }
   // remove all barriers
   for (auto F = M->begin(); F != M->end(); ++F)
-    remove_barrier(dyn_cast<llvm::Function>(F), false);
+    remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
 }

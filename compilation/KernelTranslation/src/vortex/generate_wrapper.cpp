@@ -23,6 +23,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <cstdlib>
 
 using namespace llvm;
 
@@ -336,11 +337,16 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
           "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
           "        args[0], args[1], args[2], args[3]);\n"
-          "\n"
+          "\n";
 
-          "    vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);\n"
-          "\n"
-          
+         
+    bool mapping_type = std::stoi(std::string(std::getenv("VORTEX_SCHEDULE_FLAG")));
+    if(mapping_type == 1)
+      ss << "    vx_spawn_kernel_cm(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
+    else
+      ss << "    vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
+
+    ss << "\n" 
           "    return 0;\n"
           "}\n"
           "\n";
