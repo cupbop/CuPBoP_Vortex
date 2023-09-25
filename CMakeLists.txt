@@ -33,6 +33,11 @@ else()
   message(FATAL_ERROR "llvm-config is required")
 endif()
 
+# Check the environment variable
+if(ENV{VORTEX_ARCHITECTURE} STREQUAL "64")
+  add_definitions(-DVORTEX_ARCHITECTURE_64=1)
+endif()
+
 set(CMAKE_CXX_FLAGS "${LLVM_CXX_FLAG} ${CMAKE_CXX_FLAGS}")
 
 set(GCC_COVERAGE_LINK_FLAGS

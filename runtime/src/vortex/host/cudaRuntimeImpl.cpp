@@ -6,6 +6,7 @@
 #include "macros.h"
 #include "structures.h"
 #include <iostream>
+#include <cstdlib>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,17 +29,29 @@
 // kernel number of arguments
 //#define num_args 4
 
-struct alignas(4) context_t {
-//struct context_t {
-  uint32_t num_groups[3];
-  uint32_t global_offset[3];
-  uint32_t local_size[3];
-  uint32_t printf_buffer;
-  //char * printf_buffer;
-  uint32_t printf_buffer_position;
-  uint32_t printf_buffer_capacity;
-  uint32_t work_dim;
-};
+// Different structure based on the architecture
+#ifdef VORTEX_ARCHITECTURE_64
+  struct alignas(4) context_t {
+    uint32_t num_groups[3];
+    uint32_t global_offset[3];
+    uint32_t local_size[3];
+    char * printf_buffer;
+    uint32_t printf_buffer_position;
+    uint32_t printf_buffer_capacity;
+    uint32_t work_dim;
+  };
+  #else
+  struct alignas(4) context_t {
+    uint32_t num_groups[3];
+    uint32_t global_offset[3];
+    uint32_t local_size[3];
+    uint32_t printf_buffer;
+    uint32_t printf_buffer_position;
+    uint32_t printf_buffer_capacity;
+    uint32_t work_dim;
+  };
+#endif
+
 
 struct alignas(64) kernel_arg_t {
   context_t ctx;
@@ -405,7 +418,6 @@ cudaError_t cudaLaunchKernel_vortex(
 std::cout << "RUNTIME FUNCTION" << std::endl;
 std::cout << "kernel_name: " << func << std::endl;
 std::cout << "number of arguments: " << num_args << std::endl;
-
 //reading lookup.txt
 std::fstream readfile;
 readfile.open("lookup.txt", std::ios::in);

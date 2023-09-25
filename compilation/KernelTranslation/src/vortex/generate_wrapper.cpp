@@ -330,7 +330,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
-          //"    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
+          "    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
           "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
           "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
           "        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
