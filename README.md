@@ -50,6 +50,7 @@ If you are using boson, you can pre-installed llvm 10.0.0
 4. Build CuPBoP
 
    ```bash
+   export VORTEX_ARCHITECTUE = 32                  # 64 if using 64-bit vortex
    mkdir build && cd build
    cmake .. -DLLVM_CONFIG_PATH=`which llvm-config` # need path to llvm-config
    make

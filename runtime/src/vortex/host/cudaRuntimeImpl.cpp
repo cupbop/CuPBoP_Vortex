@@ -6,7 +6,6 @@
 #include "macros.h"
 #include "structures.h"
 #include <iostream>
-#include <cstdlib>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +39,8 @@
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
   };
-  #else
+  
+#else
   struct alignas(4) context_t {
     uint32_t num_groups[3];
     uint32_t global_offset[3];

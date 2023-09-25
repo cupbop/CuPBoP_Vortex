@@ -34,8 +34,11 @@ else()
 endif()
 
 # Check the environment variable
-if(ENV{VORTEX_ARCHITECTURE} STREQUAL "64")
+if($ENV{VORTEX_ARCHITECTURE} STREQUAL "64")
   add_definitions(-DVORTEX_ARCHITECTURE_64=1)
+  message(STATUS "VORTEX_ARCHITECTURE_64 is set")
+else()
+  message(STATUS "VORTEX_ARCHITECTURE_64 is not set (32bit)")
 endif()
 
 set(CMAKE_CXX_FLAGS "${LLVM_CXX_FLAG} ${CMAKE_CXX_FLAGS}")
