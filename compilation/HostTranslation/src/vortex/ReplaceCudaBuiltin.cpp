@@ -28,6 +28,8 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
       M->getOrInsertFunction("cudaDeviceSynchronize", LauncherFuncT);
   llvm::Function *func_launch = llvm::cast<llvm::Function>(_f.getCallee());
   std::set<std::string> launch_function_name;
+
+
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
@@ -60,9 +62,16 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
             if (launch_function_name.find(calledFunction->getName().str()) !=
                 launch_function_name.end()) {
               // insert a sync after launch
+
+              //if (callInst->getNextNonDebugInstruction()) {
+              //  llvm::CallInst::Create(func_launch, "",
+              //                         callInst->getNextNonDebugInstruction());
+              //}
               if (callInst->getNextNonDebugInstruction()) {
-                llvm::CallInst::Create(func_launch, "",
-                                       callInst->getNextNonDebugInstruction());
+                  llvm::CallInst *newCall = llvm::CallInst::Create(func_launch, "");
+                  newCall->insertBefore(callInst->getNextNonDebugInstruction());
+                  // Copy debug info from the current instruction to the new one
+                  newCall->setDebugLoc(callInst->getDebugLoc());
               }
             }
           }
@@ -71,6 +80,8 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
     }
   }
 }
+
+
 
 // Change to i8* bitcast (i8* (i8*)* @_Z9vecPKiS0_Pii_wrapper to i8*)
 // Original: i8* bitcast (void (i32*, i32*, i32*, i32)* @_Z9vecPKiS0_Pii to i8*)
