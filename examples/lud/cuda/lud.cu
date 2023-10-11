@@ -23,7 +23,8 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#include "../common/common.h"
+#include "common.h"
+#include "lud_kernel.cu"
 
 #ifdef TIMING
 #include "timing.h"
@@ -174,7 +175,7 @@ main ( int argc, char *argv[] )
   if (do_verify){
     printf("After LUD\n");
     // print_matrix(m, matrix_dim);
-    printf(">>>Verify<<<<\n");
+    printf(">>>Verify<<<< %d\n", matrix_dim);
     lud_verify(mm, m, matrix_dim); 
     free(mm);
   }
