@@ -93,6 +93,7 @@ esac
 rm -f *.out *.o *.dump *.log *.ll *.bc *.elf
 
 KERNEL=`basename $KERNEL_CU .cu` 
+g++ -g -O0 ./common/common.c -c -o ./common/common.o
 
 # Possible to put -O3 here to generate simpler code
 echo "--- Generate bitcode files(.bc) for host and device by using clang++"
@@ -113,6 +114,7 @@ llvm-dis host.bc
 llc --relocation-model=pic --filetype=obj host.bc -o host.o
 
 g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
+
 
 echo "--- Compile the translated bc code for $DEVICE"
 if [ $DEVICE = "x86" ]
