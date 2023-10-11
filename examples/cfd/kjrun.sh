@@ -95,7 +95,7 @@ KERNEL=`basename $KERNEL_CU .cu`
 
 # Possible to put -O3 here to generate simpler code
 echo "--- Generate bitcode files(.bc) for host and device by using clang++"
-clang++ -g -O3 -std=c++11  ./$KERNEL_CU -I../.. -I/usr/local/cuda-10.1/samples/common/inc --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+clang++ -g -O3 -std=c++11  ./$KERNEL_CU -I../.. -I$CUDA_PATH/samples/common/inc --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 
 echo "--- Generate LLVM IR files(.ll) for host and device"
 llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
