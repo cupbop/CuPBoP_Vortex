@@ -130,9 +130,6 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
   std::set<llvm::Instruction *> need_remove;
   std::set<GlobalVariable *> need_remove_constant_memory;
 
-  std::fstream outfile;
-  outfile.open("lookup_constant.txt", std::ios::out);
-  outfile.close();
 
   // find all constant memory and generate corresponding global memory
   for (auto I = M->global_begin(), E = M->global_end(); I != E; ++I) {
@@ -143,20 +140,15 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
           need_remove_constant_memory.insert(constant_memory);
           // generate the corresponding global memory variable
           auto new_name = "wrapper_global_" + constant_memory->getName().str();
+          // printf new_name
+          std::cout <<"(debug) const mem, "<< new_name<< std::endl;
 
-          outfile.open("lookup_constant.txt", std::ios::app);
-          if (constant_memory->getType()->isPointerTy()){
-            outfile << "void *" << new_name << "\n";
-          }
-          else{
-            outfile << "void " << new_name << "\n";
-          }
-          outfile.close();
-          
           auto element_type = PT->getElementType();
           if (auto array_type = dyn_cast<ArrayType>(element_type)) {
             if (constant_memory->hasExternalLinkage() &&
                 array_type->getArrayNumElements() == 0) {
+                  std::cout << "(debug) const mem case 1"<< std::endl;
+     
               // external shared memory of []
               // generate global type pointer
               PointerType *PointerTy =
@@ -171,21 +163,33 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
                   std::pair<GlobalVariable *, GlobalVariable *>(constant_memory,
                                                                 global_ptr));
             } else {
+              std::cout << "(debug) const mem case 2"<< constant_memory->hasExternalLinkage() << " " << array_type->getArrayNumElements() <<std::endl;
+
+              Type *elementType = array_type->getElementType();
+              uint64_t numElements = array_type->getArrayNumElements();
+              elementType->print(llvm::outs(), true);
+              //print the type of the elementType
+
               llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
                   *M, array_type, false, llvm::GlobalValue::ExternalLinkage,
-                  NULL, new_name, NULL, llvm::GlobalValue::NotThreadLocal, 0);
+                  constant_memory->getInitializer(), new_name, NULL, llvm::GlobalValue::NotThreadLocal, 0);
               corresponding_global_memory.insert(
                   std::pair<GlobalVariable *, GlobalVariable *>(constant_memory,
-                                                                global_memory));
+                                                                global_memory));                                            
             }
-          } else if (element_type->isStructTy()) {
+          }
+          else if (element_type->isStructTy() || element_type->isIntegerTy() || element_type->isFloatTy() || element_type->isDoubleTy() || element_type->isPointerTy()) {
+            // TODO:  need to implement structure type definition for kernel wrapper
+            std::cout << "(debug) const mem case 3"<< std::endl;
+
             llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
                 *M, element_type, false, llvm::GlobalValue::ExternalLinkage,
-                NULL, new_name, NULL, llvm::GlobalValue::NotThreadLocal, 0);
+                constant_memory->getInitializer(), new_name, NULL, llvm::GlobalValue::NotThreadLocal, 0);
             corresponding_global_memory.insert(
                 std::pair<GlobalVariable *, GlobalVariable *>(constant_memory,
                                                               global_memory));
-          } else {
+          }
+          else {
             assert(0 && "The required Constant Memory Type is not supported\n");
           }
         }

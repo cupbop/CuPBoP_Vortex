@@ -50,6 +50,7 @@ void ReplaceConstantMemory(llvm::Module *M, std::ifstream &fin) {
         auto global_name =
             corresponding_global_memory.find(constant_memory->getName().str())
                 ->second;
+        printf("host side, constant mem name %s\n", constant_memory->getName().str().c_str());
         // create a new global variable
         if (auto PT = dyn_cast<llvm::PointerType>(I->getType())) {
           need_remove_constant_memory.insert(constant_memory);
@@ -67,7 +68,8 @@ void ReplaceConstantMemory(llvm::Module *M, std::ifstream &fin) {
                 llvm::ConstantExpr::getPointerCast(
                     global_memory,
                     cast<PointerType>(constant_memory->getType())));
-          } else if (element_type->isStructTy()) {
+          } else if (element_type->isStructTy() || element_type->isIntegerTy() || element_type->isFloatTy() ||
+                     element_type->isDoubleTy() || element_type->isPointerTy()) {
             llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
                 *M, element_type, false, llvm::GlobalValue::CommonLinkage, NULL,
                 global_name, NULL, llvm::GlobalValue::NotThreadLocal, 0);
@@ -78,7 +80,8 @@ void ReplaceConstantMemory(llvm::Module *M, std::ifstream &fin) {
                 llvm::ConstantExpr::getPointerCast(
                     global_memory,
                     cast<PointerType>(constant_memory->getType())));
-          } else {
+                     }
+            else {
             assert(0 && "The required Constant Memory Type is not supported\n");
           }
         }

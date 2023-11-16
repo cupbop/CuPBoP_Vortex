@@ -21,7 +21,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size);
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
                        cudaMemcpyKind kind);
 cudaError_t cudaMemcpyToSymbol_host(void *dst, const void *src, size_t count,
-                                    size_t offset, cudaMemcpyKind kind);
+                                    size_t offset, cudaMemcpyKind kind, void *symbol);
 cudaError_t cudaMemset(void *devPtr, int value, size_t count);
 cudaError_t cudaSetDevice(int device);
 cudaError_t cudaStreamCopyAttributes(cudaStream_t dst, cudaStream_t src);

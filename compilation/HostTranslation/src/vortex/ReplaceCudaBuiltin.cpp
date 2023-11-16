@@ -303,10 +303,15 @@ int kernel_idx = 0;
 
 }
 
+
+
+
 void ReplaceMemcpyToSymbol(llvm::Module *M) {
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
   std::vector<llvm::Instruction *> need_remove;
+  std::string arg0_name;  
+
   for (Module::iterator F = M->begin(); F != M->end(); ++F) {
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
@@ -314,6 +319,54 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
           if (Call->getCalledFunction()) {
             auto func_name = Call->getCalledFunction()->getName().str();
             if (func_name == "cudaMemcpyToSymbol") {
+              
+              llvm::Function *parentFunction = (Call->getParent()->getParent());
+
+              //get the name of the function
+              auto parentFunction_name = parentFunction->getName().str();
+              printf("parentFunction_name: %s\n", parentFunction_name.c_str());
+
+              //Go through every instruction in every module to find function call with the name of parentFunction_name
+              for (Module::iterator PF = M->begin(); PF != M->end(); ++PF) {
+                for (auto PBB = PF->begin(); PBB != PF->end(); ++PBB) {
+                  for (auto PBI = PBB->begin(); PBI != PBB->end(); PBI++) {
+                    if (auto Call_parent = dyn_cast<CallInst>(PBI)) {
+                      if (Call_parent->getCalledFunction()) {
+                        auto func_name = Call_parent->getCalledFunction()->getName().str();
+                        if (func_name == parentFunction_name) {
+                          //get first argument of the called function of call_parent
+                          auto arg0 = Call_parent->getArgOperand(0);
+                          //print the name of the value that arg0 is pointing to
+                          arg0_name += arg0->stripPointerCasts()->getName().str();
+                          arg0_name += " ";
+                          printf("arg0_name: %s\n", arg0_name.c_str());
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  printf("final arg0_name: %s\n", arg0_name.c_str());
+
+  for (Module::iterator F = M->begin(); F != M->end(); ++F) {
+    for (auto BB = F->begin(); BB != F->end(); ++BB) {
+      for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+        if (auto Call = dyn_cast<CallInst>(BI)) {
+          if (Call->getCalledFunction()) {
+            auto func_name = Call->getCalledFunction()->getName().str();
+            if (func_name == "cudaMemcpyToSymbol") {
+
+              // Create a constant for arg0_name
+              auto arg0_name_constant = llvm::ConstantDataArray::getString(context, arg0_name, /*AddNull=*/true);
+              auto arg0_name_ptr = new llvm::GlobalVariable(*M, arg0_name_constant->getType(), true, llvm::GlobalValue::ExternalLinkage, arg0_name_constant);
+
               std::vector<llvm::Type *> args;
               // i32 @cudaMemcpyToSymbol(i8* %1, i8* %2, i64 %3, i64 %4, i32 %5)
               args.push_back(llvm::Type::getInt8PtrTy(context));
@@ -321,21 +374,30 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
               args.push_back(llvm::Type::getInt64Ty(context));
               args.push_back(llvm::Type::getInt64Ty(context));
               args.push_back(llvm::Type::getInt32Ty(context));
+              args.push_back(arg0_name_ptr->getType()); 
+              //fix below based on arg0_ptr type
+  
               llvm::FunctionType *func_Type =
                   FunctionType::get(I32, args, false);
 
+              printf("inserting cudamemcpytosymbol function\n");
+
               llvm::FunctionCallee _f =
                   M->getOrInsertFunction("cudaMemcpyToSymbol_host", func_Type);
+                  
               llvm::Function *func = llvm::cast<llvm::Function>(_f.getCallee());
               // construct argument(s)
               std::vector<Value *> func_args;
+              
               func_args.push_back(Call->getArgOperand(0));
               func_args.push_back(Call->getArgOperand(1));
               func_args.push_back(Call->getArgOperand(2));
               func_args.push_back(Call->getArgOperand(3));
               func_args.push_back(Call->getArgOperand(4));
-
+              func_args.push_back(arg0_name_ptr);
+              
               auto c_inst = llvm::CallInst::Create(func, func_args, "", Call);
+
               // insert
               Call->replaceAllUsesWith(c_inst);
               need_remove.push_back(Call);

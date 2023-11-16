@@ -235,11 +235,15 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "#include <vx_print.h>\n"
           "#include <vx_intrinsics.h>\n"
           "#include <vx_spawn.h>\n"
-          "#include <stdint.h>\n"          
+          "#include <stdint.h>\n" 
+          "#include <string.h>\n"         
           "\n"
 
           "#define KERNEL_ARG_BASE_ADDR "
           << KERNEL_ARG_BASE_ADDR <<
+          "\n"
+          "#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR "
+          << KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR <<
           "\n"
           "\n"
 
@@ -268,14 +272,6 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread block_index_z;\n"
           "\n";
 
-    std::fstream infile;
-    std::string line;
-    infile.open ("lookup_constant.txt");      
-    while (std::getline(infile, line))
-    {
-      ss << line << ";\n";
-    }
-    infile.close();
     ss <<  "\n extern \"C\" {\n";
 
     for (auto f : wrapper_name) {
@@ -331,6 +327,17 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
+          "    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; \n"
+          //"    vx_printf(\"additional_info[0]: %lu\\n\", additional_info[0]);\n"
+          "    if (additional_info[0] != 0) {\n"
+          "       int additional_info_idx = 0;\n"
+          "       while (additional_info_idx < additional_info[0]) {\n"
+          "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
+          "           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];\n"
+          "           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];\n"
+          "           memcpy(dst_addr, src_addr, size);\n"
+          "           additional_info_idx++;}}\n"
+          "\n"
           "    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
           "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
           "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
@@ -347,6 +354,15 @@ void create_kernel_wrapper_function(llvm::Module *M){
       ss << "    vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
 
     ss << "\n" 
+          "    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
+          "    if (additional_info[0] != 0) {\n"
+          "       int additional_info_idx = 0;\n"
+          "       while (additional_info_idx < additional_info[0]) {\n"
+          "           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
+          "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];\n"
+          "           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];\n"
+          "           memcpy(dst_addr, src_addr, size);\n"
+          "           additional_info_idx++;}}\n"
           "    return 0;\n"
           "}\n"
           "\n";
