@@ -5,9 +5,11 @@ set -e
 
 ######################### Default Varaibles #################################
 DEVICE=vortex
-KERNEL_CU=saxpy.cu
+KERNEL_CU=saxpy_vanila.cu
 ARCH=64
 #############################################################################
+
+export VORTEX_SCHEDULE_FLAG=0
 
 show_usage()
 {
@@ -95,7 +97,7 @@ KERNEL=`basename $KERNEL_CU .cu`
 
 # Possible to put -O3 here to generate simpler code
 echo "--- Generate bitcode files(.bc) for host and device by using clang++"
-clang++ -O3 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+clang++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 
 echo "--- Generate LLVM IR files(.ll) for host and device"
 llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
@@ -156,8 +158,10 @@ then
     else
         ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl_64.o -lm ${VX_LDFLAGS} -o kernel.elf 
     fi
+    nm -C --defined-only -g kernel.elf > lookup_global_symbols.txt
     ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out    
     ${LLVM_PREFIX}/bin/llvm-objdump -D kernel.elf > kernel.dump
+    
 
     echo "--- Kernel compilation completed!"
     
@@ -167,7 +171,7 @@ then
     # simx performance counter settings
     export PERF_CLASS=2
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v # > host_out.dump
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -q -v #>  host_out.dump
     echo "--- Execution completed!"
     exit -1
 fi
