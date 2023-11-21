@@ -230,10 +230,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
             {
               std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               // remove _Z24
-              for (int i = 2; i < newName.length(); i++) {
-                if (newName[i] >= '0' && newName[i] <= '9')
+              for (int i = 2; i < func_name.length(); i++) {
+                if (func_name[i] >= '0' && func_name[i] <= '9')
                   continue;
-                newName = newName.substr(i);
+                func_name = func_name.substr(i);
                 break;
               }
               wrapper_name.push_back(func_name + "_wrapper");
