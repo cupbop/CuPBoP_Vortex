@@ -12,7 +12,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
-#include "llvm/Support/TargetRegistry.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
@@ -24,6 +24,7 @@
 #include <fstream>
 #include <limits>
 #include <cstdlib>
+#include <map>
 
 using namespace llvm;
 
@@ -58,6 +59,16 @@ void decode_input(llvm::Module *M) {
       continue;
 
     auto func_name = F->getName().str();
+    
+    // remove mangle prefix
+    // remove _Z24
+    for (int pos = 2; pos < func_name.length(); pos++) {
+      if (func_name[pos] >= '0' && func_name[pos] <= '9')
+        continue;
+      func_name = func_name.substr(pos);
+      break;
+    }
+
     llvm::IRBuilder<> Builder(M->getContext());
 
     FunctionCallee fc =
@@ -84,7 +95,7 @@ void decode_input(llvm::Module *M) {
           *M, Int32T, false, llvm::GlobalValue::ExternalLinkage, NULL,
           "thread_memory_size", NULL, llvm::GlobalValue::GeneralDynamicTLSModel,
           0, false);
-      Value *loadedValue = Builder.CreateLoad(global_mem);
+      Value *loadedValue = createLoad(Builder, global_mem);
 
       llvm::FunctionType *LaunchFun2 = FunctionType::get(
           PointerType::get(PointerType::get(Int32T, 0), 0), NULL);
@@ -126,12 +137,12 @@ void decode_input(llvm::Module *M) {
       Type *ArgType = ii->getType();
 
       // calculate addr
-      Value *GEP = Builder.CreateGEP(input_arg, ConstantInt::get(Int32T, idx));
+      Value *GEP = createGEP(Builder, input_arg, ConstantInt::get(Int32T, idx));
       // load corresponding int*
       //GEP = Builder.CreateLoad(GEP);
       // bitcast
       GEP = Builder.CreateBitOrPointerCast(GEP, PointerType::get(ArgType, 0));
-      Value *Arg = Builder.CreateLoad(GEP);
+      Value *Arg = createLoad(Builder, GEP);
       Arguments.push_back(Arg);
       ++idx;
     }
@@ -218,6 +229,13 @@ void create_kernel_wrapper_function(llvm::Module *M){
             if(isKernelFunction(M, Call->getCalledFunction()) && std::find(wrapper_name.begin(), wrapper_name.end(), func_name+"_wrapper") == wrapper_name.end())
             {
               std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
+              // remove _Z24
+              for (int i = 2; i < newName.length(); i++) {
+                if (newName[i] >= '0' && newName[i] <= '9')
+                  continue;
+                newName = newName.substr(i);
+                break;
+              }
               wrapper_name.push_back(func_name + "_wrapper");
               outfile.open("lookup.txt", std::ios::app);
               outfile << kernel_idx << " " << func_name << " " << func_arg_size << "\n";

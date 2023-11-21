@@ -26,15 +26,18 @@ int main(int argc, char **argv) {
   // load LLVM module(s)
   llvm::Module *hostModule = LoadModuleFromFilr(input_host_path);
   VerifyModule(hostModule);
+
   // replace const memory
   ReplaceConstantMemory(hostModule, fin);
+
   // process host module
   ReplaceCudaBuiltin(hostModule);
+
   // remove builtin unuse functions and variables
   RemoveCudaBuiltin(hostModule);
+  
   // replace arguments in kernel_arg, from alloc to malloc
   //ReplaceKernelArg(hostModule);
-
   VerifyModule(hostModule);
   DumpModule(hostModule, output_host_path);
 

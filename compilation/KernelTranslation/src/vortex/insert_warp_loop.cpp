@@ -7,9 +7,12 @@
 #include <set>
 
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/Triple.h"
+#include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -22,9 +25,12 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/PassInfo.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -182,7 +188,7 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
   llvm::AllocaInst *Alloca = nullptr;
 
   auto block_size_addr = M->getGlobalVariable("block_size");
-  auto block_size = builder.CreateLoad(block_size_addr);
+  auto block_size = createLoad(builder, block_size_addr);
   Alloca = builder.CreateAlloca(AllocType, block_size, varName);
 
   contextArrays[varName] = Alloca;
@@ -211,9 +217,9 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
   std::vector<llvm::Value *> gepArgs;
 
   auto inter_warp_index =
-      builder.CreateLoad(M->getGlobalVariable("inter_warp_index"));
+      createLoad(builder, M->getGlobalVariable("inter_warp_index"));
   auto intra_warp_index =
-      builder.CreateLoad(M->getGlobalVariable("intra_warp_index"));
+      createLoad(builder, M->getGlobalVariable("intra_warp_index"));
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
@@ -221,7 +227,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
       "thread_idx");
   gepArgs.push_back(thread_idx);
 
-  return builder.CreateStore(instruction, builder.CreateGEP(alloca, gepArgs));
+  return builder.CreateStore(instruction, createGEP(builder, alloca, gepArgs));
 }
 
 llvm::Instruction *AddContextRestore(llvm::Value *val,
@@ -245,9 +251,9 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
   auto M = before->getParent()->getParent()->getParent();
   auto I32 = llvm::Type::getInt32Ty(M->getContext());
   auto inter_warp_index =
-      builder.CreateLoad(M->getGlobalVariable("inter_warp_index"));
+        createLoad(builder, M->getGlobalVariable("inter_warp_index"));
   auto intra_warp_index =
-      builder.CreateLoad(M->getGlobalVariable("intra_warp_index"));
+        createLoad(builder, M->getGlobalVariable("intra_warp_index"));
   auto thread_idx = builder.CreateBinOp(
       Instruction::Add, intra_warp_index,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
@@ -256,11 +262,11 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
   gepArgs.push_back(thread_idx);
 
   llvm::Instruction *gep =
-      dyn_cast<Instruction>(builder.CreateGEP(alloca, gepArgs));
+      dyn_cast<Instruction>(createGEP(builder, alloca, gepArgs));
   if (isAlloca) {
     return gep;
   }
-  return builder.CreateLoad(gep);
+  return createLoad(builder, gep);
 }
 
 void AddContextSaveRestore(llvm::Instruction *instruction,
@@ -314,7 +320,7 @@ void handle_alloc(llvm::Function *F) {
     // generate a new alloc
     auto block_size_addr = M->getGlobalVariable("block_size");
     IRBuilder<> builder(inst);
-    auto block_size = builder.CreateLoad(block_size_addr);
+    auto block_size = createLoad(builder, block_size_addr);
 
     llvm::Type *elementType = NULL;
     if (dyn_cast<AllocaInst>(inst)->getType()->getElementType()) {
@@ -336,16 +342,16 @@ void handle_alloc(llvm::Function *F) {
       IRBuilder<> builder(user);
       // std::vector<llvm::Value *> gepArgs;
       auto inter_warp_index =
-          builder.CreateLoad(M->getGlobalVariable("inter_warp_index"));
+          createLoad(builder, M->getGlobalVariable("inter_warp_index"));
       auto intra_warp_index =
-          builder.CreateLoad(M->getGlobalVariable("intra_warp_index"));
+          createLoad(builder, M->getGlobalVariable("intra_warp_index"));
       auto thread_idx = builder.CreateBinOp(
           Instruction::Add, intra_warp_index,
           builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                               ConstantInt::get(I32, SW_WARP_SIZE)),
           "thread_idx");
 
-      auto gep = builder.CreateGEP(Alloca, thread_idx);
+      auto gep = createGEP(builder, Alloca, thread_idx);
 
       user->replaceUsesOfWith(inst, gep);
     }
@@ -357,7 +363,8 @@ void handle_alloc(llvm::Function *F) {
   }
 }
 
-void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs) {
+  void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs,
+                                      DivergenceInfo &DI) {
   bool intra_warp_loop = 1;
   // we should handle allocation generated by PHI
   {
@@ -367,6 +374,28 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs) {
       for (auto ii = bb->begin(); ii != bb->end(); ii++) {
         if (isa<AllocaInst>(&(*ii))) {
           auto alloc = dyn_cast<AllocaInst>(&(*ii));
+          // if this alloc's write are all non-divergence, then no need to
+          // replicate
+          // added: Nov 20 2023
+          bool allStoreNonDivergence = true;
+          for (Instruction::use_iterator ui = alloc->use_begin(),
+                                         ue = alloc->use_end();
+               ui != ue; ++ui) {
+            llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());
+            if (isa<StoreInst>(user)) {
+              auto storeVar = user->getOperand(0);
+              if (DI.isDivergent(*storeVar)) {
+                allStoreNonDivergence = false;
+                break;
+              }
+                          } else if (!isa<LoadInst>(user)) {
+              allStoreNonDivergence = false;
+              break;
+            }
+          }
+          if (allStoreNonDivergence) {
+            continue;
+          }
           // Do not duplicate var used outside PRs
           bool used_in_non_PR = false;
           for (Instruction::use_iterator ui = alloc->use_begin(),
@@ -480,7 +509,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   FunctionType* nTTy = FunctionType::get(IntegerType::getInt32Ty(context), true);
 
   // Load basic software info
-  auto sw_block_size = builder.CreateLoad(M->getGlobalVariable("block_size"));
+  auto sw_block_size = createLoad(builder, M->getGlobalVariable("block_size"));
   auto sw_warp_size = builder.getInt32(SW_WARP_SIZE);
 
   if (schedule_flag == 1) {
@@ -499,6 +528,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
       sche_data.inner_loop_init = builder.CreateAdd(tid, builder.CreateMul(wid, nHT, "hw_"), "hw_tlid"); 
       sche_data.inner_loop_inc = builder.CreateMul(nHT, nHW, "hw_tpc");
       sche_data.inner_loop_cond = sw_block_size;
+      printf("SCHEDULE DEBUG: no nested loop!\n");
     } else{
       //sche_data.inner_loop_init = M->getGlobalVariable("intra_warp_index");
       sche_data.inner_loop_init = tid;
@@ -511,6 +541,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
           builder.CreateSub(
             builder.CreateAdd(sw_block_size, sw_warp_size), 
               builder.getInt32(1)), sw_warp_size, "warp_number");
+              printf("SCHEDULE DEBUG: nested loop!\n");
     }
   } else { // Schedule 0 
     if(! need_nested_loop){
@@ -575,11 +606,11 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
   if (!intra_warp_loop) {
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
     cmpResult = builder.CreateICmpULT(
-      builder.CreateLoad(inter_warp_index), sche_data.outer_loop_cond);
+      createLoad(builder, inter_warp_index), sche_data.outer_loop_cond);
   } else {
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
     cmpResult = builder.CreateICmpULT(
-            builder.CreateLoad(intra_warp_index), sche_data.inner_loop_cond); 
+            createLoad(builder, intra_warp_index), sche_data.inner_loop_cond); 
   }
 
   builder.CreateCondBr(cmpResult, InsertCondBefore, LoopEnd);
@@ -602,13 +633,13 @@ BasicBlock *insert_loop_inc(llvm::BasicBlock *InsertIncBefore,
   if(!intra_warp_loop){ // inter warp
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
     auto new_index = builder.CreateBinOp(
-        Instruction::Add, builder.CreateLoad(inter_warp_index),
+        Instruction::Add, createLoad(builder, inter_warp_index),
         sche_data.outer_loop_inc, "inter_warp_index_increment");
     builder.CreateStore(new_index, inter_warp_index);
   }else { // intra warp
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
       auto new_index = builder.CreateBinOp(
-          Instruction::Add, builder.CreateLoad(intra_warp_index),
+          Instruction::Add, createLoad(builder, intra_warp_index),
           sche_data.inner_loop_inc, "intra_warp_index_increment");
       builder.CreateStore(new_index, intra_warp_index);
   } 
@@ -756,8 +787,6 @@ public:
   static char ID;
   bool intra_warp_loop;
   int schedule_flag; 
-  DominatorTree *DT;
-  PostDominatorTree *PDT;
 
   InsertWarpLoopPass(bool intra_warp = 0, int schedule = 0)
       : FunctionPass(ID), intra_warp_loop(intra_warp), schedule_flag(schedule) {}
@@ -765,6 +794,8 @@ public:
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const {
     AU.addRequired<DominatorTreeWrapperPass>();
     AU.addRequired<PostDominatorTreeWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<TargetTransformInfoWrapperPass>();
   }
 
   void getParallelRegionBefore(llvm::BasicBlock *B, bool intra_warp_loop,
@@ -952,8 +983,23 @@ public:
     tempInstructionIds.clear();
     tempInstructionIndex = 0;
 
-    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-    PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+
+    // get DivergenceInfo
+    auto DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+    auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+    llvm::Triple triple("nvptx64-nvidia-cuda");
+    std::string Error;
+    const Target *TheTarget = TargetRegistry::lookupTarget("", triple, Error);
+    llvm::TargetOptions Options;
+    llvm::TargetMachine *target_machine = TheTarget->createTargetMachine(
+        triple.getTriple(), "sm_35", "+ptx50", Options, llvm::Reloc::Static,
+        llvm::CodeModel::Small, llvm::CodeGenOpt::Aggressive);
+
+    llvm::FunctionAnalysisManager DummyFAM;
+    llvm::TargetTransformInfo TTI =
+        target_machine->getTargetIRAnalysis().run(F, DummyFAM);
+    DivergenceInfo DI(F, *DT, *PDT, LI, TTI, /*KnownReducible*/ true);
 
     // find parallel region we need to wrap
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop);
@@ -961,7 +1007,7 @@ public:
     // print_parallel_region(parallel_regions);
 
     if (intra_warp_loop) {
-      handle_local_variable_intra_warp(parallel_regions);
+      handle_local_variable_intra_warp(parallel_regions, DI);
     }
     add_warp_loop(parallel_regions, intra_warp_loop);
     remove_barrier(&F, intra_warp_loop, schedule_flag);

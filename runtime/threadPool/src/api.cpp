@@ -350,7 +350,8 @@ RETRY:
       grid_size_x = gridDim.x;
       grid_size_y = gridDim.y;
       grid_size_z = gridDim.z;
-      dynamic_shared_memory = (int *)malloc(dynamic_shared_mem_size);
+            if (dynamic_shared_mem_size > 0)
+        dynamic_shared_memory = (int *)malloc(dynamic_shared_mem_size);
       int tmp = block_index;
       block_index_x = tmp / (grid_size_y * grid_size_z);
       tmp = tmp % (grid_size_y * grid_size_z);

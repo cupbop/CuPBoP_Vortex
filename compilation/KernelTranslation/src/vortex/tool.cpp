@@ -1,8 +1,10 @@
 #include "tool.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
@@ -10,9 +12,16 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+
 #include <iostream>
 #include <set>
 
@@ -41,7 +50,7 @@ void DumpModule(llvm::Module *M, char *file_name) {
   std::string msg;
   llvm::raw_string_ostream os(msg);
   std::error_code EC;
-  ToolOutputFile Out(file_name, EC, sys::fs::F_None);
+  ToolOutputFile Out(file_name, EC, sys::fs::OF_None);
   if (EC) {
     errs() << "Fails to open output file: " << EC.message();
     return;
@@ -128,7 +137,7 @@ llvm::Instruction *BreakPHIToAllocas(PHINode *phi) {
   }
   builder.SetInsertPoint(phi);
 
-  llvm::Instruction *loadedValue = builder.CreateLoad(alloca);
+  llvm::Instruction *loadedValue = createLoad(builder, alloca);//builder.CreateLoad(alloca);
   phi->replaceAllUsesWith(loadedValue);
   phi->eraseFromParent();
 
@@ -221,13 +230,16 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
     if (!dynamic_shared_memory_addr) {
       return;
     }
-    auto load_shared_memory =
-        new LoadInst(dynamic_shared_memory_addr, "new_load");
+    auto load_shared_memory = new LoadInst(
+        dynamic_shared_memory_addr->getType()->getPointerElementType(),
+        dynamic_shared_memory_addr, "new_load", &*F->begin()->begin());
     auto new_bit_cast =
         new BitCastInst(load_shared_memory,
                         dynamic_shared_memory_addr->getType(), "new_bit_cast");
-    new_bit_cast->insertBefore(&*F->begin()->begin());
-    load_shared_memory->insertBefore(new_bit_cast);
+    //CHECK NEEDED
+    //(new)new_bit_cast->insertAfter(load_shared_memory);                        
+    //(old)new_bit_cast->insertBefore(&*F->begin()->begin());
+    //(old)load_shared_memory->insertBefore(new_bit_cast);
     dynamic_shared_memory_addr->replaceUsesWithIf(new_bit_cast, [&](Use &U) {
       auto *Instr = dyn_cast<Instruction>(U.getUser());
       return Instr != new_bit_cast && Instr != load_shared_memory;
@@ -286,21 +298,21 @@ void replace_built_in_function(llvm::Module *M) {
               auto block_size_addr = M->getGlobalVariable("block_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto val = builder.CreateLoad(block_size_addr);
+              auto val = createLoad(builder, block_size_addr);
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.y") {
               auto block_size_addr = M->getGlobalVariable("block_size_y");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto val = builder.CreateLoad(block_size_addr);
+              auto val = createLoad(builder, block_size_addr);
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.z") {
               auto block_size_addr = M->getGlobalVariable("block_size_z");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto val = builder.CreateLoad(block_size_addr);
+              auto val = createLoad(builder, block_size_addr);
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
             }
@@ -339,15 +351,16 @@ void replace_built_in_function(llvm::Module *M) {
               builder.SetInsertPoint(Call);
 
               auto thread_idx = builder.CreateBinOp(
-                  Instruction::Mul, builder.CreateLoad(local_inter_warp_idx),
+                  Instruction::Mul, createLoad(builder, local_inter_warp_idx),
                   ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
               thread_idx = builder.CreateBinOp(
-                  Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
+                  //Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
+                  Instruction::Add, createLoad(builder, local_intra_warp_idx),
                   thread_idx, "thread_idx");
 
               thread_idx = builder.CreateBinOp(
                   Instruction::SRem, thread_idx,
-                  builder.CreateLoad(M->getGlobalVariable("block_size_x")),
+                  createLoad(builder, M->getGlobalVariable("block_size_x")),
                   "thread_id_x");
 
               Call->replaceAllUsesWith(thread_idx);
@@ -358,15 +371,15 @@ void replace_built_in_function(llvm::Module *M) {
               builder.SetInsertPoint(Call);
 
               auto thread_idx = builder.CreateBinOp(
-                  Instruction::Mul, builder.CreateLoad(local_inter_warp_idx),
+                  Instruction::Mul, createLoad(builder, local_inter_warp_idx),
                   ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
               thread_idx = builder.CreateBinOp(
-                  Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
+                  Instruction::Add, createLoad(builder, local_intra_warp_idx),
                   thread_idx, "thread_idx");
               // tidy = tid / block_dim.x
               thread_idx = builder.CreateBinOp(
                   Instruction::SDiv, thread_idx,
-                  builder.CreateLoad(M->getGlobalVariable("block_size_y")),
+                  createLoad(builder, M->getGlobalVariable("block_size_x")),
                   "thread_id_y");
               Call->replaceAllUsesWith(thread_idx);
               need_remove.push_back(Call);
@@ -386,7 +399,7 @@ void replace_built_in_function(llvm::Module *M) {
               auto block_index_addr = M->getGlobalVariable("block_index_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto block_idx = builder.CreateLoad(block_index_addr);
+              auto block_idx = createLoad(builder, block_index_addr);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y") {
@@ -394,7 +407,7 @@ void replace_built_in_function(llvm::Module *M) {
               auto block_index_addr = M->getGlobalVariable("block_index_y");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto block_idx = builder.CreateLoad(block_index_addr);
+              auto block_idx = createLoad(builder, block_index_addr);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
@@ -402,7 +415,7 @@ void replace_built_in_function(llvm::Module *M) {
               auto block_index_addr = M->getGlobalVariable("block_index_z");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto block_idx = builder.CreateLoad(block_index_addr);
+              auto block_idx = createLoad(builder, block_index_addr);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             }
@@ -413,21 +426,21 @@ void replace_built_in_function(llvm::Module *M) {
               auto grid_size_addr = M->getGlobalVariable("grid_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto grid_size = builder.CreateLoad(grid_size_addr);
+              auto grid_size = createLoad(builder, grid_size_addr);
               Call->replaceAllUsesWith(grid_size);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.y") {
               auto grid_size_addr = M->getGlobalVariable("grid_size_y");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto grid_size = builder.CreateLoad(grid_size_addr);
+              auto grid_size = createLoad(builder, grid_size_addr);
               Call->replaceAllUsesWith(grid_size);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.z") {
               auto grid_size_addr = M->getGlobalVariable("grid_size_z");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto grid_size = builder.CreateLoad(grid_size_addr);
+              auto grid_size = createLoad(builder, grid_size_addr);
               Call->replaceAllUsesWith(grid_size);
               need_remove.push_back(Call);
             }
@@ -441,7 +454,7 @@ void replace_built_in_function(llvm::Module *M) {
             // return the rank within the warp
             IRBuilder<> builder(context);
             builder.SetInsertPoint(Call);
-            auto intra_warp_index = builder.CreateLoad(local_intra_warp_idx);
+            auto intra_warp_index = createLoad(builder, local_intra_warp_idx);
             Call->replaceAllUsesWith(intra_warp_index);
             need_remove.push_back(Call);
           }
@@ -498,11 +511,15 @@ void replace_built_in_function(llvm::Module *M) {
                   std::vector<Value *> Indices;
                   Indices.push_back(ConstantInt::get(I32, 0));
                   Indices.push_back(ConstantInt::get(I32, i));
-                  auto new_GEP = GetElementPtrInst::Create(NULL, // Pointee type
+                  auto new_GEP = GetElementPtrInst::Create(
+                    cast<PointerType>(src_alloc->getType()->getScalarType())
+                          ->getElementType(), // Pointee type
                                                            src_alloc, // Alloca
                                                            Indices,   // Indices
                                                            "", Call);
-                  auto new_load = new LoadInst(new_GEP, "", Call);
+                  auto new_load =
+                      new LoadInst(new_GEP->getType()->getPointerElementType(),
+                                   new_GEP, "", Call);
                   printf_args.push_back(new_load);
                 }
               }
@@ -573,7 +590,7 @@ void replace_asm_call(llvm::Module *M) {
             builder.SetInsertPoint(Call);
             auto intra_warp_index_addr =
                 M->getGlobalVariable("intra_warp_index");
-            auto intra_warp_index = builder.CreateLoad(intra_warp_index_addr);
+            auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
             Call->replaceAllUsesWith(intra_warp_index);
             need_remove.push_back(Call);
           }
@@ -721,3 +738,20 @@ void printIR(llvm::Module *module_) {
 //     }
 //   }
 // }
+
+
+LoadInst *createLoad(IRBuilder<> &B, Value *addr, bool isVolatile) {
+  return B.CreateLoad(addr->getType()->getPointerElementType(), addr,
+                      isVolatile);
+}
+
+Value *createInBoundsGEP(IRBuilder<> &B, Value *ptr,
+                         ArrayRef<Value *> idxlist) {
+  return B.CreateInBoundsGEP(
+      ptr->getType()->getScalarType()->getPointerElementType(), ptr, idxlist);
+}
+
+Value *createGEP(IRBuilder<> &B, Value *ptr, ArrayRef<Value *> idxlist) {
+  return B.CreateGEP(ptr->getType()->getScalarType()->getPointerElementType(),
+                     ptr, idxlist);
+}

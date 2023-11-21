@@ -10,6 +10,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <set>
 
 using namespace llvm;
@@ -27,6 +28,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
   llvm::FunctionCallee _f =
       M->getOrInsertFunction("cudaDeviceSynchronize", LauncherFuncT);
   llvm::Function *func_launch = llvm::cast<llvm::Function>(_f.getCallee());
+  //std::set<llvm::Instruction *> kernel_launch_instruction;
   std::set<std::string> launch_function_name;
 
 
@@ -44,6 +46,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
             if (calledFunction->getName().startswith("cudaLaunchKernel")) {
               // F is a kernel launch function
               launch_function_name.insert(func_name);
+              //kernel_launch_instruction.insert(callInst);
             }
           }
         }
@@ -67,6 +70,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
               //  llvm::CallInst::Create(func_launch, "",
               //                         callInst->getNextNonDebugInstruction());
               //}
+              // Vortex specific code
               if (callInst->getNextNonDebugInstruction()) {
                   llvm::CallInst *newCall = llvm::CallInst::Create(func_launch, "");
                   newCall->insertBefore(callInst->getNextNonDebugInstruction());
@@ -79,6 +83,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
       }
     }
   }
+  
 }
 
 
@@ -220,12 +225,31 @@ int kernel_idx = 0;
                 */
                 std::string oldName = functionOperand->getName().str();
 
-                // if parent function is __host and same as the cudaKernelLaunch
+
+                // if parent function is __host and same as the
+                // cudaKernelLaunch
                 std::string newName = oldName + "_wrapper";
                 if (func_name == oldName && host_changed &&
                     oldName.find("_host") != std::string::npos) {
-                  newName = oldName.substr(0, oldName.length() - 5) + "_wrapper";
+                  newName =
+                      oldName.substr(0, oldName.length() - 5) + "_wrapper";
                 }
+
+                // For LLVM>=14, it will add _device_stub prefix for the kernel
+                // name, thus, we need to remove the prefix
+                // example:
+                // from: _Z24__device_stub__HistogramPjS_jj
+                // to: HistogramPjS_jj
+                newName = std::regex_replace(newName,
+                                             std::regex("__device_stub__"), "");
+                // remove _Z24
+                for (int i = 2; i < newName.length(); i++) {
+                  if (newName[i] >= '0' && newName[i] <= '9')
+                    continue;
+                  newName = newName.substr(i);
+                  break;
+                }
+
                 std::cout << "Change Kernel Name to: " << newName << std::endl;
                 
                 // FROM HERE
@@ -280,12 +304,12 @@ int kernel_idx = 0;
             
 
             } else if (cuda_register_kernel_names.find(
-                           calledFunction->getName()) !=
+                           calledFunction->getName().str()) !=
                        cuda_register_kernel_names.end()) {
               // if the called function collides with kernel definiton
               // TODO: some reason changes all occurences of the function name
               // for both cudaKernelLaunch calls and regular function call
-              // errs() << *inst;
+              
               host_changed = true;
               calledFunction->setName(calledFunction->getName() + "_host");
               std::cout << std::endl;
