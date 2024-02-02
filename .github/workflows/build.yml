@@ -50,5 +50,5 @@ jobs:
           export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
           mkdir build
           cd build
-          cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
+          cmake .. -DLLVM_CONFIG_PATH=`which llvm-config` -DCUDA_PATH=${{ github.workspace }}/cuda-10.1
           make -j8
