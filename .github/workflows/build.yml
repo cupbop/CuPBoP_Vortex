@@ -48,6 +48,7 @@ jobs:
           cd ${{ github.workspace }}
           export CuPBoP_PATH=`pwd`
           export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
+          export VORTEX_ARCHITECTURE=64
           mkdir build
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config` -DCUDA_PATH=${{ github.workspace }}/cuda-10.1
