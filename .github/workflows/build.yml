@@ -42,15 +42,12 @@ jobs:
           cd ${{ github.workspace }}
           wget https://www.dropbox.com/s/4pckqsjnl920gpn/cuda-10.1.tar.gz?dl=1
           tar -xzf 'cuda-10.1.tar.gz?dl=1'
-          
+
       - name: Build project
         run: |
           cd ${{ github.workspace }}
-          ls -a
-          pwd
           export CuPBoP_PATH=`pwd`
           export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
-          export VORTEX_PATH=$CuPBoP_PATH/vortex
           mkdir build
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config`
