@@ -53,3 +53,28 @@ jobs:
           cd build
           cmake .. -DLLVM_CONFIG_PATH=`which llvm-config` -DCUDA_PATH=${{ github.workspace }}/cuda-10.1
           make -j8
+
+
+      - name: Generate bitcode files (.bc) for host/device
+        run: |
+          export CUDA_PATH=$CuPBoP_PATH/cuda-10.1
+          export VORTEX_SCHEDULE_FLAG=0
+          export KERNEL_CU=saxpy.cu
+          export ARCH=64
+          export KERNEL=`basename $KERNEL_CU .cu`
+          cd examples/microbench
+          clang++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+
+      - name: Generate LLVM IR files(.ll) for host and device
+        run: |
+          llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
+          llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
+
+      - name: Translate the kernel bitcode by using CuPBoP's kernel translator
+        run: |
+          $CuPBoP_PATH/build/compilation/hostTranslator $KERNEL-host-x86_64-unknown-linux-gnu.bc host.bc
+          llvm-dis host.bc
+          llc --relocation-model=pic --filetype=obj host.bc -o host.o
+          g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
+          
+        
