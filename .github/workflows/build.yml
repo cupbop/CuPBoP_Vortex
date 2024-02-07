@@ -26,8 +26,8 @@ jobs:
       - name: Download vortex header
         run: |
           cd ${{ github.workspace }}
-          wget https://www.dropbox.com/scl/fi/nd924ma3cq1fhauo0bs8x/vortex-header.tar.gz?rlkey=zudpp29yuxcrn42mxkiga8e06&dl=0
-          tar -xzf 'vortex-header.tar.gz?rlkey=zudpp29yuxcrn42mxkiga8e06'
+          wget https://www.dropbox.com/scl/fi/nd924ma3cq1fhauo0bs8x/vortex-header.tar.gz?rlkey=zudpp29yuxcrn42mxkiga8e06&dl=1 -O vortex-header.tar.gz
+          tar -xzf vortex-header.tar.gz
           cp vortex.h $CuPBoP_PATH/runtime/include
 
       - name: Download CUDA header files
