@@ -95,7 +95,7 @@ jobs:
 
           echo "--- compiling kernel.bc"
           export LLVM_PREFIX=${CuPBoP_PATH}/llvm
-          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log
+          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} -I/home/runner/work/CuPBoP_dev/CuPBoP_dev/VORTEX_DIR/kernel/include kernel.bc -c -o kernel.o > kernel.log
 
           echo "--- compiling kernel_wrapper.cpp"
           find ./* -name "vx_print.h"
