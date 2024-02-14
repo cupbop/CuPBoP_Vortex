@@ -156,3 +156,8 @@ jobs:
               ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} kernel_wrapper.o kernel.o ${CuPBoP_PATH}/runtime/src/vortex/kernel/cudaKernelImpl_64.o -lm ${VX_LDFLAGS} -o kernel.elf
           fi
 
+          nm -C --defined-only -g kernel.elf > lookup_global_symbols.txt
+          ${LLVM_PREFIX}/bin/llvm-objcopy -O binary kernel.elf kernel.out
+          ${LLVM_PREFIX}/bin/llvm-objdump -D kernel.elf > kernel.dump
+          echo "--- Kernel compilation completed!"
+
