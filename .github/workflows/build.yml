@@ -97,4 +97,7 @@ jobs:
           export LLVM_PREFIX=${CuPBoP_PATH}/llvm
           ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log
 
+          echo "--- compiling kernel_wrapper.cpp"
+          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o 
+          ${LLVM_PREFIX}/bin/llvm-objdump -D kernel_wrapper.o > kernel_wrapper.dump
 
