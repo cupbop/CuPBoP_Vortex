@@ -44,11 +44,6 @@ jobs:
           wget https://www.dropbox.com/s/4pckqsjnl920gpn/cuda-10.1.tar.gz?dl=1
           tar -xzf 'cuda-10.1.tar.gz?dl=1'
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential
-
       - name: Build project
         run: |
           cd ${{ github.workspace }}
@@ -87,6 +82,48 @@ jobs:
           wget -O VORTEX_DIR.tar.gz "https://www.dropbox.com/scl/fi/ywhj90xj6t80cgqsnkze3/VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9"
           tar -xzf VORTEX_DIR.tar.gz
 
+          echo "Download RISC-V toolchain dependencies"
+          cd ${CuPBoP_PATH}
+          export REPOSITORY=https://github.com/vortexgpgpu/vortex-toolchain-prebuilt/raw/master
+          export OSDIR=${OSDIR:=ubuntu/focal}
+          parts=$(eval echo {a..j})
+          
+          if [ $ARCH = 32 ]
+          then
+            for x in $parts
+            do
+                wget $REPOSITORY/riscv-gnu-toolchain/$OSDIR/riscv-gnu-toolchain.tar.bz2.parta$x
+            done
+            cat riscv-gnu-toolchain.tar.bz2.parta* > riscv-gnu-toolchain.tar.bz2
+            tar -xvf riscv-gnu-toolchain.tar.bz2
+          elif [ $ARCH = 64 ]
+          then
+            for x in $parts
+            do
+                wget $REPOSITORY/riscv64-gnu-toolchain/$OSDIR/riscv64-gnu-toolchain.tar.bz2.parta$x
+            done
+            cat riscv64-gnu-toolchain.tar.bz2.parta* > riscv64-gnu-toolchain.tar.bz2
+            tar -xvf riscv64-gnu-toolchain.tar.bz2
+          else
+              echo "ARCH is setup to a wrong number, check your bash file"
+              exit -1
+          fi
+
+          if [ $ARCH = 32 ]
+          then
+              export RISCV_TOOLCHAIN=${CuPBoP_PATH}/riscv-gnu-toolchain
+              export RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv32-unknown-elf-
+              export RISCV_TOOLCHAIN_FOLDER=$RISCV_TOOLCHAIN
+          elif [ $ARCH = 64 ]
+          then
+              export RISCV_TOOLCHAIN=${CuPBoP_PATH}/riscv64-gnu-toolchain
+              export RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv64-unknown-elf-
+              export RISCV_TOOLCHAIN_FOLDER=$RISCV_TOOLCHAIN
+          else
+              echo "ARCH is setup to a wrong number, check your bash file"
+              exit -1
+          fi
+
           echo "Compile the translated bc code for vortex"
           export VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
           export VORTEX_PATH=${CuPBoP_PATH}/VORTEX_DIR
@@ -95,22 +132,17 @@ jobs:
               VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
               VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
           else
-              VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
+              VX_CFLAGS="-v -O3 -std=c++11 --sysroot=${RISCV_TOOLCHAIN_FOLDER} --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
               VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x180000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
           fi
 
           echo "--- compiling kernel.bc"
-          cd 
-          export LLVM_PREFIX=${CuPBoP_PATH}/llvm
           cd ${CuPBoP_PATH}/examples/microbench
-          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} -I/home/runner/work/CuPBoP_dev/CuPBoP_dev/VORTEX_DIR/kernel/include kernel.bc -c -o kernel.o > kernel.log
+          export LLVM_PREFIX=${CuPBoP_PATH}/llvm
+   
+          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log
 
           echo "--- compiling kernel_wrapper.cpp"
-          pwd
-          find ./* -name "vx_print.h"
-          ls ${CuPBoP_PATH}
-          echo "ls current folder"
-          ls ${{ github.workspace }}
-          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} -I/home/runner/work/CuPBoP_dev/CuPBoP_dev/VORTEX_DIR/kernel/include --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o 
+          ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o 
           ${LLVM_PREFIX}/bin/llvm-objdump -D kernel_wrapper.o > kernel_wrapper.dump
 
