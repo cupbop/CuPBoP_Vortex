@@ -77,4 +77,19 @@ jobs:
           llc --relocation-model=pic --filetype=obj host.bc -o host.o
           g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
 
+          echo "Download vortex dependencies"
+          wget https://www.dropbox.com/scl/fi/ywhj90xj6t80cgqsnkze3/VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9&dl=0
+          tar -xzf 'VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9'
+          echo "Compile the translated bc code for vortex"
+          export VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
+          export VORTEX_PATH=${{ github.workspace }}/VORTEX_DIR
+          if [ $ARCH = 32 ]
+          then
+              VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
+              VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+          else
+              VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
+              VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x180000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+          fi
+
  
