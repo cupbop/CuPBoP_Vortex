@@ -71,4 +71,10 @@ jobs:
           $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc
           llvm-dis kernel.bc
 
+          echo "Translate the host bitcode by using CuPBoP's host translator"
+          $CuPBoP_PATH/build/compilation/hostTranslator $KERNEL-host-x86_64-unknown-linux-gnu.bc host.bc
+          llvm-dis host.bc
+          llc --relocation-model=pic --filetype=obj host.bc -o host.o
+          g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
+
  
