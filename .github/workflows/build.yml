@@ -94,5 +94,7 @@ jobs:
           fi
 
           echo "--- compiling kernel.bc"
+          whereis llvm-config-14
           ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log
+
 
