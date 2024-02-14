@@ -44,6 +44,11 @@ jobs:
           wget https://www.dropbox.com/s/4pckqsjnl920gpn/cuda-10.1.tar.gz?dl=1
           tar -xzf 'cuda-10.1.tar.gz?dl=1'
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
       - name: Build project
         run: |
           cd ${{ github.workspace }}
