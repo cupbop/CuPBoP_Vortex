@@ -63,4 +63,12 @@ jobs:
           export KERNEL=`basename $KERNEL_CU .cu`
           cd ${CuPBoP_PATH}/examples/microbench
           clang++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64 -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+
+          echo "Generate LLVM IR files(.ll) for host and device"
+          llvm-dis $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc
+          llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
+          echo "Translate the kernel bitcode by using CuPBoP's kernel translator"
+          $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc
+          llvm-dis kernel.bc
+
  
