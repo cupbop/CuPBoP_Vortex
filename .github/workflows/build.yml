@@ -80,7 +80,8 @@ jobs:
           echo "Download vortex dependencies"
           wget https://www.dropbox.com/scl/fi/ywhj90xj6t80cgqsnkze3/VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9&dl=0
           ls -l
-          tar -xzf VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9
+          tar -xzf ‘VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9’
+
           echo "Compile the translated bc code for vortex"
           export VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
           export VORTEX_PATH=${{ github.workspace }}/VORTEX_DIR
