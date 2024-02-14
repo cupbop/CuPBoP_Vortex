@@ -95,7 +95,7 @@ jobs:
                 wget $REPOSITORY/riscv-gnu-toolchain/$OSDIR/riscv-gnu-toolchain.tar.bz2.parta$x
             done
             cat riscv-gnu-toolchain.tar.bz2.parta* > riscv-gnu-toolchain.tar.bz2
-            tar -xvf riscv-gnu-toolchain.tar.bz2
+            tar -xvf riscv-gnu-toolchain.tar.bz2 > riscv_tar.log
             echo "Download RISC-V toolchain - Done"
           elif [ $ARCH = 64 ]
           then
@@ -104,7 +104,7 @@ jobs:
                 wget $REPOSITORY/riscv64-gnu-toolchain/$OSDIR/riscv64-gnu-toolchain.tar.bz2.parta$x
             done
             cat riscv64-gnu-toolchain.tar.bz2.parta* > riscv64-gnu-toolchain.tar.bz2
-            tar -xvf riscv64-gnu-toolchain.tar.bz2
+            tar -xvf riscv64-gnu-toolchain.tar.bz2 > riscv_tar.log
             echo "Download RISC-V toolchain - Done"
           else
               echo "ARCH is setup to a wrong number, check your bash file"
