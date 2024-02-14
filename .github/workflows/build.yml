@@ -83,7 +83,7 @@ jobs:
 
           echo "Compile the translated bc code for vortex"
           export VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex"
-          export VORTEX_PATH=${{ github.workspace }}/VORTEX_DIR
+          export VORTEX_PATH=${CuPBoP_PATH}/VORTEX_DIR
           if [ $ARCH = 32 ]
           then
               VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/hw"
@@ -100,7 +100,9 @@ jobs:
           echo "--- compiling kernel_wrapper.cpp"
           pwd
           find ./* -name "vx_print.h"
-          ls /home/runner/work/CuPBoP_dev/CuPBoP_dev/VORTEX_DIR/kernel/include
+          ls ${CuPBoP_PATH}
+          echo "ls current folder"
+          ls ${{ github.workspace }}
           ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} -I/home/runner/work/CuPBoP_dev/CuPBoP_dev/VORTEX_DIR/kernel/include --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o 
           ${LLVM_PREFIX}/bin/llvm-objdump -D kernel_wrapper.o > kernel_wrapper.dump
 
