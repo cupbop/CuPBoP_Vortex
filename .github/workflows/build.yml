@@ -78,7 +78,7 @@ jobs:
           g++ -g -O0 host_vortexrt.cpp -c -o host_vortexrt.o
           
           echo "Download vortex dependencies"
-          wget -O VORTEX_DIR.tar.gz "https://www.dropbox.com/scl/fi/ywhj90xj6t80cgqsnkze3/VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9"
+          wget -O VORTEX_DIR.tar.gz -P ${{ github.workspace }} "https://www.dropbox.com/scl/fi/ywhj90xj6t80cgqsnkze3/VORTEX_DIR.tar.gz?rlkey=156ajyxnwf98pscx75imjxwu9"
           tar -xzf VORTEX_DIR.tar.gz
 
           echo "Compile the translated bc code for vortex"
