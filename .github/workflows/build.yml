@@ -23,6 +23,9 @@ jobs:
         uses: actions/setup-node@v2
         with:
          node-version: '20'
+
+      - name: Check Node.js version
+        run: node -v
          
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v1
