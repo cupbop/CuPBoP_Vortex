@@ -342,9 +342,7 @@ __global__ void Fan2(float *m_cuda, float *a_cuda, float *b_cuda, int Size,
 
   int xidx = blockIdx.x * blockDim.x + threadIdx.x;
   int yidx = blockIdx.y * blockDim.y + threadIdx.y;
-  // printf("blockIdx.x: %d, threadIdx.x: %d, blockIdx.y: %d, threadIdx.y: %d,
-  // blockDim.x: %d, blockDim.y:
-  // %d\n",blockIdx.x,threadIdx.x,blockIdx.y,threadIdx.y,blockDim.x,blockDim.y);
+  printf("blockIdx.x: %d, threadIdx.x: %d, blockIdx.y: %d, threadIdx.y: %d, blockDim.x: %d, blockDim.y: %d\n",blockIdx.x,threadIdx.x,blockIdx.y,threadIdx.y,blockDim.x,blockDim.y);
 
   a_cuda[Size * (xidx + 1 + t) + (yidx + t)] -=
       m_cuda[Size * (xidx + 1 + t) + t] * a_cuda[Size * t + (yidx + t)];
@@ -415,6 +413,7 @@ void ForwardSub() {
   struct timeval time_start;
   gettimeofday(&time_start, NULL);
   for (t = 0; t < (Size - 1); t++) {
+  //  for (t = 0; t < 1; t++) {
     Fan1<<<dimGrid, dimBlock>>>(m_cuda, a_cuda, Size, t);
     cudaDeviceSynchronize();
     Fan2<<<dimGridXY, dimBlockXY>>>(m_cuda, a_cuda, b_cuda, Size, Size - t, t);

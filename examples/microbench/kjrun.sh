@@ -5,8 +5,8 @@ set -e
 
 ######################### Default Varaibles #################################
 DEVICE=vortex
-KERNEL_CU=saxpy_vanila.cu
-ARCH=64
+KERNEL_CU=saxpy.cu
+ARCH=32
 #############################################################################
 
 export VORTEX_SCHEDULE_FLAG=0
@@ -35,8 +35,8 @@ then
     RISCV_TOOLCHAIN_FOLDER=$RISCV_TOOLCHAIN
 elif [ $ARCH = 64 ]
 then
-    RISCV_TOOLCHAIN_PREFIX=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf-
-    RISCV_TOOLCHAIN_FOLDER=/opt/riscv64-gnu-toolchain
+    RISCV_TOOLCHAIN_PREFIX=$RISCV_TOOLCHAIN/riscv64-unknown-elf-
+    RISCV_TOOLCHAIN_FOLDER=$RISCV_TOOLCHAIN
 else
     echo "ARCH is setup to a wrong number, check your bash file"
     exit -1
@@ -138,10 +138,10 @@ then
     
     if [ $ARCH = 32 ]
     then
-        VX_CFLAGS="-v -O3 -std=c++11 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+        VX_CFLAGS="-v -O3 -std=c++11 --sysroot=${RISCV_TOOLCHAIN}/riscv32-unknown-elf -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
         VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     else
-        VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
+        VX_CFLAGS="-v -O3 -std=c++11 --sysroot=${RISCV_TOOLCHAIN}/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
         VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x180000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     fi
 
