@@ -348,6 +348,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; \n"
           //"    vx_printf(\"additional_info[0]: %lu\\n\", additional_info[0]);\n"
           "    if (additional_info[0] != 0) {\n"
+          "       vx_printf(\"CHECK: cudamemcpytosymbol\");\n"
           "       int additional_info_idx = 0;\n"
           "       while (additional_info_idx < additional_info[0]) {\n"
           "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
@@ -358,10 +359,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n"
           "    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
           "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
-          "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\\n\", \n"
+          "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\\n\", \n"
           "        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
           "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
-          "        args[0], args[1], args[2], args[3]);\n"
+          "        args[0], args[1], args[2], args[3], args[4], args[5]);\n"
+          "    vx_printf(\"workdim=%d\\n\", ctx->work_dim);\n"
           "\n";
 
          
