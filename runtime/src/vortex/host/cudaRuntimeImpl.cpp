@@ -26,10 +26,6 @@ std::vector<uint64_t> memcpy_symbol_single;
 //create string vector
 std::vector<std::string> symbol_name_vector;
 
- 
-//create vector of integer array
-
-
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
      int _ret = _expr;                                          \
@@ -120,6 +116,12 @@ public:
     return staging_buf_;
   }
 };
+
+auto DC_init = DeviceContext::instance();
+uint64_t NUM_THREADS, NUM_WARPS, NUM_CORES;
+int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &NUM_THREADS);
+int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &NUM_WARPS);
+int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES);
 
 cudaError_t cudaGetDevice(int *devPtr) { 
   *devPtr = 0;
@@ -535,7 +537,7 @@ readfile.close();
   RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.out"));
 
   // allocate staging buffer for kernel arguments
-  size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint32_t) * (num_args - 1)) : 0);
+  size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   printf("(debug) abuf_size = %ld\n", abuf_size);
   auto staging_buf = DC->staging_alloc(abuf_size);
 
@@ -574,7 +576,7 @@ readfile.close();
   // write arguments
   for (int i = 0; i < num_args; ++i) {    
     memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
-    printf("*** cuda kernel args[%d]=0x%x\n", i, (uint32_t)abuf_ptr->args[i]);
+    printf("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
   }  
   
   // upload kernel arguments
@@ -604,7 +606,14 @@ readfile.close();
   RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
 
   // dump performance counters for every kernel to a file
-    FILE *outputFile = fopen("perf_counter_8C_16W_16T.txt", "a");
+    
+    std::string filename = "perf_counter_" + std::to_string(NUM_CORES) + "C_" + std::to_string(NUM_WARPS) + "W_" + std::to_string(NUM_THREADS) + "T_thread_map_mem.txt";
+    std::cout << "output file: " << filename << std::endl;
+    //convert filename to char* with its content
+    char filename_char[filename.size() + 1];
+    strcpy(filename_char, filename.c_str());
+  
+    FILE *outputFile = fopen(filename_char, "a");
     if (outputFile == NULL) {
         perror("Error opening the output file");
     }
