@@ -1002,9 +1002,12 @@ public:
     DivergenceInfo DI(F, *DT, *PDT, LI, TTI, /*KnownReducible*/ true);
 
     // find parallel region we need to wrap
+    // print Function name
+    printf("Function name: %s\n", func_name.c_str());
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop);
+    print_parallel_region(parallel_regions);
     assert(!parallel_regions.empty() && "can not find any parallel regions\n");
-    // print_parallel_region(parallel_regions);
+    
 
     if (intra_warp_loop) {
       handle_local_variable_intra_warp(parallel_regions, DI);
@@ -1043,21 +1046,25 @@ void insert_warp_loop(llvm::Module *M) {
   llvm::legacy::PassManager Passes;
   need_nested_loop = has_warp_barrier(M);
   int schedule = std::stoi(std::string(std::getenv("VORTEX_SCHEDULE_FLAG")));
-
+  printf("SCHEDULE FLAG: %d\n", schedule);
   // use nested loop only when there are warp-level barrier
+  printf("NEED NESTED LOOP: %d\n", need_nested_loop);
   if (need_nested_loop) {
     bool intra_warp = true;
     Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
     // insert inter warp loop
     Passes.add(new InsertWarpLoopPass(!intra_warp, schedule));
+    printf("insert both intra and inter warp loop\n");
     Passes.run(*M);
   } else {
     bool intra_warp = true;
     // only need a single loop, with size=block_size
     Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
+    printf("insert intra warp loop\n");
     Passes.run(*M);
   }
   // remove all barriers
+  printf("remove all barriers\n");
   for (auto F = M->begin(); F != M->end(); ++F)
     remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
 }
