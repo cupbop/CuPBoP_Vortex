@@ -3,8 +3,10 @@
 #include <vx_intrinsics.h>
 #include <vx_spawn.h>
 #include <stdint.h>
+#include <string.h>
 
 #define KERNEL_ARG_BASE_ADDR 2147479552
+#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR 2147483136
 
 typedef struct {
     context_t ctx;
@@ -28,11 +30,11 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void _Z6KernelP4NodePiPbS2_S2_S1_i_wrapper(void *args);
-    extern void _Z7Kernel2PbS_S_S_i_wrapper(void *args);
+    extern void Fan1PfS_ii_wrapper(void *args);
+    extern void Fan2PfS_S_iii_wrapper(void *args);
 }
 
-void cuda__Z6KernelP4NodePiPbS2_S2_S1_i_wrapper(
+void cuda_Fan1PfS_ii_wrapper(
     const void * args, 
     const context_t* /*context*/, 
     uint32_t group_x, 
@@ -45,10 +47,10 @@ void cuda__Z6KernelP4NodePiPbS2_S2_S1_i_wrapper(
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
 
-    _Z6KernelP4NodePiPbS2_S2_S1_i_wrapper((void **)args);
+    Fan1PfS_ii_wrapper((void **)args);
 }
 
-void cuda__Z7Kernel2PbS_S_S_i_wrapper(
+void cuda_Fan2PfS_S_iii_wrapper(
     const void * args, 
     const context_t* /*context*/, 
     uint32_t group_x, 
@@ -61,12 +63,12 @@ void cuda__Z7Kernel2PbS_S_S_i_wrapper(
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
 
-    _Z7Kernel2PbS_S_S_i_wrapper((void **)args);
+    Fan2PfS_S_iii_wrapper((void **)args);
 }
 
 vx_spawn_kernel_cb callbacks[] = {
-    cuda__Z6KernelP4NodePiPbS2_S2_S1_i_wrapper, 
-    cuda__Z7Kernel2PbS_S_S_i_wrapper, 
+    cuda_Fan1PfS_ii_wrapper, 
+    cuda_Fan2PfS_S_iii_wrapper, 
 };
 
 int main() {
@@ -84,6 +86,16 @@ int main() {
 
     block_size = ctx->local_size[0] * ctx->local_size[1];
 
+    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; 
+    if (additional_info[0] != 0) {
+       int additional_info_idx = 0;
+       while (additional_info_idx < additional_info[0]) {
+           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];
+           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];
+           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];
+           memcpy(dst_addr, src_addr, size);
+           additional_info_idx++;}}
+
     vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
     vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
     vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", 
@@ -93,6 +105,15 @@ int main() {
 
     vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);
 
+    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)
+    if (additional_info[0] != 0) {
+       int additional_info_idx = 0;
+       while (additional_info_idx < additional_info[0]) {
+           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];
+           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];
+           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];
+           memcpy(dst_addr, src_addr, size);
+           additional_info_idx++;}}
     return 0;
 }
 

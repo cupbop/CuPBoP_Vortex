@@ -1,7 +1,15 @@
 # copied from MMCV (github.com/open-mmlab/mmcv)
 name: lint
 
-on: [push, pull_request]
+# File disabled
+#on: [push, pull_request]
+on:
+  push:
+    branches:
+      - non-existent-branch
+  pull_request:
+    branches:
+      - non-existent-branch
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -9,7 +17,7 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v2
       - name: Set up Python 3.7
