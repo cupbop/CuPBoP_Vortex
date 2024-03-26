@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#define KERNEL_ARG_BASE_ADDR 2147479552
-#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR 2147483136
+#define KERNEL_ARG_BASE_ADDR 6442446848
+#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR 6442450432
 
 typedef struct {
     context_t ctx;
@@ -30,11 +30,11 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void Fan1PfS_ii_wrapper(void *args);
-    extern void Fan2PfS_S_iii_wrapper(void *args);
+    extern void N3cub11EmptyKernelIvEEvv_wrapper(void *args);
+    extern void QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper(void *args);
 }
 
-void cuda_Fan1PfS_ii_wrapper(
+void cuda_N3cub11EmptyKernelIvEEvv_wrapper(
     const void * args, 
     const context_t* /*context*/, 
     uint32_t group_x, 
@@ -47,10 +47,10 @@ void cuda_Fan1PfS_ii_wrapper(
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
 
-    Fan1PfS_ii_wrapper((void **)args);
+    N3cub11EmptyKernelIvEEvv_wrapper((void **)args);
 }
 
-void cuda_Fan2PfS_S_iii_wrapper(
+void cuda_QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper(
     const void * args, 
     const context_t* /*context*/, 
     uint32_t group_x, 
@@ -63,12 +63,12 @@ void cuda_Fan2PfS_S_iii_wrapper(
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
 
-    Fan2PfS_S_iii_wrapper((void **)args);
+    QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper((void **)args);
 }
 
 vx_spawn_kernel_cb callbacks[] = {
-    cuda_Fan1PfS_ii_wrapper, 
-    cuda_Fan2PfS_S_iii_wrapper, 
+    cuda_N3cub11EmptyKernelIvEEvv_wrapper, 
+    cuda_QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper, 
 };
 
 int main() {
@@ -88,6 +88,7 @@ int main() {
 
     auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; 
     if (additional_info[0] != 0) {
+       vx_printf("CHECK: cudamemcpytosymbol");
        int additional_info_idx = 0;
        while (additional_info_idx < additional_info[0]) {
            auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];
@@ -98,10 +99,11 @@ int main() {
 
     vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
     vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
-    vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", 
+    vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n", 
         kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], 
         ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],
-        args[0], args[1], args[2], args[3]);
+        args[0], args[1], args[2], args[3], args[4], args[5]);
+    vx_printf("workdim=%d\n", ctx->work_dim);
 
     vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);
 

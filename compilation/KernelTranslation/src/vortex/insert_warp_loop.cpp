@@ -1006,8 +1006,11 @@ public:
     printf("Function name: %s\n", func_name.c_str());
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop);
     print_parallel_region(parallel_regions);
-    assert(!parallel_regions.empty() && "can not find any parallel regions\n");
-    
+    // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
+    if (parallel_regions.empty()) {
+      remove_barrier(&F, intra_warp_loop, schedule_flag);
+      return 1;      
+    }
 
     if (intra_warp_loop) {
       handle_local_variable_intra_warp(parallel_regions, DI);
