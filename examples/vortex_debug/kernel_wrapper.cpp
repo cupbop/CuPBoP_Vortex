@@ -8,6 +8,16 @@
 #define KERNEL_ARG_BASE_ADDR 6442446848
 #define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR 6442450432
 
+struct alignas(8) context_t { 
+uint32_t num_groups[3]; 
+uint32_t global_offset[3]; 
+uint32_t local_size[3]; 
+char * printf_buffer; 
+uint32_t printf_buffer_position; 
+uint32_t printf_buffer_capacity; 
+uint32_t work_dim; 
+}; 
+
 typedef struct {
     context_t ctx;
     int kernel_idx;
@@ -30,49 +40,25 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void N3cub11EmptyKernelIvEEvv_wrapper(void *args);
-    extern void QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper(void *args);
+    extern void gesummv_kerneliPfS__wrapper(void *args);
 }
 
-void cuda_N3cub11EmptyKernelIvEEvv_wrapper(
-    const void * args, 
-    const context_t* /*context*/, 
-    uint32_t group_x, 
-    uint32_t group_y, 
-    uint32_t /*group_z*/)
-{
-    block_index_x = group_x;
-    block_index_y = group_y;
-    block_index_z = 0;
+void cuda_gesummv_kerneliPfS__wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
 
-    vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
+    vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
 
-    N3cub11EmptyKernelIvEEvv_wrapper((void **)args);
+    gesummv_kerneliPfS__wrapper((void **)args);
 }
 
-void cuda_QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper(
-    const void * args, 
-    const context_t* /*context*/, 
-    uint32_t group_x, 
-    uint32_t group_y, 
-    uint32_t /*group_z*/)
-{
-    block_index_x = group_x;
-    block_index_y = group_y;
-    block_index_z = 0;
-
-    vx_printf("kernel_warpper: group=(%d, %d)\n", group_x, group_y);
-
-    QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper((void **)args);
-}
-
-vx_spawn_kernel_cb callbacks[] = {
-    cuda_N3cub11EmptyKernelIvEEvv_wrapper, 
-    cuda_QueryKernelILi128ELi4EEvPiS0_S0_S0_iPy_wrapper, 
+vx_kernel_func_cb callbacks[] = {
+    cuda_gesummv_kerneliPfS__wrapper, 
 };
 
 int main() {
-    auto kernel_arg = (kernel_arg_t*)KERNEL_ARG_BASE_ADDR; 
+    kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); 
     auto ctx = &kernel_arg->ctx; 
     auto args = (uint64_t*)kernel_arg->args;
 
@@ -86,17 +72,6 @@ int main() {
 
     block_size = ctx->local_size[0] * ctx->local_size[1];
 
-    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; 
-    if (additional_info[0] != 0) {
-       vx_printf("CHECK: cudamemcpytosymbol");
-       int additional_info_idx = 0;
-       while (additional_info_idx < additional_info[0]) {
-           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];
-           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];
-           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];
-           memcpy(dst_addr, src_addr, size);
-           additional_info_idx++;}}
-
     vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
     vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
     vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n", 
@@ -104,18 +79,8 @@ int main() {
         ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],
         args[0], args[1], args[2], args[3], args[4], args[5]);
     vx_printf("workdim=%d\n", ctx->work_dim);
+vx_printf("execute something\n");
+    return vx_spawn_threads(1, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[0], args); 
 
-    vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);
-
-    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)
-    if (additional_info[0] != 0) {
-       int additional_info_idx = 0;
-       while (additional_info_idx < additional_info[0]) {
-           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];
-           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];
-           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];
-           memcpy(dst_addr, src_addr, size);
-           additional_info_idx++;}}
-    return 0;
 }
 

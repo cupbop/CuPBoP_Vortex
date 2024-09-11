@@ -18,7 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <vector>
-
+#include <map>
 
 // Global variable to support CudaMemcpytoSymbol
 std::vector<std::vector<uint64_t> >  memcpy_symbol;
@@ -81,10 +81,18 @@ private:
     : device_(nullptr)
     , staging_buf_(std::vector<uint8_t>())
     , staging_size_(0)
+    , krnl_buffer_(nullptr)
+    , args_buffer_(nullptr)
   {}
 
   ~DeviceContext() {
     if (device_ != nullptr) {
+      // Cleanup buffers
+      if (krnl_buffer_ != nullptr)
+	vx_mem_free(krnl_buffer_);
+      if (args_buffer_ != nullptr)
+	vx_mem_free(args_buffer_);
+      
       vx_dev_close(device_);
     }
   }
@@ -99,6 +107,13 @@ private:
   std::vector<uint8_t> staging_buf_;
   size_t staging_size_;
 
+  // Buffers
+  vx_buffer_h krnl_buffer_;
+  vx_buffer_h args_buffer_;
+
+  // Pointer manager
+  std::map<void* , vx_buffer_h > ptr_map;
+  
 public:
   static DeviceContext* instance() {
     static DeviceContext s_inst;
@@ -109,11 +124,61 @@ public:
   vx_device_h device() {    
     return device_;
   }
+
+  vx_buffer_h* krnl_buffer() {
+    return &krnl_buffer_;
+  }
+
+  vx_buffer_h* args_buffer() {
+    return &args_buffer_;
+  }
+
+  vx_buffer_h get_krnl_buf() {
+    return krnl_buffer_;
+  }
+
+  vx_buffer_h get_args_buf() {
+    return args_buffer_;
+  }
   
   std::vector<uint8_t> staging_alloc(size_t size) {
     staging_buf_.resize(size);
     staging_size_ = size;
     return staging_buf_;
+  }
+
+  void dev_mem_alloc(int size, int flag, uint64_t* mem_addr) {
+    vx_buffer_h mem_buffer = nullptr;
+
+    // Allocate memory on device
+    RT_CHECK(vx_mem_alloc(this->device(), size, flag, &mem_buffer));
+    RT_CHECK(vx_mem_address(mem_buffer, mem_addr));  
+
+    // Register pointer with its handler
+    ptr_map[(void* )(* mem_addr)] = mem_buffer;
+  }
+
+  void dev_mem_free(void* mem_addr) {
+    if (ptr_map.find(mem_addr) != ptr_map.end()) {
+      vx_buffer_h mem_buffer = ptr_map[mem_addr];
+      vx_mem_free(mem_buffer);
+
+      // Unregister pointer
+      ptr_map.erase(mem_addr);
+    }
+  }
+
+  void copy_to_dev(uint64_t mem_addr, void* host_ptr, int count) {
+    if (ptr_map.find((void* )mem_addr) != ptr_map.end()) {
+      // RT_CHECK(vx_copy_to_dev(this->device(), ptr_map[(void* )mem_addr], (uint64_t)host_ptr, count));
+      RT_CHECK(vx_copy_to_dev(ptr_map[(void* )mem_addr], host_ptr, 0, count));
+    }
+  }
+
+  void copy_from_dev(uint64_t mem_addr, void* host_ptr, int count) {
+    if (ptr_map.find((void* )mem_addr) != ptr_map.end()) {
+      RT_CHECK(vx_copy_from_dev(host_ptr, ptr_map[(void* )mem_addr], 0, count));
+    }
   }
 };
 
@@ -155,7 +220,10 @@ cudaError_t cudaFreeHost(void *devPtr) {
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
   auto DC = DeviceContext::instance();
   uint64_t mem_addr;  
-  RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_TYPE_GLOBAL, &mem_addr));
+  // RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_TYPE_GLOBAL, &mem_addr));
+  // RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_READ_WRITE, (void** )&mem_addr));
+  DC->dev_mem_alloc(size, VX_MEM_READ_WRITE, &mem_addr);
+  
   printf("cudaMalloc: size=%ld, mem_addr=%lu\n", size, mem_addr);
   *devPtr = (void*)mem_addr;
    return cudaSuccess;
@@ -164,9 +232,11 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 cudaError_t cudaFree(void *devPtr) {
   auto DC = DeviceContext::instance(); 
   uint64_t mem_addr = (uint64_t)devPtr;  
-  vx_mem_free(DC->device(), mem_addr);
+  // vx_mem_free(DC->device(), mem_addr);
+  DC->dev_mem_free(devPtr);
+  
   printf("cudaFree: mem_addr=%lu\n", mem_addr);
-   return cudaSuccess;
+  return cudaSuccess;
 }
 
 cudaError_t cudaMemset(void *devPtr, int value, size_t count) {  
@@ -178,7 +248,9 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
   auto host_ptr = staging_buf.data();
   memcpy((char *)host_ptr, tmp_ptr, count);
   uint64_t mem_addr = (uint64_t)devPtr;
-  RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
+  // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
+  DC->copy_to_dev(mem_addr, host_ptr, count);
+  
   printf("cudaMemset: value=%d, dst=%lu, count=%ld\n", value, mem_addr, count);
   free(tmp_ptr);
   return cudaSuccess;
@@ -193,7 +265,8 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     auto staging_buf = DC->staging_alloc(count);
     auto host_ptr = staging_buf.data();
     uint64_t mem_addr = (uint64_t)src;
-    RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_addr, count));
+    //  RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_addr, count));
+    DC->copy_from_dev(mem_addr, host_ptr, count);
     memcpy(dst, (char*)host_ptr, count);
     printf("cudamemcpyDeviceToHost: src=%lu, dst=%p, count=%ld\n", mem_addr, dst, count);
   } else if (kind == cudaMemcpyHostToDevice) {
@@ -203,7 +276,9 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     memcpy((char *)host_ptr, src, count);
     uint64_t mem_addr = (uint64_t)dst;
     printf("(memcpy_) host_ptr value: %d %d, addr: %ld\n", *(char *)src, *(char *)host_ptr, host_ptr);
-    RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
+    // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
+    DC->copy_to_dev(mem_addr, host_ptr, count);
+
     printf("cudaMemcpyHostToDevice: src=%p, dst=%lu, count=%ld\n", src, mem_addr, count);
   } else if (kind == cudaMemcpyDeviceToDevice) {
     auto DC = DeviceContext::instance();
@@ -212,7 +287,9 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     uint64_t mem_src_addr = (uint64_t)src;
     RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_src_addr, count));
     uint64_t mem_dst_addr = (uint64_t)dst;
-    RT_CHECK(vx_copy_to_dev(DC->device(), mem_dst_addr, host_ptr, count));
+    // RT_CHECK(vx_copy_to_dev(DC->device(), mem_dst_addr, host_ptr, count));
+    DC->copy_to_dev(mem_dst_addr, host_ptr, count);
+    
     printf("cudaMemcpyDeviceToDevice: src=%lu, dst=%lu, count=%ld\n", mem_src_addr, mem_dst_addr, count);
   } else if (kind == cudaMemcpyDefault) {
     std::abort(); // not supported!
@@ -291,7 +368,9 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   // allocate a device memory(temporary) and copy the data from host to device
   auto DC = DeviceContext::instance();
   uint64_t mem_addr;  
-  RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_TYPE_GLOBAL, &mem_addr));
+  // RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_TYPE_GLOBAL, &mem_addr));
+  RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_READ_WRITE, (void** )&mem_addr));
+  
   printf("(cudamemcpytosymbol) cudaMalloc: size=%ld, mem_addr=%lu\n", count, mem_addr);
     
   // copy the host data to device
@@ -299,8 +378,9 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   auto host_ptr = staging_buf.data();
 
   memcpy((char *)host_ptr, src, count);
-  RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
-
+  // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
+  DC->copy_to_dev(mem_addr, host_ptr, count);
+  
   printf("(cudamemcpytosymbol) cudaMemcpyHostToDevice: src=%p, dst=%lu, count=%ld\n", src, mem_addr, count);
 
   memcpy_symbol_single.push_back(std::stoull(symbol_addr_tmp, nullptr, 16));
@@ -500,32 +580,29 @@ cudaError_t cudaLaunchKernel_vortex(
                              const int num_args
                              ) {
 
-//open the file lookup.txt and load the content in the memory
-//cpp hash table, look for the kernel name, and retrieve the kerenl index
-
-//DEBUG PURPOSE
-std::cout << "RUNTIME FUNCTION" << std::endl;
-std::cout << "kernel_name: " << func << std::endl;
-std::cout << "number of arguments: " << num_args << std::endl;
-//reading lookup.txt
-std::fstream readfile;
-readfile.open("lookup.txt", std::ios::in);
-std::string kernel_idx_tmp;
-std::string kernel_name_tmp;
-
-while(readfile >> kernel_idx_tmp)
-{
-  readfile >> kernel_name_tmp;
-  readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-  std::cout << "debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl;
-  if(std::string(func) == kernel_name_tmp)
-  {
-    std::cout << "found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl;
-    break;
-  }
+  //open the file lookup.txt and load the content in the memory
+  //cpp hash table, look for the kernel name, and retrieve the kerenl index
   
-}
-readfile.close();                    
+  //DEBUG PURPOSE
+  std::cout << "RUNTIME FUNCTION" << std::endl;
+  std::cout << "kernel_name: " << func << std::endl;
+  std::cout << "number of arguments: " << num_args << std::endl;
+  //reading lookup.txt
+  std::fstream readfile;
+  readfile.open("lookup.txt", std::ios::in);
+  std::string kernel_idx_tmp;
+  std::string kernel_name_tmp;
+  
+  while(readfile >> kernel_idx_tmp) {
+    readfile >> kernel_name_tmp;
+    readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::cout << "debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl;
+    if(std::string(func) == kernel_name_tmp) {
+      std::cout << "found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl;
+      break;
+    }
+  }
+  readfile.close();                    
                       
   printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
@@ -534,8 +611,8 @@ readfile.close();
   
   int status = C_RUN;
   // upload kernel to device
-  RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.out"));
-
+  RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.vxbin", DC->krnl_buffer()));
+  
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   printf("(debug) abuf_size = %ld\n", abuf_size);
@@ -580,8 +657,10 @@ readfile.close();
   }  
   
   // upload kernel arguments
-  RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
+  // RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
+  RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size, DC->args_buffer()));
 
+  /*
   // upload additional information for cudaMemcpytoSymbol
   
   int abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
@@ -599,12 +678,19 @@ readfile.close();
   }
 
   RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional));
-  // start execution
-  RT_CHECK(vx_start(DC->device()));
+  */
 
+  printf("uploaded args\n");
+  
+  // start execution
+  RT_CHECK(vx_start(DC->device(), DC->get_krnl_buf(), DC->get_args_buf()));
+
+  printf("wait device\n");
   // wait for the execution to complete
   RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
 
+  printf("sync device\n");
+  
   // dump performance counters for every kernel to a file
     
     std::string filename = "perf_counter_" + std::to_string(NUM_CORES) + "C_" + std::to_string(NUM_WARPS) + "W_" + std::to_string(NUM_THREADS) + "T_thread_map_mem.txt";
