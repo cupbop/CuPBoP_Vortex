@@ -40,21 +40,33 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void gesummv_kerneliPfS__wrapper(void *args);
+    extern void Fan1PfS_ii_wrapper(void *args);
+    extern void Fan2PfS_S_iii_wrapper(void *args);
 }
 
-void cuda_gesummv_kerneliPfS__wrapper(void* args) {
+void cuda_Fan1PfS_ii_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
 
-    gesummv_kerneliPfS__wrapper((void **)args);
+    Fan1PfS_ii_wrapper((void **)args);
+}
+
+void cuda_Fan2PfS_S_iii_wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
+
+    vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
+
+    Fan2PfS_S_iii_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_gesummv_kerneliPfS__wrapper, 
+    cuda_Fan1PfS_ii_wrapper, 
+    cuda_Fan2PfS_S_iii_wrapper, 
 };
 
 int main() {

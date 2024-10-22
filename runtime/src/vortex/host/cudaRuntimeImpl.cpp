@@ -100,6 +100,14 @@ private:
   void initialize() {
     if (device_ == nullptr) {
       RT_CHECK(vx_dev_open(&device_));
+    } else {
+      // Cleanup the internal buffers
+      if (krnl_buffer_ != nullptr) 
+        vx_mem_free(krnl_buffer_);
+      krnl_buffer_ = nullptr;
+      if (args_buffer_ != nullptr)
+        vx_mem_free(args_buffer_);
+      args_buffer_ = nullptr;
     }
   }
 
@@ -178,6 +186,18 @@ public:
   void copy_from_dev(uint64_t mem_addr, void* host_ptr, int count) {
     if (ptr_map.find((void* )mem_addr) != ptr_map.end()) {
       RT_CHECK(vx_copy_from_dev(host_ptr, ptr_map[(void* )mem_addr], 0, count));
+    }
+  }
+
+  void cleanup() {
+    if (device_ != nullptr) { 
+      if (krnl_buffer_ != nullptr)
+	vx_mem_free(krnl_buffer_);
+      if (args_buffer_ != nullptr)
+	vx_mem_free(args_buffer_);
+
+      vx_dev_close(device_);
+      device_ = nullptr;
     }
   }
 };
@@ -693,17 +713,17 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // dump performance counters for every kernel to a file
     
-    std::string filename = "perf_counter_" + std::to_string(NUM_CORES) + "C_" + std::to_string(NUM_WARPS) + "W_" + std::to_string(NUM_THREADS) + "T_thread_map_mem.txt";
-    std::cout << "output file: " << filename << std::endl;
-    //convert filename to char* with its content
-    char filename_char[filename.size() + 1];
-    strcpy(filename_char, filename.c_str());
+  std::string filename = "perf_counter_" + std::to_string(NUM_CORES) + "C_" + std::to_string(NUM_WARPS) + "W_" + std::to_string(NUM_THREADS) + "T_thread_map_mem.txt";
+  std::cout << "output file: " << filename << std::endl;
+  //convert filename to char* with its content
+  char filename_char[filename.size() + 1];
+  strcpy(filename_char, filename.c_str());
   
-    FILE *outputFile = fopen(filename_char, "a");
-    if (outputFile == NULL) {
-        perror("Error opening the output file");
-    }
+  FILE *outputFile = fopen(filename_char, "a");
+  if (outputFile == NULL) {
+    perror("Error opening the output file");
+  }
   vx_dump_perf(DC->device(), outputFile);
-
+  
   return cudaSuccess;
 }

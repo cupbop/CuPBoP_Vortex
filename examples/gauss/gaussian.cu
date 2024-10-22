@@ -416,7 +416,7 @@ void ForwardSub() {
   //  for (t = 0; t < 1; t++) {
     Fan1<<<dimGrid, dimBlock>>>(m_cuda, a_cuda, Size, t);
     cudaDeviceSynchronize();
-    Fan2<<<dimGridXY, dimBlockXY>>>(m_cuda, a_cuda, b_cuda, Size, Size - t, t);
+    ///xxx Fan2<<<dimGridXY, dimBlockXY>>>(m_cuda, a_cuda, b_cuda, Size, Size - t, t);
     cudaDeviceSynchronize();
     checkCUDAError("Fan2");
   }
