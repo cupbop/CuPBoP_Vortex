@@ -374,7 +374,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
     */
       
     // ss << "    return vx_spawn_threads(1, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[0], kernel_arg); \n";
-     ss << "    return vx_spawn_threads(1, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[0], args); \n";
+     ss << "    return vx_spawn_threads(2, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
     
     ss << "\n" 
       /*"    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
