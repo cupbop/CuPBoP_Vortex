@@ -14,6 +14,8 @@ include_directories(./include)
 include_directories(./threadPool/include)
 include_directories(./../compilation/KernelTranslation/include)
 
-include_directories($ENV{VORTEX_PATH}/runtime/include)
+include_directories($ENV{CUDA_PATH}/include)
+include_directories($ENV{VORTEX_HOME}/runtime/include)
+
 file(GLOB proj_SOURCES "./src/vortex/host/*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})

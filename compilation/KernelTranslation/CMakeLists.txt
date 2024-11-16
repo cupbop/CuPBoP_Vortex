@@ -10,7 +10,9 @@ project(
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(LIB_NAME spmd2mpmd)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
+#set(LLVM_ENABLE_ASSERTIONS ON)
+#set(LLVM_ENABLE_DUMP ON)
 set(CMAKE_BUILD_TYPE Debug)
 include_directories(./include)
 

@@ -7,8 +7,10 @@
 #include <set>
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/ADT/Triple.h"
-#include "llvm/Analysis/DivergenceAnalysis.h"
+//LLVM 18
+#include "llvm/TargetParser/Triple.h"
+//#include "llvm/ADT/Triple.h"
+//#include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -19,7 +21,9 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
-#include "llvm/IR/Instructions.h"
+//LLVM 18
+//#include "llvm/IR/Instructions.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -31,7 +35,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+// LLVM18
+//#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -40,10 +45,70 @@
 #include <sstream>
 #include <tuple>
 #include <vector>
+#include <unordered_set>
+#include <queue>
 
 using namespace llvm;
 
 #define SW_WARP_SIZE (32)
+
+// LLVM-19 does not provide divergence analysis for NVPTX backend.
+// Thus, we need to implement our own divergence analysis.
+class CustomDivergenceAnalysis {
+  std::unordered_set<const Value *> DivergentValues;
+  std::queue<const Instruction *> Worklist;
+
+public:
+  void analyze(Function &F) {
+    printf("analyze divergence\n");
+    // Identify divergence sources
+    for (Instruction &I : instructions(F)) {
+      if (isDivergenceSource(&I)) {
+        DivergentValues.insert(&I);
+        Worklist.push(&I);
+      }
+    }
+
+    // Propagate divergence
+    while (!Worklist.empty()) {
+      const Instruction *Inst = Worklist.front();
+      Worklist.pop();
+      if (auto storeInst = dyn_cast<StoreInst>(Inst)) {
+        const Instruction *storeLocation =
+            dyn_cast<Instruction>(storeInst->getOperand(1));
+        if (storeLocation && DivergentValues.insert(storeLocation).second) {
+          Worklist.push(storeLocation);
+        }
+      } else {
+        for (const Use &U : Inst->uses()) {
+          const Instruction *UserInst = dyn_cast<Instruction>(U.getUser());
+          if (UserInst && DivergentValues.insert(UserInst).second) {
+            Worklist.push(UserInst);
+          }
+        }
+      }
+    }
+  }
+
+  bool isDivergent(const Value *V) const {
+    return DivergentValues.count(V) > 0;
+  }
+
+private:
+  bool isDivergenceSource(const Instruction *I) const {
+    if (const CallInst *CI = dyn_cast<CallInst>(I)) {
+      if (const Function *F = CI->getCalledFunction()) {
+        if (F->getName() == "llvm.nvvm.read.ptx.sreg.tid.x" ||
+            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.y" ||
+            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z") {
+          return true;
+        }
+      }
+    }
+    // Add other divergence sources as needed
+    return false;
+  }
+};
 
 struct ParallelRegion {
   std::set<llvm::BasicBlock *> wrapped_block;
@@ -78,7 +143,8 @@ int need_nested_loop;
 
 // adding multiple kenerl in file support
 
-bool ShouldNotBeContextSaved(llvm::Instruction *instr) {
+bool ShouldNotBeContextSaved(llvm::Instruction *instr,
+                             CustomDivergenceAnalysis &DI) {
   if (isa<BranchInst>(instr))
     return true;
   // if (isa<AddrSpaceCastInst>(instr))
@@ -100,7 +166,9 @@ bool ShouldNotBeContextSaved(llvm::Instruction *instr) {
 
   // TODO: we should further analyze whether the local variable
   // is same among all threads within a wrap
-  return false;
+  //LLVM 18 
+  return !DI.isDivergent(instr);
+  //return false;
 }
 
 // generate countpart alloc in the beginning of the Function
@@ -135,8 +203,9 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
 
   llvm::Type *elementType;
   if (isa<AllocaInst>(instruction)) {
-    elementType =
-        dyn_cast<AllocaInst>(instruction)->getType()->getElementType();
+    //LLVM 18
+    //elementType = dyn_cast<AllocaInst>(instruction)->getType()->getElementType();
+    elementType = dyn_cast<AllocaInst>(instruction)->getAllocatedType();
   } else {
     elementType = instruction->getType();
   }
@@ -323,9 +392,14 @@ void handle_alloc(llvm::Function *F) {
     auto block_size = createLoad(builder, block_size_addr);
 
     llvm::Type *elementType = NULL;
-    if (dyn_cast<AllocaInst>(inst)->getType()->getElementType()) {
-      elementType = dyn_cast<AllocaInst>(inst)->getType()->getElementType();
+    //LLVM 18
+    //if (dyn_cast<AllocaInst>(inst)->getType()->getElementType()) {
+    //  elementType = dyn_cast<AllocaInst>(inst)->getType()->getElementType();
+    //}
+        if (dyn_cast<AllocaInst>(inst)) {
+      elementType = dyn_cast<AllocaInst>(inst)->getAllocatedType();
     }
+
     assert(elementType != NULL);
 
     auto Alloca = builder.CreateAlloca(elementType, block_size,
@@ -364,7 +438,7 @@ void handle_alloc(llvm::Function *F) {
 }
 
   void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs,
-                                      DivergenceInfo &DI) {
+                                      CustomDivergenceAnalysis &DI) {
   bool intra_warp_loop = 1;
   // we should handle allocation generated by PHI
   {
@@ -384,7 +458,7 @@ void handle_alloc(llvm::Function *F) {
             llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());
             if (isa<StoreInst>(user)) {
               auto storeVar = user->getOperand(0);
-              if (DI.isDivergent(*storeVar)) {
+              if (DI.isDivergent(storeVar)) {
                 allStoreNonDivergence = false;
                 break;
               }
@@ -443,7 +517,7 @@ void handle_alloc(llvm::Function *F) {
       for (llvm::BasicBlock::iterator instr = bb->begin(); instr != bb->end();
            ++instr) {
         llvm::Instruction *instruction = &*instr;
-        if (ShouldNotBeContextSaved(instruction))
+        if (ShouldNotBeContextSaved(instruction, DI))
           continue;
         for (Instruction::use_iterator ui = instruction->use_begin(),
                                        ue = instruction->use_end();
@@ -985,6 +1059,8 @@ public:
 
 
     // get DivergenceInfo
+    // Removed for LLVM 18 (No Divergence Analysis)
+    /*
     auto DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
@@ -998,8 +1074,11 @@ public:
 
     llvm::FunctionAnalysisManager DummyFAM;
     llvm::TargetTransformInfo TTI =
-        target_machine->getTargetIRAnalysis().run(F, DummyFAM);
-    DivergenceInfo DI(F, *DT, *PDT, LI, TTI, /*KnownReducible*/ true);
+        target_machine->getTargetIRAnalysis().run(F, DummyFAM); 
+    */
+    //DivergenceInfo DI(F, *DT, *PDT, LI, TTI, /*KnownReducible*/ true); 
+    CustomDivergenceAnalysis DI;
+    DI.analyze(F);
 
     // find parallel region we need to wrap
     // print Function name

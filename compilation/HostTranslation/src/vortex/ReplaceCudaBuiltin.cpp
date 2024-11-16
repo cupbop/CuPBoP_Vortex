@@ -43,7 +43,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
         Instruction *inst = &(*i);
         if (llvm::CallBase *callInst = llvm::dyn_cast<llvm::CallBase>(inst)) {
           if (Function *calledFunction = callInst->getCalledFunction()) {
-            if (calledFunction->getName().startswith("cudaLaunchKernel")) {
+            if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
               // F is a kernel launch function
               launch_function_name.insert(func_name);
               //kernel_launch_instruction.insert(callInst);
@@ -93,7 +93,10 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
 void ReplaceKernelLaunch(llvm::Module *M) {
   LLVMContext &context = M->getContext();
   auto VoidTy = llvm::Type::getVoidTy(context);
-  auto I8 = llvm::Type::getInt8PtrTy(context);
+  //LLVM 18 
+  auto I8 = PointerType::getUnqual(context);
+  //auto I8 = llvm::Type::getInt8PtrTy(context);
+
   std::map<std::string, Function *> kernels;
 
   std::set<llvm::Function *> need_remove;
@@ -134,6 +137,8 @@ void ReplaceKernelLaunch(llvm::Module *M) {
     }
 
   */
+
+  std::cout << "Does it come here?" << std::endl;
   Function *f_register_global = M->getFunction("__cuda_register_globals");
   if (f_register_global) {
     for (Function::iterator b = f_register_global->begin();
@@ -172,6 +177,8 @@ bool host_changed = false;
 std::vector<llvm::Instruction *> need_remove_inst;
 int kernel_idx = 0;
 
+
+
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
@@ -185,8 +192,11 @@ int kernel_idx = 0;
         if (llvm::CallBase *callInst = llvm::dyn_cast<llvm::CallBase>(inst)) {
           llvm::CallInst *callInst_inst = llvm::dyn_cast<llvm::CallInst>(inst);
           if (Function *calledFunction = callInst->getCalledFunction()) {
-
-            if (calledFunction->getName().startswith("cudaLaunchKernel")) {
+            //print function name
+            std::cout << "function_name: " << calledFunction->getName().str() << std::endl;
+            if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
+              //print function name
+              std::cout << "function_name2: " << calledFunction->getName().str() << std::endl;
 
               Value *callOperand = callInst->getArgOperand(0);
 
@@ -199,6 +209,7 @@ int kernel_idx = 0;
                 std::vector<size_t> arg_sizes;
                 functionOperand =
                     dyn_cast<Function>(callOperand->stripPointerCasts());
+              }
 
                 FunctionType *ft = calledFunction->getFunctionType();
                 std::cout << " Parent (Caller) Function Name: " << func_name
@@ -300,7 +311,7 @@ int kernel_idx = 0;
                 CI_argnum->setCallingConv(callInst_inst->getCallingConv());
                 CI_argnum->setDebugLoc(callInst_inst->getDebugLoc());
                 need_remove_inst.push_back(callInst_inst);
-              }
+              
             
 
             } else if (cuda_register_kernel_names.find(
@@ -393,8 +404,12 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
 
               std::vector<llvm::Type *> args;
               // i32 @cudaMemcpyToSymbol(i8* %1, i8* %2, i64 %3, i64 %4, i32 %5)
-              args.push_back(llvm::Type::getInt8PtrTy(context));
-              args.push_back(llvm::Type::getInt8PtrTy(context));
+              //LLVM 18
+              //args.push_back(llvm::Type::getInt8PtrTy(context));
+              //args.push_back(llvm::Type::getInt8PtrTy(context));
+              args.push_back(PointerType::getUnqual(context));
+              args.push_back(PointerType::getUnqual(context));
+
               args.push_back(llvm::Type::getInt64Ty(context));
               args.push_back(llvm::Type::getInt64Ty(context));
               args.push_back(llvm::Type::getInt32Ty(context));

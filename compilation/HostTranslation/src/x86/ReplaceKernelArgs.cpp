@@ -38,7 +38,7 @@ void ReplaceKernelArg(llvm::Module *M) {
         Instruction *inst = &(*i);
         if (llvm::CallInst *callInst = llvm::dyn_cast<llvm::CallInst>(inst)) {
           if (Function *calledFunction = callInst->getCalledFunction()) {
-            if (calledFunction->getName().startswith("cudaLaunchKernel")) {
+            if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
               need_replace.insert(F);
             }
           }

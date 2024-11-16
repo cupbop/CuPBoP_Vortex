@@ -5,6 +5,7 @@ project(
   LANGUAGES CXX)
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
+set(CMAKE_BUILD_TYPE Debug)
 
 # compile kernel translator
 include_directories(./KernelTranslation/include)

@@ -12,6 +12,7 @@ set(LIB_NAME ThreadPool)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_BUILD_TYPE Debug)
 include_directories(./include)
+include_directories($ENV{CUDA_PATH}/include)
 
 file(GLOB proj_SOURCES "src/*.cpp")
 add_library(${LIB_NAME} SHARED ${proj_SOURCES})

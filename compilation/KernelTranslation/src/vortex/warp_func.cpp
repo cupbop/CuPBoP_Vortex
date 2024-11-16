@@ -67,10 +67,14 @@ void handle_warp_vote(llvm::Module *M) {
     assert(warp_vote_ptr != NULL);
     auto intra_warp_index_addr = M->getGlobalVariable("intra_warp_index");
     auto intra_warp_index =
-      new LoadInst(intra_warp_index_addr->getType()->getPointerElementType(),
+    // LLVM 18
+      //new LoadInst(intra_warp_index_addr->getType()->getPointerElementType(),
+      new LoadInst(intra_warp_index_addr->getValueType(),
                      intra_warp_index_addr, "intra_warp_index", sync_inst);
 
-    auto GEP = GetElementPtrInst::Create(NULL,          // Pointee type
+    // LLVM 18 
+    auto GEP = GetElementPtrInst::Create(warp_vote_ptr->getValueType(),
+    //auto GEP = GetElementPtrInst::Create(NULL,          // Pointee type
                                          warp_vote_ptr, // Alloca
                                          {zero, intra_warp_index}, // Indices
                                          "", sync_inst);

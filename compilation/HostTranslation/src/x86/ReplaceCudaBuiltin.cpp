@@ -37,7 +37,7 @@ void InsertSyncAfterKernelLaunch(llvm::Module *M) {
         Instruction *inst = &(*i);
         if (llvm::CallBase *callInst = llvm::dyn_cast<llvm::CallBase>(inst)) {
           if (Function *calledFunction = callInst->getCalledFunction()) {
-            if (calledFunction->getName().startswith("cudaLaunchKernel")) {
+            if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
               // F is a kernel launch function
               launch_function_name.insert(func_name);
             }
@@ -163,7 +163,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
         if (llvm::CallBase *callInst = llvm::dyn_cast<llvm::CallBase>(inst)) {
           if (Function *calledFunction = callInst->getCalledFunction()) {
 
-            if (calledFunction->getName().startswith("cudaLaunchKernel")) {
+            if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
 
               Value *callOperand = callInst->getArgOperand(0);
 

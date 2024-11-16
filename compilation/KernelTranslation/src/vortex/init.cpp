@@ -18,9 +18,12 @@
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+//LLVM18
+//#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+
+//extern void initializeInstrumentation(PassRegistry&);
 
 using namespace llvm;
 
@@ -200,7 +203,7 @@ void init_llvm_pass() {
   initializeAnalysis(Registry);
   initializeTransformUtils(Registry);
   initializeInstCombine(Registry);
-  initializeInstrumentation(Registry);
+  //initializeInstrumentation(Registry);
   initializeTarget(Registry);
 
   llvm::StringMap<llvm::cl::Option *> &opts = llvm::cl::getRegisteredOptions();

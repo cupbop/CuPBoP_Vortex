@@ -15,12 +15,19 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/ManagedStatic.h"
-#include "llvm/Support/MemoryBuffer.h"
+
+// LLVM 18
+//#include "llvm/Support/ManagedStatic.h"
+//#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Type.h"
+
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+
 
 #include <iostream>
 #include <set>
@@ -231,7 +238,9 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
       return;
     }
     auto load_shared_memory = new LoadInst(
-        dynamic_shared_memory_addr->getType()->getPointerElementType(),
+      // LLVM 18
+      //dynamic_shared_memory_addr->getType()->getPointerElementType(),
+      dynamic_shared_memory_addr->getValueType(),
         dynamic_shared_memory_addr, "new_load", &*F->begin()->begin());
     auto new_bit_cast =
         new BitCastInst(load_shared_memory,
@@ -261,8 +270,10 @@ void replace_built_in_function(llvm::Module *M) {
     auto global_intra_warp_idx =
         F->getParent()->getGlobalVariable("intra_warp_index");
     auto local_intra_warp_idx =
-        builder.CreateAlloca(global_intra_warp_idx->getType()->getElementType(),
-                             0, "local_intra_warp_idx");
+        //LLVM 18 
+        //builder.CreateAlloca(global_intra_warp_idx->getType()->getElementType(),
+        //                     0, "local_intra_warp_idx");
+         builder.CreateAlloca(global_intra_warp_idx->getValueType(), 0, "local_intra_warp_idx");
     global_intra_warp_idx->replaceUsesWithIf(local_intra_warp_idx, [&](Use &U) {
       auto *Instr = dyn_cast<Instruction>(U.getUser());
       return Instr->getParent()->getParent()->getName().str() == func_name;
@@ -271,9 +282,12 @@ void replace_built_in_function(llvm::Module *M) {
     auto global_inter_warp_idx =
         F->getParent()->getGlobalVariable("inter_warp_index");
 
+    //LLVM 18
     auto local_inter_warp_idx =
-        builder.CreateAlloca(global_inter_warp_idx->getType()->getElementType(),
-                             0, "local_inter_warp_idx");
+    builder.CreateAlloca(
+        global_inter_warp_idx->getValueType(), 0, "local_inter_warp_idx");
+        //builder.CreateAlloca(global_inter_warp_idx->getType()->getElementType(),
+        //                     0, "local_inter_warp_idx");
 
     builder.CreateStore(ConstantInt::get(I32, 0), local_inter_warp_idx);
 
@@ -483,7 +497,9 @@ void replace_built_in_function(llvm::Module *M) {
                */
               // find/create C's printf function
               std::vector<llvm::Type *> args;
-              args.push_back(llvm::Type::getInt8PtrTy(context));
+              //LLVM 18
+              args.push_back(PointerType::getUnqual(context));
+              //args.push_back(llvm::Type::getInt8PtrTy(context));
               llvm::FunctionType *printfType =
                   FunctionType::get(I32, args, true);
 
@@ -497,6 +513,9 @@ void replace_built_in_function(llvm::Module *M) {
               auto placeholder = Call->getArgOperand(0);
               printf_args.push_back(placeholder);
               // insert arguments
+
+              // legacy code before LLVM 18 
+              /*
               auto compressed_args = Call->getArgOperand(1);
               if (auto BC = dyn_cast<BitCastInst>(compressed_args)) {
                 auto src_alloc = BC->getOperand(0);
@@ -521,6 +540,40 @@ void replace_built_in_function(llvm::Module *M) {
                       new LoadInst(new_GEP->getType()->getPointerElementType(),
                                    new_GEP, "", Call);
                   printf_args.push_back(new_load);
+
+                  */
+
+              //print the whole call instruction (Call)
+              Call->print(errs());
+              //print Call->getArgOperand(1)
+              Call->getArgOperand(1)->print(errs());
+              //print the entire module
+              M->print(errs(), nullptr);
+
+
+              auto allocaInst = dyn_cast<AllocaInst>(Call->getArgOperand(1));
+              if (!allocaInst) {
+                printf("Error: the second arguments for CUDA printf is not an "
+                       "allocaInst\n");
+                exit(1);
+              }
+              for (User *U : allocaInst->users()) {
+                if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
+                  if (ConstantInt *Index =
+                          dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+                    unsigned ArgIndex = Index->getZExtValue();
+                    // Find the store instruction that uses this GEP
+                    for (User *GU : GEP->users()) {
+                      if (StoreInst *Store = dyn_cast<StoreInst>(GU)) {
+                        Value *Arg = Store->getValueOperand();
+                        if (printf_args.size() < ArgIndex + 2)
+                          printf_args.resize(ArgIndex + 2);
+                        // The first argument is the format string,
+                        // so we need to skip it
+                        printf_args[ArgIndex + 1] = Arg;
+                      }
+                    }
+                  }
                 }
               }
               auto c_printf_inst =
@@ -741,17 +794,76 @@ void printIR(llvm::Module *module_) {
 
 
 LoadInst *createLoad(IRBuilder<> &B, Value *addr, bool isVolatile) {
-  return B.CreateLoad(addr->getType()->getPointerElementType(), addr,
-                      isVolatile);
+  // Before LLVM 18 
+  //return B.CreateLoad(addr->getType()->getPointerElementType(), addr,
+  //                    isVolatile);
+    llvm::Type *elementType = nullptr;
+  if (auto *allocaInst = dyn_cast<AllocaInst>(addr)) {
+    elementType = allocaInst->getAllocatedType();
+  } else if (auto *globalVar = dyn_cast<GlobalVariable>(addr)) {
+    elementType = globalVar->getValueType();
+  } else if (auto *gepInst = dyn_cast<GetElementPtrInst>(addr)) {
+    elementType = gepInst->getResultElementType();
+  } else {
+    errs() << "Unable to determine element type for addr in createLoad\n";
+    return nullptr; // Handle the error as appropriate
+  }
+  if (!elementType) {
+    errs() << "Element type is null for addr in createLoad\n";
+    return nullptr; // Handle the error as appropriate
+  }
+  LoadInst *loadInst = B.CreateLoad(elementType, addr);
+  loadInst->setVolatile(isVolatile);
+  return loadInst;
 }
 
 Value *createInBoundsGEP(IRBuilder<> &B, Value *ptr,
                          ArrayRef<Value *> idxlist) {
-  return B.CreateInBoundsGEP(
-      ptr->getType()->getScalarType()->getPointerElementType(), ptr, idxlist);
+  // Before LLVM 18
+  //return B.CreateInBoundsGEP(
+    //  ptr->getType()->getScalarType()->getPointerElementType(), ptr, idxlist);
+
+  llvm::Type *elementType = nullptr;
+  if (auto *allocaInst = dyn_cast<AllocaInst>(ptr)) {
+    elementType = allocaInst->getAllocatedType();
+  } else if (auto *globalVar = dyn_cast<GlobalVariable>(ptr)) {
+    elementType = globalVar->getValueType();
+  } else if (auto *gepInst = dyn_cast<GetElementPtrInst>(ptr)) {
+    elementType = gepInst->getResultElementType();
+  } else {
+    errs() << "Unable to determine element type for ptr in createInBoundsGEP\n";
+    return nullptr;
+  }
+
+  if (!elementType) {
+    errs() << "Element type is null for ptr in createInBoundsGEP\n";
+    return nullptr;
+  }
+  return B.CreateInBoundsGEP(elementType, ptr, idxlist);
 }
 
 Value *createGEP(IRBuilder<> &B, Value *ptr, ArrayRef<Value *> idxlist) {
-  return B.CreateGEP(ptr->getType()->getScalarType()->getPointerElementType(),
-                     ptr, idxlist);
+  // Before LLVM 18
+  //return B.CreateGEP(ptr->getType()->getScalarType()->getPointerElementType(),
+  //                   ptr, idxlist);
+    llvm::Type *elementType = nullptr;
+  if (auto *allocaInst = dyn_cast<AllocaInst>(ptr)) {
+    elementType = allocaInst->getAllocatedType();
+  } else if (auto *globalVar = dyn_cast<GlobalVariable>(ptr)) {
+    elementType = globalVar->getValueType();
+  } else if (auto *gepInst = dyn_cast<GetElementPtrInst>(ptr)) {
+    elementType = gepInst->getResultElementType();
+  } else if (auto *bitCastInst = dyn_cast<BitCastInst>(ptr)) {
+    elementType = bitCastInst->getDestTy();
+  } else {
+    //LLVM 18, temporarily disabled (Link issue to be fixed)
+    //ptr->dump();
+    errs() << "Unable to determine element type for ptr in createGEP\n";
+    return nullptr;
+  }
+  if (!elementType) {
+    errs() << "Element type is null for ptr in createGEP\n";
+    return nullptr;
+  }
+  return B.CreateGEP(elementType, ptr, idxlist);
 }

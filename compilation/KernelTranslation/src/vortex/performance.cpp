@@ -2,7 +2,10 @@
 #include "tool.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Triple.h"
+
+//LLVM 18
+//#include "llvm/TargetParser/Triple.h"
+
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -25,11 +28,21 @@
 #include "llvm/PassInfo.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Host.h"
+//LLVM 18
+//#include "llvm/Support/Host.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/IR/PassManager.h"
+
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+
+//LLVM 18
+#include "llvm/Passes/PassBuilder.h"
+//#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -51,7 +64,7 @@ void eliminate_redudant_threadIdx_computation(llvm::Module *M) {
     bool has_inter_warp = false;
     for (Function::iterator b = F->begin(); b != F->end(); ++b) {
       BasicBlock *B = &(*b);
-      if (B->getName().startswith("inter_warp_cond")) {
+      if (B->getName().starts_with("inter_warp_cond")) {
         has_inter_warp = true;
         break;
       }
@@ -80,7 +93,7 @@ void eliminate_redudant_threadIdx_computation(llvm::Module *M) {
               break;
             }
           } else if (auto binaryInst = dyn_cast<BinaryOperator>(inst)) {
-            if (binaryInst->getName().startswith("thread_idx") &&
+            if (binaryInst->getName().starts_with("thread_idx") &&
                 binaryInst->getOpcode() == Instruction::Add) {
               need_to_replace.insert(binaryInst);
             }
@@ -97,6 +110,37 @@ void eliminate_redudant_threadIdx_computation(llvm::Module *M) {
   }
 }
 
+void performance_optimization(llvm::Module *M) {
+  printf("performance optimization\n");
+  for (auto F = M->begin(); F != M->end(); F++) {
+    for (auto I = F->arg_begin(); I != F->arg_end(); ++I) {
+      if (I->getType()->isPointerTy()) {
+        I->addAttr(llvm::Attribute::NoAlias);
+      }
+    }
+  }
+
+  llvm::PassBuilder PassBuilder;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+
+  PassBuilder.registerModuleAnalyses(MAM);
+  PassBuilder.registerCGSCCAnalyses(CGAM);
+  PassBuilder.registerFunctionAnalyses(FAM);
+  PassBuilder.registerLoopAnalyses(LAM);
+  PassBuilder.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+  llvm::OptimizationLevel OptLevel = llvm::OptimizationLevel::O3;
+  MPM = PassBuilder.buildPerModuleDefaultPipeline(OptLevel);
+  MPM.run(*M, MAM);
+}
+
+
+// Legacy Optimization before LLVM 18
+/*
 void performance_optimization(llvm::Module *M) {
     //DEBUG_INFO("performance optimization\n");
   // remove useless load
@@ -150,3 +194,4 @@ void performance_optimization(llvm::Module *M) {
   Builder.populateModulePassManager(Passes);
   Passes.run(*M);
 }
+*/

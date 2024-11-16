@@ -59,12 +59,14 @@ int main(int argc, char **argv) {
   generate_wrapper(program);
 
   // VerifyModule(program);
-
+  std::cout << "performance opt\n" << std::flush;
   // performance optimization
   performance_optimization(program);
 
+  std::cout << "verify\n" << std::flush;
   VerifyModule(program);
 
+  std::cout << "dump\n" << std::flush;
   DumpModule(program, argv[2]);
 
   fout.close();

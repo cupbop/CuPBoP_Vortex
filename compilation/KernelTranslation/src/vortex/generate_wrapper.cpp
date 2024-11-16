@@ -25,6 +25,7 @@
 #include <limits>
 #include <cstdlib>
 #include <map>
+#include <set>
 
 using namespace llvm;
 
@@ -118,7 +119,13 @@ void decode_input(llvm::Module *M) {
       Builder2.CreateRet(share_memory);
 
       auto PT = dyn_cast<PointerType>(share_memory->getType());
-      auto element_type = PT->getElementType();
+
+      //LLVM 18 changes
+      //auto element_type = PT->getElementType();
+      auto element_type = PT->getNonOpaquePointerElementType();
+
+
+
       // std::cout << element_type->getTypeID()  << " Got global memor $$$$$$"
       // << share_memory->getName().str() << std::endl;
 
@@ -137,17 +144,20 @@ void decode_input(llvm::Module *M) {
       Type *ArgType = ii->getType();
 
       // calculate addr
-      Value *GEP = createGEP(Builder, input_arg, ConstantInt::get(Int32T, idx));
+      // LLVM 18 changes
+      //Value *GEP = createGEP(Builder, input_arg, ConstantInt::get(Int32T, idx));
+      Value *GEP = Builder.CreateGEP(PointerType::get(Int32T, 0), input_arg,
+                                     ConstantInt::get(Int32T, idx));
       // load corresponding int*
       //GEP = Builder.CreateLoad(GEP);
       // bitcast
       GEP = Builder.CreateBitOrPointerCast(GEP, PointerType::get(ArgType, 0));
-      Value *Arg = createLoad(Builder, GEP);
+      Value *Arg = Builder.CreateLoad(ArgType, GEP);
       Arguments.push_back(Arg);
       ++idx;
     }
 
-    CallInst *c = Builder.CreateCall(F, ArrayRef<llvm::Value *>(Arguments));
+    Builder.CreateCall(F, ArrayRef<llvm::Value *>(Arguments));
     Builder.CreateRetVoid();
   }
 

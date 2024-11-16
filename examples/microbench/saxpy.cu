@@ -23,7 +23,7 @@ int main(void)
   cudaMalloc(&d_y, N*sizeof(int));
 
   for (int i = 0; i < N; i++) {
-    x[i] = 2.0f;
+    x[i] = float(i);
     y[i] = 1.0f;
   }
 
@@ -41,7 +41,7 @@ int main(void)
   
   for (int i = 0; i < N; i++) {
     maxError += std::max(maxError, abs(y[i]-1.0f));
-    printf("%f", y[i]);
+    printf("%f ", y[i]);
   }
   
   printf("Max error: %f\n", maxError);
