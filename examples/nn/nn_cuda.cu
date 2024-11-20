@@ -61,6 +61,8 @@ __global__ void euclid(LatLong *d_locations, float *d_distances, int numRecords,
   // blockIdx.x + threadIdx.x;
   int globalId = blockDim.x * (gridDim.x * blockIdx.y + blockIdx.x) +
                  threadIdx.x; // more efficient
+                 //printf("globalId: %d, gridDim.x: %d, blockIdx.x: %d, blockIdx.y: %d, blockDim.x: %d, threadIdx.x: %d\n", 
+                 //globalId, gridDim.x, blockIdx.x, blockIdx.y, blockDim.x, threadIdx.x);
   LatLong *latLong = d_locations + globalId;
   if (globalId < numRecords) {
     float *dist = d_distances + globalId;
@@ -116,6 +118,7 @@ int main(int argc, char *argv[]) {
   unsigned long gridX = ceilDiv(blocks, gridY);
   // There will be no more than (gridY - 1) extra blocks
   dim3 gridDim(gridX, gridY);
+  
 
   /**
    * Allocate memory on host and device
@@ -134,6 +137,11 @@ int main(int argc, char *argv[]) {
    * Execute kernel
    */
   printf("before call\n");
+  //print gridDim
+    printf("gridDim.x: %d, gridDim.y: %d\n", gridDim.x, gridDim.y);
+    // print threadsPerBlock
+    printf("threadsPerBlock: %d\n", threadsPerBlock);
+  
   euclid<<<gridDim, threadsPerBlock>>>(d_locations, d_distances, numRecords,
                                        lat, lng);
   cudaDeviceSynchronize();

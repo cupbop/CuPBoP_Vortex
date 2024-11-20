@@ -126,16 +126,24 @@ void performance_optimization(llvm::Module *M) {
   llvm::CGSCCAnalysisManager CGAM;
   llvm::ModuleAnalysisManager MAM;
 
+  printf("registering analysis MAM\n");
   PassBuilder.registerModuleAnalyses(MAM);
+  printf("registering analysi CGAM\n");
   PassBuilder.registerCGSCCAnalyses(CGAM);
+  printf("registering analysis FAM\n");
   PassBuilder.registerFunctionAnalyses(FAM);
+  printf("registering analysis LAM\n");
   PassBuilder.registerLoopAnalyses(LAM);
+  printf("registering analysis overall\n");
   PassBuilder.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  printf("registering analysis done\n");
 
   llvm::ModulePassManager MPM;
   llvm::OptimizationLevel OptLevel = llvm::OptimizationLevel::O3;
   MPM = PassBuilder.buildPerModuleDefaultPipeline(OptLevel);
+  printf("running analysis\n");
   MPM.run(*M, MAM);
+  printf("analysis done\n");
 }
 
 

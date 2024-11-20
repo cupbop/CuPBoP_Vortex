@@ -510,18 +510,43 @@ void replace_built_in_function(llvm::Module *M) {
               // construct argument(s)
               std::vector<Value *> printf_args;
               // first argument is same between CUDA and C
-              auto placeholder = Call->getArgOperand(0);
-              printf_args.push_back(placeholder);
+
+              //auto placeholder = Call->getArgOperand(0);
+              //printf_args.push_back(placeholder);
+              for (auto &Arg : Call->args()) {
+                //check Arg is a GEP
+                if (auto GEP = dyn_cast<GetElementPtrInst>(Arg)) {
+                  Type *ElemTy;
+                  if (GEP->getType()->isOpaquePointerTy()) {
+        // For opaque pointers, we need to get the element type from the GEP instruction
+        ElemTy = GEP->getSourceElementType();
+                  }
+                  else{
+                    printf("Error: printf GEP operands is not opaque pointer\n");
+                exit(1);
+                  }
+                  //load 를 만들고 그걸로 print 넣기
+                  auto new_load =
+                      new LoadInst(ElemTy,
+                                   GEP, "", Call);
+                  printf_args.push_back(new_load);
+                  } else {
+                      printf_args.push_back(Arg);
+                      //LLVM_DEBUG(dbgs() << "Added original argument of type: " << *Arg->getType() << "\n");
+                  }
+              }
+
+
+
               // insert arguments
 
-              // legacy code before LLVM 18 
+              // New try with legacy prior LLVM18 code
               /*
               auto compressed_args = Call->getArgOperand(1);
               if (auto BC = dyn_cast<BitCastInst>(compressed_args)) {
                 auto src_alloc = BC->getOperand(0);
-                auto SrcPointTy =
-                    dyn_cast<PointerType>(BC->getOperand(0)->getType());
-                auto SrcTy = SrcPointTy->getElementType();
+                auto SrcPointTy = dyn_cast<PointerType>(BC->getOperand(0)->getType());
+                auto SrcTy = SrcPointTy->getPointerElementType();
                 // reverse the bitcast
                 auto reverse_BC = new BitCastInst(BC, SrcPointTy, "", Call);
                 assert(SrcTy->isStructTy() == 1);
@@ -532,7 +557,7 @@ void replace_built_in_function(llvm::Module *M) {
                   Indices.push_back(ConstantInt::get(I32, i));
                   auto new_GEP = GetElementPtrInst::Create(
                     cast<PointerType>(src_alloc->getType()->getScalarType())
-                          ->getElementType(), // Pointee type
+                          ->getPointerElementType(), // Pointee type
                                                            src_alloc, // Alloca
                                                            Indices,   // Indices
                                                            "", Call);
@@ -540,46 +565,89 @@ void replace_built_in_function(llvm::Module *M) {
                       new LoadInst(new_GEP->getType()->getPointerElementType(),
                                    new_GEP, "", Call);
                   printf_args.push_back(new_load);
-
-                  */
+                  
+              */
+              // legacy code before LLVM 18 
+              /*
+              auto compressed_args = Call->getArgOperand(1);
+              if (auto BC = dyn_cast<BitCastInst>(compressed_args)) {
+                auto src_alloc = BC->getOperand(0);
+                auto SrcPointTy = dyn_cast<PointerType>(BC->getOperand(0)->getType());
+                auto SrcTy = SrcPointTy->getPointerElementType();
+                // reverse the bitcast
+                auto reverse_BC = new BitCastInst(BC, SrcPointTy, "", Call);
+                assert(SrcTy->isStructTy() == 1);
+                auto StructTy = dyn_cast<StructType>(SrcTy);
+                for (int i = 0; i < StructTy->getNumElements(); i++) {
+                  std::vector<Value *> Indices;
+                  Indices.push_back(ConstantInt::get(I32, 0));
+                  Indices.push_back(ConstantInt::get(I32, i));
+                  auto new_GEP = GetElementPtrInst::Create(
+                    cast<PointerType>(src_alloc->getType()->getScalarType())
+                          ->getPointerElementType(), // Pointee type
+                                                           src_alloc, // Alloca
+                                                           Indices,   // Indices
+                                                           "", Call);
+                  auto new_load =
+                      new LoadInst(new_GEP->getType()->getPointerElementType(),
+                                   new_GEP, "", Call);
+                  printf_args.push_back(new_load);
+              */
+                  
 
               //print the whole call instruction (Call)
-              Call->print(errs());
-              //print Call->getArgOperand(1)
-              Call->getArgOperand(1)->print(errs());
-              //print the entire module
-              M->print(errs(), nullptr);
 
 
+
+              /*
               auto allocaInst = dyn_cast<AllocaInst>(Call->getArgOperand(1));
               if (!allocaInst) {
-                printf("Error: the second arguments for CUDA printf is not an "
-                       "allocaInst\n");
-                exit(1);
+                // check if allocaInst is nullptr
+                if(isa<ConstantPointerNull>(Call->getArgOperand(1)))
+                printf("warning: the second argument for CUDA print is a null pointer");
+                //create ptr noundef
+
+                //else{
+                //printf("Error: the second arguments for CUDA printf is not an "
+                //       "allocaInst\n");
+                //exit(1);}
               }
-              for (User *U : allocaInst->users()) {
-                if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
-                  if (ConstantInt *Index =
-                          dyn_cast<ConstantInt>(GEP->getOperand(2))) {
-                    unsigned ArgIndex = Index->getZExtValue();
-                    // Find the store instruction that uses this GEP
-                    for (User *GU : GEP->users()) {
-                      if (StoreInst *Store = dyn_cast<StoreInst>(GU)) {
-                        Value *Arg = Store->getValueOperand();
-                        if (printf_args.size() < ArgIndex + 2)
-                          printf_args.resize(ArgIndex + 2);
-                        // The first argument is the format string,
-                        // so we need to skip it
-                        printf_args[ArgIndex + 1] = Arg;
+              */
+
+
+              /*
+              if(!isa<ConstantPointerNull>(Call->getArgOperand(1)))
+              {
+                for (User *U : allocaInst->users()) {
+                  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
+                    if (ConstantInt *Index =
+                            dyn_cast<ConstantInt>(GEP->getOperand(2))) {
+                      unsigned ArgIndex = Index->getZExtValue();
+                      // Find the store instruction that uses this GEP
+                      for (User *GU : GEP->users()) {
+                        if (StoreInst *Store = dyn_cast<StoreInst>(GU)) {
+                          Value *Arg = Store->getValueOperand();
+                          if (printf_args.size() < ArgIndex + 2)
+                            printf_args.resize(ArgIndex + 2);
+                          // The first argument is the format string,
+                          // so we need to skip it
+                          printf_args[ArgIndex + 1] = Arg;
+                        }
                       }
                     }
                   }
                 }
               }
+              */
               auto c_printf_inst =
                   llvm::CallInst::Create(func_printf, printf_args, "", Call);
               // insert
               Call->replaceAllUsesWith(c_printf_inst);
+              Call->print(errs());
+              //print Call->getArgOperand(1)
+              Call->getArgOperand(1)->print(errs());
+              //print the entire module
+              M->print(errs(), nullptr);
               need_remove.push_back(Call);
             } else if (func_name == "__nv_fast_log2f" ||
                        func_name == "__nv_log2f" ||

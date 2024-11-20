@@ -33,6 +33,10 @@ void split_block_by_sync(llvm::Function *F) {
         if (func_name == "llvm.nvvm.barrier0" ||
             func_name == "llvm.nvvm.bar.warp.sync" ||
             func_name == "llvm.nvvm.barrier.sync") {
+          //print whole block(b)
+          
+          //printf("found barrier inst!\n");
+          //F->print(errs());
           sync_inst.insert(Call);
           // we should also sync the next instruction
           // so that we can get a block with sync inst only

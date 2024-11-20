@@ -1026,6 +1026,11 @@ public:
         auto func_name = call_inst->getCalledFunction()->getName().str();
         if (func_name == "llvm.nvvm.barrier0" ||
             func_name == "llvm.nvvm.barrier.sync") {
+              // print the whole function(s)
+              printf("found the barrier in function (initial)");
+              call_inst->getFunction()->print(llvm::errs());
+              
+              
           exit_blocks.push_back(&(*s));
         }
         // when handling intra warp loop, we need also split the blocks

@@ -7,6 +7,7 @@ void saxpy(int n, float a, float *x, float *y)
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   
   //if (i < n) 
+  printf("i: %d\n", i);
   {y[i] = x[i]-y[i];}
 }
 

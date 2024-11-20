@@ -40,21 +40,33 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void saxpyifPfS__wrapper(void *args);
+    extern void Fan1PfS_ii_wrapper(void *args);
+    extern void Fan2PfS_S_iii_wrapper(void *args);
 }
 
-void cuda_saxpyifPfS__wrapper(void* args) {
+void cuda_Fan1PfS_ii_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
 
-    saxpyifPfS__wrapper((void **)args);
+    Fan1PfS_ii_wrapper((void **)args);
+}
+
+void cuda_Fan2PfS_S_iii_wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
+
+    vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
+
+    Fan2PfS_S_iii_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_saxpyifPfS__wrapper, 
+    cuda_Fan1PfS_ii_wrapper, 
+    cuda_Fan2PfS_S_iii_wrapper, 
 };
 
 int main() {
@@ -80,7 +92,7 @@ int main() {
         args[0], args[1], args[2], args[3], args[4], args[5]);
     vx_printf("workdim=%d\n", ctx->work_dim);
 vx_printf("execute something\n");
-    return vx_spawn_threads(2, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); 
+    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); 
 
 }
 
