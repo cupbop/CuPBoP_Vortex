@@ -27,43 +27,61 @@ int main(int argc, char **argv) {
   fout.open(PATH);
 
   // inline, and create auxiliary global variables
+  std::cout << "init_block\n" << std::flush;
+  printIR(program);
   init_block(program, fout);
+  
   // insert sync before each vote, and replace the
   // original vote function to warp vote
+  std::cout << "handle_warp_vote\n" << std::flush;
+  printIR(program);
   handle_warp_vote(program);
+  
 
   // replace warp shuffle
   // VerifyModule(program);
+  std::cout << "handle_warp_shfl\n" << std::flush;
+  printIR(program);
   handle_warp_shfl(program);
   // insert sync
   // VerifyModule(program);
+  std::cout << "insert\n" << std::flush;
+  printIR(program);
   insert_sync(program);
   // split block by sync
   // VerifyModule(program);
   std::cout << "split\n" << std::flush;
+  //print the proogram
+  printIR(program);
   split_block_by_sync(program);
   // add loop for intra&intera thread
 
   // VerifyModule(program);
-  std::cout << "insert\n" << std::flush;
+  std::cout << "insert_warp_loop\n" << std::flush;
+  printIR(program);
+  //여기가 뭔가 잘못됨
   insert_warp_loop(program);
 
   // VerifyModule(program);
 
   // (TODO): replace this patch
   std::cout << "replace\n" << std::flush;
+  printIR(program);
   replace_built_in_function(program);
 
   // VerifyModule(program);
   std::cout << "generate\n" << std::flush;
+  printIR(program);
   generate_wrapper(program);
 
   // VerifyModule(program);
   std::cout << "performance opt\n" << std::flush;
+  printIR(program);
   // performance optimization
   performance_optimization(program);
 
   std::cout << "verify\n" << std::flush;
+  printIR(program);
   VerifyModule(program);
 
   std::cout << "dump\n" << std::flush;

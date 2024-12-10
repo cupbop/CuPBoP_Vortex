@@ -377,6 +377,11 @@ void replace_built_in_function(llvm::Module *M) {
                   createLoad(builder, M->getGlobalVariable("block_size_x")),
                   "thread_id_x");
 
+                  // Add metadata to indicate non-uniformity
+              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+
+
               Call->replaceAllUsesWith(thread_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.y") {
@@ -395,6 +400,12 @@ void replace_built_in_function(llvm::Module *M) {
                   Instruction::SDiv, thread_idx,
                   createLoad(builder, M->getGlobalVariable("block_size_x")),
                   "thread_id_y");
+              
+                  // Add metadata to indicate non-uniformity
+              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+
+              
               Call->replaceAllUsesWith(thread_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.z") {
@@ -518,8 +529,8 @@ void replace_built_in_function(llvm::Module *M) {
                 if (auto GEP = dyn_cast<GetElementPtrInst>(Arg)) {
                   Type *ElemTy;
                   if (GEP->getType()->isOpaquePointerTy()) {
-        // For opaque pointers, we need to get the element type from the GEP instruction
-        ElemTy = GEP->getSourceElementType();
+                  // For opaque pointers, we need to get the element type from the GEP instruction
+                  ElemTy = GEP->getSourceElementType();
                   }
                   else{
                     printf("Error: printf GEP operands is not opaque pointer\n");

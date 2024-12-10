@@ -40,33 +40,21 @@ int __thread block_index_z;
 
 
  extern "C" {
-    extern void Fan1PfS_ii_wrapper(void *args);
-    extern void Fan2PfS_S_iii_wrapper(void *args);
+    extern void calculate_tempiPfS_S_iiiiffffff_wrapper(void *args);
 }
 
-void cuda_Fan1PfS_ii_wrapper(void* args) {
+void cuda_calculate_tempiPfS_S_iiiiffffff_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
 
     vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
 
-    Fan1PfS_ii_wrapper((void **)args);
-}
-
-void cuda_Fan2PfS_S_iii_wrapper(void* args) {
-    block_index_x = blockIdx.x;
-    block_index_y = blockIdx.y;
-    block_index_z = blockIdx.z;
-
-    vx_printf("kernel_warpper: group=(%d, %d)\n", blockIdx.x, blockIdx.y);
-
-    Fan2PfS_S_iii_wrapper((void **)args);
+    calculate_tempiPfS_S_iiiiffffff_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_Fan1PfS_ii_wrapper, 
-    cuda_Fan2PfS_S_iii_wrapper, 
+    cuda_calculate_tempiPfS_S_iiiiffffff_wrapper, 
 };
 
 int main() {

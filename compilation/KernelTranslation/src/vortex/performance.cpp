@@ -142,6 +142,8 @@ void performance_optimization(llvm::Module *M) {
   llvm::OptimizationLevel OptLevel = llvm::OptimizationLevel::O3;
   MPM = PassBuilder.buildPerModuleDefaultPipeline(OptLevel);
   printf("running analysis\n");
+  //print the entire IR
+  M->print(llvm::errs(), nullptr);
   MPM.run(*M, MAM);
   printf("analysis done\n");
 }
