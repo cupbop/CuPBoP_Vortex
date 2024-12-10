@@ -52,8 +52,8 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
 2. As CuPBoP relies on CUDA structures, we need to download the CUDA header file
 
    ```bash
-   wget https://www.dropbox.com/s/r18io0zu3idke5p/cuda-header.tar.gz?dl=1
-   tar -xzf 'cuda-header.tar.gz?dl=1'
+   wget "https://dl.dropboxusercontent.com/scl/fi/m9ap1tiybau4zk720t2z7/cuda-header.tar.gz?rlkey=zmdpst5l66t48ywrbtkj426nu&st=luao6zy7" -O cuda-header.tar.gz
+   tar -xzf 'cuda-header.tar.gz'
    cp -r include/* runtime/threadPool/include/
    ```
 
