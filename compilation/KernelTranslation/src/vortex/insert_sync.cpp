@@ -399,7 +399,7 @@ public:
         if (auto Call = dyn_cast<CallInst>(j)) {
           if (Call->isInlineAsm())
             continue;
-          auto func_name = Call->getCalledFunction()->getName().str();
+          auto func_name = Call->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.bar.warp.sync" ||
               func_name == "llvm.nvvm.barrier.sync") {

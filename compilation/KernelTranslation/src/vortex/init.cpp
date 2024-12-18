@@ -41,7 +41,7 @@ bool inline_warp_level_func(llvm::Module *M) {
       for (BasicBlock::iterator BI = I->begin(), BE = I->end(); BI != BE;) {
         if (CallInst *c = dyn_cast<CallInst>(BI++)) {
           if (c->getCalledFunction()) {
-            auto func_name = c->getCalledFunction()->getName().str();
+            auto func_name = c->getCalledOperand()->getName().str();
             if (func_name == "_Z10__any_syncji" ||
                 func_name.find("shfl_down_sync") != std::string::npos) {
               InlineFunctionInfo IFI;
@@ -67,7 +67,7 @@ bool find_sreg_inst(llvm::Function *F) {
     for (BasicBlock::iterator BI = I->begin(), BE = I->end(); BI != BE;) {
       if (CallInst *c = dyn_cast<CallInst>(BI++)) {
         if (c->getCalledFunction()) {
-          auto func_name = c->getCalledFunction()->getName().str();
+          auto func_name = c->getCalledOperand()->getName().str();
           if (func_name.find("llvm.nvvm.read.ptx.sreg.") != std::string::npos) {
             return true;
           }
@@ -91,7 +91,7 @@ bool inline_func_with_tid(llvm::Module *M) {
           if (c->getCalledFunction()) {
             if (find_sreg_inst(c->getCalledFunction())) {
               printf("inline: %s\n",
-                     c->getCalledFunction()->getName().str().c_str());
+                     c->getCalledOperand()->getName().str().c_str());
               need_inline.insert(c);
               need_remove.insert(c->getCalledFunction());
             }

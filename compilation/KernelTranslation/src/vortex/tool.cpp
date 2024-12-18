@@ -116,12 +116,25 @@ llvm::CallInst *CreateInterWarpBarrier(llvm::Instruction *InsertBefore) {
 
 llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore) {
   llvm::Module *M = InsertBefore->getParent()->getParent()->getParent();
-  llvm::FunctionType *LauncherFuncT =
-      FunctionType::get(llvm::Type::getVoidTy(M->getContext()), {}, false);
+  
+  // void @llvm.nvvm.bar.warp.sync(i32 %membermask)
+  llvm::FunctionType *LauncherFuncT = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(M->getContext()),
+      { llvm::Type::getInt32Ty(M->getContext()) },
+      false
+  );
+  
   llvm::FunctionCallee f =
       M->getOrInsertFunction("llvm.nvvm.bar.warp.sync", LauncherFuncT);
+  
   llvm::Function *F = llvm::cast<llvm::Function>(f.getCallee());
-  return llvm::CallInst::Create(F, "", InsertBefore);
+
+  llvm::Constant *AllActiveMask = llvm::ConstantInt::get(
+      llvm::Type::getInt32Ty(M->getContext()),
+      0xFFFFFFFF
+  );
+
+  return llvm::CallInst::Create(F, { AllActiveMask }, "", InsertBefore);
 }
 
 llvm::Instruction *BreakPHIToAllocas(PHINode *phi) {
@@ -304,7 +317,7 @@ void replace_built_in_function(llvm::Module *M) {
           auto load_from = Load->getOperand(0);
         } else if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
-            auto func_name = Call->getCalledFunction()->getName().str();
+            auto func_name = Call->getCalledOperand()->getName().str();
             // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
             if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x" ){//||
                 //func_name ==
@@ -366,7 +379,7 @@ void replace_built_in_function(llvm::Module *M) {
 
               auto thread_idx = builder.CreateBinOp(
                   Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                  ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
+                  ConstantInt::get(I32, 32), ""); // Mark temp  (changed 32 -> 4)
               thread_idx = builder.CreateBinOp(
                   //Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
                   Instruction::Add, createLoad(builder, local_intra_warp_idx),
@@ -482,7 +495,7 @@ void replace_built_in_function(llvm::Module *M) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
-            auto func_name = Call->getCalledFunction()->getName().str();
+            auto func_name = Call->getCalledOperand()->getName().str();
             auto callFn = Call->getCalledFunction();
             if (func_name == "vprintf") {
               /*

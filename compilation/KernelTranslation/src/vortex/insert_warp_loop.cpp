@@ -48,6 +48,8 @@
 #include <unordered_set>
 #include <queue>
 
+#include "cg_sync.h"
+
 using namespace llvm;
 
 #define SW_WARP_SIZE (32)
@@ -171,6 +173,57 @@ bool ShouldNotBeContextSaved(llvm::Instruction *instr,
   //return false;
 }
 
+llvm::Instruction *GetCachedBlockSize(llvm::Function *F) {
+  static std::unordered_map<llvm::Function*, llvm::Instruction*> blockSizeCache;
+  llvm::Module *M = F->getParent();
+  if (blockSizeCache.find(F) != blockSizeCache.end()) {
+    return blockSizeCache[F];
+  } else {
+    IRBuilder<> builder(&*(F->getEntryBlock().getFirstInsertionPt()));
+    auto block_size_addr = M->getGlobalVariable("block_size");
+    auto block_size = createLoad(builder, block_size_addr);
+    blockSizeCache[F] = block_size;
+    return block_size;
+  }
+}
+
+llvm::Instruction *GetCachedIntrawarpThreadIdx(llvm::Instruction *instruction, std::vector<ParallelRegion> &PRs) {
+  static std::unordered_map<ParallelRegion*, llvm::Instruction*> intraWarpIndexCache;
+
+  ParallelRegion *matchedPR = nullptr;
+  for (auto &PR : PRs) {
+    if (PR.inst_in_region(instruction)) {
+      matchedPR = &PR;
+      break;
+    }
+  }
+
+  if (matchedPR == nullptr) {
+    assert(false && "Instruction not in any parallel region");
+  }
+
+  if (intraWarpIndexCache.find(matchedPR) != intraWarpIndexCache.end()) {
+    return intraWarpIndexCache[matchedPR];
+  } else {
+    auto M = instruction->getParent()->getParent()->getParent();
+    auto I32 = llvm::Type::getInt32Ty(M->getContext());
+    auto startOfPR = matchedPR->start_block->getFirstInsertionPt();
+    auto builder = IRBuilder<>(&(*startOfPR));
+    auto inter_warp_index =
+        createLoad(builder, M->getGlobalVariable("inter_warp_index"));
+    auto intra_warp_index =
+        createLoad(builder, M->getGlobalVariable("intra_warp_index"));
+    auto thread_idx = static_cast<llvm::Instruction*>(builder.CreateBinOp(
+        Instruction::Add, intra_warp_index,
+        builder.CreateBinOp(Instruction::Mul, inter_warp_index,
+                            ConstantInt::get(I32, SW_WARP_SIZE)), 
+        "thread_idx"));
+    
+    intraWarpIndexCache[matchedPR] = thread_idx;
+    return thread_idx;
+  }
+}
+
 // generate countpart alloc in the beginning of the Function
 llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
                                    bool intra_warp_loop) {
@@ -195,7 +248,6 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
 
   BasicBlock &bb = instruction->getParent()->getParent()->getEntryBlock();
 
-  IRBuilder<> builder(&*(bb.getFirstInsertionPt()));
   Function *FF = instruction->getParent()->getParent();
   Module *M = instruction->getParent()->getParent()->getParent();
   LLVMContext &C = M->getContext();
@@ -256,8 +308,8 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
   llvm::Value *ItemSize = nullptr;
   llvm::AllocaInst *Alloca = nullptr;
 
-  auto block_size_addr = M->getGlobalVariable("block_size");
-  auto block_size = createLoad(builder, block_size_addr);
+  auto block_size = GetCachedBlockSize(FF);
+  IRBuilder<> builder(block_size->getNextNode());
   Alloca = builder.CreateAlloca(AllocType, block_size, varName);
 
   contextArrays[varName] = Alloca;
@@ -267,7 +319,8 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
 // save the local variable into replicated array
 llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
                                   llvm::Instruction *alloca,
-                                  bool intra_warp_loop) {
+                                  bool intra_warp_loop,
+                                  std::vector<ParallelRegion> &PRs) {
 
   if (isa<AllocaInst>(instruction)) {
     return NULL;
@@ -285,15 +338,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
   IRBuilder<> builder(&*definition);
   std::vector<llvm::Value *> gepArgs;
 
-  auto inter_warp_index =
-      createLoad(builder, M->getGlobalVariable("inter_warp_index"));
-  auto intra_warp_index =
-      createLoad(builder, M->getGlobalVariable("intra_warp_index"));
-  auto thread_idx = builder.CreateBinOp(
-      Instruction::Add, intra_warp_index,
-      builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, SW_WARP_SIZE)), 
-      "thread_idx");
+  auto thread_idx = GetCachedIntrawarpThreadIdx(instruction, PRs);
   gepArgs.push_back(thread_idx);
 
   return builder.CreateStore(instruction, createGEP(builder, alloca, gepArgs));
@@ -302,7 +347,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
 llvm::Instruction *AddContextRestore(llvm::Value *val,
                                      llvm::Instruction *alloca,
                                      llvm::Instruction *before, bool isAlloca,
-                                     bool intra_warp_loop) {
+                                     bool intra_warp_loop, std::vector<ParallelRegion> &PRs) {
   assert(val != NULL);
   assert(alloca != NULL);
   IRBuilder<> builder(alloca);
@@ -317,17 +362,7 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
 
   std::vector<llvm::Value *> gepArgs;
 
-  auto M = before->getParent()->getParent()->getParent();
-  auto I32 = llvm::Type::getInt32Ty(M->getContext());
-  auto inter_warp_index =
-        createLoad(builder, M->getGlobalVariable("inter_warp_index"));
-  auto intra_warp_index =
-        createLoad(builder, M->getGlobalVariable("intra_warp_index"));
-  auto thread_idx = builder.CreateBinOp(
-      Instruction::Add, intra_warp_index,
-      builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                          ConstantInt::get(I32, SW_WARP_SIZE)),
-      "thread_idx");
+  auto thread_idx = GetCachedIntrawarpThreadIdx(before, PRs);
   gepArgs.push_back(thread_idx);
 
   llvm::Instruction *gep =
@@ -339,13 +374,13 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
 }
 
 void AddContextSaveRestore(llvm::Instruction *instruction,
-                           bool intra_warp_loop) {
+                           bool intra_warp_loop, std::vector<ParallelRegion> &PRs) {
 
   /* Allocate the context data array for the variable. */
   llvm::Instruction *alloca = GetContextArray(instruction, intra_warp_loop);
 
   llvm::Instruction *theStore =
-      AddContextSave(instruction, alloca, intra_warp_loop);
+      AddContextSave(instruction, alloca, intra_warp_loop, PRs);
 
   std::vector<Instruction *> uses;
 
@@ -364,12 +399,12 @@ void AddContextSaveRestore(llvm::Instruction *instruction,
     Instruction *contextRestoreLocation = user;
     llvm::Value *loadedValue =
         AddContextRestore(user, alloca, contextRestoreLocation,
-                          isa<AllocaInst>(instruction), intra_warp_loop);
+                          isa<AllocaInst>(instruction), intra_warp_loop, PRs);
     user->replaceUsesOfWith(instruction, loadedValue);
   }
 }
 
-void handle_alloc(llvm::Function *F) {
+void handle_alloc(llvm::Function *F, std::vector<ParallelRegion> &PRs) {
   auto M = F->getParent();
   LLVMContext &C = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(C);
@@ -387,7 +422,7 @@ void handle_alloc(llvm::Function *F) {
 
   for (auto inst : instruction_to_fix) {
     // generate a new alloc
-    auto block_size_addr = M->getGlobalVariable("block_size");
+    auto block_size_addr = GetCachedBlockSize(F);
     IRBuilder<> builder(inst);
     auto block_size = createLoad(builder, block_size_addr);
 
@@ -413,17 +448,7 @@ void handle_alloc(llvm::Function *F) {
     }
     for (auto user : replace_user) {
 
-      IRBuilder<> builder(user);
-      // std::vector<llvm::Value *> gepArgs;
-      auto inter_warp_index =
-          createLoad(builder, M->getGlobalVariable("inter_warp_index"));
-      auto intra_warp_index =
-          createLoad(builder, M->getGlobalVariable("intra_warp_index"));
-      auto thread_idx = builder.CreateBinOp(
-          Instruction::Add, intra_warp_index,
-          builder.CreateBinOp(Instruction::Mul, inter_warp_index,
-                              ConstantInt::get(I32, SW_WARP_SIZE)),
-          "thread_idx");
+      auto thread_idx = GetCachedIntrawarpThreadIdx(user, PRs);
 
       auto gep = createGEP(builder, Alloca, thread_idx);
 
@@ -437,7 +462,7 @@ void handle_alloc(llvm::Function *F) {
   }
 }
 
-  void handle_local_variable_intra_warp(std::vector<ParallelRegion> PRs,
+  void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
                                       CustomDivergenceAnalysis &DI) {
   bool intra_warp_loop = 1;
   // we should handle allocation generated by PHI
@@ -496,7 +521,7 @@ void handle_alloc(llvm::Function *F) {
       }
     }
     for (auto inst : instruction_to_fix) {
-      AddContextSaveRestore(inst, intra_warp_loop);
+      AddContextSaveRestore(inst, intra_warp_loop, PRs);
     }
   }
 
@@ -536,7 +561,7 @@ void handle_alloc(llvm::Function *F) {
       }
     }
     for (auto inst : instruction_to_fix) {
-      AddContextSaveRestore(inst, intra_warp_loop);
+      AddContextSaveRestore(inst, intra_warp_loop, PRs);
     }
   }
 }
@@ -571,9 +596,6 @@ ScheduleInfo sche_data;
 void add_mapping_variable(llvm::Function* F, bool intra_warp_loop, 
       bool need_nested_loop, int schedule_flag)
 {
-  // Define perform once in the outermost loop
-  if (need_nested_loop && intra_warp_loop)
-    return;
 
   IRBuilder<> builder(&*(F->getEntryBlock().getFirstInsertionPt()));
   auto M = F->getParent();
@@ -583,7 +605,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   FunctionType* nTTy = FunctionType::get(IntegerType::getInt32Ty(context), true);
 
   // Load basic software info
-  auto sw_block_size = createLoad(builder, M->getGlobalVariable("block_size"));
+  auto sw_block_size = GetCachedBlockSize(F);
   auto sw_warp_size = builder.getInt32(SW_WARP_SIZE);
 
   if (schedule_flag == 1) {
@@ -746,8 +768,9 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     llvm::Module *M = start_block->getParent()->getParent();
     LLVMContext &context = M->getContext();
     auto I32 = llvm::Type::getInt32Ty(context);
+    auto reset_block_name = intra_warp_loop ? "intra_reset_block" : "inter_reset_block";
     BasicBlock *reset_index = BasicBlock::Create(start_block->getContext(),
-                                                 "reset_block", F, next_block);
+                                                  reset_block_name, F, next_block);
     IRBuilder<> builder(start_block->getContext());
     builder.SetInsertPoint(reset_index);
     if (intra_warp_loop) { // intra warp
@@ -816,7 +839,7 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop, int schedule_flag) 
       if (auto Call = dyn_cast<CallInst>(BI)) {
         if (Call->isInlineAsm())
           continue;
-        auto func_name = Call->getCalledFunction()->getName().str();
+        auto func_name = Call->getCalledOperand()->getName().str();
         if (func_name == "llvm.nvvm.bar.warp.sync") {
           barriers.push_back(Call);
         }
@@ -860,10 +883,11 @@ class InsertWarpLoopPass : public llvm::FunctionPass {
 public:
   static char ID;
   bool intra_warp_loop;
+  bool init_sched;
   int schedule_flag; 
 
-  InsertWarpLoopPass(bool intra_warp = 0, int schedule = 0)
-      : FunctionPass(ID), intra_warp_loop(intra_warp), schedule_flag(schedule) {}
+  InsertWarpLoopPass(bool intra_warp = 0, int schedule = 0, bool init_sched = false)
+      : FunctionPass(ID), intra_warp_loop(intra_warp), schedule_flag(schedule), init_sched(init_sched) {}
 
   virtual void getAnalysisUsage(llvm::AnalysisUsage &AU) const {
     AU.addRequired<DominatorTreeWrapperPass>();
@@ -908,7 +932,7 @@ public:
         if (llvm::CallInst *call_inst = llvm::dyn_cast<llvm::CallInst>(&(*i))) {
           if (call_inst->isInlineAsm())
             continue;
-          auto func_name = call_inst->getCalledFunction()->getName().str();
+          auto func_name = call_inst->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync")
             has_barrier = 1;
@@ -1023,7 +1047,7 @@ public:
               llvm::dyn_cast<llvm::CallInst>(s->begin())) {
         if (call_inst->isInlineAsm())
           continue;
-        auto func_name = call_inst->getCalledFunction()->getName().str();
+        auto func_name = call_inst->getCalledOperand()->getName().str();
         if (func_name == "llvm.nvvm.barrier0" ||
             func_name == "llvm.nvvm.barrier.sync") {
               // print the whole function(s)
@@ -1036,6 +1060,11 @@ public:
         // when handling intra warp loop, we need also split the blocks
         // between warp barrier
         if (intra_warp_loop && func_name == "llvm.nvvm.bar.warp.sync") {
+          exit_blocks.push_back(&(*s));
+        }
+
+        // split the blocks between thread group barrier
+        if (intra_warp_loop && isThreadGroupSync(func_name)) {
           exit_blocks.push_back(&(*s));
         }
       }
@@ -1054,7 +1083,8 @@ public:
     if (!isKernelFunction(F.getParent(), &F))
       return 0;
 
-    add_mapping_variable(&F, intra_warp_loop, need_nested_loop, schedule_flag);
+    if (init_sched)
+      add_mapping_variable(&F, intra_warp_loop, need_nested_loop, schedule_flag);
 
     auto func_name = (&F)->getName().str();
     // clear context array, temp variables for new kernel function
@@ -1119,8 +1149,25 @@ bool has_warp_barrier(llvm::Module *M) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm())
             continue;
-          auto func_name = Call->getCalledFunction()->getName().str();
+          auto func_name = Call->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.bar.warp.sync") {
+            return true;
+          }
+        }
+      }
+    }
+  return false;
+}
+
+bool has_cg_group_sync(llvm::Module *M) {
+  for (auto F = M->begin(); F != M->end(); ++F)
+    for (auto BB = F->begin(); BB != F->end(); ++BB) {
+      for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+        if (auto Call = dyn_cast<CallInst>(BI)) {
+          if (Call->isInlineAsm())
+            continue;
+
+          if (isThreadGroupSync(Call->getCalledOperand()->getName().str())) {
             return true;
           }
         }
@@ -1131,22 +1178,27 @@ bool has_warp_barrier(llvm::Module *M) {
 
 void insert_warp_loop(llvm::Module *M) {
   llvm::legacy::PassManager Passes;
-  need_nested_loop = has_warp_barrier(M);
-  int schedule = std::stoi(std::string(std::getenv("VORTEX_SCHEDULE_FLAG")));
+  need_nested_loop = has_warp_barrier(M) || has_cg_group_sync(M);
+
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
+  }
+  
   printf("SCHEDULE FLAG: %d\n", schedule);
   // use nested loop only when there are warp-level barrier
   printf("NEED NESTED LOOP: %d\n", need_nested_loop);
   if (need_nested_loop) {
     bool intra_warp = true;
-    Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
+    Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
     // insert inter warp loop
-    Passes.add(new InsertWarpLoopPass(!intra_warp, schedule));
+    Passes.add(new InsertWarpLoopPass(!intra_warp, schedule, false));
     printf("insert both intra and inter warp loop\n");
     Passes.run(*M);
   } else {
     bool intra_warp = true;
     // only need a single loop, with size=block_size
-    Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
+    Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
     printf("insert intra warp loop\n");
     Passes.run(*M);
   }

@@ -46,7 +46,7 @@ void handle_warp_vote(llvm::Module *M) {
         if (CallInst *vote_any_sync = dyn_cast<CallInst>(BI)) {
           if (vote_any_sync->isInlineAsm())
             continue;
-          auto func_name = vote_any_sync->getCalledFunction()->getName();
+          auto func_name = vote_any_sync->getCalledOperand()->getName();
           if (func_name == "llvm.nvvm.vote.any.sync" ||
               func_name == "llvm.nvvm.vote.all.sync") {
             // insert sync before call
@@ -94,11 +94,11 @@ void handle_warp_vote(llvm::Module *M) {
         llvm::CastInst::CreateIntegerCast(valid, I8, false, "", sync_inst);
 
     llvm::Instruction *res;
-    if (sync_inst->getCalledFunction()->getName() ==
+    if (sync_inst->getCalledOperand()->getName() ==
         "llvm.nvvm.vote.any.sync") {
       res = BinaryOperator::Create(Instruction::Mul, valid_8bit, predict, "",
                                    sync_inst);
-    } else if (sync_inst->getCalledFunction()->getName() ==
+    } else if (sync_inst->getCalledOperand()->getName() ==
                "llvm.nvvm.vote.all.sync") {
       auto reverse_valid = BinaryOperator::CreateNot(valid_8bit, "", sync_inst);
       res = BinaryOperator::Create(Instruction::Or, reverse_valid, predict, "",
@@ -119,10 +119,10 @@ void handle_warp_vote(llvm::Module *M) {
     // args.push_back(mask);
     args.push_back(warp_vote_ptr);
     llvm::Instruction *warp_inst;
-    if (sync_inst->getCalledFunction()->getName() ==
+    if (sync_inst->getCalledOperand()->getName() ==
         "llvm.nvvm.vote.any.sync") {
       warp_inst = llvm::CallInst::Create(func_warp_any, args, "", sync_inst);
-    } else if (sync_inst->getCalledFunction()->getName() ==
+    } else if (sync_inst->getCalledOperand()->getName() ==
                "llvm.nvvm.vote.all.sync") {
       warp_inst = llvm::CallInst::Create(func_warp_all, args, "", sync_inst);
     }
@@ -145,7 +145,7 @@ void handle_warp_shfl(llvm::Module *M) {
     for (Function::iterator E = F->end(); I != E; ++I) {
       for (BasicBlock::iterator BI = I->begin(); BI != I->end(); BI++) {
         if (CallInst *warp_shfl = dyn_cast<CallInst>(BI)) {
-          auto func_name = warp_shfl->getCalledFunction()->getName();
+          auto func_name = warp_shfl->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.shfl.sync.down.i32" ||
               func_name == "llvm.nvvm.shfl.sync.up.i32" ||
               func_name == "llvm.nvvm.shfl.sync.bfly.i32") {
@@ -181,7 +181,7 @@ void handle_warp_shfl(llvm::Module *M) {
     // load shuffled data
     auto new_intra_warp_index =
         createLoad(builder, M->getGlobalVariable("intra_warp_index"));
-    auto shfl_name = shfl_inst->getCalledFunction()->getName().str();
+    auto shfl_name = shfl_inst->getCalledOperand()->getName().str();
     if (shfl_name.find("down") != shfl_name.npos) {
       auto calculate_offset = builder.CreateBinOp(
           Instruction::Add, new_intra_warp_index, shfl_offset);

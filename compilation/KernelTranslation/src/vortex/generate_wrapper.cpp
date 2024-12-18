@@ -175,7 +175,7 @@ void remove_barrier(llvm::Module *M) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm())
             continue;
-          auto func_name = Call->getCalledFunction()->getName().str();
+          auto func_name = Call->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.bar.warp.sync" ||
               func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync") {
@@ -231,7 +231,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
       for (auto BB = F->begin(); BB != F->end(); ++BB) {
         for (auto BI = BB->begin(); BI != BB->end(); BI++) {
           if (auto Call = dyn_cast<CallInst>(BI)) {
-            auto func_name = Call->getCalledFunction()->getName().str();
+            auto func_name = Call->getCalledOperand()->getName().str();
             auto func_arg_size = Call->getCalledFunction()->arg_size();
             std::cout << "currently looking function is " << func_name << std::endl;
 
@@ -376,7 +376,6 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n";
 
          
-    bool mapping_type = std::stoi(std::string(std::getenv("VORTEX_SCHEDULE_FLAG")));
     /*if(mapping_type == 1)
       ss << "    vx_spawn_kernel_cm(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
     else
