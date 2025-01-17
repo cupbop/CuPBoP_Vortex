@@ -110,6 +110,23 @@ void eliminate_redudant_threadIdx_computation(llvm::Module *M) {
   }
 }
 
+struct PreserveDivergenceMetadataPass : public llvm::PassInfoMixin<PreserveDivergenceMetadataPass> {
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+        for (auto &F : M) {
+            for (auto &BB : F) {
+                for (auto &I : BB) {
+                    if (I.hasMetadata("divergence")) {
+                        llvm::errs() << "Preserving metadata for instruction: " << I << "\n";
+                        // 복사 로직 추가 (필요시)
+                        I.setMetadata("divergence", I.getMetadata("divergence"));
+                    }
+                }
+            }
+        }
+        return llvm::PreservedAnalyses::all();
+    }
+};
+
 void performance_optimization(llvm::Module *M) {
   printf("performance optimization\n");
   for (auto F = M->begin(); F != M->end(); F++) {
@@ -138,9 +155,24 @@ void performance_optimization(llvm::Module *M) {
   PassBuilder.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   printf("registering analysis done\n");
 
-  llvm::ModulePassManager MPM;
+  llvm::ModulePassManager MPM = llvm::ModulePassManager();;
   llvm::OptimizationLevel OptLevel = llvm::OptimizationLevel::O3;
-  MPM = PassBuilder.buildPerModuleDefaultPipeline(OptLevel);
+
+  MPM.addPass(PassBuilder.buildPerModuleDefaultPipeline(OptLevel));
+  //MPM.addPass(PreserveDivergenceMetadataPass());
+  
+
+  /*
+  llvm::ModulePassManager TempMPM = PassBuilder.buildPerModuleDefaultPipeline(OptLevel);
+    // ControlFlowSimplificationPass를 제외한 패스 추가
+    for (auto &Pass : TempMPM) {
+        if (!Pass->name().contains("ControlFlowSimplificationPass")) {
+            MPM.addPass(std::move(Pass));
+        }
+    }
+  */
+
+
   printf("running analysis\n");
   //print the entire IR
   M->print(llvm::errs(), nullptr);
