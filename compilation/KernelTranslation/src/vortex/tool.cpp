@@ -416,6 +416,8 @@ void replace_built_in_function(llvm::Module *M) {
               need_remove.push_back(Call);
             }
             // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex 
+            
+
             else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ){//||
                        //func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
                        //             "builtin_xEv") {
@@ -423,24 +425,37 @@ void replace_built_in_function(llvm::Module *M) {
               printf("block_Id-X is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_x");
               IRBuilder<> builder(context);
+              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
               auto block_idx = createLoad(builder, block_index_addr);
+              // print block_idx instruction
+              
+
+              block_idx->setMetadata("divergence", N);
+
+              llvm::errs() << "block_idx instruction\n";
+              block_idx->print(llvm::errs());
+              
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y") {
               printf("block_Id-Y is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_y");
               IRBuilder<> builder(context);
+              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
               auto block_idx = createLoad(builder, block_index_addr);
+              block_idx->setMetadata("divergence", N);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
               printf("block_Id-Z is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_z");
               IRBuilder<> builder(context);
+              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
               auto block_idx = createLoad(builder, block_index_addr);
+              block_idx->setMetadata("divergence", N);
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             }
