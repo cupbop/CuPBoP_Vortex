@@ -44,10 +44,19 @@ public:
     std::vector<llvm::Instruction *> insert_intra_warp_sync_before;
     std::vector<llvm::Instruction *> insert_inter_warp_sync_before;
 
-    // insert sync in the entry
+    // insert sync after the entry and before the first non-AllocaInst/load/cast
+    // instruction The idea is the make as many as possible instructions in the
+    // first block, so that we do not need to execute these instructions
+    // multiple times (in intra-warp loops).
     BasicBlock *entry = &(*F.begin());
     for (auto i = entry->begin(); i != entry->end(); i++) {
-      if (!isa<AllocaInst>(i)) {
+      // LLVM 18 changes
+
+      //if (!isa<AllocaInst>(i)) {
+      if (!isa<AllocaInst>(i) && !isa<LoadInst>(i) && !isa<CastInst>(i)) {
+        //print the instruction before inserting the barrier
+        printf("inserting intra warp barrier before instruction: AllocInst\n");
+        i->print(llvm::errs());
         insert_inter_warp_sync_before.push_back(&(*(i)));
         break;
       }
@@ -60,6 +69,8 @@ public:
       for (; BI != I->end(); BI++) {
         llvm::ReturnInst *Ret = llvm::dyn_cast<llvm::ReturnInst>(&(*BI));
         if (Ret) {
+          printf("inserting intra warp barrier before instruction: ReturnInst\n");
+          Ret->print(llvm::errs());
           insert_inter_warp_sync_before.push_back(&(*BI));
         }
       }
@@ -135,6 +146,9 @@ public:
       // Unconditional barrier postdominates the entry node.
       if (PDT->getPostDomTree().dominates(b, &F.getEntryBlock()))
         continue;
+      printf("insert barrier at the beginning of block(conditional barrier): %s\n", b->getName().str().c_str());
+      // print block
+      b->print(llvm::errs());
       conditionalBarriers.push_back(b);
     }
 
@@ -161,6 +175,16 @@ public:
         if (pred == b)
           break; // Traced across a loop edge, skip this case.
       }
+
+      // print pred and b
+      printf("pred and b check\n");
+      // print block
+      printf("pred: %s\n", pred->getName().str().c_str());
+      pred->print(llvm::errs());
+      printf("b: %s\n", b->getName().str().c_str());
+      b->print(llvm::errs());
+
+
       // we should create warp/block barrier based on the conditional barrier
       if (has_warp_barrier(b)) {
         CreateIntraWarpBarrier(pred->getTerminator());
@@ -173,6 +197,7 @@ public:
       // also insert barrier at the end of conditional branch
       DominatorTree *DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
       std::queue<llvm::BasicBlock *> successor_queue;
+
       for (int i = 0; i < pred->getTerminator()->getNumSuccessors(); i++) {
         auto ss = pred->getTerminator()->getSuccessor(i);
         if (!DT->dominates(ss, pred))
@@ -209,6 +234,9 @@ public:
             successor_queue.push(ss);
         }
       }
+      // print perge point
+      printf("merge point: \n");
+      merge_point->print(llvm::errs());
       assert(merge_point && "do not find merge point\n");
       changed = true;
 
@@ -224,7 +252,13 @@ public:
           }
         }
         if (!post_dominate_all)
+        {
           conditionalBarriers.push_back(pred);
+          printf("insert barrier at the beginning of block(conditional barrier pred): %s\n", pred->getName().str().c_str());
+          // print block
+          pred->print(llvm::errs());
+
+        }
       }
 
       // find any block which are not dominated by header
@@ -403,6 +437,12 @@ public:
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.bar.warp.sync" ||
               func_name == "llvm.nvvm.barrier.sync") {
+                printf("found barrier inst new!\n");
+                // print the whole block
+                (*i)->print(errs());
+                // print the whole function
+                printf("-----------------\n");
+                L->getHeader()->getParent()->print(errs());
             is_conditional_loop = true;
             if (func_name == "llvm.nvvm.bar.warp.sync") {
               is_warp = 1;

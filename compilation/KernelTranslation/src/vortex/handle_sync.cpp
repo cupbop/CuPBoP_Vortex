@@ -16,6 +16,7 @@ using namespace llvm;
 
 void split_block_by_sync(llvm::Function *F) {
   std::set<llvm::Instruction *> sync_inst;
+  // Jumping the first sync has been removed in LLVM 18 CPU CuPBoP
   // bool jump_first_sync = 1;
   for (Function::iterator b = F->begin(); b != F->end(); ++b) {
     BasicBlock *B = &(*b);
@@ -41,8 +42,9 @@ void split_block_by_sync(llvm::Function *F) {
             isCGSync(func_name)) {
           //print whole block(b)
           
-          //printf("found barrier inst!\n");
-          //F->print(errs());
+          printf("found barrier inst!\n");
+          i->print(llvm::errs());
+          b->print(errs());
           sync_inst.insert(Call);
           // we should also sync the next instruction
           // so that we can get a block with sync inst only
@@ -66,9 +68,14 @@ void split_block_by_sync(llvm::Function *F) {
 }
 
 void split_block_by_sync(llvm::Module *M) {
+  //printf("splitting block by sync starting\n");
+  //printIR(M);
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     if (isKernelFunction(M, F))
       split_block_by_sync(F);
   }
+  //print the whole module 
+  //printf("printing the whole module after splitting the block\n");
+  //printIR(M);
 }
