@@ -2,6 +2,7 @@
 #include "assert.h"
 #include "handle_sync.h"
 #include "tool.h"
+#include "cg_sync.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -435,7 +436,7 @@ public:
             continue;
           auto func_name = Call->getCalledOperand()->getName().str();
           if (func_name == "llvm.nvvm.barrier0" ||
-              func_name == "llvm.nvvm.bar.warp.sync" ||
+              isWarpSync(func_name) ||
               func_name == "llvm.nvvm.barrier.sync") {
                 printf("found barrier inst new!\n");
                 // print the whole block
@@ -444,7 +445,7 @@ public:
                 printf("-----------------\n");
                 L->getHeader()->getParent()->print(errs());
             is_conditional_loop = true;
-            if (func_name == "llvm.nvvm.bar.warp.sync") {
+            if (isWarpSync(func_name)) {
               is_warp = 1;
             }
             break;

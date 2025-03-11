@@ -37,7 +37,7 @@ void split_block_by_sync(llvm::Function *F) {
           continue;
         auto func_name = Call->getCalledOperand()->getName().str();
         if (func_name == "llvm.nvvm.barrier0" ||
-            func_name == "llvm.nvvm.bar.warp.sync" ||
+            isWarpSync(func_name) ||
             func_name == "llvm.nvvm.barrier.sync" ||
             isCGSync(func_name)) {
           //print whole block(b)
@@ -68,14 +68,24 @@ void split_block_by_sync(llvm::Function *F) {
 }
 
 void split_block_by_sync(llvm::Module *M) {
-  //printf("splitting block by sync starting\n");
-  //printIR(M);
-  for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
-    Function *F = &(*i);
-    if (isKernelFunction(M, F))
-      split_block_by_sync(F);
+
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
   }
-  //print the whole module 
-  //printf("printing the whole module after splitting the block\n");
-  //printIR(M);
+
+  if (schedule == 0 || schedule == 1) {
+    //printf("splitting block by sync starting\n");
+    //printIR(M);
+    for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
+      Function *F = &(*i);
+      if (isKernelFunction(M, F))
+        split_block_by_sync(F);
+    }
+    //print the whole module 
+    //printf("printing the whole module after splitting the block\n");
+    //printIR(M);
+  } else {
+    printf("no need to split block by sync\n");
+  }
 }

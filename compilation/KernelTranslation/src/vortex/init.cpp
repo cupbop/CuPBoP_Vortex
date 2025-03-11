@@ -188,6 +188,9 @@ void create_global_variable(llvm::Module *M) {
       *M, VoteArrayType, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "warp_vote", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
   warp_vote->setAlignment(llvm::MaybeAlign(32));
+  auto vote_count = new llvm::GlobalVariable(
+      *M, I32, false, llvm::GlobalValue::ExternalLinkage, NULL, 
+      "vote_count", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
 }
 
 void remove_metadata(llvm::Module *M) {

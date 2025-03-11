@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 project(CudaOnX86)
 set(CMAKE_PROJECT_DESCRIPTION "Executing CUDA on X86 architecture.")
@@ -34,7 +34,7 @@ else()
 endif()
 
 # Check the environment variable
-if($ENV{VORTEX_ARCHITECTURE} STREQUAL "64")
+if("$ENV{VORTEX_ARCHITECTURE}" STREQUAL "64")
   add_definitions(-DVORTEX_ARCHITECTURE_64=1)
   message(STATUS "VORTEX_ARCHITECTURE_64 is set")
 else()

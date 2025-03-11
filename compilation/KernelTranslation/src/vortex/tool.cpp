@@ -28,6 +28,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include "cg_sync.h"
+
 
 #include <iostream>
 #include <set>
@@ -771,7 +773,7 @@ bool has_warp_barrier(llvm::BasicBlock *B) {
       if (Call->isInlineAsm())
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
-      if (func_name == "llvm.nvvm.bar.warp.sync") {
+      if (isWarpSync(func_name)) {
         return true;
       }
     }
@@ -788,7 +790,7 @@ bool has_barrier(llvm::BasicBlock *B) {
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
       if (func_name == "llvm.nvvm.barrier0" ||
-          func_name == "llvm.nvvm.bar.warp.sync" ||
+          isWarpSync(func_name) ||
           func_name == "llvm.nvvm.barrier.sync") {
         return true;
       }

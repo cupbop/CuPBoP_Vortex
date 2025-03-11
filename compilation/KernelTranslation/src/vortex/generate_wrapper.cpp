@@ -1,6 +1,7 @@
 #include "generate_wrapper.h"
 #include "base_address.h"
 #include "tool.h"
+#include "cg_sync.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
@@ -176,7 +177,7 @@ void remove_barrier(llvm::Module *M) {
           if (Call->isInlineAsm())
             continue;
           auto func_name = Call->getCalledOperand()->getName().str();
-          if (func_name == "llvm.nvvm.bar.warp.sync" ||
+          if (isWarpSync(func_name) ||
               func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync") {
             need_remove.push_back(Call);
@@ -383,8 +384,18 @@ void create_kernel_wrapper_function(llvm::Module *M){
     */
       
     // ss << "    return vx_spawn_threads(1, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[0], kernel_arg); \n";
-     ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
+    int schedule = 0;
+    if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+      schedule = std::stoi(std::string(env));
+    }
     
+    if (schedule == 0) { // thread mapping
+      ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
+    } else if (schedule == 1) { // block mapping
+      std::cerr << "Block mapping is not implemented yet\n";
+    } else { // one to one mapping
+      ss << "    return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
+    }
     ss << "\n" 
       /*"    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
           "    if (additional_info[0] != 0) {\n"

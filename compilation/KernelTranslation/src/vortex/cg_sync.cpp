@@ -20,7 +20,7 @@ bool isCGThreadBlockSync(const std::string &FuncNameStr) {
     return (hasCgnamespace && (hasBlockSynchronize || hasBlockSync));
 }
 
-bool isThreadGroupSync(const std::string &FuncNameStr) {
+bool isCGThreadGroupSync(const std::string &FuncNameStr) {
     // cg::
     bool hasCgnamespace = FuncNameStr.find("cooperative_groups") != FuncNameStr.npos;
     // synchronize(thread_block) or sync(thread_block)
@@ -35,8 +35,14 @@ bool isThreadGroupSync(const std::string &FuncNameStr) {
 // @_ZN18cooperative_groups11synchronizeENS_12thread_blockE
 // @_ZNK18cooperative_groups12thread_group4syncEv(
 bool isCGSync(const std::string &name) {
-    bool state = isCGThreadBlockSync(name) || isThreadGroupSync(name);
+    bool state = isCGThreadBlockSync(name) || isCGThreadGroupSync(name);
     if (state)
       printf("Found CG Sync: %s\n", name.c_str());
     return state;
+}
+
+
+// @_Z10__syncwarpj(i32 noundef -1) or llvm.nvvm.bar.warp.sync
+bool isWarpSync(const std::string &FuncNameStr) {
+    return FuncNameStr.find("syncwarp") != FuncNameStr.npos || FuncNameStr == "llvm.nvvm.bar.warp.sync";
 }

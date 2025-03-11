@@ -224,30 +224,25 @@ private:
   }
 };
 
-struct ParallelRegion {
-  std::set<llvm::BasicBlock *> wrapped_block;
-  llvm::BasicBlock *successor_block;
-  llvm::BasicBlock *start_block;
-  llvm::BasicBlock *end_block;
-  bool inst_in_region(llvm::Instruction *inst) {
-    for (auto bb : wrapped_block) {
-      if (inst->getParent()->getName().str() == bb->getName().str())
-        return true;
-    }
-    return false;
+bool ParallelRegion::inst_in_region(llvm::Instruction *inst) {
+  for (auto bb : wrapped_block) {
+    if (inst->getParent()->getName().str() == bb->getName().str())
+      return true;
   }
-  bool inst_used_in_region(llvm::Instruction *inst) {
-    for (auto ui = inst->use_begin(); ui != inst->use_end(); ++ui) {
-      auto *user = dyn_cast<Instruction>(ui->getUser());
-      if (user == NULL)
-        continue;
-      if (inst_in_region(user)) {
-        return 1;
-      }
+  return false;
+}
+
+bool ParallelRegion::inst_used_in_region(llvm::Instruction *inst) {
+  for (auto ui = inst->use_begin(); ui != inst->use_end(); ++ui) {
+    auto *user = dyn_cast<Instruction>(ui->getUser());
+    if (user == NULL)
+      continue;
+    if (inst_in_region(user)) {
+      return 1;
     }
-    return 0;
   }
-};
+  return 0;
+}
 
 std::map<llvm::Instruction *, unsigned> tempInstructionIds;
 std::map<std::string, llvm::Instruction *> contextArrays;
@@ -1195,7 +1190,7 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop, int schedule_flag) 
         if (Call->isInlineAsm())
           continue;
         auto func_name = Call->getCalledOperand()->getName().str();
-        if (func_name == "llvm.nvvm.bar.warp.sync") {
+        if (isWarpSync(func_name)) {
           barriers.push_back(Call);
         }
         if (!intra_warp_loop && (func_name == "llvm.nvvm.barrier0" ||
@@ -1297,7 +1292,7 @@ public:
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync")
             has_barrier = 1;
-          if (func_name == "llvm.nvvm.bar.warp.sync" && intra_warp_loop)
+          if (isWarpSync(func_name) && intra_warp_loop)
             has_barrier = 1;
         }
       }
@@ -1479,12 +1474,12 @@ public:
         }
         // when handling intra warp loop, we need also split the blocks
         // between warp barrier
-        if (intra_warp_loop && func_name == "llvm.nvvm.bar.warp.sync") {
+        if (intra_warp_loop && isWarpSync(func_name)) {
           exit_blocks.push_back(&(*s));
         }
 
         // split the blocks between thread group barrier
-        if (intra_warp_loop && isThreadGroupSync(func_name)) {
+        if (intra_warp_loop && isCGThreadGroupSync(func_name)) {
           exit_blocks.push_back(&(*s));
         }
       }
@@ -1599,7 +1594,7 @@ bool has_warp_barrier(llvm::Module *M) {
           if (Call->isInlineAsm())
             continue;
           auto func_name = Call->getCalledOperand()->getName().str();
-          if (func_name == "llvm.nvvm.bar.warp.sync") {
+          if (isWarpSync(func_name)) {
             return true;
           }
         }
@@ -1616,7 +1611,7 @@ bool has_cg_group_sync(llvm::Module *M) {
           if (Call->isInlineAsm())
             continue;
 
-          if (isThreadGroupSync(Call->getCalledOperand()->getName().str())) {
+          if (isCGThreadGroupSync(Call->getCalledOperand()->getName().str())) {
             return true;
           }
         }
@@ -1633,26 +1628,33 @@ void insert_warp_loop(llvm::Module *M) {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     schedule = std::stoi(std::string(env));
   }
+
+  int need_loop_serialize = (schedule != 2);
   
   printf("SCHEDULE FLAG: %d\n", schedule);
+  // no loop serialization performed for one on one mapping
+  printf("NEED LOOP SERIALIZE: %d\n", need_loop_serialize);
   // use nested loop only when there are warp-level barrier
   printf("NEED NESTED LOOP: %d\n", need_nested_loop);
-  if (need_nested_loop) {
-    bool intra_warp = true;
-    Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
-    // insert inter warp loop
-    Passes.add(new InsertWarpLoopPass(!intra_warp, schedule, false));
-    printf("insert both intra and inter warp loop\n");
-    Passes.run(*M);
-  } else {
-    bool intra_warp = true;
-    // only need a single loop, with size=block_size
-    Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
-    printf("insert intra warp loop\n");
-    Passes.run(*M);
+
+  if (need_loop_serialize) {
+    if (need_nested_loop) {
+      bool intra_warp = true;
+      Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
+      // insert inter warp loop
+      Passes.add(new InsertWarpLoopPass(!intra_warp, schedule, false));
+      printf("insert both intra and inter warp loop\n");
+      Passes.run(*M);
+    } else {
+      bool intra_warp = true;
+      // only need a single loop, with size=block_size
+      Passes.add(new InsertWarpLoopPass(intra_warp, schedule, true));
+      printf("insert intra warp loop\n");
+      Passes.run(*M);
+    }
+    // remove all barriers
+    printf("remove all barriers\n");
+    for (auto F = M->begin(); F != M->end(); ++F)
+      remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
   }
-  // remove all barriers
-  printf("remove all barriers\n");
-  for (auto F = M->begin(); F != M->end(); ++F)
-    remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
 }

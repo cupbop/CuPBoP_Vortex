@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 project(
   NVVM2X86
   DESCRIPTION "Translate NVVM IR to LLVM IR for X86"

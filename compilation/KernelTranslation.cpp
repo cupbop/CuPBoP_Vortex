@@ -19,6 +19,12 @@ using namespace llvm;
 
 std::string PATH = "kernel_meta.log";
 
+static void dumpFile(llvm::Module * program, std::string name) {
+  std::error_code EC;
+  raw_fd_ostream OutFile(name, EC);
+  program->print(OutFile, nullptr);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
@@ -30,46 +36,58 @@ int main(int argc, char **argv) {
   std::cout << "init_block\n" << std::flush;
   printIR(program);
   init_block(program, fout);
-  
+
+  dumpFile(program, "0.ll");
+
+  VerifyModule(program);
   // insert sync before each vote, and replace the
   // original vote function to warp vote
   std::cout << "handle_warp_vote\n" << std::flush;
   printIR(program);
   handle_warp_vote(program);
-  
+
+  dumpFile(program, "1.ll");
 
   // replace warp shuffle
-  // VerifyModule(program);
-  std::cout << "handle_warp_shfl\n" << std::flush;
-  printIR(program);
+  VerifyModule(program);
   handle_warp_shfl(program);
+
+  dumpFile(program, "2.ll");
+
   // insert sync
-  // VerifyModule(program);
-  std::cout << "insert\n" << std::flush;
-  printIR(program);
+  VerifyModule(program);
   insert_sync(program);
+
+  dumpFile(program, "3.ll");
+
   // split block by sync
-  // VerifyModule(program);
+  VerifyModule(program);
+
+
   std::cout << "split\n" << std::flush;
   //print the proogram
   printIR(program);
   split_block_by_sync(program);
   // add loop for intra&intera thread
 
+
+  dumpFile(program, "4.ll");
+  
   // VerifyModule(program);
   std::cout << "insert_warp_loop\n" << std::flush;
   printIR(program);
-  //여기가 뭔가 잘못됨
   insert_warp_loop(program);
 
-  // VerifyModule(program);
+  dumpFile(program, "5.ll");
+
+  VerifyModule(program);
 
   // (TODO): replace this patch
   std::cout << "replace\n" << std::flush;
   printIR(program);
   replace_built_in_function(program);
 
-  // VerifyModule(program);
+  VerifyModule(program);
   std::cout << "generate\n" << std::flush;
   printIR(program);
   generate_wrapper(program);
