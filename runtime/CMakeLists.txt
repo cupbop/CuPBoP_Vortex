@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 project(
   Vortexruntime
   DESCRIPTION "Implementation CUDA runtime API with vortex"

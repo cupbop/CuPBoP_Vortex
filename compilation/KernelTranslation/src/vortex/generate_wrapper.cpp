@@ -31,9 +31,16 @@
 using namespace llvm;
 
 void set_meta_data(llvm::Module *M) {
-  M->setTargetTriple("riscv32-unknown-linux-gnu");
-  M->setDataLayout(
-      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128");
+  std::string arch = std::getenv("VORTEX_ARCHITECTURE");
+
+  if (arch == "64") {
+    M->setTargetTriple("riscv64-unknown-unknown-elf");
+    M->setDataLayout("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128");
+  } else {
+    // this is an unverified guess for 32-bit RISC-V
+    M->setTargetTriple("riscv32-unknown-unknown-elf");
+    M->setDataLayout("e-m:e-p:32:32-i64:64-n32-S128"); 
+  }
 }
 
 // as pthread only accept a single void* for input
@@ -310,6 +317,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread block_index_x;\n"
           "int __thread block_index_y;\n"
           "int __thread block_index_z;\n"
+          "int __thread thread_id_x;\n"
+          "int __thread thread_id_y;\n"
+          "int __thread thread_id_z;\n"
           "\n";
     
     ss <<  "\n extern \"C\" {\n";
@@ -327,8 +337,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
               "    block_index_x = blockIdx.x;\n"  
               "    block_index_y = blockIdx.y;\n"  
               "    block_index_z = blockIdx.z;\n" 
+              "\n"
+              "    thread_id_x = threadIdx.x;\n"
+              "    thread_id_y = threadIdx.y;\n"
+              "    thread_id_z = threadIdx.z;\n"
               "\n" 
-              "    vx_printf(\"kernel_warpper: group=(%d, %d)\\n\", blockIdx.x, blockIdx.y);\n"  
+              "    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"  
               "\n"     
 	  "    " << f << "((void **)args);\n" 
             "}\n" 
@@ -370,6 +384,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
           "        args[0], args[1], args[2], args[3], args[4], args[5]);\n"
           "    vx_printf(\"workdim=%d\\n\", ctx->work_dim);\n"
+          "    vx_printf(\"threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\\n\", threadIdx.x, threadIdx.y, threadIdx.z);\n"
       
 
       "vx_printf(\"execute something\\n\");"

@@ -29,6 +29,7 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 #include "cg_sync.h"
+#include "llvm_type_utils.h"
 
 
 #include <iostream>
@@ -272,6 +273,12 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
 }
 
 void replace_built_in_function(llvm::Module *M) {
+
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
+  }
+
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
   std::vector<llvm::Instruction *> need_remove;
@@ -355,74 +362,130 @@ void replace_built_in_function(llvm::Module *M) {
               // printf("global_intra_warp_idx is : %d \n", global_intra_warp_idx);
               // printf("global_inter_warp_idx is : %d \n", global_inter_warp_idx);
 
-                  auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
-                  errs() << block_size_x_tmp;
-                  
-                  Constant* const_intra_warp_idx = global_intra_warp_idx->getInitializer();
-                  Constant* const_inter_warp_idx = global_inter_warp_idx->getInitializer();
-                  //Constant* const_block_size_x = block_size_x_tmp->getInitializer();
+                if (schedule == 2) {
+                    IRBuilder<> builder(context);
+                    builder.SetInsertPoint(Call);
+                    
+                    GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(M->getOrInsertGlobal("thread_id_x", I32));
 
-                  ConstantInt* con_intra_warp_idx = cast<ConstantInt>(const_intra_warp_idx);
-                  ConstantInt* con_inter_warp_idx = cast<ConstantInt>(const_inter_warp_idx);
-                  //ConstantInt* con_block_size_x = cast<ConstantInt>(const_block_size_x);
+                    auto threadLocalAddr = builder.CreateIntrinsic(
+                      Intrinsic::threadlocal_address, 
+                      {I32->getPointerTo()}, 
+                      {threadIdx}, 
+                      nullptr);
+                    auto tidx = builder.CreateLoad(I32, threadLocalAddr, "tidx");
 
-                  int32_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue(); //changed to 32
-                  int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
-                  //int64_t int_block_size_x = con_block_size_x->getSExtValue();
+                    MDNode* N = MDNode::get(context, MDString::get(context, "divergence"));
+                    tidx->setMetadata("divergence", N);
 
-                  printf("intra warp corresponding value is : %d \n", int_intra_warp_idx);
-                  printf("inter warp corresponding value is : %d \n", int_inter_warp_idx);
-                  //printf("block size x corresponding value is : %ld \n", int_block_size_x);
+                    Call->replaceAllUsesWith(tidx);
+                    need_remove.push_back(Call);
+                } else {
+                      auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
+                      errs() << block_size_x_tmp;
+                      
+                      Constant* const_intra_warp_idx = global_intra_warp_idx->getInitializer();
+                      Constant* const_inter_warp_idx = global_inter_warp_idx->getInitializer();
+                      //Constant* const_block_size_x = block_size_x_tmp->getInitializer();
 
-              // Mark Debug: Until here (printing out warp_idx values)
+                      ConstantInt* con_intra_warp_idx = cast<ConstantInt>(const_intra_warp_idx);
+                      ConstantInt* con_inter_warp_idx = cast<ConstantInt>(const_inter_warp_idx);
+                      //ConstantInt* con_block_size_x = cast<ConstantInt>(const_block_size_x);
 
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
+                      int32_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue(); //changed to 32
+                      int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
+                      //int64_t int_block_size_x = con_block_size_x->getSExtValue();
 
-              auto thread_idx = builder.CreateBinOp(
-                  Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                  ConstantInt::get(I32, 32), ""); // Mark temp  (changed 32 -> 4)
-              thread_idx = builder.CreateBinOp(
-                  //Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
-                  Instruction::Add, createLoad(builder, local_intra_warp_idx),
-                  thread_idx, "thread_idx");
+                      printf("intra warp corresponding value is : %d \n", int_intra_warp_idx);
+                      printf("inter warp corresponding value is : %d \n", int_inter_warp_idx);
+                      //printf("block size x corresponding value is : %ld \n", int_block_size_x);
 
-              thread_idx = builder.CreateBinOp(
-                  Instruction::SRem, thread_idx,
-                  createLoad(builder, M->getGlobalVariable("block_size_x")),
-                  "thread_id_x");
+                  // Mark Debug: Until here (printing out warp_idx values)
 
-                  // Add metadata to indicate non-uniformity
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+                  IRBuilder<> builder(context);
+                  builder.SetInsertPoint(Call);
+
+                  auto thread_idx = builder.CreateBinOp(
+                      Instruction::Mul, createLoad(builder, local_inter_warp_idx),
+                      ConstantInt::get(I32, 32), ""); // Mark temp  (changed 32 -> 4)
+                  thread_idx = builder.CreateBinOp(
+                      //Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
+                      Instruction::Add, createLoad(builder, local_intra_warp_idx),
+                      thread_idx, "thread_idx");
+
+                  thread_idx = builder.CreateBinOp(
+                      Instruction::SRem, thread_idx,
+                      createLoad(builder, M->getGlobalVariable("block_size_x")),
+                      "thread_id_x");
+
+                      // Add metadata to indicate non-uniformity
+                  MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+                  cast<Instruction>(thread_idx)->setMetadata("divergence", N);
 
 
-              Call->replaceAllUsesWith(thread_idx);
-              need_remove.push_back(Call);
+                  Call->replaceAllUsesWith(thread_idx);
+                  need_remove.push_back(Call);
+                }
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.y") {
-              // replace it by warp_id
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
+                if (schedule == 2) {
+                  IRBuilder<> builder(context);
+                  builder.SetInsertPoint(Call);
+                  
+                  GlobalVariable *threadIdxVar = (GlobalVariable *)M->getOrInsertGlobal("threadIdx", 
+                      StructType::get(context, {I32, I32, I32}, false));
+                  threadIdxVar->setLinkage(GlobalValue::ExternalLinkage);
+                  
+                  /* typedef union {
+                      struct {
+                        uint32_t x;
+                        uint32_t y;
+                        uint32_t z;
+                      };
+                      uint32_t m[3];
+                    } dim3_t;
 
-              auto thread_idx = builder.CreateBinOp(
-                  Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                  ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
-              thread_idx = builder.CreateBinOp(
-                  Instruction::Add, createLoad(builder, local_intra_warp_idx),
-                  thread_idx, "thread_idx");
-              // tidy = tid / block_dim.x
-              thread_idx = builder.CreateBinOp(
-                  Instruction::SDiv, thread_idx,
-                  createLoad(builder, M->getGlobalVariable("block_size_x")),
-                  "thread_id_y");
-              
+                    extern __thread dim3_t blockIdx;
+                    extern __thread dim3_t threadIdx;
+                  */
+                  std::vector<Value *> indices;
+                  indices.push_back(ConstantInt::get(I32, 0));  // threadIdx->struct
+                  indices.push_back(ConstantInt::get(I32, 1));  // threadIdx->struct->y
+                  
+                  Value *tidxPtr = createGEP(builder, threadIdxVar, indices);
+                  Value *tidx = createLoad(builder, tidxPtr);
+                  
                   // Add metadata to indicate non-uniformity
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+                  MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+                  cast<Instruction>(tidx)->setMetadata("divergence", N);
+                  
+                  Call->replaceAllUsesWith(tidx);
+                  need_remove.push_back(Call);
+              } else {
+                // replace it by warp_id
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
 
-              
-              Call->replaceAllUsesWith(thread_idx);
-              need_remove.push_back(Call);
+                auto thread_idx = builder.CreateBinOp(
+                    Instruction::Mul, createLoad(builder, local_inter_warp_idx),
+                    ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
+                    // TODO: get warp size instead of hardcoding
+                thread_idx = builder.CreateBinOp(
+                    Instruction::Add, createLoad(builder, local_intra_warp_idx),
+                    thread_idx, "thread_idx");
+                // tidy = tid / block_dim.x
+                thread_idx = builder.CreateBinOp(
+                    Instruction::SDiv, thread_idx,
+                    createLoad(builder, M->getGlobalVariable("block_size_x")),
+                    "thread_id_y");
+                
+                    // Add metadata to indicate non-uniformity
+                MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+                cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+
+                
+                Call->replaceAllUsesWith(thread_idx);
+                need_remove.push_back(Call);
+              }
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.z") {
               printf("[WARNING] We DO NOT support triple-dim block\n");
               exit(1);
@@ -526,160 +589,44 @@ void replace_built_in_function(llvm::Module *M) {
             auto func_name = Call->getCalledOperand()->getName().str();
             auto callFn = Call->getCalledFunction();
             if (func_name == "vprintf") {
-              /*
-               * replace CUDA's printf to Vortex's vx_printf (same as c's printf)
-               * CUDA:
-               * %0 = tail call i32 @vprintf(i8* getelementptr inbounds ([19 x
-               * i8], [19 x i8]* @.str, i64 0, i64 0), i8* null)
-               * C: %call1 = call i32 (i8*, ...) @printf(i8* getelementptr
-               * inbounds ([45 x i8], [45 x i8]* @.str.1, i64 0, i64 0))
-               * Vortex: %84 = call i32 (i8*, ...) @vx_printf(i8* getelementptr inbounds ([20 x i8], [20 x i8]* @.str.1, i64 0, i64 0), i32 %83), !dbg !159
-                       * %67 = call i32 (i8*, ...) @vx_printf(i8* getelementptr inbounds ([11 x i8], [11 x i8]* @.str, i64 0, i64 0), i32 %66)
-               */
-              // find/create C's printf function
-              std::vector<llvm::Type *> args;
-              //LLVM 18
-              args.push_back(PointerType::getUnqual(context));
-              //args.push_back(llvm::Type::getInt8PtrTy(context));
-              llvm::FunctionType *printfType =
-                  FunctionType::get(I32, args, true);
 
+
+              llvm::FunctionType *printfType =
+                  FunctionType::get(I32, {PointerType::getUnqual(context)}, true);
               llvm::FunctionCallee _f =
                   M->getOrInsertFunction("vx_printf", printfType);
               llvm::Function *func_printf =
                   llvm::cast<llvm::Function>(_f.getCallee());
-              // construct argument(s)
               std::vector<Value *> printf_args;
-              // first argument is same between CUDA and C
 
-              //auto placeholder = Call->getArgOperand(0);
-              //printf_args.push_back(placeholder);
+              // Skip the first argument (format string)
+              bool isFirstArg = true;
               for (auto &Arg : Call->args()) {
-                //check Arg is a GEP
-                if (auto GEP = dyn_cast<GetElementPtrInst>(Arg)) {
-                  Type *ElemTy;
-                  if (GEP->getType()->isOpaquePointerTy()) {
-                  // For opaque pointers, we need to get the element type from the GEP instruction
-                  ElemTy = GEP->getSourceElementType();
-                  }
-                  else{
-                    printf("Error: printf GEP operands is not opaque pointer\n");
-                exit(1);
-                  }
-                  //load 를 만들고 그걸로 print 넣기
-                  auto new_load =
-                      new LoadInst(ElemTy,
-                                   GEP, "", Call);
+                if (isFirstArg) {
+                  printf_args.push_back(Arg);
+                  isFirstArg = false;
+                  continue;
+                }
+
+                // If it's not a pointer type, keep it as is
+                if (!Arg->getType()->isPointerTy()) {
+                  printf_args.push_back(Arg);
+                  continue;
+                }
+
+                // For pointers, try to determine element type and create a load
+                Type* ElemTy = getOpaquePointerElementType(Arg);
+                
+                if (ElemTy) {
+                  auto new_load = new LoadInst(ElemTy, Arg, "", Call);
                   printf_args.push_back(new_load);
-                  } else {
-                      printf_args.push_back(Arg);
-                      //LLVM_DEBUG(dbgs() << "Added original argument of type: " << *Arg->getType() << "\n");
-                  }
-              }
-
-
-
-              // insert arguments
-
-              // New try with legacy prior LLVM18 code
-              /*
-              auto compressed_args = Call->getArgOperand(1);
-              if (auto BC = dyn_cast<BitCastInst>(compressed_args)) {
-                auto src_alloc = BC->getOperand(0);
-                auto SrcPointTy = dyn_cast<PointerType>(BC->getOperand(0)->getType());
-                auto SrcTy = SrcPointTy->getPointerElementType();
-                // reverse the bitcast
-                auto reverse_BC = new BitCastInst(BC, SrcPointTy, "", Call);
-                assert(SrcTy->isStructTy() == 1);
-                auto StructTy = dyn_cast<StructType>(SrcTy);
-                for (int i = 0; i < StructTy->getNumElements(); i++) {
-                  std::vector<Value *> Indices;
-                  Indices.push_back(ConstantInt::get(I32, 0));
-                  Indices.push_back(ConstantInt::get(I32, i));
-                  auto new_GEP = GetElementPtrInst::Create(
-                    cast<PointerType>(src_alloc->getType()->getScalarType())
-                          ->getPointerElementType(), // Pointee type
-                                                           src_alloc, // Alloca
-                                                           Indices,   // Indices
-                                                           "", Call);
-                  auto new_load =
-                      new LoadInst(new_GEP->getType()->getPointerElementType(),
-                                   new_GEP, "", Call);
-                  printf_args.push_back(new_load);
-                  
-              */
-              // legacy code before LLVM 18 
-              /*
-              auto compressed_args = Call->getArgOperand(1);
-              if (auto BC = dyn_cast<BitCastInst>(compressed_args)) {
-                auto src_alloc = BC->getOperand(0);
-                auto SrcPointTy = dyn_cast<PointerType>(BC->getOperand(0)->getType());
-                auto SrcTy = SrcPointTy->getPointerElementType();
-                // reverse the bitcast
-                auto reverse_BC = new BitCastInst(BC, SrcPointTy, "", Call);
-                assert(SrcTy->isStructTy() == 1);
-                auto StructTy = dyn_cast<StructType>(SrcTy);
-                for (int i = 0; i < StructTy->getNumElements(); i++) {
-                  std::vector<Value *> Indices;
-                  Indices.push_back(ConstantInt::get(I32, 0));
-                  Indices.push_back(ConstantInt::get(I32, i));
-                  auto new_GEP = GetElementPtrInst::Create(
-                    cast<PointerType>(src_alloc->getType()->getScalarType())
-                          ->getPointerElementType(), // Pointee type
-                                                           src_alloc, // Alloca
-                                                           Indices,   // Indices
-                                                           "", Call);
-                  auto new_load =
-                      new LoadInst(new_GEP->getType()->getPointerElementType(),
-                                   new_GEP, "", Call);
-                  printf_args.push_back(new_load);
-              */
-                  
-
-              //print the whole call instruction (Call)
-
-
-
-              /*
-              auto allocaInst = dyn_cast<AllocaInst>(Call->getArgOperand(1));
-              if (!allocaInst) {
-                // check if allocaInst is nullptr
-                if(isa<ConstantPointerNull>(Call->getArgOperand(1)))
-                printf("warning: the second argument for CUDA print is a null pointer");
-                //create ptr noundef
-
-                //else{
-                //printf("Error: the second arguments for CUDA printf is not an "
-                //       "allocaInst\n");
-                //exit(1);}
-              }
-              */
-
-
-              /*
-              if(!isa<ConstantPointerNull>(Call->getArgOperand(1)))
-              {
-                for (User *U : allocaInst->users()) {
-                  if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
-                    if (ConstantInt *Index =
-                            dyn_cast<ConstantInt>(GEP->getOperand(2))) {
-                      unsigned ArgIndex = Index->getZExtValue();
-                      // Find the store instruction that uses this GEP
-                      for (User *GU : GEP->users()) {
-                        if (StoreInst *Store = dyn_cast<StoreInst>(GU)) {
-                          Value *Arg = Store->getValueOperand();
-                          if (printf_args.size() < ArgIndex + 2)
-                            printf_args.resize(ArgIndex + 2);
-                          // The first argument is the format string,
-                          // so we need to skip it
-                          printf_args[ArgIndex + 1] = Arg;
-                        }
-                      }
-                    }
-                  }
+                } else {
+                  // Cannot determine element type, keep it as is
+                  printf_args.push_back(Arg);
+                  dbgs() << "Warning: Couldn't determine element type for pointer argument\n";
                 }
               }
-              */
+              
               auto c_printf_inst =
                   llvm::CallInst::Create(func_printf, printf_args, "", Call);
               // insert
