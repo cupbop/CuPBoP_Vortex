@@ -561,6 +561,44 @@ void replace_built_in_function(llvm::Module *M) {
               auto grid_size = createLoad(builder, grid_size_addr);
               Call->replaceAllUsesWith(grid_size);
               need_remove.push_back(Call);
+            } else if (func_name == "llvm.nvvm.barrier0") {
+              if (schedule == 2) {
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
+                
+                auto localGroupIdGV = (llvm::GlobalVariable *)M->getNamedGlobal("__local_group_id"); 
+                auto warpsPerGroupGV = (llvm::GlobalVariable *)M->getNamedGlobal("__warps_per_group");
+
+
+                FunctionCallee threadIdxFunc = M->getOrInsertFunction(
+                    "vx_barrier", 
+                    FunctionType::get(
+                      Type::getVoidTy(context), 
+                      {Type::getInt32Ty(context), Type::getInt32Ty(context)},
+                      false
+                    )
+                );
+
+                auto localGroupId = builder.CreateLoad(localGroupIdGV->getValueType(), localGroupIdGV);
+                auto warpsPerGroup = builder.CreateLoad(warpsPerGroupGV->getValueType(), warpsPerGroupGV);
+                
+                CallInst* syncThreads = builder.CreateCall(
+                  threadIdxFunc, 
+                  {localGroupId, warpsPerGroup});
+                
+                MDNode* N = MDNode::get(context, MDString::get(context, "divergence"));
+                syncThreads->setMetadata("divergence", N);
+                
+                Call->replaceAllUsesWith(syncThreads);
+                need_remove.push_back(Call);
+              }
+            } else if (isWarpSync(func_name)) {
+              // Warp barrier is unnecessary in vortex
+              // Removing barriers including warp barrier is usually done at insert_warp_loop stage
+              // Since schedule 2 skips this stage, we remove warp barriers here
+              if (schedule == 2) {
+                need_remove.push_back(Call);
+              }
             }
           }
           if (Call->isInlineAsm()) {

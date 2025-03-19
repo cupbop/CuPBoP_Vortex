@@ -283,6 +283,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n"
           "\n"
 
+          "void (* volatile vx_barrier_dummy)(int, int) = vx_barrier;\n"
+          "\n"
+          "\n"
+
       "struct alignas(8) context_t { \n"
       "uint32_t num_groups[3]; \n"
       "uint32_t global_offset[3]; \n"

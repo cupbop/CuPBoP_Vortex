@@ -147,6 +147,9 @@ void create_global_variable(llvm::Module *M) {
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_z", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
+  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "__warps_per_group", NULL,
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   auto block_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_index_x", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
@@ -165,6 +168,9 @@ void create_global_variable(llvm::Module *M) {
   auto thread_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "thread_id_z", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  auto local_group_id = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "__local_group_id", NULL,
+                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
 
   // LLVM is broken when using TLS with dynamic linkage on RISCV
   // and the generated binary contains invalid instructions.
@@ -176,6 +182,8 @@ void create_global_variable(llvm::Module *M) {
   thread_index_x->setDSOLocal(true);
   thread_index_y->setDSOLocal(true);
   thread_index_z->setDSOLocal(true);
+
+  local_group_id->setDSOLocal(true);
 
   // TLS variable used for warp-level collective operators
   new llvm::GlobalVariable(
