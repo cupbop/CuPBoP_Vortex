@@ -207,11 +207,11 @@ private:
       if (const Function *F = CI->getCalledFunction()) {
         if (F->getName() == "llvm.nvvm.read.ptx.sreg.tid.x" ||
             F->getName() == "llvm.nvvm.read.ptx.sreg.tid.y" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" ||
+            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" //||
             //LLVM 18 added for thread mapping (flat collapsing)
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.z" 
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.z" 
             ) {
           return true;
         }
