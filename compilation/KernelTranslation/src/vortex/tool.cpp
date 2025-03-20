@@ -378,8 +378,8 @@ void replace_built_in_function(llvm::Module *M) {
                   "thread_id_x");
 
                   // Add metadata to indicate non-uniformity
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              //cast<Instruction>(thread_idx)->setMetadata("divergence", N);
 
 
               Call->replaceAllUsesWith(thread_idx);
@@ -402,8 +402,8 @@ void replace_built_in_function(llvm::Module *M) {
                   "thread_id_y");
               
                   // Add metadata to indicate non-uniformity
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              //cast<Instruction>(thread_idx)->setMetadata("divergence", N);
 
               
               Call->replaceAllUsesWith(thread_idx);
@@ -425,13 +425,20 @@ void replace_built_in_function(llvm::Module *M) {
               printf("block_Id-X is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_x");
               IRBuilder<> builder(context);
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
-              auto block_idx = createLoad(builder, block_index_addr);
+
+              //[Mark] fix try for divergence error
+              auto tls_ptr = builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
+              {block_index_addr});
+              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+
+              //auto block_idx = createLoad(builder, block_index_addr);
               // print block_idx instruction
               
 
-              block_idx->setMetadata("divergence", N);
+              //block_idx->setMetadata("divergence", N);
 
               llvm::errs() << "block_idx instruction\n";
               block_idx->print(llvm::errs());
@@ -444,8 +451,16 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
-              auto block_idx = createLoad(builder, block_index_addr);
-              block_idx->setMetadata("divergence", N);
+
+              //auto block_idx = createLoad(builder, block_index_addr);
+              //block_idx->setMetadata("divergence", N);
+
+              //[Mark] fix try for divergence error
+              auto tls_ptr = builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
+              {block_index_addr});
+              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
@@ -454,8 +469,16 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
-              auto block_idx = createLoad(builder, block_index_addr);
-              block_idx->setMetadata("divergence", N);
+
+              //[Mark] fix try for divergence error
+              auto tls_ptr = builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
+              {block_index_addr});
+              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+
+              //auto block_idx = createLoad(builder, block_index_addr);
+              //block_idx->setMetadata("divergence", N);
+
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             }
