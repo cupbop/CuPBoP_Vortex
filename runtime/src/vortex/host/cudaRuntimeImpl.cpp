@@ -305,7 +305,8 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     auto staging_buf = DC->staging_alloc(count);
     auto host_ptr = staging_buf.data();
     uint64_t mem_src_addr = (uint64_t)src;
-    RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_src_addr, count));
+    // RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_src_addr, count));
+    DC->copy_from_dev(mem_src_addr, host_ptr, count);
     uint64_t mem_dst_addr = (uint64_t)dst;
     // RT_CHECK(vx_copy_to_dev(DC->device(), mem_dst_addr, host_ptr, count));
     DC->copy_to_dev(mem_dst_addr, host_ptr, count);
