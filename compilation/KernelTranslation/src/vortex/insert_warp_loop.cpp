@@ -21,7 +21,7 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
-//LLVM 18
+//LLVM 18 
 //#include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
@@ -209,11 +209,11 @@ private:
       if (const Function *F = CI->getCalledFunction()) {
         if (F->getName() == "llvm.nvvm.read.ptx.sreg.tid.x" ||
             F->getName() == "llvm.nvvm.read.ptx.sreg.tid.y" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" ||
+            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" //||
             //LLVM 18 added for thread mapping (flat collapsing)
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.z" 
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
+            //F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.z" 
             ) {
           return true;
         }
@@ -1254,6 +1254,7 @@ public:
     SmallVector<BasicBlock *, 4> pending_blocks;
     BasicBlock *region_entry_barrier = NULL;
     BasicBlock *entry = NULL;
+    // TODO: does it cover when there's multiple predecessors?
     BasicBlock *exit = B->getSinglePredecessor();
     for (BasicBlock *Pred : predecessors(B)) {
       pending_blocks.push_back(Pred);
@@ -1406,6 +1407,9 @@ public:
     
     iter = entry;
     bool any_divergent_var = false;
+    // create a vector of BasicBlock*
+    std::vector<BasicBlock*> checked_blocks;
+    checked_blocks.push_back(entry);
     do {
       //llvm::errs() << "divergent iteration check: \n";
       // go through every variable in the block and check whether they have any divergent variable
@@ -1435,7 +1439,33 @@ public:
       if (iter == exit) {
         break;
       }
-      iter = iter->getTerminator()->getSuccessor(0);
+
+      if (auto *BI = dyn_cast<BranchInst>(iter->getTerminator())) {
+        if (BI->isConditional()) {
+          // pick the “other” successor that isn’t the back‐edge
+          BasicBlock *succ0 = BI->getSuccessor(0);
+          BasicBlock *succ1 = BI->getSuccessor(1);
+          
+          // check if the successor is in the checked_blocks
+          if (std::find(checked_blocks.begin(), checked_blocks.end(), succ0) == checked_blocks.end()) {
+            checked_blocks.push_back(succ0);
+            iter = succ0;
+          }
+          else {
+            checked_blocks.push_back(succ1);
+            iter = succ1;
+          }
+        }
+        else {
+          iter = iter->getTerminator()->getSuccessor(0);
+        }
+      }
+        
+      llvm::errs() << iter->getName().str() << "\n";
+      llvm::errs() << exit->getName().str() << "\n";
+      llvm::errs() << "iter, exit check--------------\n";
+
+
     } while (iter != exit);
     
 
