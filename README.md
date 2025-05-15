@@ -93,6 +93,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    | bfs             |     O      |                          |
    | nn              |     O      | Math Library (sqrt)       |
    | nw              |     O      | Shared Mem + syncthreads  |
+   | srad_v2              |     O      | Shared Mem + syncthreads  |
    | hotspot         |     O      | Shared Mem + syncthreads  |
    | StreamCluster   |     O      | Const Mem                |
    | Myocyte         |     O      |                          |
