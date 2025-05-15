@@ -45,6 +45,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    ```bash
    git clone https://github.com/cupbop/CuPBoP_dev CuPBoP
    cd CuPBoP
+   git checkout vortex-llvm18
    export CuPBoP_PATH=`pwd`
    export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
    ```
