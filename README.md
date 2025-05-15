@@ -20,7 +20,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
 
 1. Setup Vortex Environment 
 
-   Refer to the [Vortex Repo](https://github.com/vortexgpgpu/vortex) for instructions on setting up the Vortex environment. While CuPBoP supports both 32-bit and 64-bit architectures, we recommend building Vortex in 64-bit.  
+   Refer to the [Vortex Repo](https://github.com/vortexgpgpu/vortex) for instructions on setting up the Vortex environment. While CuPBoP supports both 32-bit and 64-bit architectures, **we recommend building Vortex in 64-bit. ** 
    *(If you are part of HParch and have access to the Kia server, you can use the Vortex toolchain/pocl in the shared directory.)*
 
 2. Install Vortex-llvm for CuPBoP (LLVM 18)
