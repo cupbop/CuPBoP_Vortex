@@ -80,7 +80,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    make
    ```
 
-6.	Test benchmarks (table updated on Dec 10, 2024)
+6.	Test benchmarks (table updated on May 14, 2025)
    CuPBoP includes a subset of Rodinia/Hetero-Mark benchmarks to test functionality. Benchmarks supported with Vortex 2.0 are available in the `/example` folder, each with a `kjrun_llvm18.sh` file.
 
    <div align="center">
@@ -92,14 +92,14 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    | bfs             |     O      |                          |
    | nn              |     O      | Math Library (sqrt)       |
    | nw              |     O      | Shared Mem + syncthreads  |
-   | hotspot         |     X      | Shared Mem + syncthreads  |
-   | StreamCluster   |     X      | Const Mem                |
-   | Myocyte         |     X      |                          |
-   | Pathfinder      |     X      | Shared Mem + syncthreads  |
-   | LUD             |     X      | Shared Mem + syncthreads  |
+   | hotspot         |     O      | Shared Mem + syncthreads  |
+   | StreamCluster   |     O      | Const Mem                |
+   | Myocyte         |     O      |                          |
+   | Pathfinder      |     O      | Shared Mem + syncthreads  |
+   | LUD             |     O      | Shared Mem + syncthreads  |
    | CFD             |     X      | device, inline function   |
    | Btree           |     X      |                          |
-   | Backprop        |     X      | __powf, __log2f          |
+   | Backprop        |     O      | __powf, __log2f          |
    | Heartwall       |     X      |                          |
    | Huffman         |     X      | Atomics                  |
 
