@@ -99,7 +99,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    | Pathfinder      |     O      | Shared Mem + syncthreads  |
    | LUD             |     O      | Shared Mem + syncthreads  |
    | CFD             |     X      | device, inline function   |
-   | Btree           |     X      |                          |
+   | Btree           |     O      |                          |
    | Backprop        |     O      | __powf, __log2f          |
    | Heartwall       |     X      |                          |
    | Huffman         |     X      | Atomics                  |
