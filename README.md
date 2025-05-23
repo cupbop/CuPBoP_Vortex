@@ -20,7 +20,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
 
 1. Setup Vortex Environment 
 
-   Refer to the [Vortex Repo](https://github.com/vortexgpgpu/vortex) for instructions on setting up the Vortex environment. While CuPBoP supports both 32-bit and 64-bit architectures, we recommend building Vortex in 64-bit.  
+   Refer to the [Vortex Repo](https://github.com/vortexgpgpu/vortex) for instructions on setting up the Vortex environment. While CuPBoP supports both 32-bit and 64-bit architectures, **(we recommend building Vortex in 64-bit.)** 
    *(If you are part of HParch and have access to the Kia server, you can use the Vortex toolchain/pocl in the shared directory.)*
 
 2. Install Vortex-llvm for CuPBoP (LLVM 18)
@@ -45,6 +45,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    ```bash
    git clone https://github.com/cupbop/CuPBoP_dev CuPBoP
    cd CuPBoP
+   git checkout vortex-llvm18
    export CuPBoP_PATH=`pwd`
    export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
    ```
@@ -80,7 +81,7 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    make
    ```
 
-6.	Test benchmarks (table updated on Dec 10, 2024)
+6.	Test benchmarks (table updated on May 14, 2025)
    CuPBoP includes a subset of Rodinia/Hetero-Mark benchmarks to test functionality. Benchmarks supported with Vortex 2.0 are available in the `/example` folder, each with a `kjrun_llvm18.sh` file.
 
    <div align="center">
@@ -92,14 +93,15 @@ CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVI
    | bfs             |     O      |                          |
    | nn              |     O      | Math Library (sqrt)       |
    | nw              |     O      | Shared Mem + syncthreads  |
-   | hotspot         |     X      | Shared Mem + syncthreads  |
-   | StreamCluster   |     X      | Const Mem                |
-   | Myocyte         |     X      |                          |
-   | Pathfinder      |     X      | Shared Mem + syncthreads  |
-   | LUD             |     X      | Shared Mem + syncthreads  |
+   | srad_v2              |     O      | Shared Mem + syncthreads  |
+   | hotspot         |     O      | Shared Mem + syncthreads  |
+   | StreamCluster   |     O      | Const Mem                |
+   | Myocyte         |     O      |                          |
+   | Pathfinder      |     O      | Shared Mem + syncthreads  |
+   | LUD             |     O      | Shared Mem + syncthreads  |
    | CFD             |     X      | device, inline function   |
-   | Btree           |     X      |                          |
-   | Backprop        |     X      | __powf, __log2f          |
+   | Btree           |     O      |                          |
+   | Backprop        |     O      | __powf, __log2f          |
    | Heartwall       |     X      |                          |
    | Huffman         |     X      | Atomics                  |
 
