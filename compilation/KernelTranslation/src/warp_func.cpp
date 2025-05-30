@@ -13,6 +13,8 @@
 #include <llvm-18/llvm/IR/PassManager.h>
 #include <llvm-18/llvm/Pass.h>
 #include <llvm-18/llvm/Support/Casting.h>
+#include <llvm-18/llvm/Support/Debug.h>
+#include <llvm-18/llvm/Support/raw_ostream.h>
 #include <set>
 
 #include "insert_warp_loop.h"
@@ -22,13 +24,13 @@ namespace cupbop {
 using namespace llvm;
 using namespace std;
 
-ReplaceWarpLevelPrimitive::ReplaceWarpLevelPrimitive(MapOpt mapping) : 
-  ModulePass(PID),
-  mapping_(mapping)
-{}
+ReplaceWarpLevelPrimitive::ReplaceWarpLevelPrimitive(MapOpt mapping)
+    : mapping_(mapping) {}
 
-bool ReplaceWarpLevelPrimitive::runOnModule(Module& m) {
-  return replaceWarpShfl(m) || replaceWarpVote(m);
+PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
+  replaceWarpShfl(m);
+  replaceWarpVote(m);
+  return PreservedAnalyses::all();
 }
 
 bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
@@ -48,7 +50,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
             name_callee == "llvm.nvvm.vote.all.sync" ||
             name_callee == "llvm.nvvm.vote.uni.sync" ||
             name_callee == "llvm.nvvm.vote.ballot.sync") {
-          // insert sync before call
+          dbgs() << "vote detected";
+          ci->print(dbgs(), true);
           replace.insert(ci);
         }
       }
@@ -71,7 +74,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
   return !replace.empty();
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(Module &m, const set<CallInst *> &replace) {
+void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
+    Module &m, const set<CallInst *> &replace) {
   // type
   Type *Int1T = Type::getInt1Ty(m.getContext());
   Type *I32 = Type::getInt32Ty(m.getContext());
@@ -135,7 +139,8 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(Module &m, const set<CallIns
   }
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(Module &m, const set<CallInst *> &replace) {
+void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
+    Module &m, const set<CallInst *> &replace) {
   LLVMContext &Context = m.getContext();
   vector<Type *> ParamTypes(4, Type::getInt32Ty(Context));
   Type *ReturnType = Type::getInt32Ty(Context);
@@ -174,7 +179,8 @@ void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(Module &m, const set<CallIns
   }
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpVoteX86(Module &m, const set<CallInst *> &replace) {}
+void ReplaceWarpLevelPrimitive::replaceWarpVoteX86(
+    Module &m, const set<CallInst *> &replace) {}
 
 bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
   // get the callee functions to be replaced
@@ -193,7 +199,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
             name_callee == "llvm.nvvm.shfl.sync.up.i32" ||
             name_callee == "llvm.nvvm.shfl.sync.bfly.i32" ||
             name_callee == "llvm.nvvm.shfl.sync.idx.i32") {
-          // insert sync before call
+          dbgs() << "shfl detected";
+          ci->print(dbgs(), true);
           replace.insert(ci);
         }
       }
@@ -216,8 +223,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
   return !replace.empty();
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(Module &m,
-                                               const set<CallInst *> &replace) {
+void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
+    Module &m, const set<CallInst *> &replace) {
   // type
   Type *Int1T = Type::getInt1Ty(m.getContext());
   Type *I32 = Type::getInt32Ty(m.getContext());
@@ -290,8 +297,8 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(Module &m,
   }
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(Module &m,
-                                               const set<CallInst *> &replace) {
+void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
+    Module &m, const set<CallInst *> &replace) {
   LLVMContext &Context = m.getContext();
   vector<Type *> ParamTypes(4, Type::getInt32Ty(Context));
   Type *ReturnType = Type::getInt32Ty(Context);
@@ -322,7 +329,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(Module &m,
   }
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpShflX86(Module &m,
-                                               const set<CallInst *> &replace) {}
+void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
+    Module &m, const set<CallInst *> &replace) {}
 
 } // namespace cupbop

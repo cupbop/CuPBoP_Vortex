@@ -2,13 +2,10 @@
 #include "memory_hierarchy.h"
 #include "tool.h"
 #include <fstream>
-#include <iostream>
 #include <set>
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -18,9 +15,12 @@
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+//LLVM18
+//#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+
+//extern void initializeInstrumentation(PassRegistry&);
 
 using namespace llvm;
 
@@ -38,11 +38,11 @@ bool inline_warp_level_func(llvm::Module *M) {
       for (BasicBlock::iterator BI = I->begin(), BE = I->end(); BI != BE;) {
         if (CallInst *c = dyn_cast<CallInst>(BI++)) {
           if (c->getCalledFunction()) {
-            auto func_name = c->getCalledFunction()->getName().str();
+            auto func_name = c->getCalledOperand()->getName().str();
             if (func_name == "_Z10__any_syncji" ||
                 func_name.find("shfl_down_sync") != std::string::npos) {
               InlineFunctionInfo IFI;
-              InlineFunction(c, IFI);
+              InlineFunction(*c, IFI);
               need_remove.insert(c->getCalledFunction());
               changed = true;
             }
@@ -64,7 +64,7 @@ bool find_sreg_inst(llvm::Function *F) {
     for (BasicBlock::iterator BI = I->begin(), BE = I->end(); BI != BE;) {
       if (CallInst *c = dyn_cast<CallInst>(BI++)) {
         if (c->getCalledFunction()) {
-          auto func_name = c->getCalledFunction()->getName().str();
+          auto func_name = c->getCalledOperand()->getName().str();
           if (func_name.find("llvm.nvvm.read.ptx.sreg.") != std::string::npos) {
             return true;
           }
@@ -88,7 +88,7 @@ bool inline_func_with_tid(llvm::Module *M) {
           if (c->getCalledFunction()) {
             if (find_sreg_inst(c->getCalledFunction())) {
               printf("inline: %s\n",
-                     c->getCalledFunction()->getName().str().c_str());
+                     c->getCalledOperand()->getName().str().c_str());
               need_inline.insert(c);
               need_remove.insert(c->getCalledFunction());
             }
@@ -102,7 +102,7 @@ bool inline_func_with_tid(llvm::Module *M) {
   }
   for (auto c : need_inline) {
     InlineFunctionInfo IFI;
-    InlineFunction(c, IFI);
+    InlineFunction(*c, IFI);
   }
   return changed;
 }
@@ -119,40 +119,69 @@ void create_global_variable(llvm::Module *M) {
 
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "intra_warp_index", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "inter_warp_index", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_size_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "grid_size_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "__warps_per_group", NULL,
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
+  auto block_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_index_x", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+  auto block_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_index_y", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+  auto block_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "block_index_z", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  auto thread_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "thread_id_x", NULL,
+                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  auto thread_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "thread_id_y", NULL,
+                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  auto thread_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "thread_id_z", NULL,
+                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  auto local_group_id = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "__local_group_id", NULL,
+                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+
+  // LLVM is broken when using TLS with dynamic linkage on RISCV
+  // and the generated binary contains invalid instructions.
+  // Disable dynamic linkage since we don't create a shared library.
+  block_index_x->setDSOLocal(true);
+  block_index_y->setDSOLocal(true);
+  block_index_z->setDSOLocal(true);
+
+  thread_index_x->setDSOLocal(true);
+  thread_index_y->setDSOLocal(true);
+  thread_index_z->setDSOLocal(true);
+
+  local_group_id->setDSOLocal(true);
+
   // TLS variable used for warp-level collective operators
   new llvm::GlobalVariable(
       *M, WarpArrayType, false, llvm::GlobalValue::ExternalLinkage, NULL,
@@ -161,6 +190,9 @@ void create_global_variable(llvm::Module *M) {
       *M, VoteArrayType, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "warp_vote", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
   warp_vote->setAlignment(llvm::MaybeAlign(32));
+  auto vote_count = new llvm::GlobalVariable(
+      *M, I32, false, llvm::GlobalValue::ExternalLinkage, NULL, 
+      "vote_count", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
 }
 
 void remove_metadata(llvm::Module *M) {
@@ -192,7 +224,7 @@ void init_llvm_pass() {
   initializeAnalysis(Registry);
   initializeTransformUtils(Registry);
   initializeInstCombine(Registry);
-  initializeInstrumentation(Registry);
+  //initializeInstrumentation(Registry);
   initializeTarget(Registry);
 
   llvm::StringMap<llvm::cl::Option *> &opts = llvm::cl::getRegisteredOptions();
@@ -359,6 +391,7 @@ void replace_cuda_math_built_in(llvm::Module *M) {
   }
 }
 
+
 void init_block(llvm::Module *M, std::ofstream &fout) {
   // using official llvm preprocess
   llvm_preprocess(M);
@@ -394,6 +427,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   mem_constant2global(M, fout);
   // replace asm Inline
   replace_asm_call(M);
+
   // replace dynamic shared memory
-  replace_dynamic_shared_memory(M);
+  //replace_dynamic_shared_memory(M);
 }

@@ -13,17 +13,12 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
-#include "llvm/MC/TargetRegistry.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <iostream>
 #include <sstream>
 #include <fstream>
-#include <limits>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -106,8 +101,7 @@ void decode_input(llvm::Module *M) {
           0, false);
       Value *loadedValue = createLoad(Builder, global_mem);
 
-      llvm::FunctionType *LaunchFun2 = FunctionType::get(
-          PointerType::get(PointerType::get(Int32T, 0), 0), NULL);
+      llvm::FunctionType *LaunchFun2 = FunctionType::get(PointerType::get(PointerType::get(Int32T, 0), 0), false);
 
       FunctionCallee fc2 =
           M->getOrInsertFunction("_wrapper_global_data", LaunchFun2);

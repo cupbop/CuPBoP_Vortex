@@ -11,6 +11,9 @@
 #include <assert.h>
 #include <fstream>
 #include <iostream>
+#include <llvm-18/llvm/Analysis/CGSCCPassManager.h>
+#include <llvm-18/llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm-18/llvm/Passes/PassBuilder.h>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Support/raw_ostream.h>
@@ -40,11 +43,24 @@ int main(int argc, char **argv) {
   init_block(program, fout);
 
   dumpFile(program, "0.ll");
-  auto analysis_manager = AnalysisManager<Module>();
-  auto module_pass_manager = PassManager<Module>();
-  auto replace_warp = ReplaceWarpLevelPrimitive(MAPPING_1TO1);
-  module_pass_manager.addPass(replace_warp);
-  module_pass_manager.run(*program, analysis_manager);
+  // Create pass infrastructure
+  PassBuilder PB;
+  ModuleAnalysisManager MAM;
+  FunctionAnalysisManager FAM;
+  LoopAnalysisManager LAM;
+  CGSCCAnalysisManager CGAM;
+
+  // Register analyses
+  PB.registerModuleAnalyses(MAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  // Create pass manager and add your pass
+  ModulePassManager MPM;
+  MPM.addPass(ReplaceWarpLevelPrimitive(MAPPING_1TO1));
+  MPM.run(*program, MAM);
 
   // insert sync
   VerifyModule(program);

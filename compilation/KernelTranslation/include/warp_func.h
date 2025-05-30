@@ -17,18 +17,17 @@ namespace cupbop {
 using namespace llvm;
 using namespace std;
 
-class ReplaceWarpLevelPrimitive : ModulePass {
+class ReplaceWarpLevelPrimitive : public PassInfoMixin<ReplaceWarpLevelPrimitive> {
 
 private:
   /// the mapping options
   MapOpt mapping_;
-  static char PID;
 
 public:
   /// @brief construct warp level primitives & mapping
   ReplaceWarpLevelPrimitive(MapOpt mapping);
   /// @brief replace warp level primitives
-  bool runOnModule(Module &M) override;
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager&);
 
 private:
   /// @brief replace warp vote
