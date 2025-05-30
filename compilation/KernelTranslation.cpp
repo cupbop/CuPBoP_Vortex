@@ -1,3 +1,4 @@
+#include "flag.h"
 #include "generate_wrapper.h"
 #include "handle_sync.h"
 #include "init.h"
@@ -10,12 +11,13 @@
 #include <assert.h>
 #include <fstream>
 #include <iostream>
+#include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/PassManager.h>
 #include <llvm/Support/raw_ostream.h>
-#include <map>
-#include <set>
 #include <stdlib.h>
 
 using namespace llvm;
+using namespace cupbop;
 
 std::string PATH = "kernel_meta.log";
 
@@ -38,21 +40,11 @@ int main(int argc, char **argv) {
   init_block(program, fout);
 
   dumpFile(program, "0.ll");
-
-  VerifyModule(program);
-  // insert sync before each vote, and replace the
-  // original vote function to warp vote
-  std::cout << "handle_warp_vote\n" << std::flush;
-  printIR(program);
-  handle_warp_vote(program);
-
-  dumpFile(program, "1.ll");
-
-  // replace warp shuffle
-  VerifyModule(program);
-  handle_warp_shfl(program);
-
-  dumpFile(program, "2.ll");
+  auto analysis_manager = AnalysisManager<Module>();
+  auto module_pass_manager = PassManager<Module>();
+  auto replace_warp = ReplaceWarpLevelPrimitive(MAPPING_1TO1);
+  module_pass_manager.addPass(replace_warp);
+  module_pass_manager.run(*program, analysis_manager);
 
   // insert sync
   VerifyModule(program);

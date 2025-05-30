@@ -132,8 +132,6 @@ void decode_input(llvm::Module *M) {
       //auto element_type = PT->getElementType();
       auto element_type = PT->getNonOpaquePointerElementType();
 
-
-
       // std::cout << element_type->getTypeID()  << " Got global memor $$$$$$"
       // << share_memory->getName().str() << std::endl;
 

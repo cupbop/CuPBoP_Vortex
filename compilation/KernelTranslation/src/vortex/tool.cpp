@@ -17,11 +17,11 @@
 #include "llvm/Support/FileSystem.h"
 
 // LLVM 18
-//#include "llvm/Support/ManagedStatic.h"
-//#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/SourceMgr.h"
-#include "llvm/Pass.h"
+// #include "llvm/Support/ManagedStatic.h"
+// #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/SourceMgr.h"
 
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
@@ -30,7 +30,6 @@
 
 #include "cg_sync.h"
 #include "llvm_type_utils.h"
-
 
 #include <iostream>
 #include <set>
@@ -119,25 +118,21 @@ llvm::CallInst *CreateInterWarpBarrier(llvm::Instruction *InsertBefore) {
 
 llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore) {
   llvm::Module *M = InsertBefore->getParent()->getParent()->getParent();
-  
+
   // void @llvm.nvvm.bar.warp.sync(i32 %membermask)
-  llvm::FunctionType *LauncherFuncT = llvm::FunctionType::get(
-      llvm::Type::getVoidTy(M->getContext()),
-      { llvm::Type::getInt32Ty(M->getContext()) },
-      false
-  );
-  
+  llvm::FunctionType *LauncherFuncT =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(M->getContext()),
+                              {llvm::Type::getInt32Ty(M->getContext())}, false);
+
   llvm::FunctionCallee f =
       M->getOrInsertFunction("llvm.nvvm.bar.warp.sync", LauncherFuncT);
-  
+
   llvm::Function *F = llvm::cast<llvm::Function>(f.getCallee());
 
   llvm::Constant *AllActiveMask = llvm::ConstantInt::get(
-      llvm::Type::getInt32Ty(M->getContext()),
-      0xFFFFFFFF
-  );
+      llvm::Type::getInt32Ty(M->getContext()), 0xFFFFFFFF);
 
-  return llvm::CallInst::Create(F, { AllActiveMask }, "", InsertBefore);
+  return llvm::CallInst::Create(F, {AllActiveMask}, "", InsertBefore);
 }
 
 llvm::Instruction *BreakPHIToAllocas(PHINode *phi) {
@@ -160,7 +155,8 @@ llvm::Instruction *BreakPHIToAllocas(PHINode *phi) {
   }
   builder.SetInsertPoint(phi);
 
-  llvm::Instruction *loadedValue = createLoad(builder, alloca);//builder.CreateLoad(alloca);
+  llvm::Instruction *loadedValue =
+      createLoad(builder, alloca); // builder.CreateLoad(alloca);
   phi->replaceAllUsesWith(loadedValue);
   phi->eraseFromParent();
 
@@ -232,7 +228,7 @@ static void breakConstantExpressions(llvm::Value *Val, llvm::Function *Func) {
       llvm::Instruction *I = CE->getAsInstruction();
       I->insertBefore(&*Func->begin()->begin());
       printf("--------------------\n");
-      std::cout<<I<<std::endl;
+      std::cout << I << std::endl;
       CE->replaceAllUsesWith(I);
       CE->destroyConstant();
     }
@@ -246,7 +242,7 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
       continue;
     for (Module::global_iterator i = M->global_begin(), e = M->global_end();
          i != e; ++i) {
-        breakConstantExpressions(&*i, F);
+      breakConstantExpressions(&*i, F);
     }
     auto dynamic_shared_memory_addr =
         M->getGlobalVariable("dynamic_shared_memory");
@@ -254,15 +250,15 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
       return;
     }
     auto load_shared_memory = new LoadInst(
-      // LLVM 18
-      //dynamic_shared_memory_addr->getType()->getPointerElementType(),
-      dynamic_shared_memory_addr->getValueType(),
-        dynamic_shared_memory_addr, "new_load", &*F->begin()->begin());
+        // LLVM 18
+        // dynamic_shared_memory_addr->getType()->getPointerElementType(),
+        dynamic_shared_memory_addr->getValueType(), dynamic_shared_memory_addr,
+        "new_load", &*F->begin()->begin());
     auto new_bit_cast =
         new BitCastInst(load_shared_memory,
                         dynamic_shared_memory_addr->getType(), "new_bit_cast");
-    //CHECK NEEDED
-    //(new)new_bit_cast->insertAfter(load_shared_memory);                        
+    // CHECK NEEDED
+    //(new)new_bit_cast->insertAfter(load_shared_memory);
     //(old)new_bit_cast->insertBefore(&*F->begin()->begin());
     //(old)load_shared_memory->insertBefore(new_bit_cast);
     dynamic_shared_memory_addr->replaceUsesWithIf(new_bit_cast, [&](Use &U) {
@@ -292,10 +288,11 @@ void replace_built_in_function(llvm::Module *M) {
     auto global_intra_warp_idx =
         F->getParent()->getGlobalVariable("intra_warp_index");
     auto local_intra_warp_idx =
-        //LLVM 18 
-        //builder.CreateAlloca(global_intra_warp_idx->getType()->getElementType(),
-        //                     0, "local_intra_warp_idx");
-         builder.CreateAlloca(global_intra_warp_idx->getValueType(), 0, "local_intra_warp_idx");
+        // LLVM 18
+        // builder.CreateAlloca(global_intra_warp_idx->getType()->getElementType(),
+        //                      0, "local_intra_warp_idx");
+        builder.CreateAlloca(global_intra_warp_idx->getValueType(), 0,
+                             "local_intra_warp_idx");
     global_intra_warp_idx->replaceUsesWithIf(local_intra_warp_idx, [&](Use &U) {
       auto *Instr = dyn_cast<Instruction>(U.getUser());
       return Instr->getParent()->getParent()->getName().str() == func_name;
@@ -304,12 +301,11 @@ void replace_built_in_function(llvm::Module *M) {
     auto global_inter_warp_idx =
         F->getParent()->getGlobalVariable("inter_warp_index");
 
-    //LLVM 18
-    auto local_inter_warp_idx =
-    builder.CreateAlloca(
+    // LLVM 18
+    auto local_inter_warp_idx = builder.CreateAlloca(
         global_inter_warp_idx->getValueType(), 0, "local_inter_warp_idx");
-        //builder.CreateAlloca(global_inter_warp_idx->getType()->getElementType(),
-        //                     0, "local_inter_warp_idx");
+    // builder.CreateAlloca(global_inter_warp_idx->getType()->getElementType(),
+    //                      0, "local_inter_warp_idx");
 
     builder.CreateStore(ConstantInt::get(I32, 0), local_inter_warp_idx);
 
@@ -317,7 +313,7 @@ void replace_built_in_function(llvm::Module *M) {
       auto *Instr = dyn_cast<Instruction>(U.getUser());
       return Instr->getParent()->getParent()->getName().str() == func_name;
     });
-  
+
     printf(" replacing built-in functions\n");
 
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
@@ -327,10 +323,11 @@ void replace_built_in_function(llvm::Module *M) {
         } else if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
             auto func_name = Call->getCalledOperand()->getName().str();
-            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
-            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x" ){//||
-                //func_name ==
-                //    "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
+            // Mark: Temporarily commented out the _ZN25 function, we don't
+            // think it's being used in vortex
+            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x") { //||
+              // func_name ==
+              //     "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
               auto block_size_addr = M->getGlobalVariable("block_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -352,136 +349,145 @@ void replace_built_in_function(llvm::Module *M) {
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
             }
-            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
-             else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x" ){//||
-              //         func_name == "_ZN26__cuda_builtin_threadIdx_t17__fetch_"
-              //                      "builtin_xEv") {
-              // replace it by warp_id
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x") {
+              if (schedule == 2) {
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
 
-              // Mark: printing out the warp_idx values
-              // printf("global_intra_warp_idx is : %d \n", global_intra_warp_idx);
-              // printf("global_inter_warp_idx is : %d \n", global_inter_warp_idx);
+                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
+                    M->getOrInsertGlobal("thread_id_x", I32));
 
-                if (schedule == 2) {
-                    IRBuilder<> builder(context);
-                    builder.SetInsertPoint(Call);
-                    
-                    GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(M->getOrInsertGlobal("thread_id_x", I32));
+                auto threadLocalAddr = builder.CreateIntrinsic(
+                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
+                    {threadIdx}, nullptr);
+                auto tidx = builder.CreateLoad(I32, threadLocalAddr, "tidx");
 
-                    auto threadLocalAddr = builder.CreateIntrinsic(
-                      Intrinsic::threadlocal_address, 
-                      {I32->getPointerTo()}, 
-                      {threadIdx}, 
-                      nullptr);
-                    auto tidx = builder.CreateLoad(I32, threadLocalAddr, "tidx");
+                MDNode *N =
+                    MDNode::get(context, MDString::get(context, "divergence"));
+                tidx->setMetadata("divergence", N);
 
-                    MDNode* N = MDNode::get(context, MDString::get(context, "divergence"));
-                    tidx->setMetadata("divergence", N);
+                Call->replaceAllUsesWith(tidx);
+                need_remove.push_back(Call);
+              } else {
+                auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
+                errs() << block_size_x_tmp;
 
-                    Call->replaceAllUsesWith(tidx);
-                    need_remove.push_back(Call);
-                } else {
-                      auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
-                      errs() << block_size_x_tmp;
-                      
-                      Constant* const_intra_warp_idx = global_intra_warp_idx->getInitializer();
-                      Constant* const_inter_warp_idx = global_inter_warp_idx->getInitializer();
-                      //Constant* const_block_size_x = block_size_x_tmp->getInitializer();
+                Constant *const_intra_warp_idx =
+                    global_intra_warp_idx->getInitializer();
+                Constant *const_inter_warp_idx =
+                    global_inter_warp_idx->getInitializer();
+                // Constant* const_block_size_x =
+                // block_size_x_tmp->getInitializer();
 
-                      ConstantInt* con_intra_warp_idx = cast<ConstantInt>(const_intra_warp_idx);
-                      ConstantInt* con_inter_warp_idx = cast<ConstantInt>(const_inter_warp_idx);
-                      //ConstantInt* con_block_size_x = cast<ConstantInt>(const_block_size_x);
+                ConstantInt *con_intra_warp_idx =
+                    cast<ConstantInt>(const_intra_warp_idx);
+                ConstantInt *con_inter_warp_idx =
+                    cast<ConstantInt>(const_inter_warp_idx);
+                // ConstantInt* con_block_size_x =
+                // cast<ConstantInt>(const_block_size_x);
 
-                      int32_t int_intra_warp_idx = con_intra_warp_idx->getSExtValue(); //changed to 32
-                      int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
-                      //int64_t int_block_size_x = con_block_size_x->getSExtValue();
+                int32_t int_intra_warp_idx =
+                    con_intra_warp_idx->getSExtValue(); // changed to 32
+                int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
+                // int64_t int_block_size_x = con_block_size_x->getSExtValue();
 
-                      printf("intra warp corresponding value is : %d \n", int_intra_warp_idx);
-                      printf("inter warp corresponding value is : %d \n", int_inter_warp_idx);
-                      //printf("block size x corresponding value is : %ld \n", int_block_size_x);
+                printf("intra warp corresponding value is : %d \n",
+                       int_intra_warp_idx);
+                printf("inter warp corresponding value is : %d \n",
+                       int_inter_warp_idx);
+                // printf("block size x corresponding value is : %ld \n",
+                // int_block_size_x);
 
-                  // Mark Debug: Until here (printing out warp_idx values)
+                // Mark Debug: Until here (printing out warp_idx values)
 
-                  IRBuilder<> builder(context);
-                  builder.SetInsertPoint(Call);
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
 
-                  auto thread_idx = builder.CreateBinOp(
-                      Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                      ConstantInt::get(I32, 32), ""); // Mark temp  (changed 32 -> 4)
-                  thread_idx = builder.CreateBinOp(
-                      //Instruction::Add, builder.CreateLoad(local_intra_warp_idx),
-                      Instruction::Add, createLoad(builder, local_intra_warp_idx),
-                      thread_idx, "thread_idx");
+                auto thread_idx = builder.CreateBinOp(
+                    Instruction::Mul, createLoad(builder, local_inter_warp_idx),
+                    ConstantInt::get(I32, 32),
+                    ""); // Mark temp  (changed 32 -> 4)
+                thread_idx = builder.CreateBinOp(
+                    // Instruction::Add,
+                    // builder.CreateLoad(local_intra_warp_idx),
+                    Instruction::Add, createLoad(builder, local_intra_warp_idx),
+                    thread_idx, "thread_idx");
 
-                  thread_idx = builder.CreateBinOp(
-                      Instruction::SRem, thread_idx,
-                      createLoad(builder, M->getGlobalVariable("block_size_x")),
-                      "thread_id_x");
+                thread_idx = builder.CreateBinOp(
+                    Instruction::SRem, thread_idx,
+                    createLoad(builder, M->getGlobalVariable("block_size_x")),
+                    "thread_id_x");
 
-                  // Add metadata to indicate non-uniformity
-              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              //cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+                // Add metadata to indicate non-uniformity
+                // MDNode* N = MDNode::get(context, MDString::get(context,
+                // "non-uniform"));
+                // cast<Instruction>(thread_idx)->setMetadata("divergence", N);
 
-
-                  Call->replaceAllUsesWith(thread_idx);
-                  need_remove.push_back(Call);
-                }
+                Call->replaceAllUsesWith(thread_idx);
+                need_remove.push_back(Call);
+              }
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.y") {
-                if (schedule == 2) {
-                  IRBuilder<> builder(context);
-                  builder.SetInsertPoint(Call);
-                  
-                  GlobalVariable *threadIdxVar = (GlobalVariable *)M->getOrInsertGlobal("threadIdx", 
-                      StructType::get(context, {I32, I32, I32}, false));
-                  threadIdxVar->setLinkage(GlobalValue::ExternalLinkage);
-                  
-                  /* typedef union {
-                      struct {
-                        uint32_t x;
-                        uint32_t y;
-                        uint32_t z;
-                      };
-                      uint32_t m[3];
-                    } dim3_t;
+              if (schedule == 2) {
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
 
-                    extern __thread dim3_t blockIdx;
-                    extern __thread dim3_t threadIdx;
-                  */
-                  std::vector<Value *> indices;
-                  indices.push_back(ConstantInt::get(I32, 0));  // threadIdx->struct
-                  indices.push_back(ConstantInt::get(I32, 1));  // threadIdx->struct->y
-                  
-                  Value *tidxPtr = createGEP(builder, threadIdxVar, indices);
-                  Value *tidx = createLoad(builder, tidxPtr);
-                  
-                  // Add metadata to indicate non-uniformity
-                  MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-                  cast<Instruction>(tidx)->setMetadata("divergence", N);
-                  
-                  Call->replaceAllUsesWith(tidx);
-                  need_remove.push_back(Call);
+                GlobalVariable *threadIdxVar =
+                    (GlobalVariable *)M->getOrInsertGlobal(
+                        "threadIdx",
+                        StructType::get(context, {I32, I32, I32}, false));
+                threadIdxVar->setLinkage(GlobalValue::ExternalLinkage);
+
+                /* typedef union {
+                    struct {
+                      uint32_t x;
+                      uint32_t y;
+                      uint32_t z;
+                    };
+                    uint32_t m[3];
+                  } dim3_t;
+
+                  extern __thread dim3_t blockIdx;
+                  extern __thread dim3_t threadIdx;
+                */
+                std::vector<Value *> indices;
+                indices.push_back(
+                    ConstantInt::get(I32, 0)); // threadIdx->struct
+                indices.push_back(
+                    ConstantInt::get(I32, 1)); // threadIdx->struct->y
+
+                Value *tidxPtr = createGEP(builder, threadIdxVar, indices);
+                Value *tidx = createLoad(builder, tidxPtr);
+
+                // Add metadata to indicate non-uniformity
+                MDNode *N =
+                    MDNode::get(context, MDString::get(context, "non-uniform"));
+                cast<Instruction>(tidx)->setMetadata("divergence", N);
+
+                Call->replaceAllUsesWith(tidx);
+                need_remove.push_back(Call);
               } else {
                 // replace it by warp_id
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
 
-              auto thread_idx = builder.CreateBinOp(
-                  Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                  ConstantInt::get(I32, 4), ""); // Mark temp  (changed 32 -> 4)
-              thread_idx = builder.CreateBinOp(
-                  Instruction::Add, createLoad(builder, local_intra_warp_idx),
-                  thread_idx, "thread_idx");
-              // tidy = tid / block_dim.x
-              thread_idx = builder.CreateBinOp(
-                  Instruction::SDiv, thread_idx,
-                  createLoad(builder, M->getGlobalVariable("block_size_x")),
-                  "thread_id_y");
-              
-                  // Add metadata to indicate non-uniformity
-              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
-              //cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+                auto thread_idx = builder.CreateBinOp(
+                    Instruction::Mul, createLoad(builder, local_inter_warp_idx),
+                    ConstantInt::get(I32, 4),
+                    ""); // Mark temp  (changed 32 -> 4)
+                thread_idx = builder.CreateBinOp(
+                    Instruction::Add, createLoad(builder, local_intra_warp_idx),
+                    thread_idx, "thread_idx");
+                // tidy = tid / block_dim.x
+                thread_idx = builder.CreateBinOp(
+                    Instruction::SDiv, thread_idx,
+                    createLoad(builder, M->getGlobalVariable("block_size_x")),
+                    "thread_id_y");
 
-                
+                // Add metadata to indicate non-uniformity
+                // MDNode* N = MDNode::get(context, MDString::get(context,
+                // "non-uniform"));
+                // cast<Instruction>(thread_idx)->setMetadata("divergence", N);
+
                 Call->replaceAllUsesWith(thread_idx);
                 need_remove.push_back(Call);
               }
@@ -492,51 +498,56 @@ void replace_built_in_function(llvm::Module *M) {
               Call->replaceAllUsesWith(zero);
               need_remove.push_back(Call);
             }
-            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex 
-            
+            // Mark: Temporarily commented out the _ZN25 function, we don't
+            // think it's being used in vortex
 
-            else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ){//||
-                       //func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
-                       //             "builtin_xEv") {
-              /* replace this with what??? */  // hyesoon 
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x") { //||
+              // func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
+              //              "builtin_xEv") {
+              /* replace this with what??? */ // hyesoon
               printf("block_Id-X is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_x");
               IRBuilder<> builder(context);
-              //MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              // MDNode* N = MDNode::get(context, MDString::get(context,
+              // "non-uniform"));
               builder.SetInsertPoint(Call);
 
               //[Mark] fix try for divergence error
               auto tls_ptr = builder.CreateCall(
-              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
-              {block_index_addr});
-              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                            {block_index_addr->getType()}),
+                  {block_index_addr});
+              auto block_idx =
+                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
 
-              //auto block_idx = createLoad(builder, block_index_addr);
-              // print block_idx instruction
-              
+              // auto block_idx = createLoad(builder, block_index_addr);
+              //  print block_idx instruction
 
-              //block_idx->setMetadata("divergence", N);
+              // block_idx->setMetadata("divergence", N);
 
               llvm::errs() << "block_idx instruction\n";
               block_idx->print(llvm::errs());
-              
+
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y") {
               printf("block_Id-Y is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_y");
               IRBuilder<> builder(context);
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              MDNode *N =
+                  MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
 
-              //auto block_idx = createLoad(builder, block_index_addr);
-              //block_idx->setMetadata("divergence", N);
+              // auto block_idx = createLoad(builder, block_index_addr);
+              // block_idx->setMetadata("divergence", N);
 
               //[Mark] fix try for divergence error
               auto tls_ptr = builder.CreateCall(
-              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
-              {block_index_addr});
-              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                            {block_index_addr->getType()}),
+                  {block_index_addr});
+              auto block_idx =
+                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
 
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
@@ -544,25 +555,29 @@ void replace_built_in_function(llvm::Module *M) {
               printf("block_Id-Z is called\n");
               auto block_index_addr = M->getGlobalVariable("block_index_z");
               IRBuilder<> builder(context);
-              MDNode* N = MDNode::get(context, MDString::get(context, "non-uniform"));
+              MDNode *N =
+                  MDNode::get(context, MDString::get(context, "non-uniform"));
               builder.SetInsertPoint(Call);
 
               //[Mark] fix try for divergence error
               auto tls_ptr = builder.CreateCall(
-              Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {block_index_addr->getType()}),
-              {block_index_addr});
-              auto block_idx = builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
+                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                            {block_index_addr->getType()}),
+                  {block_index_addr});
+              auto block_idx =
+                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
 
-              //auto block_idx = createLoad(builder, block_index_addr);
-              //block_idx->setMetadata("divergence", N);
+              // auto block_idx = createLoad(builder, block_index_addr);
+              // block_idx->setMetadata("divergence", N);
 
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             }
-            // Mark: Temporarily commented out the _ZN25 function, we don't think it's being used in vortex
-             else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x" ){// ||
-                       //func_name == "_ZN24__cuda_builtin_gridDim_t17__fetch_"
-                       //             "builtin_xEv") {
+            // Mark: Temporarily commented out the _ZN25 function, we don't
+            // think it's being used in vortex
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x") { // ||
+              // func_name == "_ZN24__cuda_builtin_gridDim_t17__fetch_"
+              //              "builtin_xEv") {
               auto grid_size_addr = M->getGlobalVariable("grid_size_x");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
@@ -587,37 +602,39 @@ void replace_built_in_function(llvm::Module *M) {
               if (schedule == 2) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
-                
-                auto localGroupIdGV = (llvm::GlobalVariable *)M->getNamedGlobal("__local_group_id"); 
-                auto warpsPerGroupGV = (llvm::GlobalVariable *)M->getNamedGlobal("__warps_per_group");
 
+                auto localGroupIdGV = (llvm::GlobalVariable *)M->getNamedGlobal(
+                    "__local_group_id");
+                auto warpsPerGroupGV =
+                    (llvm::GlobalVariable *)M->getNamedGlobal(
+                        "__warps_per_group");
 
                 FunctionCallee threadIdxFunc = M->getOrInsertFunction(
-                    "vx_barrier", 
-                    FunctionType::get(
-                      Type::getVoidTy(context), 
-                      {Type::getInt32Ty(context), Type::getInt32Ty(context)},
-                      false
-                    )
-                );
+                    "vx_barrier", FunctionType::get(Type::getVoidTy(context),
+                                                    {Type::getInt32Ty(context),
+                                                     Type::getInt32Ty(context)},
+                                                    false));
 
-                auto localGroupId = builder.CreateLoad(localGroupIdGV->getValueType(), localGroupIdGV);
-                auto warpsPerGroup = builder.CreateLoad(warpsPerGroupGV->getValueType(), warpsPerGroupGV);
-                
-                CallInst* syncThreads = builder.CreateCall(
-                  threadIdxFunc, 
-                  {localGroupId, warpsPerGroup});
-                
-                MDNode* N = MDNode::get(context, MDString::get(context, "divergence"));
+                auto localGroupId = builder.CreateLoad(
+                    localGroupIdGV->getValueType(), localGroupIdGV);
+                auto warpsPerGroup = builder.CreateLoad(
+                    warpsPerGroupGV->getValueType(), warpsPerGroupGV);
+
+                CallInst *syncThreads = builder.CreateCall(
+                    threadIdxFunc, {localGroupId, warpsPerGroup});
+
+                MDNode *N =
+                    MDNode::get(context, MDString::get(context, "divergence"));
                 syncThreads->setMetadata("divergence", N);
-                
+
                 Call->replaceAllUsesWith(syncThreads);
                 need_remove.push_back(Call);
               }
             } else if (isWarpSync(func_name)) {
               // Warp barrier is unnecessary in vortex
-              // Removing barriers including warp barrier is usually done at insert_warp_loop stage
-              // Since schedule 2 skips this stage, we remove warp barriers here
+              // Removing barriers including warp barrier is usually done at
+              // insert_warp_loop stage Since schedule 2 skips this stage, we
+              // remove warp barriers here
               if (schedule == 2) {
                 need_remove.push_back(Call);
               }
@@ -650,9 +667,8 @@ void replace_built_in_function(llvm::Module *M) {
             auto callFn = Call->getCalledFunction();
             if (func_name == "vprintf") {
 
-
-              llvm::FunctionType *printfType =
-                  FunctionType::get(I32, {PointerType::getUnqual(context)}, true);
+              llvm::FunctionType *printfType = FunctionType::get(
+                  I32, {PointerType::getUnqual(context)}, true);
               llvm::FunctionCallee _f =
                   M->getOrInsertFunction("vx_printf", printfType);
               llvm::Function *func_printf =
@@ -675,26 +691,27 @@ void replace_built_in_function(llvm::Module *M) {
                 }
 
                 // For pointers, try to determine element type and create a load
-                Type* ElemTy = getOpaquePointerElementType(Arg);
-                
+                Type *ElemTy = getOpaquePointerElementType(Arg);
+
                 if (ElemTy) {
                   auto new_load = new LoadInst(ElemTy, Arg, "", Call);
                   printf_args.push_back(new_load);
                 } else {
                   // Cannot determine element type, keep it as is
                   printf_args.push_back(Arg);
-                  dbgs() << "Warning: Couldn't determine element type for pointer argument\n";
+                  dbgs() << "Warning: Couldn't determine element type for "
+                            "pointer argument\n";
                 }
               }
-              
+
               auto c_printf_inst =
                   llvm::CallInst::Create(func_printf, printf_args, "", Call);
               // insert
               Call->replaceAllUsesWith(c_printf_inst);
               Call->print(errs());
-              //print Call->getArgOperand(1)
+              // print Call->getArgOperand(1)
               Call->getArgOperand(1)->print(errs());
-              //print the entire module
+              // print the entire module
               M->print(errs(), nullptr);
               need_remove.push_back(Call);
             } else if (func_name == "__nv_fast_log2f" ||
@@ -796,8 +813,7 @@ bool has_barrier(llvm::BasicBlock *B) {
       if (Call->isInlineAsm())
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
-      if (func_name == "llvm.nvvm.barrier0" ||
-          isWarpSync(func_name) ||
+      if (func_name == "llvm.nvvm.barrier0" || isWarpSync(func_name) ||
           func_name == "llvm.nvvm.barrier.sync") {
         return true;
       }
@@ -884,10 +900,10 @@ bool find_barrier_in_region(llvm::BasicBlock *start, llvm::BasicBlock *end) {
   Print IR Module for Debugging Purposes
 */
 void printIR(llvm::Module *module_) {
- std::string module_str;
- llvm::raw_string_ostream ostream{module_str};
- module_->print(ostream, nullptr, false);
- std::cout << module_str << std::endl;
+  std::string module_str;
+  llvm::raw_string_ostream ostream{module_str};
+  module_->print(ostream, nullptr, false);
+  std::cout << module_str << std::endl;
 }
 
 /*
@@ -908,12 +924,11 @@ void printIR(llvm::Module *module_) {
 //   }
 // }
 
-
 LoadInst *createLoad(IRBuilder<> &B, Value *addr, bool isVolatile) {
-  // Before LLVM 18 
-  //return B.CreateLoad(addr->getType()->getPointerElementType(), addr,
+  // Before LLVM 18
+  // return B.CreateLoad(addr->getType()->getPointerElementType(), addr,
   //                    isVolatile);
-    llvm::Type *elementType = nullptr;
+  llvm::Type *elementType = nullptr;
   if (auto *allocaInst = dyn_cast<AllocaInst>(addr)) {
     elementType = allocaInst->getAllocatedType();
   } else if (auto *globalVar = dyn_cast<GlobalVariable>(addr)) {
@@ -936,8 +951,8 @@ LoadInst *createLoad(IRBuilder<> &B, Value *addr, bool isVolatile) {
 Value *createInBoundsGEP(IRBuilder<> &B, Value *ptr,
                          ArrayRef<Value *> idxlist) {
   // Before LLVM 18
-  //return B.CreateInBoundsGEP(
-    //  ptr->getType()->getScalarType()->getPointerElementType(), ptr, idxlist);
+  // return B.CreateInBoundsGEP(
+  //  ptr->getType()->getScalarType()->getPointerElementType(), ptr, idxlist);
 
   llvm::Type *elementType = nullptr;
   if (auto *allocaInst = dyn_cast<AllocaInst>(ptr)) {
@@ -960,9 +975,10 @@ Value *createInBoundsGEP(IRBuilder<> &B, Value *ptr,
 
 Value *createGEP(IRBuilder<> &B, Value *ptr, ArrayRef<Value *> idxlist) {
   // Before LLVM 18
-  //return B.CreateGEP(ptr->getType()->getScalarType()->getPointerElementType(),
+  // return
+  // B.CreateGEP(ptr->getType()->getScalarType()->getPointerElementType(),
   //                   ptr, idxlist);
-    llvm::Type *elementType = nullptr;
+  llvm::Type *elementType = nullptr;
   if (auto *allocaInst = dyn_cast<AllocaInst>(ptr)) {
     elementType = allocaInst->getAllocatedType();
   } else if (auto *globalVar = dyn_cast<GlobalVariable>(ptr)) {
@@ -972,8 +988,8 @@ Value *createGEP(IRBuilder<> &B, Value *ptr, ArrayRef<Value *> idxlist) {
   } else if (auto *bitCastInst = dyn_cast<BitCastInst>(ptr)) {
     elementType = bitCastInst->getDestTy();
   } else {
-    //LLVM 18, temporarily disabled (Link issue to be fixed)
-    //ptr->dump();
+    // LLVM 18, temporarily disabled (Link issue to be fixed)
+    // ptr->dump();
     errs() << "Unable to determine element type for ptr in createGEP\n";
     return nullptr;
   }
