@@ -172,50 +172,29 @@ CuPBoP includes a subset of Rodinia/Hetero-Mark benchmarks to test functionality
 
   
 
-<div  align="center">
+   <div align="center">
 
-  
+   | Benchmark       | Supported? | CUDA feature             |
+   |------------------|:----------:|--------------------------|
+   | microbench (saxpy) |     O      |                          |
+   | gauss           |     O      | Multi-kernel in series    |
+   | bfs             |     O      |                          |
+   | nn              |     O      | Math Library (sqrt)       |
+   | nw              |     O      | Shared Mem + syncthreads  |
+   | srad_v2              |     O      | Shared Mem + syncthreads  |
+   | hotspot         |     O      | Shared Mem + syncthreads  |
+   | StreamCluster   |     O      | Const Mem                |
+   | Myocyte         |     O      |                          |
+   | Pathfinder      |     O      | Shared Mem + syncthreads  |
+   | LUD             |     O      | Shared Mem + syncthreads  |
+   | CFD             |     X      | device, inline function   |
+   | Btree           |     O      |                          |
+   | Backprop        |     O      | __powf, __log2f          |
+   | Heartwall       |     X      |                          |
+   | Huffman         |     X      | Atomics                  |
 
-| Benchmark | Supported? | CUDA feature |
 
-|------------------|:----------:|--------------------------|
-
-| microbench (saxpy) | O | |
-
-| gauss | O | Multi-kernel in series |
-
-| bfs | O | |
-
-| nn | O | Math Library (sqrt) |
-
-| nw | O | Shared Mem + syncthreads |
-
-| srad_v2 | O | Shared Mem + syncthreads |
-
-| hotspot | O | Shared Mem + syncthreads |
-
-| StreamCluster | O | Const Mem |
-
-| Myocyte | O | |
-
-| Pathfinder | O | Shared Mem + syncthreads |
-
-| LUD | O | Shared Mem + syncthreads |
-
-| CFD | X | device, inline function |
-
-| Btree | O | |
-
-| Backprop | O | __powf, __log2f |
-
-| Heartwall | X | |
-
-| Huffman | X | Atomics |
-
-  
-  
-
-</div>
+   </div>
 
 
 ## Installation Issues
