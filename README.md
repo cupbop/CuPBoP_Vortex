@@ -9,7 +9,9 @@
 CuPBoP is a framework designed to execute unmodified CUDA source code on non-NVIDIA devices. It currently supports several CPU backends, including x86 and AArch64, as well as GPU backends such as AMD GPUs and the open-source RISC-V (Vortex). This repository specifically focuses on enabling CUDA execution on Vortex [GitHub link](https://github.com/vortexgpgpu/vortex).
 
 Please look at the following files to understand the basics of CuPBoP:
-[Basic Definitions and Concepts](./docs/README_Defs.md))
+
+[Basic Definitions and Concepts](./docs/README_Defs.md)
+
 [Codebase Overview](./docs/README_Codebase.md)
 
   
