@@ -27,7 +27,7 @@
 
 Below is the architectural diagram for our work, which is taking a CUDA program and making it compatible for RISC-V.
 
-Image
+[Image](./CuPBoP_Architecture.png)
 
 In this diagram, we have 4 stages:
 
