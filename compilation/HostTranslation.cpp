@@ -35,9 +35,9 @@ int main(int argc, char **argv) {
 
   // remove builtin unuse functions and variables
   RemoveCudaBuiltin(hostModule);
-  
+
   // replace arguments in kernel_arg, from alloc to malloc
-  //ReplaceKernelArg(hostModule);
+  // ReplaceKernelArg(hostModule);
   VerifyModule(hostModule);
   DumpModule(hostModule, output_host_path);
 

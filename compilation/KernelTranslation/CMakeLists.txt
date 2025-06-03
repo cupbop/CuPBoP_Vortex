@@ -17,7 +17,7 @@ set(CMAKE_BUILD_TYPE Debug)
 include_directories(./include)
 
 file(GLOB proj_HEADERS "include/*.h")
-file(GLOB proj_SOURCES "src/vortex/*.cpp")
+file(GLOB proj_SOURCES "src/*.cpp")
 
 # Add core library.
 add_library(${LIB_NAME} STATIC ${proj_HEADERS} ${proj_SOURCES})

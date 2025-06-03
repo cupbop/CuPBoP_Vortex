@@ -1,3 +1,4 @@
+#include "flag.h"
 #include "generate_wrapper.h"
 #include "handle_sync.h"
 #include "init.h"
@@ -10,12 +11,16 @@
 #include <assert.h>
 #include <fstream>
 #include <iostream>
+#include <llvm-18/llvm/Analysis/CGSCCPassManager.h>
+#include <llvm-18/llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm-18/llvm/Passes/PassBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/PassManager.h>
 #include <llvm/Support/raw_ostream.h>
-#include <map>
-#include <set>
 #include <stdlib.h>
 
 using namespace llvm;
+using namespace cupbop;
 
 std::string PATH = "kernel_meta.log";
 
@@ -38,21 +43,24 @@ int main(int argc, char **argv) {
   init_block(program, fout);
 
   dumpFile(program, "0.ll");
+  // Create pass infrastructure
+  PassBuilder PB;
+  ModuleAnalysisManager MAM;
+  FunctionAnalysisManager FAM;
+  LoopAnalysisManager LAM;
+  CGSCCAnalysisManager CGAM;
 
-  VerifyModule(program);
-  // insert sync before each vote, and replace the
-  // original vote function to warp vote
-  std::cout << "handle_warp_vote\n" << std::flush;
-  printIR(program);
-  handle_warp_vote(program);
+  // Register analyses
+  PB.registerModuleAnalyses(MAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  dumpFile(program, "1.ll");
-
-  // replace warp shuffle
-  VerifyModule(program);
-  handle_warp_shfl(program);
-
-  dumpFile(program, "2.ll");
+  // Create pass manager and add your pass
+  ModulePassManager MPM;
+  MPM.addPass(ReplaceWarpLevelPrimitive(MAPPING_1TO1));
+  MPM.run(*program, MAM);
 
   // insert sync
   VerifyModule(program);

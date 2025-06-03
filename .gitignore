@@ -1,6 +1,9 @@
 # Prerequisites
 *.d
 
+# Clangd File
+.cache
+
 # Compiled Object files
 *.slo
 *.lo

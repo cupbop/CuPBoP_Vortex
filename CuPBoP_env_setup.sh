@@ -1,6 +1,6 @@
 ########## USER DEFINED VARIABLES ##########
 export VORTEX_ARCHITECTURE=64     #(32 or 64)
-export VORTEX_SCHEDULE_FLAG=0     #(0(TM) or 1(CM)
+export VORTEX_SCHEDULE_FLAG=2     #(0(TM) or 1(CM)
 #############################################
 
 if [ -z "${TOOLDIR}" ]; then

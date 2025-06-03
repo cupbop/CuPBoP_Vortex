@@ -1,14 +1,5 @@
 #include "cg_sync.h"
 
-#include "llvm/IR/Function.h"
-#include "llvm/IR/GlobalValue.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-
-
 bool isCGThreadBlockSync(const std::string &FuncNameStr) {
     // cg::
     bool hasCgnamespace = FuncNameStr.find("cooperative_groups") != FuncNameStr.npos;
