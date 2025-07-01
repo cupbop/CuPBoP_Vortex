@@ -9,7 +9,7 @@ KERNEL_CU=gaussian.cu
 ARCH=64
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=0
+export VORTEX_SCHEDULE_FLAG=2
 
 show_usage()
 {
@@ -109,6 +109,8 @@ llvm-dis $KERNEL-host-x86_64-unknown-linux-gnu.bc
 echo "--- Translate the kernel bitcode by using CuPBoP's kernel translator"
 #$CuPBoP_PATH/build/compilation/kernelTranslator.x86 $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel_host.bc 
 $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc 
+# gdb --args $CuPBoP_PATH/build/compilation/kernelTranslator $KERNEL-cuda-nvptx64-nvidia-cuda-sm_50.bc kernel.bc
+
 llvm-dis kernel.bc
 
 echo "--- Translate the host bitcode by using CuPBoP's host translator"
@@ -145,7 +147,7 @@ then
         VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_HOME}/kernel/linker/vx_link32.ld,--defsym=XLEN=32,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     else
         VX_CFLAGS="-O3 --sysroot=${RISCV_TOOLCHAIN}/riscv64-unknown-elf --gcc-toolchain=${TOOLDIR}/riscv64-gnu-toolchain -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I${VORTEX_HOME}/kernel/include -I${VORTEX_PATH}/kernel/../hw -DXLEN_64 -DNDEBUG"
-        VX_LDFLAGS="-Wl,-Bstatic,--gc-sections,-T,${VORTEX_HOME}/kernel/scripts/link64.ld,--defsym=STARTUP_ADDR=0x180000000 ${VORTEX_HOME}/build/kernel/libvortex.a -L${TOOLDIR}/libc64/lib -lm -lc ${TOOLDIR}/libcrt64/lib/baremetal/libclang_rt.builtins-riscv64.a"
+        VX_LDFLAGS="-Wl,-Bstatic,--gc-sections,-T,${VORTEX_HOME}/kernel/scripts/link64.ld,--defsym=STARTUP_ADDR=0x080000000 ${VORTEX_HOME}/build/kernel/libvortex.a -L${TOOLDIR}/libc64/lib -lm -lc ${TOOLDIR}/libcrt64/lib/baremetal/libclang_rt.builtins-riscv64.a"
     fi
 
     echo "--- compiling kernel.bc"

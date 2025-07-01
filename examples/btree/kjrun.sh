@@ -141,7 +141,7 @@ then
         VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link32.ld,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     else
         VX_CFLAGS="-v -O3 -std=c++11 --sysroot=/opt/riscv64-gnu-toolchain/riscv64-unknown-elf --target=riscv64 -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_PATH}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
-        VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x180000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
+        VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_PATH}/kernel/linker/vx_link64.ld,--defsym=XLEN=64,--defsym=STARTUP_ADDR=0x080000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     fi
 
     echo "--- compiling kernel.bc"
