@@ -8,8 +8,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-#include <llvm-18/llvm/IR/PassManager.h>
-#include <llvm-18/llvm/Support/Casting.h>
+#include "llvm/IR/PassManager.h"
+#include "llvm/Support/Casting.h"
 #include <set>
 
 namespace cupbop {

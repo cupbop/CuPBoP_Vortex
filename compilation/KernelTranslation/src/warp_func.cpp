@@ -10,11 +10,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-#include <llvm-18/llvm/IR/PassManager.h>
-#include <llvm-18/llvm/Pass.h>
-#include <llvm-18/llvm/Support/Casting.h>
-#include <llvm-18/llvm/Support/Debug.h>
-#include <llvm-18/llvm/Support/raw_ostream.h>
+#include "llvm/IR/PassManager.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include <set>
 
 #include "insert_warp_loop.h"
@@ -128,7 +128,9 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
       result = builder.CreateICmpNE(count, C0);
     } else {
       auto count = new LoadInst(I32, vote_count_ptr, "", sync_inst);
-      auto block_size = GetCachedBlockSize(F);
+      // auto block_size = GetCachedBlockSize(F);
+      auto block_size_addr = m.getGlobalVariable("block_size");
+      auto block_size = createLoad(builder, block_size_addr);
       result = builder.CreateICmpEQ(count, block_size);
     }
     // Reset count

@@ -428,39 +428,19 @@ void replace_built_in_function(llvm::Module *M) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
 
-                GlobalVariable *threadIdxVar =
-                    (GlobalVariable *)M->getOrInsertGlobal(
-                        "threadIdx",
-                        StructType::get(context, {I32, I32, I32}, false));
-                threadIdxVar->setLinkage(GlobalValue::ExternalLinkage);
+                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
+                    M->getOrInsertGlobal("thread_id_y", I32));
 
-                /* typedef union {
-                    struct {
-                      uint32_t x;
-                      uint32_t y;
-                      uint32_t z;
-                    };
-                    uint32_t m[3];
-                  } dim3_t;
+                auto threadLocalAddr = builder.CreateIntrinsic(
+                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
+                    {threadIdx}, nullptr);
+                auto tidy = builder.CreateLoad(I32, threadLocalAddr, "tidy");
 
-                  extern __thread dim3_t blockIdx;
-                  extern __thread dim3_t threadIdx;
-                */
-                std::vector<Value *> indices;
-                indices.push_back(
-                    ConstantInt::get(I32, 0)); // threadIdx->struct
-                indices.push_back(
-                    ConstantInt::get(I32, 1)); // threadIdx->struct->y
-
-                Value *tidxPtr = createGEP(builder, threadIdxVar, indices);
-                Value *tidx = createLoad(builder, tidxPtr);
-
-                // Add metadata to indicate non-uniformity
                 MDNode *N =
-                    MDNode::get(context, MDString::get(context, "non-uniform"));
-                cast<Instruction>(tidx)->setMetadata("divergence", N);
+                    MDNode::get(context, MDString::get(context, "divergence"));
+                tidy->setMetadata("divergence", N);
 
-                Call->replaceAllUsesWith(tidx);
+                Call->replaceAllUsesWith(tidy);
                 need_remove.push_back(Call);
               } else {
                 // replace it by warp_id

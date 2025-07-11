@@ -1,8 +1,9 @@
-#ifndef __RUNTIME_IMPL__
+#ifndef __KERNEL_IMPL__
 #define __KERNEL_IMPL__
 #include "cudaStatus.h"
 #include "structures.h"
 #include <stdint.h>
+
 extern "C" {
 double __nv_exp(double);
 double __nv_sqrt(double);
@@ -22,4 +23,5 @@ float __nv_fabsf(float);
 int __nvvm_mul24_i(int, int);
 double _ZL3expd(double);
 }
+
 #endif

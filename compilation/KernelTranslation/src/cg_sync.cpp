@@ -37,3 +37,20 @@ bool isCGSync(const std::string &name) {
 bool isWarpSync(const std::string &FuncNameStr) {
     return FuncNameStr.find("syncwarp") != FuncNameStr.npos || FuncNameStr == "llvm.nvvm.bar.warp.sync";
 }
+
+bool has_cg_group_sync(llvm::Module *M) {
+  for (auto F = M->begin(); F != M->end(); ++F)
+    for (auto BB = F->begin(); BB != F->end(); ++BB) {
+      for (auto BI = BB->begin(); BI != BB->end(); BI++) {
+        if (auto Call = llvm::dyn_cast<llvm::CallInst>(BI)) {
+          if (Call->isInlineAsm())
+            continue;
+
+          if (isCGThreadGroupSync(Call->getCalledOperand()->getName().str())) {
+            return true;
+          }
+        }
+      }
+    }
+  return false;
+}

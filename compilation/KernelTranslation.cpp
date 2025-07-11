@@ -11,12 +11,12 @@
 #include <assert.h>
 #include <fstream>
 #include <iostream>
-#include <llvm-18/llvm/Analysis/CGSCCPassManager.h>
-#include <llvm-18/llvm/Analysis/LoopAnalysisManager.h>
-#include <llvm-18/llvm/Passes/PassBuilder.h>
-#include <llvm/IR/DebugInfoMetadata.h>
-#include <llvm/IR/PassManager.h>
-#include <llvm/Support/raw_ostream.h>
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
 #include <stdlib.h>
 
 using namespace llvm;

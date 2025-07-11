@@ -208,6 +208,8 @@ int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &NUM_THRE
 int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &NUM_WARPS);
 int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES);
 
+extern "C" {
+
 cudaError_t cudaGetDevice(int *devPtr) { 
   *devPtr = 0;
   return cudaSuccess;
@@ -517,6 +519,10 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
+cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
+  return cudaGetDeviceProperties(deviceProp, device);
+}
+
 static cudaError_t lastError = cudaSuccess;
 const char *cudaGetErrorString(cudaError_t error) {
   if (error == cudaSuccess) {
@@ -727,4 +733,6 @@ cudaError_t cudaLaunchKernel_vortex(
   vx_dump_perf(DC->device(), outputFile);
   
   return cudaSuccess;
+}
+
 }

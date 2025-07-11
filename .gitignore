@@ -46,5 +46,22 @@ CMakeCache.txt
 *.log
 
 # exclude folders
-/cuda-10.1/**
+/cuda-12.1/**
 /build/**
+/runtime/threadPool/include/
+/include/
+
+.vscode/
+
+# tests
+*.ll
+*.ii
+*.cubin
+*.s
+*.cui
+*.dump
+*.ch*
+*.elf
+*.vxbin
+*.txt
+*.fatbin
