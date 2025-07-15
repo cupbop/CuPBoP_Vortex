@@ -109,6 +109,7 @@ int main(int argc, char *argv[]) {
   cudaGetDeviceProperties(&deviceProp, 0);
   cudaDeviceSynchronize();
   unsigned long maxGridX = deviceProp.maxGridSize[0];
+  printf("maxGridX: %d\n", maxGridX);
   unsigned long threadsPerBlock = 64;
   size_t totalDeviceMemory;
   size_t freeDeviceMemory;

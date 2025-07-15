@@ -183,6 +183,7 @@ lud_verify(float *m, float *lu, int matrix_dim){
             printf("dismatch at (%d, %d): (o)%f (n)%f\n", i, j, m[i*matrix_dim+j], tmp[i*matrix_dim+j]);
       }
   }
+  printf("no_errors!\n");
   free(tmp);
 }
 

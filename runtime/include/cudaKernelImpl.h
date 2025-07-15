@@ -1,7 +1,7 @@
 #ifndef __KERNEL_IMPL__
 #define __KERNEL_IMPL__
 #include "cudaStatus.h"
-#include "structures.h"
+//#include "structures.h"
 #include <stdint.h>
 
 extern "C" {

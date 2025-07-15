@@ -96,12 +96,13 @@ rm -f *.out *.o *.dump *.log *.ll *.bc *.elf
 
 KERNEL=`basename $KERNEL_CU .cu` 
 
-#g++ -g -O0 ./util/num/num.c -c -o ./util/num/num.o
-#g++ -g -O0 ./main.c -c -o ./util/main.o
+gcc -g -c ./util/num/num.c -I./  -o ./util/num/num.o
+gcc -g -c ./main.c -I./util/cuda/ -o ./util/main.o
 
 # Possible to put -O3 here to generate simpler code
 echo "--- Generate bitcode files(.bc) for host and device by using clang++"
 ${LLVM_PREFIX}/bin/clang++ -O0 -g -std=c++11  ./$KERNEL_CU ./util/main.o ./util/num/num.o -I../.. -I$ADDITIONAL_PATH --sysroot=/ --target=x86_64-linux-gnu --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
+#${LLVM_PREFIX}/bin/clang++ -O0 -g -std=c++11  ./$KERNEL_CU main.c ./util/num/num.c -I../.. -I$ADDITIONAL_PATH --sysroot=/ --target=x86_64-linux-gnu --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 #${LLVM_PREFIX}/bin/clang++ --stdlib=libstdc++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --target=x86_64-linux-gnu --gcc-toolchain=/usr/lib/gcc/x86_64-linux-gnu/13 --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 #/software/vortex-schedule/llvm-vortex/bin/clang++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --target=x86_64-linux-gnu --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
 #/software/LLVM_14/bin/clang++ -O0 -g -std=c++11  ./$KERNEL_CU -I../.. --cuda-path=$CUDA_PATH --cuda-gpu-arch=sm_50 -L$CUDA_PATH/lib64  -lcudart_static -ldl -lrt -pthread -save-temps -v  || true
@@ -176,12 +177,13 @@ then
     echo "--- Kernel compilation completed!"
     
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/ -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o ./util/num/num.o ./util/main.o -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
+    #g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/ -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
 
     # simx performance counter settings
     export PERF_CLASS=2
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out file ../../data/b+tree/mil.txt command ../../data/b+tree/command.txt 
+    LD_LIBRARY_PATH=../../build/runtime/threadÍPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out file ../../data/b+tree/mil.txt command ../../data/b+tree/command.txt 
     echo "--- Execution completed!"
     exit -1
 fi

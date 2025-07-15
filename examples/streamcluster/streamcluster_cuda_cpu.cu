@@ -343,7 +343,7 @@ float pFL(Points *points, int *feasible, int numfeasible, float z, long *k,
 
     for (i = 0; i < iter; i++) {
       x = i % numfeasible;
-      printf("iter index %d\n", i, iter);
+      printf("iter index %d %lu\n", i, iter);
       change +=
           pgain(feasible[x], points, z, k, kmax, is_center, center_table,
                 switch_membership, isCoordChanged, &serial_t, &cpu_to_gpu_t,
@@ -575,6 +575,7 @@ float pkmedian(Points *points, long kmin, long kmax, long *kfinal, int pid,
     lastcost = cost;
     cost = pFL(points, feasible, numfeasible, z, &k, kmax, cost,
                (long)(ITER * kmax * log((float)kmax)), 0.1, pid, barrier);
+    printf("EEEEEEEEEEEE iteration: %ld\n", (long)(ITER * kmax * log((float)kmax)));
 
     /* if number of centers seems good, try a more accurate FL */
     if (((k <= (1.1) * kmax) && (k >= (0.9) * kmin)) ||

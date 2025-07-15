@@ -270,8 +270,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "#define KERNEL_ARG_BASE_ADDR "
           << KERNEL_ARG_BASE_ADDR <<
           "\n"
-          "#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR "
-          << KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR <<
+          //"#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR "
+          //<< KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR <<
           "\n"
           "\n"
 
@@ -293,6 +293,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "typedef struct {\n"
           "    context_t ctx;\n"
           "    int kernel_idx;\n"
+          "    int num_args;\n"
           "    uint64_t args[0];\n"
           "} kernel_arg_t;\n"          
           "\n"
@@ -313,6 +314,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread block_index_x;\n"
           "int __thread block_index_y;\n"
           "int __thread block_index_z;\n"
+          
           "int __thread thread_id_x;\n"
           "int __thread thread_id_y;\n"
           "int __thread thread_id_z;\n"
@@ -355,9 +357,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n" 
 
           "int main() {\n"
+          "    vx_printf(\"kernel_wrapper: main\\n\");\n"
           "    kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); \n"
           "    auto ctx = &kernel_arg->ctx; \n"
+          "    auto num_args = kernel_arg->num_args;\n"
           "    auto args = (uint64_t*)kernel_arg->args;\n"
+          "    auto memcpy_symbol_array = (uint64_t*)kernel_arg->args + num_args;"
           "\n"
 
           "    grid_size_x = ctx->num_groups[0];\n"
@@ -372,7 +377,32 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
-     
+
+          "if (memcpy_symbol_array[0] != 0) {\n"
+          "    vx_printf(\"CHECK: cudamemcpytosymbol, number of cudamemcpytosymbol=%d \\n\", memcpy_symbol_array[0]);\n"
+          "    int memcpy_symbol_idx = 0;\n"
+          "    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
+          "        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
+          "        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
+          "        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
+          "        memcpy(dst_addr, src_addr, size);\n"
+          "        vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
+          "        memcpy_symbol_idx++;}}\n"
+
+
+          //      "    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; \n"
+          // //"    vx_printf(\"additional_info[0]: %lu\\n\", additional_info[0]);\n"
+          // "    if (additional_info[0] != 0) {\n"
+          // "       vx_printf(\"CHECK: cudamemcpytosymbol\");\n"
+          // "       int additional_info_idx = 0;\n"
+          // "       while (additional_info_idx < additional_info[0]) {\n"
+          // "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
+          // "           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];\n"
+          // "           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];\n"
+          // "           memcpy(dst_addr, src_addr, size);\n"
+          // "           additional_info_idx++;}}\n"
+
+
           "    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
           "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
           "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\\n\", \n"
@@ -408,6 +438,20 @@ void create_kernel_wrapper_function(llvm::Module *M){
       ss << "    return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
     }
     ss << "\n" 
+
+          // --------------- CUDAMemcpytosymbol -----------4temp disabled
+          // "    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
+          // "if (memcpy_symbol_array[0] != 0) {\n"
+          // "    vx_printf(\"CHECK: cudamemcpytosymbol, number of cudamemcpytosymbol=%d \\n\", memcpy_symbol_array[0]);\n"
+          // "    int memcpy_symbol_idx = 0;\n"
+          // "    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
+          // "        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
+          // "        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
+          // "        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
+          // "        memcpy(dst_addr, src_addr, size);\n"
+          // "        vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
+          // "        memcpy_symbol_idx++;}}\n"
+
       /*"    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
           "    if (additional_info[0] != 0) {\n"
           "       int additional_info_idx = 0;\n"

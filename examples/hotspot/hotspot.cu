@@ -117,7 +117,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
 
   int tx = threadIdx.x;
   int ty = threadIdx.y;
-
+  
   step_div_Cap = step / Cap;
 
   Rx_1 = 1 / Rx;
@@ -147,7 +147,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
   // load data if it is within the valid input range
   int loadYidx = yidx, loadXidx = xidx;
   int index = grid_cols * loadYidx + loadXidx;
-
+  
   if (IN_RANGE(loadYidx, 0, grid_rows - 1) &&
       IN_RANGE(loadXidx, 0, grid_cols - 1)) {
     temp_on_cuda[ty][tx] = temp_src[index]; // Load the temperature data from
@@ -155,6 +155,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
     power_on_cuda[ty][tx] =
         power[index]; // Load the power data from global memory to shared memory
   }
+  
   __syncthreads();
 
   // effective range within this block that falls within
@@ -180,6 +181,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
   E = (E > validXmax) ? validXmax : E;
 
   bool computed;
+  
   for (int i = 0; i < iteration; i++) {
     computed = false;
     if (IN_RANGE(tx, i + 1, BLOCK_SIZE - i - 2) &&
@@ -187,6 +189,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
         IN_RANGE(tx, validXmin, validXmax) &&
         IN_RANGE(ty, validYmin, validYmax)) {
       computed = true;
+      //printf("hello");  
       temp_t[ty][tx] =
           temp_on_cuda[ty][tx] +
           step_div_Cap * (power_on_cuda[ty][tx] +
@@ -197,12 +200,20 @@ __global__ void calculate_temp(int iteration,   // number of iteration
                            2.0 * temp_on_cuda[ty][tx]) *
                               Rx_1 +
                           (amb_temp - temp_on_cuda[ty][tx]) * Rz_1);
+      //printf("temp_t[%d][%d] = %f\n", ty, tx, temp_t[ty][tx]);
     }
     __syncthreads();
     if (i == iteration - 1)
       break;
-    if (computed) // Assign the computation range
+    // comment out printf, otherwise, it breaks
+    //printf("computed = %d\n", computed);
+    if (computed)
+    { // Assign the computation range
+      
       temp_on_cuda[ty][tx] = temp_t[ty][tx];
+      // comment out printf, otherwise, it breaks
+      //printf("temp_dst[%d] = %f\n", index, temp_dst[index]);
+    }
     __syncthreads();
   }
 
@@ -211,6 +222,7 @@ __global__ void calculate_temp(int iteration,   // number of iteration
   // small block perform the calculation and switch on ``computed''
   if (computed) {
     temp_dst[index] = temp_t[ty][tx];
+    //printf("temp_dst[%d] = %f\n", index, temp_dst[index]);
   }
 }
 

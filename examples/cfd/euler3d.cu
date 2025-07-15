@@ -1,6 +1,6 @@
 #include <fstream>
-#include <helper_cuda.h>
-#include <helper_timer.h>
+//#include <helper_cuda.h>
+//#include <helper_timer.h>
 #include <iostream>
 
 /*
@@ -88,27 +88,35 @@
  */
 template <typename T> T *alloc(int N) {
   T *t;
-  checkCudaErrors(cudaMalloc((void **)&t, sizeof(T) * N));
+  //checkCudaErrors(cudaMalloc((void **)&t, sizeof(T) * N));
+  cudaMalloc((void **)&t, sizeof(T) * N);
   return t;
 }
 
 template <typename T> void dealloc(T *array) {
-  checkCudaErrors(cudaFree((void *)array));
+  //checkCudaErrors(cudaFree((void *)array));
+  cudaFree((void *)array);
 }
 
 template <typename T> void copy(T *dst, T *src, int N) {
-  checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
-                             cudaMemcpyDeviceToDevice));
+  //checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+                             //cudaMemcpyDeviceToDevice));
+  cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+                             cudaMemcpyDeviceToDevice);
 }
 
 template <typename T> void upload(T *dst, T *src, int N) {
-  checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
-                             cudaMemcpyHostToDevice));
+  //checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+  //                           cudaMemcpyHostToDevice));
+  cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+                             cudaMemcpyHostToDevice);
 }
 
 template <typename T> void download(T *dst, T *src, int N) {
-  checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
-                             cudaMemcpyDeviceToHost));
+  //checkCudaErrors(cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+  //                           cudaMemcpyDeviceToHost));
+  cudaMemcpy((void *)dst, (void *)src, N * sizeof(T),
+                             cudaMemcpyDeviceToHost);
 }
 
 void dump(float *variables, int nel, int nelr) {
@@ -159,7 +167,7 @@ __global__ void cuda_initialize_variables(int nelr, float *variables) {
 void initialize_variables(int nelr, float *variables) {
   dim3 Dg(nelr / BLOCK_SIZE_1), Db(BLOCK_SIZE_1);
   cuda_initialize_variables<<<Dg, Db>>>(nelr, variables);
-  getLastCudaError("initialize_variables failed");
+  //getLastCudaError("initialize_variables failed");
 }
 
 __device__ __host__ inline void compute_flux_contribution(
@@ -235,13 +243,29 @@ void compute_step_factor(int nelr, float *variables, float *areas,
                          float *step_factors) {
   dim3 Dg(nelr / BLOCK_SIZE_2), Db(BLOCK_SIZE_2);
   cuda_compute_step_factor<<<Dg, Db>>>(nelr, variables, areas, step_factors);
-  getLastCudaError("compute_step_factor failed");
+  //getLastCudaError("compute_step_factor failed");
 }
 
 /*
  *
  *
  */
+
+ __global__ void check_surrounding_elements(int nelr, int *elements_surrounding_elements) {
+  
+  
+  
+  const int i = (blockDim.x * blockIdx.x + threadIdx.x);
+  for (int j = 0; j < NNB; j++) {
+    if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+      {
+        printf("elements[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+      }
+ }
+
+}
+
+
 __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
                                   float *normals, float *variables,
                                   float *fluxes) {
@@ -261,19 +285,83 @@ __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
 
   float density_energy_i = variables[i + VAR_DENSITY_ENERGY * nelr];
 
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements1[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
+
+
   float3 velocity_i;
+  if (threadIdx.x == 0)
+    {printf("%d, compute_velocity\n", blockIdx.x);
+                                  }
   compute_velocity(density_i, momentum_i, velocity_i);
+  // if (threadIdx.x == 0)
+  //   {printf("%d, compute_speed_sqd\n", blockIdx.x);
+  //                                 }
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements2[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
   float speed_sqd_i = compute_speed_sqd(velocity_i);
+  // if (threadIdx.x == 0)
+  // {printf("%d, sqrtf\n", blockIdx.x);
+  //                               }
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements3[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
   float speed_i = sqrtf(speed_sqd_i);
+  // if (threadIdx.x == 0)
+  // {printf("%d, compute_presssure\n", blockIdx.x);
+  //                               }
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements4[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
   float pressure_i = compute_pressure(density_i, density_energy_i, speed_sqd_i);
+  // if (threadIdx.x == 0)
+  // {printf("%d, compute_speed_of_sound\n", blockIdx.x);
+  //                               }
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements5[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
   float speed_of_sound_i = compute_speed_of_sound(density_i, pressure_i);
   float3 flux_contribution_i_momentum_x, flux_contribution_i_momentum_y,
       flux_contribution_i_momentum_z;
   float3 flux_contribution_i_density_energy;
+  // if (threadIdx.x == 0)
+  // {printf("%d, compute_flux_contribution\n", blockIdx.x);
+  //                               
+
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements6[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
   compute_flux_contribution(
       density_i, momentum_i, density_energy_i, pressure_i, velocity_i,
       flux_contribution_i_momentum_x, flux_contribution_i_momentum_y,
       flux_contribution_i_momentum_z, flux_contribution_i_density_energy);
+
+      // for (j = 0; j < NNB; j++) {
+      //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+      //     {
+      //       printf("elements7[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+      //     }
+      // }
 
   float flux_i_density = float(0.0f);
   float3 flux_i_momentum;
@@ -290,9 +378,27 @@ __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
   float3 flux_contribution_nb_density_energy;
   float speed_sqd_nb, speed_of_sound_nb, pressure_nb;
 
-#pragma unroll
+  // for (j = 0; j < NNB; j++) {
+  //   if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
+  //     {
+  //       printf("elements8[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+  //     }
+  // }
+
+  // Mark : temporaily disabled
+//#pragma unroll
   for (j = 0; j < NNB; j++) {
     nb = elements_surrounding_elements[i + j * nelr];
+    // // check nb is a valid number
+    // if (nb > nelr || nb < -3)
+    // {
+    // printf("wrong! j = %d, nb = %d\n", j, nb);
+    // }
+    // else{
+    //   printf("correct, j = %d, nb = %d\n", j, nb);
+    // }
+    
+    
     normal.x = normals[i + (j + 0 * NNB) * nelr];
     normal.y = normals[i + (j + 1 * NNB) * nelr];
     normal.z = normals[i + (j + 2 * NNB) * nelr];
@@ -359,7 +465,8 @@ __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
                                      flux_contribution_i_momentum_y.z);
       flux_i_momentum.z += factor * (flux_contribution_nb_momentum_z.z +
                                      flux_contribution_i_momentum_z.z);
-    } else if (nb == -1) // a wing boundary
+    } 
+    else if (nb == -1) // a wing boundary
     {
       flux_i_momentum.x += normal.x * pressure_i;
       flux_i_momentum.y += normal.y * pressure_i;
@@ -402,6 +509,7 @@ __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
       flux_i_momentum.z += factor * (ff_flux_contribution_momentum_z[0].z +
                                      flux_contribution_i_momentum_z.z);
     }
+    
   }
 
   fluxes[i + VAR_DENSITY * nelr] = flux_i_density;
@@ -415,7 +523,7 @@ void compute_flux(int nelr, int *elements_surrounding_elements, float *normals,
   dim3 Dg(nelr / BLOCK_SIZE_3), Db(BLOCK_SIZE_3);
   cuda_compute_flux<<<Dg, Db>>>(nelr, elements_surrounding_elements, normals,
                                 variables, fluxes);
-  getLastCudaError("compute_flux failed");
+  //getLastCudaError("compute_flux failed");
 }
 
 __global__ void cuda_time_step(int j, int nelr, float *old_variables,
@@ -445,7 +553,7 @@ void time_step(int j, int nelr, float *old_variables, float *variables,
   dim3 Dg(nelr / BLOCK_SIZE_4), Db(BLOCK_SIZE_4);
   cuda_time_step<<<Dg, Db>>>(j, nelr, old_variables, variables, step_factors,
                              fluxes);
-  getLastCudaError("update failed");
+  //getLastCudaError("update failed");
 }
 
 /*
@@ -466,7 +574,8 @@ int main(int argc, char **argv) {
   cudaDeviceProp prop;
   int dev;
 
-  checkCudaErrors(cudaSetDevice(0));
+  //checkCudaErrors(cudaSetDevice(0));
+  cudaSetDevice(0);
 
   // set far field conditions and load them into constant memory on the gpu
   {
@@ -513,21 +622,35 @@ int main(int argc, char **argv) {
                               h_ff_flux_contribution_density_energy);
 
     // copy far field conditions to the gpu
-    checkCudaErrors(
-        cudaMemcpyToSymbol(ff_variable, h_ff_variable, NVAR * sizeof(float)));
-    checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_x,
-                                       &h_ff_flux_contribution_momentum_x,
-                                       sizeof(float3)));
-    checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_y,
-                                       &h_ff_flux_contribution_momentum_y,
-                                       sizeof(float3)));
-    checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_z,
-                                       &h_ff_flux_contribution_momentum_z,
-                                       sizeof(float3)));
+    //checkCudaErrors(
+    //    cudaMemcpyToSymbol(ff_variable, h_ff_variable, NVAR * sizeof(float)));
+    printf("CUDA memcpyto SYMBOL starts\n");
+        cudaMemcpyToSymbol(ff_variable, h_ff_variable, NVAR * sizeof(float));
+    //checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_x,
+    //                                   &h_ff_flux_contribution_momentum_x,
+    //                                   sizeof(float3)));
+    cudaMemcpyToSymbol(ff_flux_contribution_momentum_x,
+      &h_ff_flux_contribution_momentum_x,
+      sizeof(float3));
+    //checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_y,
+    //                                   &h_ff_flux_contribution_momentum_y,
+    //                                   sizeof(float3)));
+    cudaMemcpyToSymbol(ff_flux_contribution_momentum_y,
+                                        &h_ff_flux_contribution_momentum_y,
+                                        sizeof(float3));
+    //checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_momentum_z,
+    //                                   &h_ff_flux_contribution_momentum_z,
+    //                                   sizeof(float3)));
+    cudaMemcpyToSymbol(ff_flux_contribution_momentum_z,
+                                        &h_ff_flux_contribution_momentum_z,
+                                        sizeof(float3));
 
-    checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_density_energy,
-                                       &h_ff_flux_contribution_density_energy,
-                                       sizeof(float3)));
+    //checkCudaErrors(cudaMemcpyToSymbol(ff_flux_contribution_density_energy,
+    //                                   &h_ff_flux_contribution_density_energy,
+    //                                   sizeof(float3)));
+    cudaMemcpyToSymbol(ff_flux_contribution_density_energy,
+                                        &h_ff_flux_contribution_density_energy,
+                                        sizeof(float3));
   }
   int nel;
   int nelr;
@@ -542,6 +665,7 @@ int main(int argc, char **argv) {
     file >> nel;
     nelr =
         BLOCK_SIZE_0 * ((nel / BLOCK_SIZE_0) + std::min(1, nel % BLOCK_SIZE_0));
+    printf("nelr = %d\n", nelr);
 
     float *h_areas = new float[nelr];
     int *h_elements_surrounding_elements = new int[nelr * NNB];
@@ -596,6 +720,7 @@ int main(int argc, char **argv) {
 
   // Create arrays and set initial conditions
   float *variables = alloc<float>(nelr * NVAR);
+  // Mark: temporaily disabled
   initialize_variables(nelr, variables);
 
   float *old_variables = alloc<float>(nelr * NVAR);
@@ -603,45 +728,62 @@ int main(int argc, char **argv) {
   float *step_factors = alloc<float>(nelr);
 
   // make sure all memory is floatly allocated before we start timing
+  // Mark: temporaily disabled
   initialize_variables(nelr, old_variables);
   initialize_variables(nelr, fluxes);
   cudaMemset((void *)step_factors, 0, sizeof(float) * nelr);
   // make sure CUDA isn't still doing something before we start timing
+
   cudaThreadSynchronize();
 
   // these need to be computed the first time in order to compute time step
   std::cout << "Starting..." << std::endl;
 
-  StopWatchInterface *timer = 0;
+  // 여기까지는 괜찮고 
+
+  //StopWatchInterface *timer = 0;
   //	unsigned int timer = 0;
 
   // CUT_SAFE_CALL( cutCreateTimer( &timer));
   // CUT_SAFE_CALL( cutStartTimer( timer));
-  sdkCreateTimer(&timer);
-  sdkStartTimer(&timer);
+  //sdkCreateTimer(&timer);
+  //sdkStartTimer(&timer);
   // Begin iterations
+  
   for (int i = 0; i < iterations; i++) {
+    // update this into memcpy to host and then device
+
+
     copy<float>(old_variables, variables, nelr * NVAR);
 
+    printf("compute_step_factor starts\n");
     // for the first iteration we compute the time step
+    
+    
     compute_step_factor(nelr, variables, areas, step_factors);
-    getLastCudaError("compute_step_factor failed");
+    //getLastCudaError("compute_step_factor failed");
+
+    //dim3 Dg2(nelr / BLOCK_SIZE_3), Db2(BLOCK_SIZE_3);
+    //check_surrounding_elements<<<Dg2, Db2>>>(nelr, elements_surrounding_elements);
 
     for (int j = 0; j < RK; j++) {
+      printf("compute_flux starts\n");
       compute_flux(nelr, elements_surrounding_elements, normals, variables,
                    fluxes);
-      getLastCudaError("compute_flux failed");
+      //getLastCudaError("compute_flux failed");
+      printf("time_step starts\n");
       time_step(j, nelr, old_variables, variables, step_factors, fluxes);
-      getLastCudaError("time_step failed");
+      //getLastCudaError("time_step failed");
     }
   }
 
+
   cudaThreadSynchronize();
   //	CUT_SAFE_CALL( cutStopTimer(timer) );
-  sdkStopTimer(&timer);
+  //sdkStopTimer(&timer);
 
-  std::cout << (sdkGetAverageTimerValue(&timer) / 1000.0) / iterations
-            << " seconds per iteration" << std::endl;
+  //std::cout << (sdkGetAverageTimerValue(&timer) / 1000.0) / iterations
+  //          << " seconds per iteration" << std::endl;
 
   std::cout << "Saving solution..." << std::endl;
   dump(variables, nel, nelr);

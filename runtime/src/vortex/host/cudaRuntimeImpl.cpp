@@ -64,6 +64,7 @@ std::vector<std::string> symbol_name_vector;
 struct alignas(64) kernel_arg_t {
   context_t ctx;
   int kernel_idx;
+  int num_args;
   uint64_t  args[0];
 };
 
@@ -246,7 +247,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
   // RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_READ_WRITE, (void** )&mem_addr));
   DC->dev_mem_alloc(size, VX_MEM_READ_WRITE, &mem_addr);
   
-  printf("cudaMalloc: size=%ld, mem_addr=%lu\n", size, mem_addr);
+  printf("cudaMalloc: size=%ld, mem_addr=%p\n", size, mem_addr);
   *devPtr = (void*)mem_addr;
    return cudaSuccess;
 }
@@ -265,9 +266,11 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
   void* tmp_ptr;
   tmp_ptr = (void *) malloc(count);
   memset(tmp_ptr, value, count);
+
   auto DC = DeviceContext::instance();
   auto staging_buf = DC->staging_alloc(count);
   auto host_ptr = staging_buf.data();
+
   memcpy((char *)host_ptr, tmp_ptr, count);
   uint64_t mem_addr = (uint64_t)devPtr;
   // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
@@ -277,6 +280,29 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
   free(tmp_ptr);
   return cudaSuccess;
 }
+
+// cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+//   auto DC = DeviceContext::instance();
+//   auto staging_buf = DC->staging_alloc(count);
+//   auto host_ptr = staging_buf.data();
+
+//   // 정수 단위로 4바이트 정렬된 메모리에만 동작하는 memset 대체
+//   if (count % sizeof(int) != 0) {
+//     printf("cudaMemset: count (%lu) is not aligned to sizeof(int)\n", count);
+//     return cudaErrorInvalidValue;
+//   }
+
+//   size_t num_ints = count / sizeof(int);
+//   for (size_t i = 0; i < num_ints; ++i) {
+//     host_ptr[i] = value;
+//   }
+
+//   uint64_t mem_addr = (uint64_t)devPtr;
+//   DC->copy_to_dev(mem_addr, host_ptr, count);
+
+//   printf("cudaMemset: int_value=%d, dst=%lu, count=%lu\n", value, mem_addr, count);
+//   return cudaSuccess;
+// }
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind kind) {
   int vx_err; 
@@ -309,6 +335,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     uint64_t mem_src_addr = (uint64_t)src;
     // RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_src_addr, count));
     DC->copy_from_dev(mem_src_addr, host_ptr, count);
+    RT_CHECK(vx_ready_wait(DC->device(), 1000));
     uint64_t mem_dst_addr = (uint64_t)dst;
     // RT_CHECK(vx_copy_to_dev(DC->device(), mem_dst_addr, host_ptr, count));
     DC->copy_to_dev(mem_dst_addr, host_ptr, count);
@@ -388,13 +415,19 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   //cast string(in hex) to uint64_t
   uint64_t symbol_addr = std::stoull(symbol_addr_tmp, nullptr, 16);
 
+  // print symbol_addr_tmp, and compare it with dst
+  printf("symbol_addr_tmp: %p, dst: %p\n", symbol_addr, dst);
+
   // allocate a device memory(temporary) and copy the data from host to device
   auto DC = DeviceContext::instance();
   uint64_t mem_addr;  
   // RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_TYPE_GLOBAL, &mem_addr));
-  RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_READ_WRITE, (void** )&mem_addr));
+
+  // May 20 수정
+  // RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_READ_WRITE, (void** )&mem_addr));
+  DC->dev_mem_alloc(count, VX_MEM_READ_WRITE, &mem_addr);
   
-  printf("(cudamemcpytosymbol) cudaMalloc: size=%ld, mem_addr=%lu\n", count, mem_addr);
+  printf("(cudamemcpytosymbol) cudaMalloc: size=%ld, mem_addr=%p\n", count, mem_addr);
     
   // copy the host data to device
   auto staging_buf = DC->staging_alloc(count);
@@ -404,12 +437,12 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
   DC->copy_to_dev(mem_addr, host_ptr, count);
   
-  printf("(cudamemcpytosymbol) cudaMemcpyHostToDevice: src=%p, dst=%lu, count=%ld\n", src, mem_addr, count);
+  printf("(cudamemcpytosymbol) cudaMemcpyHostToDevice: src=%p, dst=%p, count=%ld\n", src, mem_addr, count);
 
-  memcpy_symbol_single.push_back(std::stoull(symbol_addr_tmp, nullptr, 16));
-  memcpy_symbol_single.push_back((uint64_t)mem_addr);
-  memcpy_symbol_single.push_back((uint64_t)count);
-  memcpy_symbol_single.push_back((uint64_t)offset);
+  memcpy_symbol_single.push_back(std::stoull(symbol_addr_tmp, nullptr, 16)); // actual device variable address
+  memcpy_symbol_single.push_back((uint64_t)mem_addr); // staging buffer address
+  memcpy_symbol_single.push_back((uint64_t)count); // size of the data
+  memcpy_symbol_single.push_back((uint64_t)offset); // offset
   memcpy_symbol.push_back(memcpy_symbol_single);
   memcpy_symbol_single.clear();
               
@@ -643,7 +676,10 @@ cudaError_t cudaLaunchKernel_vortex(
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   printf("(debug) abuf_size = %ld\n", abuf_size);
-  auto staging_buf = DC->staging_alloc(abuf_size);
+
+  size_t abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
+
+  auto staging_buf = DC->staging_alloc(abuf_size+abuf_size_additional);
 
   auto abuf_ptr = (kernel_arg_t*)staging_buf.data();
   //auto abuf_ptr = (kernel_arg_t*)vx_host_ptr(staging_buf);
@@ -668,6 +704,7 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // write the kerenel index here it retrives
   abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
+  abuf_ptr->num_args = num_args;
   
   // Mark Debug Check 
   //printf("test:: kernel_idx %d sizes: %d %d \n", abuf_ptr->kernel_idx, sizeof(kernel_arg_t), sizeof(context_t));
@@ -682,30 +719,44 @@ cudaError_t cudaLaunchKernel_vortex(
     memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
     printf("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
   }  
+
+  abuf_ptr->args[num_args] = memcpy_symbol.size();
+  int memcpy_symbol_idx = 0;
+  for (int i=num_args+1; i < num_args + (1 + memcpy_symbol.size() * 3); i+=3)
+  {
+    memcpy(&abuf_ptr->args[i], &memcpy_symbol[memcpy_symbol_idx][0], sizeof(uint64_t));
+    memcpy(&abuf_ptr->args[i+1], &memcpy_symbol[memcpy_symbol_idx][1], sizeof(uint64_t));
+    memcpy(&abuf_ptr->args[i+2], &memcpy_symbol[memcpy_symbol_idx][2], sizeof(uint64_t));
+    memcpy_symbol_idx++;
+  }
+  // upload additional information for cudaMemcpytoSymbol
+  
+  
+  // auto staging_buf_additional = DC->staging_alloc(abuf_size_additional);
+  // auto abuf_ptr_additional = (uint64_t*)staging_buf_additional.data();
+  // abuf_ptr_additional[0] = memcpy_symbol.size();
+  // printf("memcpy_symbol.size(): %lu\n", memcpy_symbol.size());
+  // int abuf_ptr_additional_idx = 1;
+  // while (abuf_ptr_additional_idx < memcpy_symbol.size()+1)
+  // {
+  //   memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3-2], &memcpy_symbol[abuf_ptr_additional_idx-1][0], sizeof(uint64_t));
+  //   memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3-1], &memcpy_symbol[abuf_ptr_additional_idx-1][1], sizeof(uint64_t));
+  //   memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3], &memcpy_symbol[abuf_ptr_additional_idx-1][2], sizeof(uint64_t));
+  //   abuf_ptr_additional_idx++;
+  // }
+
   
   // upload kernel arguments
   // RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
-  RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size, DC->args_buffer()));
-
-  /*
-  // upload additional information for cudaMemcpytoSymbol
+  RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size+abuf_size_additional, DC->args_buffer()));
+  printf("args_buffer: %p\n", DC->args_buffer());
   
-  int abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
-  auto staging_buf_additional = DC->staging_alloc(abuf_size_additional);
-  auto abuf_ptr_additional = (uint64_t*)staging_buf_additional.data();
-  abuf_ptr_additional[0] = memcpy_symbol.size();
-  //printf("memcpy_symbol.size(): %lu\n", memcpy_symbol.size());
-  int abuf_ptr_additional_idx = 1;
-  while (abuf_ptr_additional_idx < memcpy_symbol.size()+1)
-  {
-    memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3-2], &memcpy_symbol[abuf_ptr_additional_idx-1][0], sizeof(uint64_t));
-    memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3-1], &memcpy_symbol[abuf_ptr_additional_idx-1][1], sizeof(uint64_t));
-    memcpy(&abuf_ptr_additional[abuf_ptr_additional_idx*3], &memcpy_symbol[abuf_ptr_additional_idx-1][2], sizeof(uint64_t));
-    abuf_ptr_additional_idx++;
-  }
 
-  RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional));
-  */
+
+  //RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional));
+  //DC->copy_to_dev(KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional);
+  //RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr_additional, abuf_size_additional, (void**)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR));
+  
 
   printf("uploaded args\n");
   

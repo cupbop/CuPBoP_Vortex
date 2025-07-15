@@ -1974,6 +1974,7 @@ int main(int argc, char **argv) {
       int *keys;
       keys = (int *)malloc(count * sizeof(int));
       // INPUT: keys CPU initialization
+      srand(42);
       int i;
       for (i = 0; i < count; i++) {
         keys[i] = (rand() / (float)RAND_MAX) * size;
@@ -2106,6 +2107,7 @@ int main(int argc, char **argv) {
       int *end;
       end = (int *)malloc(count * sizeof(int));
       // INPUT: start, end CPU initialization
+      srand(42);
       int i;
       for (i = 0; i < count; i++) {
         start[i] = (rand() / (float)RAND_MAX) * size;
