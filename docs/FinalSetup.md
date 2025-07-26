@@ -4,10 +4,10 @@
 
 Try to store the CuPBoP and Vortex repo's in a single directory, in this case `/Project`. By doing so, your directory structure should look something like:
 
-`/Project`
------> `/CuPBoP`
------> `/vortex`
------> `env_setup.sh`
+`/Project` <br>
+-----> `/CuPBoP` <br>
+-----> `/vortex` <br>
+-----> `env_setup.sh`<br>
 
 Take a look at the next section below to understand what `env_setup.sh` is.
 
