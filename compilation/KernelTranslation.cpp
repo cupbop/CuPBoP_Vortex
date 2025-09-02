@@ -95,6 +95,8 @@ int main(int argc, char **argv) {
   printIR(program);
   replace_built_in_function(program);
 
+  dumpFile(program, "6.ll");
+  
   VerifyModule(program);
   std::cout << "generate\n" << std::flush;
   printIR(program);

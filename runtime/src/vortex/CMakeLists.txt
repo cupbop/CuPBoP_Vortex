@@ -1,24 +1,6 @@
-cmake_minimum_required(VERSION 3.1)
-
-# C project
-project(
-  vortexRuntime
-  DESCRIPTION ""
-  LANGUAGES CXX)
-
-set(CMAKE_VERBOSE_MAKEFILE ON)
-set(LIB_NAME vortexRuntime)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_BUILD_TYPE Debug)
-
-include_directories(./../../include)
-include_directories(./../../threadPool/include)
-include_directories($ENV{VORTEX_PATH}/runtime/include)
-file(GLOB proj_SOURCES "./host/*.cpp")
-add_library(${LIB_NAME} SHARED ${proj_SOURCES})
-
-
-
-
-
+add_custom_target(
+    vortexRuntimeKernel ALL
+    COMMAND ${CMAKE_MAKE_PROGRAM} -C ${CMAKE_CURRENT_SOURCE_DIR}/kernel
+    COMMENT "Building kernel object files using Makefile"
+    VERBATIM
+)

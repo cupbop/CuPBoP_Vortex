@@ -231,6 +231,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
       for (auto BB = F->begin(); BB != F->end(); ++BB) {
         for (auto BI = BB->begin(); BI != BB->end(); BI++) {
           if (auto Call = dyn_cast<CallInst>(BI)) {
+            if (!Call->getCalledFunction())
+              continue;
+
             auto func_name = Call->getCalledOperand()->getName().str();
             auto func_arg_size = Call->getCalledFunction()->arg_size();
             std::cout << "currently looking function is " << func_name << std::endl;
@@ -276,6 +279,14 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n"
 
           "void (* volatile vx_barrier_dummy)(int, int) = vx_barrier;\n"
+          // "int (* volatile vx_vote_all_dummy)(int) = vx_vote_all;\n"
+          // "int (* volatile vx_vote_any_dummy)(int) = vx_vote_any;\n"
+          // "int (* volatile vx_vote_uni_dummy)(int) = vx_vote_uni;\n"
+          // "int (* volatile vx_vote_ballot_dummy)(int) = vx_vote_ballot;\n"
+          // "int (* volatile vx_shfl_up_dummy)(size_t, int, int, int) = vx_shfl_up;\n"
+          // "int (* volatile vx_shfl_down_dummy)(size_t, int, int, int) = vx_shfl_down;\n"
+          // "int (* volatile vx_shfl_bfly_dummy)(size_t, int, int, int) = vx_shfl_bfly;\n"
+          // "int (* volatile vx_shfl_idx_dummy)(size_t, int, int, int) = vx_shfl_idx;\n"
           "\n"
           "\n"
 

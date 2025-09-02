@@ -34,11 +34,28 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
 }
 
 bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
+
+  DenseSet<StringRef> voteFuncs;
+  if (mapping_ == MAPPING_1TO1) {
+    voteFuncs = {
+    "_Z10__any_syncji",
+    "_Z10__all_syncji",     
+    "_Z14__uniform_syncji", 
+    "_Z13__ballot_syncji"   
+    };
+
+  } else {
+    voteFuncs = {"llvm.nvvm.vote.any.sync",
+                 "llvm.nvvm.vote.all.sync",
+                 "llvm.nvvm.vote.uni.sync",
+                 "llvm.nvvm.vote.ballot.sync"};
+  }
+
   // get the callee functions to be replaced
   set<CallInst *> replace;
   for (auto &f : m.functions()) {
-    if (isKernelFunction(&m, &f))
-      continue;
+    // if (isKernelFunction(&m, &f))
+    //   continue;
     auto name_caller = f.getName().str();
     for (auto &bb : f) {
       for (auto &i : bb) {
@@ -46,12 +63,10 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
         if (!ci || ci->isInlineAsm())
           continue;
         auto name_callee = ci->getCalledOperand()->getName();
-        if (name_callee == "llvm.nvvm.vote.any.sync" ||
-            name_callee == "llvm.nvvm.vote.all.sync" ||
-            name_callee == "llvm.nvvm.vote.uni.sync" ||
-            name_callee == "llvm.nvvm.vote.ballot.sync") {
-          dbgs() << "vote detected";
+        if (voteFuncs.count(name_callee.str())) {
+          dbgs() << "\nvote detected: ";
           ci->print(dbgs(), true);
+          dbgs() << "\n";
           replace.insert(ci);
         }
       }
@@ -143,41 +158,11 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
 
 void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
     Module &m, const set<CallInst *> &replace) {
-  LLVMContext &Context = m.getContext();
-  vector<Type *> ParamTypes(4, Type::getInt32Ty(Context));
-  Type *ReturnType = Type::getInt32Ty(Context);
-  FunctionType *nTTy = FunctionType::get(ReturnType, ParamTypes, false);
-  FunctionCallee vote_func = m.getOrInsertFunction("vx_vote_sync", nTTy);
-  for (auto sync_inst : replace) {
-    IRBuilder<> builder(sync_inst);
-    auto func_name = sync_inst->getCalledOperand()->getName();
-    Value *mode, *neg, *mask, *pred;
-    if (func_name == "llvm.nvvm.vote.all.sync") {
-      mode = builder.getInt32(0);
-      neg = builder.getInt32(0);
-    } else if (func_name == "llvm.nvvm.vote.any.sync") {
-      mode = builder.getInt32(1);
-      neg = builder.getInt32(0);
-    } else if (func_name == "llvm.nvvm.vote.uni.sync") {
-      mode = builder.getInt32(2);
-      neg = builder.getInt32(0);
-    } else if (func_name == "llvm.nvvm.vote.ballot.sync") {
-      mode = builder.getInt32(3);
-      neg = builder.getInt32(0);
-    } else {
-      errs() << "Unknown vote function: " << func_name << "\n";
-      continue;
-    }
-    mask = sync_inst->getArgOperand(0);
-    auto pred_i1 = sync_inst->getArgOperand(1);
-    pred = builder.CreateZExt(pred_i1, builder.getInt32Ty());
-    Value *result = builder.CreateCall(vote_func, {pred, neg, mode, mask});
-    // all, any, uni returns i1 base on nvvm specification
-    if (func_name != "llvm.nvvm.vote.ballot.sync") {
-      result = builder.CreateICmpNE(result, builder.getInt32(0));
-    }
-    sync_inst->replaceAllUsesWith(result);
-    sync_inst->eraseFromParent();
+  for (auto &callInst : replace) {
+    dbgs() << "vote replaced to 1to1 mapping: ";
+    callInst->print(dbgs());
+    callInst->getCalledFunction()->setComdat(nullptr);
+    callInst->getCalledFunction()->deleteBody();
   }
 }
 
@@ -185,24 +170,42 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteX86(
     Module &m, const set<CallInst *> &replace) {}
 
 bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
+
+  DenseSet<StringRef> shflFuncs;
+
+  if (mapping_ == MAPPING_1TO1) {
+    shflFuncs = {
+      "_Z11__shfl_syncjiii",
+      "_Z11__shfl_syncjfii",
+      "_Z14__shfl_up_syncjiji",
+      "_Z16__shfl_down_syncjiji",
+      "_Z15__shfl_xor_syncjiii"
+    };
+
+  } else {
+    shflFuncs = {"llvm.nvvm.shfl.sync.down.i32",
+                 "llvm.nvvm.shfl.sync.up.i32",
+                 "llvm.nvvm.shfl.sync.bfly.i32",
+                 "llvm.nvvm.shfl.sync.idx.i32"};
+  }
+
   // get the callee functions to be replaced
   set<CallInst *> replace;
   for (auto &f : m.functions()) {
-    if (isKernelFunction(&m, &f))
-      continue;
+    // if (isKernelFunction(&m, &f))
+    //   continue;
     auto name_caller = f.getName().str();
+    dbgs() << "Processing function: " << name_caller << "\n";
     for (auto &bb : f) {
       for (auto &i : bb) {
         auto ci = dyn_cast<CallInst>(&i);
         if (!ci || ci->isInlineAsm())
           continue;
         auto name_callee = ci->getCalledOperand()->getName();
-        if (name_callee == "llvm.nvvm.shfl.sync.down.i32" ||
-            name_callee == "llvm.nvvm.shfl.sync.up.i32" ||
-            name_callee == "llvm.nvvm.shfl.sync.bfly.i32" ||
-            name_callee == "llvm.nvvm.shfl.sync.idx.i32") {
-          dbgs() << "shfl detected";
+        if (shflFuncs.count(name_callee.str())) {
+          dbgs() << "\nshfl detected: ";
           ci->print(dbgs(), true);
+          dbgs() << "\n";
           replace.insert(ci);
         }
       }
@@ -301,33 +304,11 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 
 void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
     Module &m, const set<CallInst *> &replace) {
-  LLVMContext &Context = m.getContext();
-  vector<Type *> ParamTypes(4, Type::getInt32Ty(Context));
-  Type *ReturnType = Type::getInt32Ty(Context);
-  FunctionType *nTTy = FunctionType::get(ReturnType, ParamTypes, false);
-  FunctionCallee shfl_func = m.getOrInsertFunction("vx_shfl_sync", nTTy);
-  for (auto shfl_inst : replace) {
-    IRBuilder<> builder(shfl_inst);
-    Value *offset, *mode, *val, *mask;
-    auto func_name = shfl_inst->getCalledOperand()->getName().str();
-    if (func_name == "llvm.nvvm.shfl.sync.down.i32") {
-      mode = builder.getInt32(0);
-    } else if (func_name == "llvm.nvvm.shfl.sync.up.i32") {
-      mode = builder.getInt32(1);
-    } else if (func_name == "llvm.nvvm.shfl.sync.bfly.i32") {
-      mode = builder.getInt32(2);
-    } else if (func_name == "llvm.nvvm.shfl.sync.idx.i32") {
-      mode = builder.getInt32(3);
-    } else {
-      errs() << "Unknown shuffle function: " << func_name << "\n";
-      continue;
-    }
-    offset = shfl_inst->getArgOperand(2);
-    val = shfl_inst->getArgOperand(1);
-    mask = shfl_inst->getArgOperand(3);
-    Value *result = builder.CreateCall(shfl_func, {offset, mode, val, mask});
-    shfl_inst->replaceAllUsesWith(result);
-    shfl_inst->eraseFromParent();
+  for (auto callInst : replace) {
+    dbgs() << "shfl replaced to 1to1 mapping: ";
+    callInst->print(dbgs());
+    callInst->getCalledFunction()->setComdat(nullptr);
+    callInst->getCalledFunction()->deleteBody();
   }
 }
 

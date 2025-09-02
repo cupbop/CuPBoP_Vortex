@@ -204,10 +204,10 @@ public:
 };
 
 auto DC_init = DeviceContext::instance();
-uint64_t NUM_THREADS, NUM_WARPS, NUM_CORES;
-int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &NUM_THREADS);
-int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &NUM_WARPS);
-int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES);
+uint64_t num_threads, num_warps, num_cores;
+int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &num_threads);
+int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &num_warps);
+int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &num_cores);
 
 extern "C" {
 
@@ -347,6 +347,63 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
   return cudaSuccess;
 }
 
+
+cudaError_t cudaMemcpyFromSymbol(void *dst, 
+                                 const void *symbol, 
+                                 size_t count, 
+                                 size_t offset, 
+                                 cudaMemcpyKind kind) {
+
+    if (kind != cudaMemcpyDeviceToHost) {
+        return cudaErrorInvalidValue;
+    }
+
+    std::string symbolName((char*)symbol);
+    printf("cudaMemcpyFromSymbol: Looking for symbol '%s'\n", symbolName.c_str());
+
+    std::fstream readfile;
+    readfile.open("lookup_global_symbols.txt", std::ios::in);
+    if (!readfile.is_open()) {
+        printf("Error: Could not open lookup_global_symbols.txt\n");
+        return cudaErrorFileNotFound;
+    }
+
+    std::string symbol_addr_str;
+    std::string symbol_type_tmp;
+    std::string symbol_name_tmp;
+    uint64_t device_symbol_address = 0;
+    bool found = false;
+
+    while(readfile >> symbol_addr_str) {
+        readfile >> symbol_type_tmp;
+        std::getline(readfile, symbol_name_tmp);
+        if (!symbol_name_tmp.empty() && symbol_name_tmp[0] == ' ') {
+            symbol_name_tmp = symbol_name_tmp.substr(1);
+        }
+
+        if(symbolName == symbol_name_tmp) {
+            device_symbol_address = std::stoull(symbol_addr_str, nullptr, 16);
+            found = true;
+            break;
+        }
+    }
+    readfile.close();
+
+    if (!found) {
+        printf("Error: Symbol '%s' not found in lookup_global_symbols.txt\n", symbolName.c_str());
+        return cudaErrorInvalidSymbol;
+    }
+
+    auto DC = DeviceContext::instance();
+    uint64_t source_address = device_symbol_address + offset;
+
+    printf("cudaMemcpyFromSymbol: Copying %zu bytes from device address 0x%llx to host address %p\n",
+           count, source_address, dst);
+    
+    DC->copy_from_dev(source_address, dst, count);
+
+    return cudaSuccess;
+}
 
 
 cudaError_t cudaMemcpyToSymbol_host(void *dst, 

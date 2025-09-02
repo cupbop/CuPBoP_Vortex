@@ -14,12 +14,17 @@ if [ -z "${VORTEX_HOME}" ]; then
 fi
 
 if [ -z "${LLVM_VORTEX}" ]; then
-  echo "Error: VORTEX_PATH is not defined. Please check whether Vortex LLVM is built and installed."
+  echo "Error: LLVM_VORTEX is not defined. Please check whether Vortex LLVM is built and installed."
   exit 1
 fi
 
 if [ -z "${CuPBoP_PATH}" ]; then
   echo "Error: CuPBoP_PATH is not defined. Please check whether CuPBoP is built and installed."
+  exit 1
+fi
+
+if [ -z "${VORTEX_PATH}" ]; then
+  echo "Error: VORTEX_PATH is not defined. Please check where vortex build are located"
   exit 1
 fi
 
@@ -48,14 +53,11 @@ export PATH=$YOSYS_PATH/bin:$SV2V_PATH/bin:$VERILATOR_ROOT/bin:$PATH
 export LD_LIBRARY_PATH=${GNU_RISCV_ROOT}:$LD_LIBRARY_PATH
 
 # For CuPBoP
+export LLVM_PATH=${LLVM_VORTEX}
+export PATH=$LLVM_PATH/bin:$PATH
+
 export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=$CuPBoP_PATH/cuda-12.1/lib64:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=${LLVM_VORTEX}/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=${VORTEX_PATH}/runtime/:${LD_LIBRARY_PATH}
 export CUDA_PATH=$CuPBoP_PATH/cuda-12.1
-
-export LLVM_PATH=${LLVM_VORTEX}
-export PATH=$LLVM_PATH/bin:$PATH
-export VORTEX_PATH=$VORTEX_HOME/build
-
-

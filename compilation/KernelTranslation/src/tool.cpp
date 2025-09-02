@@ -91,6 +91,16 @@ bool isKernelFunction(llvm::Module *M, llvm::Function *F) {
   return false;
 }
 
+bool isDeviceFunction(Module *M, Function *F) {
+  // Must be device-side code
+  if (!(M->getTargetTriple().substr(0,5) == "nvptx")) return false;
+  // Skip declarations and intrinsics
+  if (F->isDeclaration() || F->isIntrinsic()) return false;
+  // Skip kernels
+  if (isKernelFunction(M, F)) return false;
+  return true;
+}
+
 void replace_block(llvm::Function *F, llvm::BasicBlock *before,
                    llvm::BasicBlock *after) {
   for (Function::iterator i = F->begin(); i != F->end(); ++i) {
@@ -278,7 +288,11 @@ void replace_built_in_function(llvm::Module *M) {
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
-    if (!isKernelFunction(M, F))
+
+    printf("Function name: %s\n", func_name.c_str());
+    printf("iskernel=%d\n", isKernelFunction(M, F));
+    printf("isdevice=%d\n", isDeviceFunction(M, F));
+    if (!(isKernelFunction(M, F) || isDeviceFunction(M, F)))
       continue;
 
     IRBuilder<> builder(&*(F->getEntryBlock().getFirstInsertionPt()));
@@ -311,8 +325,6 @@ void replace_built_in_function(llvm::Module *M) {
       return Instr->getParent()->getParent()->getName().str() == func_name;
     });
 
-    printf(" replacing built-in functions\n");
-
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Load = dyn_cast<LoadInst>(BI)) {
@@ -323,7 +335,6 @@ void replace_built_in_function(llvm::Module *M) {
             // Mark: Temporarily commented out the _ZN25 function, we don't
             // think it's being used in vortex
             if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x") { //||
-              // func_name ==
               //     "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
               auto block_size_addr = M->getGlobalVariable("block_size_x");
               IRBuilder<> builder(context);
@@ -620,8 +631,9 @@ void replace_built_in_function(llvm::Module *M) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
             if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
-              printf("unknown InlineAsm\n");
-              exit(1);
+              printf("Warning: unhandled InlineAsm: %s\n",
+                     asm_inst->getAsmString().c_str());
+              continue;
             }
             // return the rank within the warp
             IRBuilder<> builder(context);
@@ -701,7 +713,9 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "__nv_sqrtf" || func_name == "__nv_exp" ||
                        func_name == "__nv_isnanf" ||
                        func_name == "__nv_isinff" || func_name == "__nv_powi" ||
-                       func_name == "__nv_powif") {
+                       func_name == "__nv_powif" ||
+                       func_name == "__nv_ffs" || func_name == "__nv_popc") {
+              dbgs() << "Removing call to " << func_name << "\n";
               Call->getCalledFunction()->deleteBody();
             } else if (func_name == "llvm.nvvm.fma.rn.d") {
               Call->getCalledFunction()->setName("__nvvm_fma_rn_d");
