@@ -120,7 +120,8 @@ void bscan (const int repeat)
   double time = 0.0;
   srand(123);
 
-  size_t grid_size = 12*7*8*9*10;
+  // size_t grid_size = 12*7*8*9*10;
+  size_t grid_size = 1024;
   dim3 grids (grid_size);
   dim3 blocks (N);
 
