@@ -51,7 +51,7 @@ CMakeCache.txt
 /runtime/threadPool/include/
 /include/
 
-.vscode/
+.vscode
 
 # tests
 *.ll

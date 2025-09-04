@@ -9,7 +9,7 @@ KERNEL_CU=gaussian.cu
 ARCH=32
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=0
+export VORTEX_SCHEDULE_FLAG=2
 
 show_usage()
 {

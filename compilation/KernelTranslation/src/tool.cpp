@@ -480,11 +480,30 @@ void replace_built_in_function(llvm::Module *M) {
                 need_remove.push_back(Call);
               }
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.z") {
-              printf("[WARNING] We DO NOT support triple-dim block\n");
-              exit(1);
-              auto zero = ConstantInt::get(I32, 0);
-              Call->replaceAllUsesWith(zero);
-              need_remove.push_back(Call);
+              if (schedule == 2) {
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
+
+                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
+                    M->getOrInsertGlobal("thread_id_z", I32));
+
+                auto threadLocalAddr = builder.CreateIntrinsic(
+                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
+                    {threadIdx}, nullptr);
+                auto tidz = builder.CreateLoad(I32, threadLocalAddr, "tidz");
+
+                MDNode *N =
+                    MDNode::get(context, MDString::get(context, "divergence"));
+                tidz->setMetadata("divergence", N);
+                Call->replaceAllUsesWith(tidz);
+                need_remove.push_back(Call);
+              } else {
+                printf("[WARNING] We DO NOT support triple-dim block\n");
+                exit(1);
+                auto zero = ConstantInt::get(I32, 0);
+                Call->replaceAllUsesWith(zero);
+                need_remove.push_back(Call);
+              }
             }
             // Mark: Temporarily commented out the _ZN25 function, we don't
             // think it's being used in vortex
@@ -709,7 +728,7 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "__nv_powf" || func_name == "__nv_logf" ||
                        func_name == "__nv_expf" || func_name == "__nv_fabsf" ||
                        func_name == "__nv_log10f" ||
-                       func_name == "__nv_fmodf" || func_name == "__nv_sqrt" ||
+                       func_name == "__nv_fmodf" || func_name == "__nv_sqrt" || func_name == "__nv_rsqrtf" ||
                        func_name == "__nv_sqrtf" || func_name == "__nv_exp" ||
                        func_name == "__nv_isnanf" ||
                        func_name == "__nv_isinff" || func_name == "__nv_powi" ||
@@ -731,6 +750,22 @@ void replace_built_in_function(llvm::Module *M) {
               Call->getCalledFunction()->setName("__nvvm_fabs_f");
             } else if (func_name == "llvm.nvvm.mul24.i") {
               Call->getCalledFunction()->setName("__nvvm_mul24_i");
+            } else if (func_name == "llvm.nvvm.fmin.ftz.f") {
+              Call->getCalledFunction()->setName("__nvvm_fmin_ftz_f");
+            } else if (func_name == "llvm.nvvm.fmin.f") {
+              Call->getCalledFunction()->setName("__nvvm_fmin_f");
+            } else if (func_name == "llvm.nvvm.fmax.ftz.f") {
+              Call->getCalledFunction()->setName("__nvvm_fmax_ftz_f");
+            } else if (func_name == "llvm.nvvm.fmax.f") {
+              Call->getCalledFunction()->setName("__nvvm_fmax_f");
+            } else if (func_name == "llvm.nvvm.membar.gl") {
+              Call->getCalledFunction()->setName("__nvvm_membar_gl");
+            } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") != std::string::npos) {
+              Call->getCalledFunction()->setName("__nvvm_atomic_load_inc_32");
+            } else if (func_name == "llvm.nvvm.div.approx.ftz.f") {
+              Call->getCalledFunction()->setName("__nvvm_div_approx_ftz_f");
+            } else if (func_name == "llvm.nvvm.div.approx.f") {
+              Call->getCalledFunction()->setName("__nvvm_div_approx_f");
             }
           }
         }

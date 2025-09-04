@@ -24,17 +24,29 @@ int __nvvm_mul24_i(int, int);
 double _ZL3expd(double);
 int __nv_ffs(int);
 int __nv_popc(int);
-
+float __nvvm_fmin_ftz_f(int, int);
+float __nvvm_fmin_f(float, float);
+float __nvvm_fmax_ftz_f(float, float);
+float __nvvm_fmax_f(float, float);
+void __nvvm_membar_gl();
+int __nvvm_atomic_load_inc_32(int*, int);
+float __nv_rsqrtf(float);
+int __nvvm_reflect(int*);
+float __nvvm_div_approx_ftz_f(float, float);
+float __nvvm_div_approx_f(float, float);
 }
 
-int __all_sync(unsigned, int);
-int __any_sync(unsigned, int);
-unsigned __ballot_sync(unsigned, int);
-unsigned __activemask();
-int __uniform_sync(unsigned, int);
-int __shfl_up_sync(unsigned, int, unsigned int, int);
-int __shfl_down_sync(unsigned, int, unsigned int, int);
-int __shfl_xor_sync(unsigned, int, int, int);
-int __shfl_sync(unsigned, int, int, int);
-float __shfl_sync(unsigned, float, int, int);
+int __all_sync(int, int);
+int __any_sync(int, int);
+int __ballot_sync(int, int);
+int __activemask();
+int __uniform_sync(int, int);
+int __shfl_up_sync(int, int, int, int);
+int __shfl_down_sync(int, int, int, int);
+int __shfl_xor_sync(int, int, int, int);
+int __shfl_sync(int, int, int, int);
+float __shfl_sync(int, float, int, int);
+float __shfl_up_sync(int, float, int, int);
+float __shfl_down_sync(int, float, int, int);
+float __shfl_xor_sync(int, float, int, int);
 #endif

@@ -43,7 +43,7 @@ else
 fi
 
 CUDA_PATH=$CuPBoP_PATH/cuda-12.1
-DEBUG_LEVEL=0
+DEBUG_LEVEL=2
 
 DPRINT()
 {

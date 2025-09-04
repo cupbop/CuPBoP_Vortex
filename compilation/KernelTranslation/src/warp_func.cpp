@@ -16,6 +16,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
+#include <vector>
 
 #include "insert_warp_loop.h"
 
@@ -36,20 +37,10 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
 bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
 
   DenseSet<StringRef> voteFuncs;
-  if (mapping_ == MAPPING_1TO1) {
-    voteFuncs = {
-    "_Z10__any_syncji",
-    "_Z10__all_syncji",     
-    "_Z14__uniform_syncji", 
-    "_Z13__ballot_syncji"   
-    };
-
-  } else {
-    voteFuncs = {"llvm.nvvm.vote.any.sync",
-                 "llvm.nvvm.vote.all.sync",
-                 "llvm.nvvm.vote.uni.sync",
-                 "llvm.nvvm.vote.ballot.sync"};
-  }
+  voteFuncs = {"llvm.nvvm.vote.any.sync",
+              "llvm.nvvm.vote.all.sync",
+              "llvm.nvvm.vote.uni.sync",
+              "llvm.nvvm.vote.ballot.sync"};
 
   // get the callee functions to be replaced
   set<CallInst *> replace;
@@ -158,11 +149,43 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
 
 void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
     Module &m, const set<CallInst *> &replace) {
-  for (auto &callInst : replace) {
-    dbgs() << "vote replaced to 1to1 mapping: ";
-    callInst->print(dbgs());
-    callInst->getCalledFunction()->setComdat(nullptr);
-    callInst->getCalledFunction()->deleteBody();
+  auto &ctx = m.getContext();
+  Type *I1 = Type::getInt1Ty(ctx);
+  Type *I32 = Type::getInt32Ty(ctx);
+
+  // Use mangled C++ names to match runtime symbols
+  FunctionCallee fn_all = m.getOrInsertFunction(
+      "_Z10__all_syncib", FunctionType::get(I1, {I32, I1}, false));
+  FunctionCallee fn_any = m.getOrInsertFunction(
+      "_Z10__any_syncib", FunctionType::get(I1, {I32, I1}, false));
+  FunctionCallee fn_uni = m.getOrInsertFunction(
+      "_Z14__uniform_syncib", FunctionType::get(I1, {I32, I1}, false));
+  FunctionCallee fn_ballot = m.getOrInsertFunction(
+      "_Z13__ballot_syncib", FunctionType::get(I32, {I32, I1}, false));
+
+  for (auto *ci : replace) {
+    IRBuilder<> builder(ci);
+    auto callee_name = ci->getCalledOperand()->getName().str();
+
+    Value *mask = ci->getArgOperand(0); // i32
+    Value *pred = ci->getArgOperand(1); // i1
+
+    CallInst *call = nullptr;
+    if (callee_name.find(".all.") != string::npos) {
+      call = builder.CreateCall(fn_all, {mask, pred});
+    } else if (callee_name.find(".any.") != string::npos) {
+      call = builder.CreateCall(fn_any, {mask, pred});
+    } else if (callee_name.find(".uni.") != string::npos) {
+      call = builder.CreateCall(fn_uni, {mask, pred});
+    } else if (callee_name.find(".ballot.") != string::npos) {
+      call = builder.CreateCall(fn_ballot, {mask, pred});
+    } else {
+      dbgs() << "Unknown vote variant: " << callee_name << "\n";
+      continue;
+    }
+
+    ci->replaceAllUsesWith(call);
+    ci->eraseFromParent();
   }
 }
 
@@ -173,21 +196,14 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
 
   DenseSet<StringRef> shflFuncs;
 
-  if (mapping_ == MAPPING_1TO1) {
-    shflFuncs = {
-      "_Z11__shfl_syncjiii",
-      "_Z11__shfl_syncjfii",
-      "_Z14__shfl_up_syncjiji",
-      "_Z16__shfl_down_syncjiji",
-      "_Z15__shfl_xor_syncjiii"
-    };
-
-  } else {
-    shflFuncs = {"llvm.nvvm.shfl.sync.down.i32",
-                 "llvm.nvvm.shfl.sync.up.i32",
-                 "llvm.nvvm.shfl.sync.bfly.i32",
-                 "llvm.nvvm.shfl.sync.idx.i32"};
-  }
+  shflFuncs = {"llvm.nvvm.shfl.sync.down.i32",
+                "llvm.nvvm.shfl.sync.up.i32",
+                "llvm.nvvm.shfl.sync.bfly.i32",
+                "llvm.nvvm.shfl.sync.idx.i32",
+                "llvm.nvvm.shfl.sync.down.f32",
+                "llvm.nvvm.shfl.sync.up.f32",
+                "llvm.nvvm.shfl.sync.bfly.f32",
+                "llvm.nvvm.shfl.sync.idx.f32"};
 
   // get the callee functions to be replaced
   set<CallInst *> replace;
@@ -304,11 +320,77 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 
 void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
     Module &m, const set<CallInst *> &replace) {
-  for (auto callInst : replace) {
-    dbgs() << "shfl replaced to 1to1 mapping: ";
-    callInst->print(dbgs());
-    callInst->getCalledFunction()->setComdat(nullptr);
-    callInst->getCalledFunction()->deleteBody();
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx);
+  Type *F32 = Type::getFloatTy(ctx);
+
+  for (auto *ci : replace) {
+    IRBuilder<> builder(ci);
+    auto name = ci->getCalledOperand()->getName().str();
+
+    // NVVM shfl signature: (mask, val, delta/srcLane, clamp)
+    Value *mask = ci->getArgOperand(0);
+    Value *val = ci->getArgOperand(1);
+    Value *arg2 = ci->getArgOperand(2);
+    Value *cparam = ci->getArgOperand(3);
+
+    if (mask->getType() != I32) mask = builder.CreateIntCast(mask, I32, false);
+    if (arg2->getType() != I32) arg2 = builder.CreateIntCast(arg2, I32, false);
+    if (cparam->getType() != I32) cparam = builder.CreateIntCast(cparam, I32, false);
+
+    bool isFloat = (ci->getType() == F32);
+
+    FunctionCallee callee;
+    std::vector<Value*> args;
+
+    if (name.find(".down.") != string::npos) {
+      if (isFloat) {
+        FunctionType *FT = FunctionType::get(F32, {I32, F32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z16__shfl_down_syncifii", FT);
+      } else {
+        FunctionType *FT = FunctionType::get(I32, {I32, I32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z16__shfl_down_synciiii", FT);
+        if (val->getType() != I32) val = builder.CreateIntCast(val, I32, false);
+      }
+      args = {mask, val, arg2, cparam};
+    } else if (name.find(".up.") != string::npos) {
+      if (isFloat) {
+        FunctionType *FT = FunctionType::get(F32, {I32, F32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z14__shfl_up_syncifii", FT);
+      } else {
+        FunctionType *FT = FunctionType::get(I32, {I32, I32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z14__shfl_up_synciiii", FT);
+        if (val->getType() != I32) val = builder.CreateIntCast(val, I32, false);
+      }
+      args = {mask, val, arg2, cparam};
+    } else if (name.find(".bfly.") != string::npos) {
+      if (isFloat) {
+        FunctionType *FT = FunctionType::get(F32, {I32, F32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z15__shfl_xor_syncifii", FT);
+      } else {
+        FunctionType *FT = FunctionType::get(I32, {I32, I32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z15__shfl_xor_synciiii", FT);
+        if (val->getType() != I32) val = builder.CreateIntCast(val, I32, false);
+      }
+      args = {mask, val, arg2, cparam};
+    } else if (name.find(".idx.") != string::npos) {
+      if (isFloat) {
+        FunctionType *FT = FunctionType::get(F32, {I32, F32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z11__shfl_syncifii", FT);
+      } else {
+        FunctionType *FT = FunctionType::get(I32, {I32, I32, I32, I32}, false);
+        callee = m.getOrInsertFunction("_Z11__shfl_synciiii", FT);
+        if (val->getType() != I32) val = builder.CreateIntCast(val, I32, false);
+      }
+      args = {mask, val, arg2, cparam};
+    } else {
+      // Unknown variant, skip
+      continue;
+    }
+
+    CallInst *newCall = builder.CreateCall(callee, args);
+    ci->replaceAllUsesWith(newCall);
+    ci->eraseFromParent();
   }
 }
 

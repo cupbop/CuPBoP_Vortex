@@ -8,6 +8,9 @@
 #define KERNEL_ARG_BASE_ADDR 6442446848
 
 
+void (* volatile vx_barrier_dummy)(int, int) = vx_barrier;
+
+
 struct alignas(8) context_t { 
 uint32_t num_groups[3]; 
 uint32_t global_offset[3]; 
@@ -44,16 +47,10 @@ int __thread thread_id_z;
 
 
  extern "C" {
-<<<<<<< Updated upstream
-    extern void cgkernelv_wrapper(void *args);
+    extern void welford_kernelIfffEvPKT_PT1_S4_iii_wrapper(void *args);
 }
 
-void cuda_cgkernelv_wrapper(void* args) {
-=======
-    extern void saxpy2DiiifPfS__wrapper(void *args);
-}
-
-void cuda_saxpy2DiiifPfS__wrapper(void* args) {
+void cuda_welford_kernelIfffEvPKT_PT1_S4_iii_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
@@ -62,11 +59,13 @@ void cuda_saxpy2DiiifPfS__wrapper(void* args) {
     thread_id_y = threadIdx.y;
     thread_id_z = threadIdx.z;
 
-    saxpy2DiiifPfS__wrapper((void **)args);
+    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
+
+    welford_kernelIfffEvPKT_PT1_S4_iii_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_saxpy2DiiifPfS__wrapper, 
+    cuda_welford_kernelIfffEvPKT_PT1_S4_iii_wrapper, 
 };
 
 int main() {
