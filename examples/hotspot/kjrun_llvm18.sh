@@ -9,7 +9,8 @@ KERNEL_CU=hotspot.cu
 ARCH=64
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=0
+# default: 1:1 mapping(2), can change it to thread mapping (0)
+export VORTEX_SCHEDULE_FLAG=${VORTEX_SCHEDULE_FLAG:-2}
 
 show_usage()
 {
@@ -137,19 +138,21 @@ then
 elif [ $DEVICE = "vortex" ]
 then
 
-    VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all"
+    #VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all"
+    VX_VXFLAGS="-Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -vortex-branch-divergence=2 -disable-loop-idiom-all"
     
     if [ $ARCH = 32 ]
     then
         VX_CFLAGS="-v -O3 -std=c++11 --sysroot=${RISCV_TOOLCHAIN}/riscv32-unknown-elf --target=riscv32 -march=rv32imf -mabi=ilp32f -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -fdata-sections -ffunction-sections -I${VORTEX_HOME}/kernel/include -I${VORTEX_PATH}/kernel/../hw"
         VX_LDFLAGS="-Wl,-Bstatic,-T,${VORTEX_HOME}/kernel/linker/vx_link32.ld,--defsym=XLEN=32,--defsym=STARTUP_ADDR=0x80000000 -Wl,--gc-sections ${VORTEX_PATH}/kernel/libvortexrt.a"
     else
-        VX_CFLAGS="-O3 --sysroot=${RISCV_TOOLCHAIN}/riscv64-unknown-elf --gcc-toolchain=${TOOLDIR}/riscv64-gnu-toolchain -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I${VORTEX_HOME}/kernel/include -I${VORTEX_PATH}/kernel/../hw -DXLEN_64 -DNDEBUG"
-        VX_LDFLAGS="-Wl,-Bstatic,--gc-sections,-T,${VORTEX_HOME}/kernel/scripts/link64.ld,--defsym=STARTUP_ADDR=0x080000000 ${VORTEX_HOME}/build/kernel/libvortex.a -L${TOOLDIR}/libc64/lib -lm -lc ${TOOLDIR}/libcrt64/lib/baremetal/libclang_rt.builtins-riscv64.a"
+        #VX_CFLAGS="-O3 --sysroot=${RISCV_TOOLCHAIN}/riscv64-unknown-elf --gcc-toolchain=${TOOLDIR}/riscv64-gnu-toolchain -march=rv64imafd -mabi=lp64d -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I${VORTEX_HOME}/kernel/include -I${VORTEX_PATH}/kernel/../hw -DXLEN_64 -DNDEBUG"
+        VX_CFLAGS="-O3 --sysroot=${RISCV_TOOLCHAIN}/riscv64-unknown-elf --gcc-toolchain=${TOOLDIR}/riscv64-gnu-toolchain -march=rv64imafd -mabi=lp64d -mcmodel=medany -debug -debug-only=riscv-lower -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I${VORTEX_HOME}/kernel/include -I${VORTEX_PATH}/kernel/../hw -DXLEN_64"
+        VX_LDFLAGS="-Wl,-Bstatic,--gc-sections,-T,${VORTEX_HOME}/kernel/scripts/link64.ld,--defsym=STARTUP_ADDR=0x180000000 ${VORTEX_HOME}/build/kernel/libvortex.a -L${TOOLDIR}/libc64/lib -lm -lc ${TOOLDIR}/libcrt64/lib/baremetal/libclang_rt.builtins-riscv64.a"
     fi
 
     echo "--- compiling kernel.bc"
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
+    ${LLVM_PREFIX}/bin/clang++ -v ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
     echo "--- compiling kernel_wrapper.cpp"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ../vortex_debug/kernel_wrapper.cpp -c -o kernel_wrapper.o -save-temps -v  || true  
     llvm-dis kernel_wrapper.bc
@@ -177,7 +180,8 @@ then
     # simx performance counter settings
     export PERF_CLASS=2
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out 16 2 2 ../../data/hotspot/temp_16 ../../data/hotspot/power_16 output.out # > host_out.dump
+    # LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime:../../build/runtime:${LD_LIBRARY_PATH} ./host.out 16 2 2 ../../data/hotspot/temp_16 ../../data/hotspot/power_16 output.out # > host_out.dump
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime:../../build/runtime:${LD_LIBRARY_PATH} ./host.out 512 1 60 ../../data/hotspot/temp_512 ../../data/hotspot/power_512 output.out # > host_out.dump
     echo "--- Execution completed!"
     exit -1
 fi

@@ -37,20 +37,21 @@ __global__ void needle_cuda_shared_1(int *referrence, int *matrix_cuda,
 
   if (tx == 0)
     temp[tx][0] = matrix_cuda[index_nw];
-
+    b_index_x = 29;
   for (int ty = 0; ty < BLOCK_SIZE; ty++)
     ref[ty][tx] = referrence[index + cols * ty];
-
+    b_index_x = 31;
   __syncthreads();
 
   temp[tx + 1][0] = matrix_cuda[index_w + cols * tx];
-
+  b_index_x = 33;
   __syncthreads();
 
   temp[0][tx + 1] = matrix_cuda[index_n];
 
   __syncthreads();
-
+  b_index_x = 34;
+// 여기에 추가로 barrier 가 들어감. 왜?
   for (int m = 0; m < BLOCK_SIZE; m++) {
 
     if (tx <= m) {
@@ -64,6 +65,9 @@ __global__ void needle_cuda_shared_1(int *referrence, int *matrix_cuda,
                          temp[t_index_y][t_index_x - 1] - penalty,
                          temp[t_index_y - 1][t_index_x] - penalty);
     }
+
+    b_index_x = 35;
+
 
     __syncthreads();
   }
@@ -124,7 +128,7 @@ __global__ void needle_cuda_shared_2(int *referrence, int *matrix_cuda,
 
   temp[0][tx + 1] = matrix_cuda[index_n];
 
-  __syncthreads();
+ __syncthreads();
 
   for (int m = 0; m < BLOCK_SIZE; m++) {
 
@@ -140,7 +144,7 @@ __global__ void needle_cuda_shared_2(int *referrence, int *matrix_cuda,
                          temp[t_index_y - 1][t_index_x] - penalty);
     }
 
-    __syncthreads();
+  __syncthreads();
   }
 
   for (int m = BLOCK_SIZE - 2; m >= 0; m--) {

@@ -27,6 +27,7 @@ findK(	long height,
 			// this conditional statement is inserted to avoid crush due to but in original code
 			// "offset[bid]" calculated below that addresses knodes[] in the next iteration goes outside of its bounds cause segmentation fault
 			// more specifically, values saved into knodes->indices in the main function are out of bounds of knodes that they address
+			// 들어가는애가 다른지 체크해볼수 있다
 			if(knodesD[offsetD[bid]].indices[thid] < knodes_elem){
 				offsetD[bid] = knodesD[offsetD[bid]].indices[thid];
 			}

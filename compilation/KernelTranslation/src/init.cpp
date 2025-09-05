@@ -3,6 +3,8 @@
 #include "tool.h"
 #include <fstream>
 #include <set>
+#include <cstdlib>
+#include <iostream>
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -168,7 +170,10 @@ void create_global_variable(llvm::Module *M) {
   auto local_group_id = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "__local_group_id", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-
+  auto dyn_shared_mem_size = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           NULL, "dyn_shared_mem_size", NULL,
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
+                           
   // LLVM is broken when using TLS with dynamic linkage on RISCV
   // and the generated binary contains invalid instructions.
   // Disable dynamic linkage since we don't create a shared library.
@@ -421,8 +426,20 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   create_global_variable(M);
   // replace phi with data load
   phi2alloc(M);
+
   // replace share memory
-  mem_share2global(M);
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
+  }
+  if (schedule == 0){
+    mem_share2global(M);}
+  else if (schedule == 2){
+    mem_share2local(M);}
+  else {
+    std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0 or 2)\n";
+    std::exit(1);
+  }
   // replace share memory
   mem_constant2global(M, fout);
   // replace asm Inline

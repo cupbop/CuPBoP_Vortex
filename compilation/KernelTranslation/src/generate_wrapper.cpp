@@ -298,6 +298,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
       "uint32_t printf_buffer_position; \n"
       "uint32_t printf_buffer_capacity; \n"
       "uint32_t work_dim; \n"
+      "uint32_t dyn_shared_mem_size; \n"
       "}; \n"
       "\n"
       
@@ -329,8 +330,26 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread thread_id_x;\n"
           "int __thread thread_id_y;\n"
           "int __thread thread_id_z;\n"
-          "\n";
+
+          "\n"
+
+          "int dyn_shared_mem_size;\n\n"
     
+
+          "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
+            "void* p = __local_mem(size);\n"
+            //"vx_printf(\"local memory allocation with %d bytes, add 0x%p\\n\", size, p);\n"
+            // "void* csr_read = (void*)csr_read(VX_CSR_LOCAL_MEM_BASE);\n"
+            // "vx_printf(\"csr_parameter: %d\\n\", VX_CSR_LOCAL_MEM_BASE);\n"
+            // "vx_printf(\"csr_read_value: %p\\n\", csr_read);\n"
+            // "vx_printf(\"local_group_id: %d\\n\", __local_group_id);\n"
+            "return p;\n"
+          "}\n"
+          
+
+          "\n";
+
+
     ss <<  "\n extern \"C\" {\n";
 
     for (auto f : wrapper_name) {
@@ -351,7 +370,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
               "    thread_id_y = threadIdx.y;\n"
               "    thread_id_z = threadIdx.z;\n"
               "\n" 
-              "    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"  
+              "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"  
               "\n"     
 	  "    " << f << "((void **)args);\n" 
             "}\n" 
@@ -368,7 +387,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n" 
 
           "int main() {\n"
-          "    vx_printf(\"kernel_wrapper: main\\n\");\n"
+          "//    vx_printf(\"kernel_wrapper: main\\n\");\n"
           "    kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); \n"
           "    auto ctx = &kernel_arg->ctx; \n"
           "    auto num_args = kernel_arg->num_args;\n"
@@ -385,7 +404,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    block_size_y = ctx->local_size[1];\n"
           "    block_size_z = ctx->local_size[2];\n"
           "\n"
-
+          "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
           "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
           "\n"
 
@@ -397,7 +416,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
           "        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
           "        memcpy(dst_addr, src_addr, size);\n"
-          "        vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
+          "        //vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
           "        memcpy_symbol_idx++;}}\n"
 
 
@@ -414,17 +433,18 @@ void create_kernel_wrapper_function(llvm::Module *M){
           // "           additional_info_idx++;}}\n"
 
 
-          "    vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
-          "    vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
-          "    vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\\n\", \n"
-          "        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
-          "        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
-          "        args[0], args[1], args[2], args[3], args[4], args[5]);\n"
-          "    vx_printf(\"workdim=%d\\n\", ctx->work_dim);\n"
-          "    vx_printf(\"threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\\n\", threadIdx.x, threadIdx.y, threadIdx.z);\n"
+          "    //vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
+          "    //vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
+          "    //vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\\n\", \n"
+          "    //    kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
+          "    //    ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
+          "    //    args[0], args[1], args[2], args[3], args[4], args[5]);\n"
+          "    //vx_printf(\"workdim=%d\\n\", ctx->work_dim);\n"
+          "    //vx_printf(\"threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\\n\", threadIdx.x, threadIdx.y, threadIdx.z);\n"
+          
       
 
-      "vx_printf(\"execute something\\n\");"
+      "//vx_printf(\"execute something\\n\");"
       
           "\n";
 

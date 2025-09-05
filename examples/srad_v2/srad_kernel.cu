@@ -50,18 +50,19 @@ srad_cuda_1(
   else if ( by == gridDim.y - 1 ){
   south[ty][tx] = J_cuda[cols * BLOCK_SIZE * (gridDim.y - 1) + BLOCK_SIZE * bx + cols * ( BLOCK_SIZE - 1 ) + tx];
   }
+  //printf("here?1\n");
    __syncthreads();
-
+    //printf("here?4\n");
   west[ty][tx] = J_cuda[index_w];
   east[ty][tx] = J_cuda[index_e];
-
+  //printf("here?3\n");
   if ( bx == 0 ){
   west[ty][tx] = J_cuda[cols * BLOCK_SIZE * by + cols * ty];
   }
   else if ( bx == gridDim.x - 1 ){
   east[ty][tx] = J_cuda[cols * BLOCK_SIZE * by + BLOCK_SIZE * ( gridDim.x - 1) + cols * ty + BLOCK_SIZE-1];
   }
-
+  //printf("here?2\n");
   __syncthreads();
 
 

@@ -46,6 +46,7 @@ std::vector<std::string> symbol_name_vector;
     uint32_t printf_buffer_position;
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
+    uint32_t dyn_shared_mem_size;
   };
   
 #else
@@ -57,6 +58,7 @@ std::vector<std::string> symbol_name_vector;
     uint32_t printf_buffer_position;
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
+    uint32_t dyn_shared_mem_size;
   };
 #endif
 
@@ -204,10 +206,12 @@ public:
 };
 
 auto DC_init = DeviceContext::instance();
-uint64_t num_threads, num_warps, num_cores;
-int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &num_threads);
-int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &num_warps);
-int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &num_cores);
+
+uint64_t NUM_THREADS_VX, NUM_WARPS_VX, NUM_CORES_VX;
+int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &NUM_THREADS_VX);
+int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &NUM_WARPS_VX);
+int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES_VX);
+
 
 extern "C" {
 
@@ -609,9 +613,9 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
-cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
-  return cudaGetDeviceProperties(deviceProp, device);
-}
+// cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
+//   return cudaGetDeviceProperties(deviceProp, device);
+// }
 
 static cudaError_t lastError = cudaSuccess;
 const char *cudaGetErrorString(cudaError_t error) {
@@ -756,6 +760,7 @@ cudaError_t cudaLaunchKernel_vortex(
   ctx.global_offset[0] = 0;
   ctx.global_offset[1] = 0;
   ctx.global_offset[2] = 0;
+  ctx.dyn_shared_mem_size = sharedMem;
 
   memcpy(&abuf_ptr->ctx, &ctx, sizeof(context_t));
   
@@ -828,7 +833,7 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // dump performance counters for every kernel to a file
     
-  std::string filename = "perf_counter_" + std::to_string(NUM_CORES) + "C_" + std::to_string(NUM_WARPS) + "W_" + std::to_string(NUM_THREADS) + "T_thread_map_mem.txt";
+  std::string filename = "perf_counter_" + std::to_string(NUM_CORES_VX) + "C_" + std::to_string(NUM_WARPS_VX) + "W_" + std::to_string(NUM_THREADS_VX) + "T_thread_map_mem.txt";
   std::cout << "output file: " << filename << std::endl;
   //convert filename to char* with its content
   char filename_char[filename.size() + 1];

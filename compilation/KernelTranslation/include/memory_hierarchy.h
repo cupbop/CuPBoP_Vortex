@@ -5,6 +5,7 @@
 using namespace llvm;
 
 void mem_share2global(llvm::Module *M);
+void mem_share2local(llvm::Module *M);
 void mem_constant2global(llvm::Module *M, std::ofstream &fout);
 
 

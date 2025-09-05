@@ -5,7 +5,7 @@ set -e
 
 ######################### Default Varaibles #################################
 DEVICE=vortex
-KERNEL_CU=saxpy.cu
+KERNEL_CU=saxpy_2d.cu
 ARCH=64
 #############################################################################
 
@@ -170,6 +170,7 @@ then
 
     echo "--- Kernel compilation completed!"
     
+    #g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/ -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     g++ -g -O0 -Wall -L../../build/runtime -L../../build/runtime/threadPool -L${VORTEX_PATH}/runtime/ -I${VORTEX_PATH}/kernel/include -o host.out -fPIC -no-pie host.o host_vortexrt.o  -lc -lvortexRuntime -lvortex -lThreadPool -lpthread 
     echo "--- Host compilation completed!"
 

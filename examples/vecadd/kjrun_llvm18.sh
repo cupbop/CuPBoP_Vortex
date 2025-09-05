@@ -9,7 +9,7 @@ KERNEL_CU=vectorAdd.cu
 ARCH=64
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=1
+export VORTEX_SCHEDULE_FLAG=0
 
 show_usage()
 {
@@ -177,7 +177,7 @@ then
     # simx performance counter settings
     export PERF_CLASS=2
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out  > host_out.dump
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out -n 4096 -b 512  > host_out.dump
     echo "--- Execution completed!"
     exit -1
 fi

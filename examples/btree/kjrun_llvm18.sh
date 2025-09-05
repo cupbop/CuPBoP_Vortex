@@ -10,7 +10,8 @@ ARCH=64
 ADDITIONAL_PATH="./common"
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=0
+# default: 1:1 mapping(2), can change it to thread mapping (0)
+export VORTEX_SCHEDULE_FLAG=${VORTEX_SCHEDULE_FLAG:-2}
 
 show_usage()
 {

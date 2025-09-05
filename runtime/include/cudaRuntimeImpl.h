@@ -31,7 +31,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream);
 cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 cudaError_t cudaGetDeviceCount(int *count);
 cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device);
-cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device);
+// cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device);
 const char *cudaGetErrorString(cudaError_t error);
 cudaError_t cudaGetLastError(void);
 }

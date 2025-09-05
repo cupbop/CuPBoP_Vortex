@@ -50,17 +50,53 @@ public:
     // first block, so that we do not need to execute these instructions
     // multiple times (in intra-warp loops).
     BasicBlock *entry = &(*F.begin());
-    for (auto i = entry->begin(); i != entry->end(); i++) {
-      // LLVM 18 changes
+    // for (auto i = entry->begin(); i != entry->end(); i++) {
+    //   // LLVM 18 changes
 
-      //if (!isa<AllocaInst>(i)) {
-      if (!isa<AllocaInst>(i) && !isa<LoadInst>(i) && !isa<CastInst>(i)) {
-        //print the instruction before inserting the barrier
-        printf("inserting intra warp barrier before instruction: AllocInst\n");
-        i->print(llvm::errs());
-        insert_inter_warp_sync_before.push_back(&(*(i)));
+    //   //if (!isa<AllocaInst>(i)) {
+    //   if (!isa<AllocaInst>(i) && !isa<LoadInst>(i) && !isa<CastInst>(i)) {
+    //     //print the instruction before inserting the barrier
+    //     printf("inserting intra warp barrier before instruction: AllocInst\n");
+    //     i->print(llvm::errs());
+    //     insert_inter_warp_sync_before.push_back(&(*(i)));
+    //     break;
+    //   }
+    // }
+    
+    auto iter = entry->begin();
+    while (iter != entry->end()) {
+        Instruction* I = &*iter;
+
+        // 기존 예외: AllocaInst, LoadInst, CastInst
+        if (isa<AllocaInst>(I) || isa<LoadInst>(I) || isa<CastInst>(I)) {
+            ++iter;
+            continue;
+        }
+
+        // vx_local_alloc + gep + addrspacecast + store 시퀀스 예외
+        if (auto call = dyn_cast<CallInst>(I)) {
+            Function *callee = call->getCalledFunction();
+            if (callee && callee->getName().contains("vx_local_alloc")) {
+                // 뒤에 gep, addrspacecast, store 있는지 체크
+                auto next1 = std::next(iter);
+                auto next2 = std::next(next1);
+                auto next3 = std::next(next2);
+                if (next1 != entry->end() && next2 != entry->end() && next3 != entry->end() &&
+                    isa<GetElementPtrInst>(&*next1) &&
+                    isa<AddrSpaceCastInst>(&*next2) &&
+                    isa<StoreInst>(&*next3)) {
+                    // 네 개 다 barrier 앞 예외로 인정 (store까지 스킵)
+                    iter = ++next3; // store까지 skip
+                    continue;
+                }
+            }
+        }
+
+        // 위 예외에 걸리지 않으면, 여기에 barrier 삽입
+        printf("inserting intra warp barrier before instruction:\n");
+        I->print(llvm::errs());
+        insert_inter_warp_sync_before.push_back(I);
         break;
-      }
     }
 
     for (Function::iterator I = F.begin(); I != F.end(); ++I) {

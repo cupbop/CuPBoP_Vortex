@@ -96,18 +96,17 @@ int main(int argc, char **argv) {
   replace_built_in_function(program);
 
   dumpFile(program, "6.ll");
-  
   VerifyModule(program);
   std::cout << "generate\n" << std::flush;
   printIR(program);
   generate_wrapper(program);
-
+  dumpFile(program, "7.ll");
   // VerifyModule(program);
   std::cout << "performance opt\n" << std::flush;
   printIR(program);
   // performance optimization
   performance_optimization(program);
-
+  dumpFile(program, "8.ll");
   std::cout << "verify\n" << std::flush;
   printIR(program);
   VerifyModule(program);

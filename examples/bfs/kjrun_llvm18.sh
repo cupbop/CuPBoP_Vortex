@@ -9,7 +9,8 @@ KERNEL_CU=bfs.cu
 ARCH=64
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=0
+# default: 1:1 mapping(2), can change it to thread mapping (0)
+export VORTEX_SCHEDULE_FLAG=${VORTEX_SCHEDULE_FLAG:-2}
 
 show_usage()
 {
@@ -179,7 +180,7 @@ then
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph20.txt  > host_out.dump
 
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph20.txt  > host_out.dump
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph4096.txt  > host_out.dump
     echo "--- Execution completed!"
     exit -1
 fi

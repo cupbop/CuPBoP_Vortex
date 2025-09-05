@@ -13,7 +13,7 @@ void saxpy(int n, float a, float *x, float *y)
 
 int main(void)
 {
-  int N = 1024;//32*32*32*4;
+  int N = 144;//32*32*32*4;
   int T = 16;
 
   float *x, *y, *d_x, *d_y;
