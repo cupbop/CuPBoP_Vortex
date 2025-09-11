@@ -104,13 +104,13 @@ __global__ void sgemm2_kernel(const TYPE* __restrict__ A,
   for (int k = 0; k < (int)N; k += TILE_SIZE) {
     // localA[localRow][localCol] = A[globalRow * N + (k + localCol)];
     // localB[localRow][localCol] = B[(k + localRow) * N + globalCol];
-    localA[localRow][localCol] = A[globalRow * N + (k + localCol)];
-    localB[localRow][localCol] = B[(k + localRow) * N + globalCol];
+    // localA[localRow][localCol] = A[globalRow * N + (k + localCol)];
+    // localB[localRow][localCol] = B[(k + localRow) * N + globalCol];
     // A 타일: 행 m = globalRow, 열 k = k0 + localCol  → A[(k0+localCol)*M + globalRow]
-    //localA[localRow][localCol] = A[(k + localCol) * N + globalRow];
+    localA[localRow][localCol] = A[(k + localCol) * N + globalRow];
 
     // B 타일: 행 k = k0 + localRow, 열 n = globalCol → B[globalCol*K + (k0+localRow)]
-    //localB[localRow][localCol] = B[globalCol * N + (k + localRow)];
+    localB[localRow][localCol] = B[globalCol * N + (k + localRow)];
 
     __syncthreads(); // barrier(CLK_LOCAL_MEM_FENCE)
 
@@ -125,8 +125,8 @@ __global__ void sgemm2_kernel(const TYPE* __restrict__ A,
 
   // C[globalRow * N + globalCol] = sum;
   //임시
-  C[globalRow * N + globalCol] = sum;
-  //C[globalCol * N + globalRow] = sum;
+  // C[globalRow * N + globalCol] = sum;
+  C[globalCol * N + globalRow] = sum;
 }
 
 // ---------------- Host main (OpenCL 호스트 로직 1:1 매핑) ----------------

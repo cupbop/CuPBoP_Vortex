@@ -180,7 +180,7 @@ then
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} gdb --arg ./host.out -q -v
     #LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph20.txt  > host_out.dump
 
-    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph4096.txt  > host_out.dump
+    LD_LIBRARY_PATH=../../build/runtime/threadPool:${VORTEX_PATH}/runtime/simx:../../build/runtime:${LD_LIBRARY_PATH} ./host.out ../../data/bfs/graph4096.txt  > CGO_vortex_test1.log
     echo "--- Execution completed!"
     exit -1
 fi

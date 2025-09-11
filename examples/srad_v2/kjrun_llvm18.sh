@@ -9,7 +9,8 @@ KERNEL_CU=srad.cu
 ARCH=64
 #############################################################################
 
-export VORTEX_SCHEDULE_FLAG=2
+# default: 1:1 mapping(2), can change it to thread mapping (0)
+export VORTEX_SCHEDULE_FLAG=${VORTEX_SCHEDULE_FLAG:-2}
 
 show_usage()
 {

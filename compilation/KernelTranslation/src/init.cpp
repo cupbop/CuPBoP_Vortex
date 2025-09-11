@@ -435,7 +435,8 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   if (schedule == 0){
     mem_share2global(M);}
   else if (schedule == 2){
-    mem_share2local(M);}
+    //mem_share2local(M);}
+    mem_share2global_sche_2(M);}
   else {
     std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0 or 2)\n";
     std::exit(1);

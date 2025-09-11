@@ -832,8 +832,13 @@ cudaError_t cudaLaunchKernel_vortex(
   printf("sync device\n");
   
   // dump performance counters for every kernel to a file
-    
-  std::string filename = "perf_counter_" + std::to_string(NUM_CORES_VX) + "C_" + std::to_string(NUM_WARPS_VX) + "W_" + std::to_string(NUM_THREADS_VX) + "T_thread_map_mem.txt";
+  
+  int schedule = 0;
+    if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+      schedule = std::stoi(std::string(env));
+    }
+
+  std::string filename = "CGO_perf_counter_" + std::to_string(NUM_CORES_VX) + "C_" + std::to_string(NUM_WARPS_VX) + "W_" + std::to_string(NUM_THREADS_VX) + "T_SCHE_"+ std::to_string(schedule) + ".txt";
   std::cout << "output file: " << filename << std::endl;
   //convert filename to char* with its content
   char filename_char[filename.size() + 1];

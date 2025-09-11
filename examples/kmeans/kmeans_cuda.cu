@@ -4,7 +4,7 @@
 #include <math.h>
 #include <assert.h>
 
-#include <omp.h>
+//#include <omp.h>
 
 #include <cuda.h>
 
@@ -306,4 +306,3 @@ kmeansCuda(float  **feature,				/* in: [npoints][nfeatures] */
 	
 }
 /* ------------------- kmeansCuda() end ------------------------ */    
-

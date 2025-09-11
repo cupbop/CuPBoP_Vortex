@@ -5,7 +5,7 @@ set -e
 
 ######################### Default Varaibles #################################
 DEVICE=vortex
-KERNEL_CU=euler3d_original.cu
+KERNEL_CU=euler3d_no_memcpytosymbol.cu # euler3d_original.cu
 ARCH=64
 #############################################################################
 

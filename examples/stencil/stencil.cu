@@ -81,19 +81,20 @@ __global__ void naive_kernel_cuda(float *Anext,
                                   int nx, int ny, int nz,
                                   float c0, float c1)
 {
-  // Emulate OpenCL: block=(128,1,1), grid=(ceil((nx-2)/128), ny-2, nz-2), offset=(+1,+1,+1)
   int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
-  int j = blockIdx.y + 1;
+  int j = blockIdx.y * blockDim.y + threadIdx.y + 1;  // ← Y도 일반화
   int k = blockIdx.z + 1;
 
-  if (i < (nx - 1)) { // j,k exact by grid size
+  if (i < nx-1 && j < ny-1) {  // j 가드 추가
     int plane = nx * ny;
     int idx   = i + j * nx + k * plane;
 
-    Anext[idx] = c0 * A0[idx] +
-                 c1 * ( A0[idx-1] + A0[idx+1]
-                      + A0[idx-nx] + A0[idx+nx]
-                      + A0[idx-plane] + A0[idx+plane] );
+    // OpenCL 과 동일: c1*이웃합 - c0*A0
+    Anext[idx] =
+        c1 * ( A0[idx-1] + A0[idx+1]
+             + A0[idx-nx] + A0[idx+nx]
+             + A0[idx-plane] + A0[idx+plane] )
+      - c0 * A0[idx];
   }
 }
 

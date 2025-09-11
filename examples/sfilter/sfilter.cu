@@ -137,17 +137,41 @@ __global__ void sfilter_kernel(const float* __restrict__ src,
   const int work_y = ldc - 2;
 
   // 오프셋 적용 전의 “작업 좌표”
-  const int x0 = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y0 = blockIdx.y * blockDim.y + threadIdx.y;
+  // blockidx.y 0-61 
+  // threadidx.x 0-63
 
-  // work 범위 밖이면 리턴 (오프셋 적용 前 기준)
-  if (x0 >= work_x || y0 >= work_y) return;
+  const int x0 = blockIdx.x * blockDim.x + threadIdx.x; // x0(0-64)
+  const int y0 = blockIdx.y * blockDim.y + threadIdx.y; // y0(62)
 
-  // 실제 좌표 = 내부 시작점 (1,1) 에서 오프셋 +1
+    // 실제 좌표 = 내부 시작점 (1,1) 에서 오프셋 +1
   const int x = x0 + 1;
   const int y = y0 + 1;
 
   const int addr = x + y * ldc;
+  if (x0 == 0)
+  {
+    printf("blockidx.y= %d", blockIdx.y);
+  }
+  //printf("blockdim.x: %d, blockDim.y: %d", blockDim.x, blockDim.y);
+  //printf("griddim.x: %d griddim.y:  %d", gridDim.x, gridDim.y);
+  // if (y0 == 16)
+  // {
+  //      printf("blockIdx.x: %d, threadIdx.x: %d", blockIdx.x, threadIdx.x);
+  //       printf("blockIdx.y: %d, threadIdx.y: %d", blockIdx.y, threadIdx.y);
+  //       printf("x0=%d, y0=%d", x0, y0); 
+  // }
+  // if (addr > 1089 && addr <1150)
+  // {
+  //   printf("blockIdx.x: %d, threadIdx.x: %d", blockIdx.x, threadIdx.x);
+  //   printf("blockIdx.y: %d, threadIdx.y: %d", blockIdx.y, threadIdx.y);
+  //   printf("x0=%d, y0=%d", x0, y0);
+  // }
+
+  // work 범위 밖이면 리턴 (오프셋 적용 前 기준)
+  if (x0 >= work_x || y0 >= work_y) return;
+
+
+
 
   float i0 = src[addr-1-1*ldc]*m0;
   float i1 = src[addr+0-1*ldc]*m1;

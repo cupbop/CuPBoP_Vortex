@@ -82,16 +82,90 @@ static int compare_floats(const float* src, const float* gold, int count){
   return num_errors;
 }
 
-// .vec: 공백 구분 텍스트 float 벡터
-static bool read_vec_text(const std::string& path, std::vector<TYPE>& x, int expectedN){
-  std::ifstream ifs(path);
-  if (!ifs) return false;
-  x.clear(); x.reserve(expectedN);
-  double v;
-  while (ifs >> v){
-    x.push_back((TYPE)v);
+// 텍스트/MatrixMarket/바이너리 모두 지원
+static bool read_vec_auto(const std::string& path, std::vector<TYPE>& x, int expectedN){
+  // 1) 텍스트 시도
+  {
+    std::ifstream ifs(path);
+    if (ifs) {
+      x.clear(); x.reserve(expectedN);
+      double v;
+      while (ifs >> v) x.push_back((TYPE)v);
+      if ((int)x.size() == expectedN) return true;
+    }
   }
-  return (int)x.size() == expectedN;
+
+  // 2) MatrixMarket 텍스트 시도
+  {
+    std::ifstream ifs(path);
+    if (ifs) {
+      std::string line;
+      if (std::getline(ifs, line) && line.rfind("%%MatrixMarket", 0) == 0) {
+        // 사이즈 라인까지 스킵
+        while (std::getline(ifs, line)) {
+          if (!line.empty() && line[0] != '%') break;
+        }
+        if (!line.empty()) {
+          std::istringstream ss(line);
+          int n=0, m=1; // "n" 또는 "n m" 형태 모두 수용
+          ss >> n; if (ss >> m) { /* ok */ }
+          // 배열(array) 스타일: 값 n개
+          x.clear(); x.reserve(n);
+          double v;
+          while (ifs >> v) x.push_back((TYPE)v);
+          if ((int)x.size()==n && n==expectedN) return true;
+        }
+      }
+    }
+  }
+
+  // 파일 크기 얻기
+  auto file_size = [](const std::string& p)->long long {
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) return -1;
+    return (long long)f.tellg();
+  };
+  long long sz = file_size(path);
+
+  // 3) 바이너리: int N + N floats
+  {
+    std::ifstream ifs(path, std::ios::binary);
+    if (ifs) {
+      int N = 0;
+      ifs.read(reinterpret_cast<char*>(&N), sizeof(int));
+      if (ifs && N > 0) {
+        // 크기 검증(가능하면)
+        if (sz < 0 || sz == (long long)sizeof(int) + (long long)N * sizeof(float) || N==expectedN) {
+          std::vector<float> buf(N);
+          ifs.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)N*sizeof(float));
+          if (ifs) {
+            x.resize(N);
+            for (int i=0;i<N;++i) x[i]=(TYPE)buf[i];
+            return N==expectedN; // 기대 길이와 맞아야 성공으로 간주
+          }
+        }
+      }
+    }
+  }
+
+  // 4) 바이너리: N floats (헤더 없음)
+  if (sz >= 0 && sz % (long long)sizeof(float) == 0) {
+    int N = (int)(sz / (long long)sizeof(float));
+    if (N == expectedN) {
+      std::ifstream ifs(path, std::ios::binary);
+      if (ifs) {
+        std::vector<float> buf(N);
+        ifs.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)N*sizeof(float));
+        if (ifs) {
+          x.resize(N);
+          for (int i=0;i<N;++i) x[i]=(TYPE)buf[i];
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 // ------------------------ Matrix Market -> COO ------------------------
@@ -107,30 +181,60 @@ static bool read_matrix_market(const std::string& path, COO& coo){
     std::fprintf(stderr, "Cannot open %s\n", path.c_str());
     return false;
   }
-  std::string line;
-  if (!std::getline(ifs, line)) return false;
-  if (line.rfind("%%MatrixMarket", 0) != 0){
+  std::string header;
+  if (!std::getline(ifs, header)) return false;
+  if (header.rfind("%%MatrixMarket", 0) != 0){
     std::fprintf(stderr, "Not a MatrixMarket file\n");
     return false;
   }
-  // 스펙 간략 대응: coordinate real general
-  // 주석/공백 스킵 후 크기/NNZ 라인
-  while (std::getline(ifs, line)){
-    if (line.empty() || line[0]=='%') continue;
-    std::istringstream iss(line);
-    int M,N,NNZ; if (!(iss>>M>>N>>NNZ)){ std::fprintf(stderr,"Bad size line\n"); return false; }
-    coo.rows=M; coo.cols=N; coo.I.reserve(NNZ); coo.J.reserve(NNZ); coo.V.reserve(NNZ);
-    for (int k=0;k<NNZ;++k){
-      if (!std::getline(ifs, line)) return false;
-      if (line.empty() || line[0]=='%'){ --k; continue; }
-      std::istringstream t(line);
-      int i,j; double v;
-      if (!(t >> i >> j >> v)) return false;
-      coo.I.push_back(i-1);
-      coo.J.push_back(j-1);
+
+  // 헤더 토큰 파싱: coordinate / array, real|integer|pattern, general|symmetric 등
+  // ex) "%%MatrixMarket matrix coordinate real symmetric"
+  bool is_coordinate = header.find("coordinate") != std::string::npos;
+  bool is_symmetric  = header.find("symmetric")  != std::string::npos;
+
+  // 사이즈 라인까지 주석 스킵
+  std::string line;
+  do {
+    if (!std::getline(ifs, line)) return false;
+  } while (line.empty() || line[0] == '%');
+
+  int M,N,NNZ;
+  {
+    std::istringstream ss(line);
+    if (!(ss >> M >> N >> NNZ)){
+      std::fprintf(stderr,"Bad size line\n");
+      return false;
+    }
+  }
+
+  coo.rows=M; coo.cols=N;
+  coo.I.reserve(is_symmetric ? NNZ*2 : NNZ);
+  coo.J.reserve(is_symmetric ? NNZ*2 : NNZ);
+  coo.V.reserve(is_symmetric ? NNZ*2 : NNZ);
+
+  if (!is_coordinate){
+    std::fprintf(stderr,"Only coordinate format is supported\n");
+    return false;
+  }
+
+  for (int k=0;k<NNZ;++k){
+    if (!std::getline(ifs, line)) return false;
+    if (line.empty() || line[0]=='%'){ --k; continue; }
+    std::istringstream t(line);
+    int i,j; double v;
+    if (!(t >> i >> j >> v)) return false;
+    --i; --j;                // 0-based
+
+    coo.I.push_back(i);
+    coo.J.push_back(j);
+    coo.V.push_back((TYPE)v);
+
+    if (is_symmetric && i!=j){
+      coo.I.push_back(j);
+      coo.J.push_back(i);
       coo.V.push_back((TYPE)v);
     }
-    break;
   }
   return true;
 }
@@ -198,7 +302,8 @@ struct JDS {
 static void csr_to_jds(const CSR& csr, int pad, JDS& jds){
   const int M = csr.rows;
   jds.dim = M;
-  // 행별 nnz
+
+  // 1) 행별 nnz와 depth
   std::vector<int> row_nnz(M);
   int depth = 0;
   for (int r=0;r<M;++r){
@@ -207,54 +312,58 @@ static void csr_to_jds(const CSR& csr, int pad, JDS& jds){
   }
   jds.depth = depth;
 
-  // perm: nnz 내림차순으로 행 인덱스 정렬
+  // 2) perm: nnz 내림차순
   jds.perm.resize(M);
   for (int r=0;r<M;++r) jds.perm[r]=r;
   std::stable_sort(jds.perm.begin(), jds.perm.end(),
                    [&](int a,int b){ return row_nnz[a] > row_nnz[b]; });
 
-  // 각 대각의 길이: diag_len[k] = nnz가 k+1 이상인 행의 수
+  // 3) 각 대각의 실제 길이 diag_len[k]
   std::vector<int> diag_len(depth, 0);
   for (int k=0;k<depth;++k){
     int cnt=0;
     for (int p=0;p<M;++p){
       int r = jds.perm[p];
-      if (row_nnz[r] > k) ++cnt;
-      else break; // 정렬된 상태라 break 가능
+      if (row_nnz[r] > k) ++cnt; else break;
     }
     diag_len[k]=cnt;
   }
 
-  // jds_ptr = 각 대각의 시작 오프셋 (누적합)
+  // 4) 패딩된 길이와 jds_ptr
+  std::vector<int> diag_len_padded(depth, 0);
   jds.jds_ptr.resize(depth);
-  int off=0;
-  for (int k=0;k<depth;++k){ jds.jds_ptr[k]=off; off += diag_len[k]; }
+  int off = 0;
+  for (int k=0;k<depth;++k){
+    int L  = diag_len[k];
+    int LP = (L + pad - 1) / pad * pad;     // pad 배수로
+    diag_len_padded[k] = LP;
+    jds.jds_ptr[k] = off;
+    off += LP;
+  }
   jds.len = off;
 
   jds.data.assign(jds.len, (TYPE)0);
   jds.indices.assign(jds.len, 0);
 
-  // 각 행의 k번째(0-based) 비제로를 찾아 대각 k의 [jds_ptr[k] + p] 위치에 기록
-  // CSR 안에서 행의 비제로들은 이미 열 인덱스 오름차순
-  // p: permuted row order index(=thread 내 행 순번)
+  // 5) 데이터 채우기 (유효 구간만 채우고 나머지는 0으로 유지)
   for (int p=0; p<M; ++p){
     int r = jds.perm[p];
-    int s = csr.Ap[r], e = csr.Ap[r+1];
-    int nnz = e - s;
+    int s = csr.Ap[r], e = csr.Ap[r+1], nnz = e - s;
     for (int k=0;k<nnz;++k){
-      int j = jds.jds_ptr[k] + p; // 해당 대각의 p번째 원소
+      int base = jds.jds_ptr[k];
+      // k번째 대각에서 p번째 위치는 항상 존재 (패딩 덕분)
+      int j = base + p;
       jds.data[j]   = csr.Ax[s+k];
       jds.indices[j]= csr.Aj[s+k];
     }
   }
 
-  // sh_zcnt: 블록(=warp)별 유효 대각 수
+  // 6) sh_zcnt (블록 그룹별 유효 대각 수)
   int numBlocks = (M + pad - 1) / pad;
   jds.nzcnt_len = numBlocks;
   jds.sh_zcnt.assign(numBlocks, 0);
   for (int b=0;b<numBlocks;++b){
     int row_start = b*pad;
-    // 각 대각에서 row_start < diag_len[k] 인 k의 개수
     int bound=0;
     for (int k=0;k<depth;++k){
       if (row_start < diag_len[k]) ++bound; else break;
@@ -285,24 +394,26 @@ static void spmv_jds_cpu(const JDS& jds, const std::vector<TYPE>& x, std::vector
 
 // ------------------------ CUDA 커널 ------------------------
 __global__ void spmv_jds_naive_kernel(
-    float* __restrict__ d_Ax,        // dim
-    const float* __restrict__ d_data,// len
-    const int*   __restrict__ d_idx, // len
-    const int*   __restrict__ d_perm,// dim
-    const float* __restrict__ d_x,   // cols
+    float* __restrict__ d_Ax,
+    const float* __restrict__ d_data,
+    const int*   __restrict__ d_idx,
+    const int*   __restrict__ d_perm,
+    const float* __restrict__ d_x,
     int dim,
-    const int*   __restrict__ jds_ptr,   // depth
-    const int*   __restrict__ sh_zcnt)   // nzcnt_len == numBlocks
+    const int*   __restrict__ jds_ptr,
+    const int*   __restrict__ sh_zcnt,
+    int pad)                             // ← pad 추가
 {
-  int tx = threadIdx.x;
-  int bx = blockIdx.x;
-  int i  = bx * blockDim.x + tx;  // permuted row
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= dim) return;
 
+  int group = i / pad;                   // ← OpenCL의 ix/32와 동일 개념
   float sum = 0.0f;
-  int bound = sh_zcnt[bx];        // 이 블록에서 유효한 대각 개수
-  for (int k=0;k<bound;++k){
-    int j = jds_ptr[k] + i;
+  int bound = sh_zcnt[group];            // ← 여기!
+
+  #pragma unroll 1
+  for (int k = 0; k < bound; ++k) {
+    int j = jds_ptr[k] + i;              // 패딩이 되어 있어야 안전 (수정 2 참고)
     sum += d_data[j] * d_x[d_idx[j]];
   }
   d_Ax[d_perm[i]] = sum;
@@ -351,8 +462,9 @@ int main(int argc, char** argv){
 
   // x 벡터 로드 (크기 csr.cols)
   std::vector<TYPE> h_x(csr.cols);
-  if (!read_vec_text(vec_path, h_x, csr.cols)){
-    std::fprintf(stderr, "Failed to read vector '%s' with length %d\n", vec_path.c_str(), csr.cols);
+  if (!read_vec_auto(vec_path, h_x, csr.cols)) {
+    std::fprintf(stderr, "Failed to read vector '%s' with expected length %d\n",
+                vec_path.c_str(), csr.cols);
     return 1;
   }
 
@@ -385,7 +497,7 @@ int main(int argc, char** argv){
 
   auto t0 = std::chrono::high_resolution_clock::now();
   spmv_jds_naive_kernel<<<grid, block>>>(d_Ax, d_data, d_idx, d_perm, d_x,
-                                         jds.dim, d_jds_ptr, d_shzcnt);
+                                         jds.dim, d_jds_ptr, d_shzcnt, pad);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
   auto t1 = std::chrono::high_resolution_clock::now();
