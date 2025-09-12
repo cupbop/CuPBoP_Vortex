@@ -70,7 +70,6 @@ benchmarks=(
   btree
   conv3
   dotproduct
-  gauss
   nn
   pathfinder
   psort

@@ -55,10 +55,10 @@ return p;
 
 
  extern "C" {
-    extern void dotProductKernelPKfS0_Pfi_wrapper(void *args);
+    extern void parallelSumKernelPKfPfi_wrapper(void *args);
 }
 
-void cuda_dotProductKernelPKfS0_Pfi_wrapper(void* args) {
+void cuda_parallelSumKernelPKfPfi_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
@@ -69,11 +69,11 @@ void cuda_dotProductKernelPKfS0_Pfi_wrapper(void* args) {
 
 //    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
 
-    dotProductKernelPKfS0_Pfi_wrapper((void **)args);
+    parallelSumKernelPKfPfi_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_dotProductKernelPKfS0_Pfi_wrapper, 
+    cuda_parallelSumKernelPKfPfi_wrapper, 
 };
 
 int main() {
