@@ -429,18 +429,37 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
 
   // replace share memory
   int schedule = 0;
+  int local_mem_use = 1;
+
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     schedule = std::stoi(std::string(env));
   }
-  if (schedule == 0){
-    mem_share2global(M);}
-  else if (schedule == 2){
-    //mem_share2local(M);}
-    mem_share2global_sche_2(M);}
-  else {
+  if (char *env = std::getenv("VORTEX_LOCALMEM_FLAG"))
+  {
+    local_mem_use = std::stoi(std::string(env));
+  }
+
+  if (schedule == 0)
+  {
+    mem_share2global(M);
+  }
+
+  else if (schedule == 2)
+  {
+    if (local_mem_use == 1)
+    {
+      mem_share2local(M);
+    }
+    else
+    {
+      mem_share2global_sche_2(M);
+    }
+  }
+    else 
+    {
     std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0 or 2)\n";
     std::exit(1);
-  }
+    }
   // replace share memory
   mem_constant2global(M, fout);
   // replace asm Inline

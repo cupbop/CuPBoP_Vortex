@@ -50,11 +50,9 @@ make  install
 
 ```bash
 
-git clone https://github.com/cupbop/CuPBoP_dev CuPBoP
+git clone https://github.com/cupbop/CuPBoP_Vortex.git
 
-cd CuPBoP
-
-git checkout vortex-llvm18
+cd CuPBoP_Vortex
 
 export  CuPBoP_PATH=`pwd`
 
@@ -97,6 +95,7 @@ sh cuda_12.1.1_530.30.02_linux.run --silent --toolkit --toolkitpath=$CuPBoP_PATH
   
 
 Use the CuPBoP_env_setup.sh file to set up the environment variables:
+If you're planning to use Cuda only (not OpenCL), you can execute CuPBoP_env_setup_wo_PoCL.sh.
 
 ```bash
 

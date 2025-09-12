@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
   VerifyModule(program);
   insert_sync(program);
 
-  dumpFile(program, "3.ll");
+  //dumpFile(program, "3.ll");
 
   // split block by sync
   VerifyModule(program);
@@ -74,41 +74,41 @@ int main(int argc, char **argv) {
 
   std::cout << "split\n" << std::flush;
   //print the proogram
-  printIR(program);
+  //printIR(program);
   split_block_by_sync(program);
   // add loop for intra&intera thread
 
 
-  dumpFile(program, "4.ll");
+  //dumpFile(program, "4.ll");
   
   // VerifyModule(program);
   std::cout << "insert_warp_loop\n" << std::flush;
   printIR(program);
   insert_warp_loop(program);
 
-  dumpFile(program, "5.ll");
+  //dumpFile(program, "5.ll");
 
   VerifyModule(program);
 
   // (TODO): replace this patch
   std::cout << "replace\n" << std::flush;
-  printIR(program);
+  //printIR(program);
   replace_built_in_function(program);
 
-  dumpFile(program, "6.ll");
+  //dumpFile(program, "6.ll");
   VerifyModule(program);
   std::cout << "generate\n" << std::flush;
-  printIR(program);
+  //printIR(program);
   generate_wrapper(program);
-  dumpFile(program, "7.ll");
+  //dumpFile(program, "7.ll");
   // VerifyModule(program);
   std::cout << "performance opt\n" << std::flush;
-  printIR(program);
+  //printIR(program);
   // performance optimization
   performance_optimization(program);
-  dumpFile(program, "8.ll");
+  //dumpFile(program, "8.ll");
   std::cout << "verify\n" << std::flush;
-  printIR(program);
+  //printIR(program);
   VerifyModule(program);
 
   std::cout << "dump\n" << std::flush;

@@ -1,6 +1,7 @@
 ########## USER DEFINED VARIABLES ##########
 export VORTEX_ARCHITECTURE=64     #(32 or 64)
-export VORTEX_SCHEDULE_FLAG=0     #(0(TM) or 1(CM)
+export VORTEX_SCHEDULE_FLAG=2     #(0(TM) or 1(CM) or 2(1:1 mapping, default)
+export VORTEX_LOCALMEM_FLAG=1     # Switch for Vortex Localmem HW (only works for schedule=2)
 #############################################
 
 if [ -z "${TOOLDIR}" ]; then
