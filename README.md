@@ -36,7 +36,7 @@ Please look at the following files to understand the basics of CuPBoP:
 
 - GCC (Verified with 7.5.0, 10.5.0)
 
-- Vortex 2.0 ([Verified with commit on Oct 22, 2024](https://github.com/vortexgpgpu/vortex/tree/3a3bb7b70a395a6f96a2bfe657bc724186565fe0))
+- Vortex 2.0 ([Verified with commit on Aug 2, 2025](https://github.com/vortexgpgpu/vortex/tree/9cd0e1bb5f63bd93f04bd940a866d717dd22cf30))
 
 ### Installation Procedure
 

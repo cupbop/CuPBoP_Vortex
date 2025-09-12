@@ -6,8 +6,21 @@ from typing import Optional, Dict, Tuple
 
 # Benchmarks to be checked
 benchmarks = [
+    "backprop",
+    "bfs",
+    "btree",
+    "conv3",
     "dotproduct",
+    "gauss",
+    "nn",
+    "pathfinder",
+    "psum",
     "saxpy",
+    "sgemm",
+    "stencil",
+    "transpose",
+    "vecadd",
+    "psort",
 ]
 
 LINE_RE = re.compile(
