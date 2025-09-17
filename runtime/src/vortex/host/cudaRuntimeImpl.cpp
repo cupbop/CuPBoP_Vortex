@@ -613,10 +613,6 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
-cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
-  return cudaGetDeviceProperties(deviceProp, device);
-}
-
 static cudaError_t lastError = cudaSuccess;
 const char *cudaGetErrorString(cudaError_t error) {
   if (error == cudaSuccess) {

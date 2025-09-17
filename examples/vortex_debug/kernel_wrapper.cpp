@@ -19,7 +19,6 @@ char * printf_buffer;
 uint32_t printf_buffer_position; 
 uint32_t printf_buffer_capacity; 
 uint32_t work_dim; 
-uint32_t dyn_shared_mem_size; 
 }; 
 
 typedef struct {
@@ -46,19 +45,14 @@ int __thread thread_id_x;
 int __thread thread_id_y;
 int __thread thread_id_z;
 
-int dyn_shared_mem_size;
-
-extern "C" void* vx_local_alloc(uint32_t size) {
-void* p = __local_mem(size);
-return p;
-}
-
 
  extern "C" {
-    extern void parallelSumKernelPKfPfi_wrapper(void *args);
+    extern void VoteAnyKernel1PKjPji_wrapper(void *args);
+    extern void VoteAllKernel2PKjPji_wrapper(void *args);
+    extern void VoteAnyKernel3Pbii_wrapper(void *args);
 }
 
-void cuda_parallelSumKernelPKfPfi_wrapper(void* args) {
+void cuda_VoteAnyKernel1PKjPji_wrapper(void* args) {
     block_index_x = blockIdx.x;
     block_index_y = blockIdx.y;
     block_index_z = blockIdx.z;
@@ -67,17 +61,47 @@ void cuda_parallelSumKernelPKfPfi_wrapper(void* args) {
     thread_id_y = threadIdx.y;
     thread_id_z = threadIdx.z;
 
-//    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
+    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
 
-    parallelSumKernelPKfPfi_wrapper((void **)args);
+    VoteAnyKernel1PKjPji_wrapper((void **)args);
+}
+
+void cuda_VoteAllKernel2PKjPji_wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
+
+    thread_id_x = threadIdx.x;
+    thread_id_y = threadIdx.y;
+    thread_id_z = threadIdx.z;
+
+    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
+
+    VoteAllKernel2PKjPji_wrapper((void **)args);
+}
+
+void cuda_VoteAnyKernel3Pbii_wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
+
+    thread_id_x = threadIdx.x;
+    thread_id_y = threadIdx.y;
+    thread_id_z = threadIdx.z;
+
+    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
+
+    VoteAnyKernel3Pbii_wrapper((void **)args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_parallelSumKernelPKfPfi_wrapper, 
+    cuda_VoteAnyKernel1PKjPji_wrapper, 
+    cuda_VoteAllKernel2PKjPji_wrapper, 
+    cuda_VoteAnyKernel3Pbii_wrapper, 
 };
 
 int main() {
-//    vx_printf("kernel_wrapper: main\n");
+    vx_printf("kernel_wrapper: main\n");
     kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); 
     auto ctx = &kernel_arg->ctx; 
     auto num_args = kernel_arg->num_args;
@@ -91,7 +115,6 @@ int main() {
     block_size_y = ctx->local_size[1];
     block_size_z = ctx->local_size[2];
 
-    dyn_shared_mem_size = ctx->dyn_shared_mem_size;
     block_size = ctx->local_size[0] * ctx->local_size[1];
 
 if (memcpy_symbol_array[0] != 0) {
@@ -102,17 +125,17 @@ if (memcpy_symbol_array[0] != 0) {
         auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];
         auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];
         memcpy(dst_addr, src_addr, size);
-        //vx_printf("memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\n", memcpy_symbol_idx, dst_addr, src_addr, size);
+        vx_printf("memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\n", memcpy_symbol_idx, dst_addr, src_addr, size);
         memcpy_symbol_idx++;}}
-    //vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
-    //vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
-    //vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n", 
-    //    kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], 
-    //    ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],
-    //    args[0], args[1], args[2], args[3], args[4], args[5]);
-    //vx_printf("workdim=%d\n", ctx->work_dim);
-    //vx_printf("threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\n", threadIdx.x, threadIdx.y, threadIdx.z);
-//vx_printf("execute something\n");
+    vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
+    vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
+    vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n", 
+        kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], 
+        ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],
+        args[0], args[1], args[2], args[3], args[4], args[5]);
+    vx_printf("workdim=%d\n", ctx->work_dim);
+    vx_printf("threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\n", threadIdx.x, threadIdx.y, threadIdx.z);
+vx_printf("execute something\n");
     return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); 
 
 }
