@@ -156,8 +156,7 @@ then
     echo "--- compiling kernel.bc"
     ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} kernel.bc -c -o kernel.o > kernel.log 2>&1    
     echo "--- compiling kernel_wrapper.cpp"
-    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ./kernel_wrapper.cpp -c -o kernel_wrapper.o -save-temps -v  || true  
-    llvm-dis kernel_wrapper.bc
+    ${LLVM_PREFIX}/bin/clang++ ${VX_CFLAGS} ${VX_VXFLAGS} --gcc-toolchain=${RISCV_TOOLCHAIN_FOLDER} ./kernel_wrapper.cpp -c -o kernel_wrapper.o  || true  
     ${LLVM_PREFIX}/bin/llvm-objdump -D kernel_wrapper.o > kernel_wrapper.dump
 
     echo "--- compiling kernel.elf"
