@@ -250,8 +250,14 @@ void create_kernel_wrapper_function(llvm::Module *M){
                 break;
               }
               wrapper_name.push_back(func_name + "_wrapper");
+              // Read static shared memory size from function attribute (set by mem_share2local)
+              uint32_t static_shared_bytes = 0;
+              if (Call->getCalledFunction()->hasFnAttribute("cupbop.static_shared_bytes")) {
+                auto attr = Call->getCalledFunction()->getFnAttribute("cupbop.static_shared_bytes");
+                static_shared_bytes = std::stoul(attr.getValueAsString().str());
+              }
               outfile.open("lookup.txt", std::ios::app);
-              outfile << kernel_idx << " " << func_name << " " << func_arg_size << "\n";
+              outfile << kernel_idx << " " << func_name << " " << func_arg_size << " " << static_shared_bytes << "\n";
               outfile.close();
               kernel_idx++;
             }
@@ -370,10 +376,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
               "    thread_id_y = threadIdx.y;\n"
               "    thread_id_z = threadIdx.z;\n"
               "\n" 
-              "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"  
-              "\n"     
-	  "    " << f << "((void **)args);\n" 
-            "}\n" 
+              "\n"
+	  "    " << f << "((void **)args);\n"
+            "}\n"
             "\n";   
     }
       
@@ -387,7 +392,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n" 
 
           "int main() {\n"
-          "//    vx_printf(\"kernel_wrapper: main\\n\");\n"
+          "//    vx_printf(\"[KERNEL] main() entered\\n\");\n"
           "    kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); \n"
           "    auto ctx = &kernel_arg->ctx; \n"
           "    auto num_args = kernel_arg->num_args;\n"
@@ -502,7 +507,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
     std::ofstream ofs;
 
-    ofs.open("../vortex_debug/kernel_wrapper.cpp");
+    ofs.open("kernel_wrapper.cpp");
     ofs << ss.rdbuf();
     ofs.close();    
 

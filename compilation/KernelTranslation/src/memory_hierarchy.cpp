@@ -566,6 +566,9 @@ void mem_share2local(llvm::Module *M) {
       }
       uint32_t staticAligned = alignTo(staticBytes, dynAlign);
 
+      // Record static shared memory size as function attribute for resource checks
+      F.addFnAttr("cupbop.static_shared_bytes", std::to_string(staticAligned));
+
       Value *dynBytes = ConstantInt::get(I32, 0);
       if (!usedDynamic.empty() && DynSizeGV)
         dynBytes = B.CreateLoad(I32, DynSizeGV, "dyn_bytes");
@@ -656,6 +659,9 @@ void mem_share2local(llvm::Module *M) {
       dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
     }
     uint32_t staticAligned = alignTo(staticBytes, dynAlign);
+
+    // Record static shared memory size as function attribute for resource checks
+    F.addFnAttr("cupbop.static_shared_bytes", std::to_string(staticAligned));
 
     Value *dynBytes = ConstantInt::get(I32, 0);
     if (!usedDynamic.empty() && DynSizeGV)

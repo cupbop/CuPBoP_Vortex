@@ -19,6 +19,22 @@
 #include <limits>
 #include <vector>
 #include <map>
+#include <signal.h>
+#include <execinfo.h>
+
+// SIGABRT handler to print backtrace before crash
+static void sigabrt_handler(int sig) {
+  void *bt[30];
+  int n = backtrace(bt, 30);
+  fprintf(stderr, "\n[CuPBoP] SIGABRT caught! Backtrace (%d frames):\n", n);
+  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  signal(SIGABRT, SIG_DFL);
+  raise(SIGABRT);
+}
+
+static struct SigabrtInstaller {
+  SigabrtInstaller() { signal(SIGABRT, sigabrt_handler); }
+} __sigabrt_installer;
 
 // Global variable to support CudaMemcpytoSymbol
 std::vector<std::vector<uint64_t> >  memcpy_symbol;
@@ -714,13 +730,24 @@ cudaError_t cudaLaunchKernel_vortex(
   readfile.open("lookup.txt", std::ios::in);
   std::string kernel_idx_tmp;
   std::string kernel_name_tmp;
-  
+  uint32_t static_shared_bytes = 0;
+
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
+    // Read arg count and static shared memory size (4th column, added by kernelTranslator)
+    std::string func_arg_size_tmp;
+    std::string static_shared_tmp;
+    readfile >> func_arg_size_tmp;
+    if (readfile >> static_shared_tmp) {
+      // 4th column exists
+    } else {
+      static_shared_tmp = "0";
+    }
     readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     std::cout << "debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl;
     if(std::string(func) == kernel_name_tmp) {
       std::cout << "found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl;
+      static_shared_bytes = std::stoul(static_shared_tmp);
       break;
     }
   }
@@ -729,12 +756,55 @@ cudaError_t cudaLaunchKernel_vortex(
   printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
+  fprintf(stderr, "[DBG] step1: before DeviceContext::instance()\n");
   auto DC = DeviceContext::instance();
-  
+
+  // Resource check 1: block size vs hardware thread count
+  uint64_t num_warps = 0, num_threads = 0;
+  vx_dev_caps(DC->device(), VX_CAPS_NUM_WARPS, &num_warps);
+  vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &num_threads);
+  uint64_t threads_per_core = num_warps * num_threads;
+  uint64_t group_size = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
+  if (group_size > threads_per_core) {
+    fprintf(stderr, "[CuPBoP] Error: blockDim (%d x %d x %d = %llu) exceeds hardware threads_per_core (%llu = %llu warps x %llu threads).\n",
+            blockDim.x, blockDim.y, blockDim.z, (unsigned long long)group_size,
+            (unsigned long long)threads_per_core, (unsigned long long)num_warps, (unsigned long long)num_threads);
+    fprintf(stderr, "[CuPBoP] Rebuild Vortex simx with NUM_WARPS >= %llu to support this kernel.\n",
+            (unsigned long long)((group_size + num_threads - 1) / num_threads));
+    std::abort();
+  }
+
+  // Resource check 2: local memory capacity
+  {
+    uint64_t local_mem_size = 0;
+    vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size);
+    uint64_t warps_per_group = group_size / num_threads;
+    if (warps_per_group == 0) warps_per_group = 1;
+    uint64_t groups_per_core = num_warps / warps_per_group;
+    if (groups_per_core == 0) groups_per_core = 1;
+    uint64_t total_shared_per_group = (uint64_t)static_shared_bytes + sharedMem;
+    uint64_t total_lmem_needed = groups_per_core * total_shared_per_group;
+    fprintf(stderr, "[CuPBoP] LMEM check: %llu groups/core x %llu bytes/group (static=%u + dynamic=%lu) = %llu bytes, LMEM capacity = %llu bytes\n",
+            (unsigned long long)groups_per_core, (unsigned long long)total_shared_per_group,
+            static_shared_bytes, sharedMem,
+            (unsigned long long)total_lmem_needed, (unsigned long long)local_mem_size);
+    if (total_lmem_needed > local_mem_size) {
+      fprintf(stderr, "[CuPBoP] Error: total local memory needed (%llu bytes) exceeds hardware LMEM capacity (%llu bytes).\n",
+              (unsigned long long)total_lmem_needed, (unsigned long long)local_mem_size);
+      fprintf(stderr, "[CuPBoP]   %llu groups/core x %llu bytes/group (static=%u + dynamic=%lu)\n",
+              (unsigned long long)groups_per_core, (unsigned long long)total_shared_per_group,
+              static_shared_bytes, sharedMem);
+      fprintf(stderr, "[CuPBoP]   Increase LMEM_LOG_SIZE or reduce block count per core.\n");
+      std::abort();
+    }
+  }
+
+  fprintf(stderr, "[DBG] step2: before vx_upload_kernel_file\n");
   int status = C_RUN;
   // upload kernel to device
   RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.vxbin", DC->krnl_buffer()));
-  
+  fprintf(stderr, "[DBG] step3: kernel file uploaded OK\n");
+
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   printf("(debug) abuf_size = %ld\n", abuf_size);
@@ -811,24 +881,37 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // upload kernel arguments
   // RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
+  fprintf(stderr, "[DBG] step4: before vx_upload_bytes (args)\n");
   RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size+abuf_size_additional, DC->args_buffer()));
+  fprintf(stderr, "[DBG] step5: args uploaded OK\n");
   printf("args_buffer: %p\n", DC->args_buffer());
-  
+
 
 
   //RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional));
   //DC->copy_to_dev(KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR, abuf_ptr_additional, abuf_size_additional);
   //RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr_additional, abuf_size_additional, (void**)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR));
-  
+
 
   printf("uploaded args\n");
-  
+
   // start execution
+  fprintf(stderr, "[DBG] step6: before vx_start\n");
   RT_CHECK(vx_start(DC->device(), DC->get_krnl_buf(), DC->get_args_buf()));
+  fprintf(stderr, "[DBG] step7: vx_start returned OK\n");
 
   printf("wait device\n");
   // wait for the execution to complete
-  RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
+  fprintf(stderr, "[DBG] step8: before vx_ready_wait\n");
+  {
+    int __wait_ret = vx_ready_wait(DC->device(), VX_MAX_TIMEOUT);
+    fprintf(stderr, "[CuPBoP] vx_ready_wait returned %d\n", __wait_ret);
+    if (__wait_ret != 0) {
+      fprintf(stderr, "[CuPBoP] Error: kernel execution failed (vx_ready_wait returned %d)\n", __wait_ret);
+      std::abort();
+    }
+  }
+  fprintf(stderr, "[DBG] step9: execution completed OK\n");
 
   printf("sync device\n");
   
