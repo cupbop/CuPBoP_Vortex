@@ -747,7 +747,7 @@ void replace_built_in_function(llvm::Module *M) {
             } else if (func_name == "llvm.nvvm.lohi.i2d") {
               Call->getCalledFunction()->setName("__nvvm_lohi_i2d");
             } else if (func_name == "llvm.nvvm.fabs.f") {
-              Call->getCalledFunction()->setName("__nvvm_fabs_f");
+              // Handled in NVVM intrinsic replacement pass below
             } else if (func_name == "llvm.nvvm.mul24.i") {
               Call->getCalledFunction()->setName("__nvvm_mul24_i");
             } else if (func_name == "llvm.nvvm.fmin.ftz.f") {
@@ -776,6 +776,78 @@ void replace_built_in_function(llvm::Module *M) {
   for (auto inst : need_remove) {
     inst->eraseFromParent();
   }
+
+  // Replace NVVM float intrinsics with standard LLVM IR operations.
+  // These intrinsics are not supported by the RISC-V backend and would
+  // cause "Don't know how to custom type legalize this intrinsic!" errors.
+  {
+    std::vector<CallInst *> to_replace;
+    for (auto &F : *M) {
+      for (auto &BB : F) {
+        for (auto &Inst : BB) {
+          if (auto *Call = dyn_cast<CallInst>(&Inst)) {
+            if (!Call->getCalledFunction())
+              continue;
+            auto name = Call->getCalledFunction()->getName().str();
+            if (name.find("llvm.nvvm.fma.rn") != std::string::npos ||
+                name.find("llvm.nvvm.mul.rn") != std::string::npos ||
+                name == "llvm.nvvm.fabs.f" ||
+                name.find("llvm.nvvm.fabs.ftz") != std::string::npos ||
+                name.find("llvm.nvvm.f2i.rn") != std::string::npos ||
+                name.find("llvm.nvvm.add.rn.f") != std::string::npos) {
+              to_replace.push_back(Call);
+            }
+          }
+        }
+      }
+    }
+
+    for (auto *Call : to_replace) {
+      auto name = Call->getCalledFunction()->getName().str();
+      IRBuilder<> Builder(Call);
+
+      Value *replacement = nullptr;
+
+      if (name.find("llvm.nvvm.fma.rn") != std::string::npos) {
+        // fma(a, b, c) = a * b + c
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        Value *c = Call->getArgOperand(2);
+        Function *fma_func = Intrinsic::getDeclaration(
+            M, Intrinsic::fma, {a->getType()});
+        replacement = Builder.CreateCall(fma_func, {a, b, c});
+      } else if (name.find("llvm.nvvm.mul.rn") != std::string::npos) {
+        // mul(a, b) = a * b
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        replacement = Builder.CreateFMul(a, b);
+      } else if (name.find("llvm.nvvm.add.rn.f") != std::string::npos) {
+        // add(a, b) = a + b
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        replacement = Builder.CreateFAdd(a, b);
+      } else if (name == "llvm.nvvm.fabs.f" ||
+                 name.find("llvm.nvvm.fabs.ftz") != std::string::npos) {
+        // fabs(x)
+        Value *x = Call->getArgOperand(0);
+        Function *fabs_func = Intrinsic::getDeclaration(
+            M, Intrinsic::fabs, {x->getType()});
+        replacement = Builder.CreateCall(fabs_func, {x});
+      } else if (name.find("llvm.nvvm.f2i.rn") != std::string::npos) {
+        // float-to-int with round-to-nearest: roundf(x) then fptosi
+        Value *x = Call->getArgOperand(0);
+        Function *round_func = Intrinsic::getDeclaration(
+            M, Intrinsic::roundeven, {x->getType()});
+        Value *rounded = Builder.CreateCall(round_func, {x});
+        replacement = Builder.CreateFPToSI(rounded, Builder.getInt32Ty());
+      }
+
+      if (replacement) {
+        Call->replaceAllUsesWith(replacement);
+        Call->eraseFromParent();
+      }
+    }
+  }
 }
 
 void replace_asm_call(llvm::Module *M) {
@@ -784,27 +856,56 @@ void replace_asm_call(llvm::Module *M) {
   std::vector<CallInst *> need_remove;
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
-    auto func_name = F->getName().str();
-    if (!isKernelFunction(M, F))
-      continue;
 
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
-            if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
-              printf("unknown InlineAsm\n");
-              exit(1);
+            auto asm_str = asm_inst->getAsmString();
+
+            if (asm_str == "mov.u32 $0, %laneid;") {
+              // return the rank within the warp
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              auto intra_warp_index_addr =
+                  M->getGlobalVariable("intra_warp_index");
+              auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
+              Call->replaceAllUsesWith(intra_warp_index);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("mad.lo.cc.u32") != std::string::npos &&
+                       asm_str.find("madc.hi.u32") != std::string::npos) {
+              // PTX: {lo, hi} = a * b + c (64-bit multiply-add)
+              // Replace with standard 64-bit arithmetic
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              auto I64 = llvm::Type::getInt64Ty(context);
+              Value *a = Call->getArgOperand(0);  // multiplier
+              Value *b = Call->getArgOperand(1);  // multiplicand
+              Value *c = Call->getArgOperand(2);  // addend
+              Value *a64 = builder.CreateZExt(a, I64);
+              Value *b64 = builder.CreateZExt(b, I64);
+              Value *c64 = builder.CreateZExt(c, I64);
+              Value *prod = builder.CreateMul(a64, b64);
+              Value *sum = builder.CreateAdd(prod, c64);
+              Value *lo = builder.CreateTrunc(sum, I32);
+              Value *hi = builder.CreateTrunc(builder.CreateLShr(sum, 32), I32);
+              // Return {lo, hi} as struct
+              Value *result = UndefValue::get(Call->getType());
+              result = builder.CreateInsertValue(result, lo, 0);
+              result = builder.CreateInsertValue(result, hi, 1);
+              Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else {
+              printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
+              // For other unknown PTX asm, replace with zero/undef
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              if (!Call->getType()->isVoidTy()) {
+                Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
+              }
+              need_remove.push_back(Call);
             }
-            // return the rank within the warp
-            IRBuilder<> builder(context);
-            builder.SetInsertPoint(Call);
-            auto intra_warp_index_addr =
-                M->getGlobalVariable("intra_warp_index");
-            auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
-            Call->replaceAllUsesWith(intra_warp_index);
-            need_remove.push_back(Call);
           }
         }
       }
