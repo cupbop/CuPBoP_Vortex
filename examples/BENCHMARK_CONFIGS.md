@@ -6,19 +6,41 @@ Minimum simx configuration needed for each benchmark (with NUM_THREADS=4).
 
 Current simx config that runs ALL benchmarks:
 ```
-NUM_WARPS=64    # supports up to 256 threads/block (64 warps x 4 threads)
-NUM_THREADS=4   # default
-NUM_CORES=1     # default
-LMEM_ENABLE     # required for benchmarks with shared memory
+NUM_WARPS=64        # supports up to 256 threads/block (64 warps x 4 threads)
+NUM_THREADS=4       # default
+NUM_CORES=1         # default
+LMEM_ENABLE         # required for benchmarks with shared memory
+LMEM_LOG_SIZE=17    # workaround for Vortex LMEM addressing bug (see below)
 ```
 
 **Note:** NUM_WARPS=128 is NOT supported by the current Vortex simx (produces incorrect results).
-Benchmarks that originally used 512 threads/block have been adjusted to 256.
 
 ### Rebuild command:
 ```bash
 make -C /projects/ci-runners/CuPBoP-Vortex/tools/vortex/build/runtime/simx \
-  CONFIGS='-DNUM_WARPS=64 -DLMEM_ENABLE'
+  CONFIGS='-DNUM_WARPS=64 -DLMEM_ENABLE -DLMEM_LOG_SIZE=17'
+```
+
+### Known Vortex simx bug: LMEM addressing wraps too early
+
+In `sim/simx/local_mem.cpp`, `to_local_addr()` uses `log2(capacity/line_size)` bits
+instead of `log2(capacity)` bits, causing LMEM addresses to wrap at
+`capacity / LSU_WORD_SIZE` bytes instead of `capacity` bytes.
+
+With the default LMEM_LOG_SIZE=14 (16KB) and LSU_WORD_SIZE=8, only 2048 bytes
+are addressable. Shared memory allocations >2048 bytes see address aliasing
+(offset 2048 maps to the same location as offset 0).
+
+**Workaround:** Use LMEM_LOG_SIZE=17 so the addressable range is 2^14=16384 bytes.
+
+**Proper fix (in Vortex):** In `local_mem.cpp:32`, change:
+```cpp
+return bit_getw(addr, 0, line_bits_-1);
+```
+to:
+```cpp
+uint32_t addr_bits = log2ceil(config_.capacity);
+return bit_getw(addr, 0, addr_bits-1);
 ```
 
 ## Per-Benchmark Requirements
