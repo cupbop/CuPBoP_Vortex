@@ -161,42 +161,43 @@ in LLVM IR but may cause subtle precision issues.
 - `atomicCAS` → `cmpxchg ptr %p, i32 %expected, i32 %desired seq_cst`
 - `atomicMax` → `atomicrmw max ptr %p, i32 %val seq_cst`
 
-**Implementation approach:**
-Vortex supports RISC-V atomic instructions (A extension: `amoadd.w`,
-`amomax.w`, `lr/sc`). The LLVM backend should lower these automatically.
+**Verified behavior (March 2026 testing):**
 
-The issue is that CuPBoP's `replace_built_in_function` might strip or
-rename atomic operations. Need to verify that atomicrmw and cmpxchg
-instructions pass through the translation unchanged.
+| Operation | CUDA | RISC-V Lowering | Vortex simx | Status |
+|-----------|------|----------------|-------------|--------|
+| `atomicAdd(int*, int)` | `atomicrmw add i32` | `amoadd.w` (single instruction) | PASS | Works |
+| `atomicAdd(float*, float)` | `atomicrmw fadd float` | LR/SC CAS loop | **CRASH** | Divergent branch error |
+| `atomicMax(int*, int)` | `atomicrmw max i32` | `amomax.w` | Untested (likely works) | |
+| `atomicCAS(int*, int, int)` | `cmpxchg i32` | LR/SC pair | Untested | |
 
-For `atomicAdd` on **float**: RISC-V A extension only supports integer
-atomics. Float atomicAdd requires a compare-and-swap loop:
-```c
-float atomicAdd_float(float *addr, float val) {
-    uint32_t *iaddr = (uint32_t *)addr;
-    uint32_t old, assumed;
-    old = *iaddr;
-    do {
-        assumed = old;
-        float new_val = __int_as_float(assumed) + val;
-        old = atomicCAS(iaddr, assumed, __float_as_int(new_val));
-    } while (assumed != old);
-    return __int_as_float(old);
-}
+**Root cause of float atomicAdd crash:**
+LLVM generates a CAS loop for float atomicAdd (no hardware float AMO):
+```asm
+loop:
+  lr.w  tmp, [addr]       // load reserved
+  // reinterpret as float, add, reinterpret as int
+  sc.w  status, result, [addr]  // store conditional
+  bnez  status, loop       // retry on failure
 ```
+The backward branch (`bnez status, loop`) causes thread divergence within
+a warp — threads that succeed SC exit the loop, threads that fail retry.
+Vortex's SIMT divergence handler (split/join stack) does not support this
+loop-back-on-failure pattern, producing: `divergent branch! PC=0x...`
 
-**Challenges:**
-- Float atomicAdd needs CAS loop emulation (no hardware support)
-- Memory ordering: CUDA uses relaxed atomics by default, but RISC-V
-  `amo` instructions have acquire/release semantics. May need `fence`
-  instructions for correct ordering.
-- In the Vortex simx, atomic operations go through the memory hierarchy.
-  Need to verify simx correctly handles `amoadd.w` on shared (LMEM)
-  and global memory.
-- CuPBoP currently doesn't have atomic operation tests.
+**Possible fixes:**
+1. **Vortex-side:** Fix divergent branch handling for CAS loops. The split/join
+   mechanism needs to handle backward branches where some threads loop back.
+2. **CuPBoP-side:** Serialize float atomics — detect `atomicrmw fadd float`
+   in the kernel translator and replace with a serialized wrapper that uses
+   `vx_serial()` to execute one thread at a time.
+3. **CuPBoP-side:** Replace `atomicrmw fadd float` with integer AMO emulation:
+   reinterpret float bits as int, do `amoadd.w`, reinterpret back. This avoids
+   the CAS loop entirely but gives WRONG results (int add ≠ float add).
 
-**Estimated effort:** Medium. Integer atomics should "just work" if LLVM
-lowers them correctly. Float atomicAdd needs the CAS loop wrapper.
+**Recommended approach:** Option 2 (serialize) is simplest and correct,
+though slow. Option 1 is the proper long-term fix in Vortex.
+
+**Estimated effort:** Medium for option 2, high for option 1.
 
 ---
 
