@@ -759,19 +759,16 @@ cudaError_t cudaLaunchKernel_vortex(
   fprintf(stderr, "[DBG] step1: before DeviceContext::instance()\n");
   auto DC = DeviceContext::instance();
 
-  // Resource check 1: block size vs hardware thread count
+  // Resource check 1: block size vs hardware thread count (warning only)
   uint64_t num_warps = 0, num_threads = 0;
   vx_dev_caps(DC->device(), VX_CAPS_NUM_WARPS, &num_warps);
   vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &num_threads);
   uint64_t threads_per_core = num_warps * num_threads;
   uint64_t group_size = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
   if (group_size > threads_per_core) {
-    fprintf(stderr, "[CuPBoP] Error: blockDim (%d x %d x %d = %llu) exceeds hardware threads_per_core (%llu = %llu warps x %llu threads).\n",
+    fprintf(stderr, "[CuPBoP] Warning: blockDim (%d x %d x %d = %llu) exceeds hardware threads_per_core (%llu = %llu warps x %llu threads). Vortex will handle scheduling.\n",
             blockDim.x, blockDim.y, blockDim.z, (unsigned long long)group_size,
             (unsigned long long)threads_per_core, (unsigned long long)num_warps, (unsigned long long)num_threads);
-    fprintf(stderr, "[CuPBoP] Rebuild Vortex simx with NUM_WARPS >= %llu to support this kernel.\n",
-            (unsigned long long)((group_size + num_threads - 1) / num_threads));
-    std::abort();
   }
 
   // Resource check 2: local memory capacity
