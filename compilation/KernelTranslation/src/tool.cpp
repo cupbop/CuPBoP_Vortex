@@ -817,7 +817,8 @@ void replace_built_in_function(llvm::Module *M) {
                 name.find("llvm.nvvm.div.r") != std::string::npos ||
                 name.find("llvm.nvvm.fmin.") != std::string::npos ||
                 name.find("llvm.nvvm.fmax.") != std::string::npos ||
-                name.find("llvm.nvvm.saturate") != std::string::npos) {
+                name.find("llvm.nvvm.saturate") != std::string::npos ||
+                name.find("llvm.nvvm.cp.async.") != std::string::npos) {
               to_replace.push_back(Call);
             }
           }
@@ -1014,6 +1015,67 @@ void replace_built_in_function(llvm::Module *M) {
       // === Double-to-float truncation ===
       } else if (name.find("llvm.nvvm.d2f.r") != std::string::npos) {
         replacement = Builder.CreateFPTrunc(Call->getArgOperand(0), F32);
+
+      // === cp.async: synchronous fallback (no async DMA on Vortex) ===
+      } else if (name.find("llvm.nvvm.cp.async.ca.shared.global.4") != std::string::npos) {
+        // 4-byte async copy → synchronous load/store
+        Value *dst = Call->getArgOperand(0);
+        Value *src = Call->getArgOperand(1);
+        auto *I32Ptr = llvm::PointerType::get(I32, 0);
+        Value *srcCast = Builder.CreateBitCast(src, I32Ptr);
+        Value *dstCast = Builder.CreateBitCast(dst, I32Ptr);
+        Value *val = Builder.CreateLoad(I32, srcCast);
+        Builder.CreateStore(val, dstCast);
+        // void return — no replacement value, just erase
+        Call->eraseFromParent();
+        continue;
+      } else if (name.find("llvm.nvvm.cp.async.ca.shared.global.8") != std::string::npos) {
+        // 8-byte async copy → synchronous load/store
+        Value *dst = Call->getArgOperand(0);
+        Value *src = Call->getArgOperand(1);
+        auto *I64Ptr = llvm::PointerType::get(I64, 0);
+        Value *srcCast = Builder.CreateBitCast(src, I64Ptr);
+        Value *dstCast = Builder.CreateBitCast(dst, I64Ptr);
+        Value *val = Builder.CreateLoad(I64, srcCast);
+        Builder.CreateStore(val, dstCast);
+        Call->eraseFromParent();
+        continue;
+      } else if (name.find("llvm.nvvm.cp.async.ca.shared.global.16") != std::string::npos) {
+        // 16-byte async copy → 2× synchronous load/store of i64
+        Value *dst = Call->getArgOperand(0);
+        Value *src = Call->getArgOperand(1);
+        auto *I64Ptr = llvm::PointerType::get(I64, 0);
+        auto *I8Ptr = llvm::PointerType::get(llvm::Type::getInt8Ty(M->getContext()), 0);
+        // First 8 bytes
+        Value *srcCast = Builder.CreateBitCast(src, I64Ptr);
+        Value *dstCast = Builder.CreateBitCast(dst, I64Ptr);
+        Value *val0 = Builder.CreateLoad(I64, srcCast);
+        Builder.CreateStore(val0, dstCast);
+        // Second 8 bytes (offset by 8)
+        Value *srcOff = Builder.CreateBitCast(
+            Builder.CreateGEP(llvm::Type::getInt8Ty(M->getContext()),
+                              Builder.CreateBitCast(src, I8Ptr),
+                              Builder.getInt64(8)),
+            I64Ptr);
+        Value *dstOff = Builder.CreateBitCast(
+            Builder.CreateGEP(llvm::Type::getInt8Ty(M->getContext()),
+                              Builder.CreateBitCast(dst, I8Ptr),
+                              Builder.getInt64(8)),
+            I64Ptr);
+        Value *val1 = Builder.CreateLoad(I64, srcOff);
+        Builder.CreateStore(val1, dstOff);
+        Call->eraseFromParent();
+        continue;
+      } else if (name.find("llvm.nvvm.cp.async.commit.group") != std::string::npos) {
+        // commit_group is a no-op without async hardware
+        Call->eraseFromParent();
+        continue;
+      } else if (name.find("llvm.nvvm.cp.async.wait.group") != std::string::npos ||
+                 name.find("llvm.nvvm.cp.async.wait.all") != std::string::npos) {
+        // wait.group/wait.all → __syncthreads barrier
+        CreateInterWarpBarrier(Call);
+        Call->eraseFromParent();
+        continue;
       }
 
       if (replacement) {
@@ -1069,6 +1131,65 @@ void replace_asm_call(llvm::Module *M) {
               result = builder.CreateInsertValue(result, lo, 0);
               result = builder.CreateInsertValue(result, hi, 1);
               Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("cp.async") != std::string::npos) {
+              // PTX cp.async inline assembly → synchronous fallback
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              auto I64 = llvm::Type::getInt64Ty(context);
+
+              if (asm_str.find("cp.async.ca.shared.global") != std::string::npos ||
+                  asm_str.find("cp.async.cg.shared.global") != std::string::npos) {
+                // Async copy → synchronous load/store
+                // PTX asm typically has 2 operands: dst (shared), src (global)
+                if (Call->arg_size() >= 2) {
+                  Value *dst = Call->getArgOperand(0);
+                  Value *src = Call->getArgOperand(1);
+                  // Determine copy size from PTX string
+                  int copyBytes = 4;  // default
+                  if (asm_str.find("[.16]") != std::string::npos ||
+                      asm_str.find(", 16]") != std::string::npos ||
+                      asm_str.find(".16;") != std::string::npos) {
+                    copyBytes = 16;
+                  } else if (asm_str.find("[.8]") != std::string::npos ||
+                             asm_str.find(", 8]") != std::string::npos ||
+                             asm_str.find(".8;") != std::string::npos) {
+                    copyBytes = 8;
+                  }
+
+                  auto I32 = llvm::Type::getInt32Ty(context);
+                  if (copyBytes == 4) {
+                    auto *I32Ptr = llvm::PointerType::get(I32, 0);
+                    Value *val = builder.CreateLoad(I32, builder.CreateBitCast(src, I32Ptr));
+                    builder.CreateStore(val, builder.CreateBitCast(dst, I32Ptr));
+                  } else if (copyBytes == 8) {
+                    auto *I64Ptr = llvm::PointerType::get(I64, 0);
+                    Value *val = builder.CreateLoad(I64, builder.CreateBitCast(src, I64Ptr));
+                    builder.CreateStore(val, builder.CreateBitCast(dst, I64Ptr));
+                  } else {
+                    // 16 bytes: 2× i64 load/store
+                    auto *I64Ptr = llvm::PointerType::get(I64, 0);
+                    auto *I8Ty = llvm::Type::getInt8Ty(context);
+                    auto *I8Ptr = llvm::PointerType::get(I8Ty, 0);
+                    Value *val0 = builder.CreateLoad(I64, builder.CreateBitCast(src, I64Ptr));
+                    builder.CreateStore(val0, builder.CreateBitCast(dst, I64Ptr));
+                    Value *srcOff = builder.CreateBitCast(
+                        builder.CreateGEP(I8Ty, builder.CreateBitCast(src, I8Ptr),
+                                          builder.getInt64(8)), I64Ptr);
+                    Value *dstOff = builder.CreateBitCast(
+                        builder.CreateGEP(I8Ty, builder.CreateBitCast(dst, I8Ptr),
+                                          builder.getInt64(8)), I64Ptr);
+                    Value *val1 = builder.CreateLoad(I64, srcOff);
+                    builder.CreateStore(val1, dstOff);
+                  }
+                }
+                // else: no args means malformed, just remove
+              }
+              // commit_group and wait_group are no-ops (copies are synchronous)
+              // The LLVM intrinsic path already inserts barriers for wait_group
+              if (!Call->getType()->isVoidTy()) {
+                Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
+              }
               need_remove.push_back(Call);
             } else {
               printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
