@@ -38,6 +38,8 @@ jobs:
       fail-fast: false
       matrix:
         name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd]
+        # New benchmarks (not yet enabled):
+        # atomicAggregate-cuda, bscan-cuda, gc-cuda, memcpytosymbol_test, psort, shuffle-cuda, vote-cuda
         scheduler: [2, 0]
 
     steps:

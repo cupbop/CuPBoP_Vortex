@@ -603,12 +603,22 @@ static RegisterPass<InsertBuiltInBarrier>
 } // namespace
 
 void insert_sync(llvm::Module *M) {
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
+  }
+
   auto Registry = PassRegistry::getPassRegistry();
 
   llvm::legacy::PassManager Passes;
 
   std::vector<std::string> passes;
-  passes.push_back("insert-built-in-barriers");
+  // Entry/exit barriers are warp-loop boundary markers for schedule 0/1.
+  // In schedule 2 (1:1 mapping), no warp loops exist, so these become
+  // pure overhead — forcing all warps to synchronize on every kernel call.
+  if (schedule == 0 || schedule == 1) {
+    passes.push_back("insert-built-in-barriers");
+  }
   passes.push_back("insert-conditional-if-barriers");
   passes.push_back("insert-conditional-for-barriers");
   passes.push_back("insert-special-case-barriers");

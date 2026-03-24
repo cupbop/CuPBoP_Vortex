@@ -119,73 +119,116 @@ void create_global_variable(llvm::Module *M) {
   llvm::Type *WarpArrayType = llvm::ArrayType::get(I32, 32);
   llvm::Type *VoteArrayType = llvm::ArrayType::get(I8, 32);
 
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    schedule = std::stoi(std::string(env));
+  }
+
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "intra_warp_index", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "inter_warp_index", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_size", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_size_x", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_size_y", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_size_z", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "grid_size_x", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "grid_size_y", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
-  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "grid_size_z", NULL,
-                           llvm::GlobalValue::NotThreadLocal, 0, false);
+
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "__warps_per_group", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
-  auto block_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_index_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto block_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_index_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto block_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "block_index_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto thread_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "thread_id_x", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto thread_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "thread_id_y", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto thread_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
-                           NULL, "thread_id_z", NULL,
-                           llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+
   auto local_group_id = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "__local_group_id", NULL,
                            llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-  auto dyn_shared_mem_size = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+  local_group_id->setDSOLocal(true);
+
+  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "dyn_shared_mem_size", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
-                           
-  // LLVM is broken when using TLS with dynamic linkage on RISCV
-  // and the generated binary contains invalid instructions.
-  // Disable dynamic linkage since we don't create a shared library.
-  block_index_x->setDSOLocal(true);
-  block_index_y->setDSOLocal(true);
-  block_index_z->setDSOLocal(true);
 
-  thread_index_x->setDSOLocal(true);
-  thread_index_y->setDSOLocal(true);
-  thread_index_z->setDSOLocal(true);
+  if (schedule == 2) {
+    // Schedule 2 (1:1 mapping): use vx_spawn's dim3_t globals directly,
+    // eliminating the cuda_*_wrapper TLS copy layer.
+    // dim3_t = union { struct {uint32_t x,y,z}; uint32_t m[3]; }
+    auto Dim3Type = llvm::StructType::create(M->getContext(), {I32, I32, I32}, "dim3_t");
 
-  local_group_id->setDSOLocal(true);
+    // Remove CUDA's dummy @blockIdx/@threadIdx declarations (non-TLS, addrspace(1))
+    // so we can create proper TLS globals matching vx_spawn's definitions.
+    if (auto *existing = M->getGlobalVariable("blockIdx")) {
+      existing->eraseFromParent();
+    }
+    if (auto *existing = M->getGlobalVariable("threadIdx")) {
+      existing->eraseFromParent();
+    }
+
+    // TLS: blockIdx, threadIdx (set by vx_spawn's process_threads)
+    auto blockIdxGV = new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "blockIdx", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    blockIdxGV->setDSOLocal(true);
+
+    auto threadIdxGV = new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "threadIdx", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    threadIdxGV->setDSOLocal(true);
+
+    // Global structs: blockDim, gridDim (set by vx_spawn_threads before callback)
+    new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "blockDim", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "gridDim", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+  } else {
+    // Schedule 0/1: use CuPBoP's individual i32 globals (populated by cuda_*_wrapper)
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_size", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_size_x", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_size_y", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_size_z", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "grid_size_x", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "grid_size_y", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "grid_size_z", NULL,
+                             llvm::GlobalValue::NotThreadLocal, 0, false);
+    auto block_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_index_x", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    auto block_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_index_y", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    auto block_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "block_index_z", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    auto thread_index_x = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "thread_id_x", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    auto thread_index_y = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "thread_id_y", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    auto thread_index_z = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             NULL, "thread_id_z", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+
+    // LLVM is broken when using TLS with dynamic linkage on RISCV
+    // and the generated binary contains invalid instructions.
+    // Disable dynamic linkage since we don't create a shared library.
+    block_index_x->setDSOLocal(true);
+    block_index_y->setDSOLocal(true);
+    block_index_z->setDSOLocal(true);
+    thread_index_x->setDSOLocal(true);
+    thread_index_y->setDSOLocal(true);
+    thread_index_z->setDSOLocal(true);
+  }
 
   // TLS variable used for warp-level collective operators
   new llvm::GlobalVariable(
@@ -196,7 +239,7 @@ void create_global_variable(llvm::Module *M) {
       "warp_vote", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
   warp_vote->setAlignment(llvm::MaybeAlign(32));
   auto vote_count = new llvm::GlobalVariable(
-      *M, I32, false, llvm::GlobalValue::ExternalLinkage, NULL, 
+      *M, I32, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "vote_count", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
 }
 
@@ -210,6 +253,14 @@ void remove_metadata(llvm::Module *M) {
     }
     F->removeFnAttr("target-features");
     F->removeFnAttr("target-cpu");
+    // Strip optnone so that backend -O3 can actually optimize kernel functions.
+    // optnone is inherited from the frontend -O0 compilation and blocks all
+    // LLVM optimization passes even when -O3 is specified at the backend.
+    if (F->hasFnAttribute(Attribute::OptimizeNone)) {
+      F->removeFnAttr(Attribute::OptimizeNone);
+      // optnone forces noinline; remove it to allow inlining decisions at -O3
+      F->removeFnAttr(Attribute::NoInline);
+    }
   }
 }
 

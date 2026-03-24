@@ -39,6 +39,8 @@
 
 # CMake temp files
 Makefile
+!examples/**/Makefile
+!examples/Makefile
 CMakeCache.txt
 *.cmake
 

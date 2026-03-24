@@ -29,23 +29,6 @@ typedef struct {
     uint64_t args[0];
 } kernel_arg_t;
 
-int grid_size_x;
-int grid_size_y;
-int grid_size_z;
-
-int block_size_x;
-int block_size_y;
-int block_size_z;
-
-int block_size;
-
-int __thread block_index_x;
-int __thread block_index_y;
-int __thread block_index_z;
-int __thread thread_id_x;
-int __thread thread_id_y;
-int __thread thread_id_z;
-
 int dyn_shared_mem_size;
 
 extern "C" void* vx_local_alloc(uint32_t size) {
@@ -55,41 +38,11 @@ return p;
 
 
  extern "C" {
-    extern void bpnn_layerforward_CUDAPfS_S_S_ii_wrapper(void *args);
-    extern void bpnn_adjust_weights_cudaPfiS_iS_S__wrapper(void *args);
-}
-
-void cuda_bpnn_layerforward_CUDAPfS_S_S_ii_wrapper(void* args) {
-    block_index_x = blockIdx.x;
-    block_index_y = blockIdx.y;
-    block_index_z = blockIdx.z;
-
-    thread_id_x = threadIdx.x;
-    thread_id_y = threadIdx.y;
-    thread_id_z = threadIdx.z;
-
-//    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
-
-    bpnn_layerforward_CUDAPfS_S_S_ii_wrapper((void **)args);
-}
-
-void cuda_bpnn_adjust_weights_cudaPfiS_iS_S__wrapper(void* args) {
-    block_index_x = blockIdx.x;
-    block_index_y = blockIdx.y;
-    block_index_z = blockIdx.z;
-
-    thread_id_x = threadIdx.x;
-    thread_id_y = threadIdx.y;
-    thread_id_z = threadIdx.z;
-
-//    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
-
-    bpnn_adjust_weights_cudaPfiS_iS_S__wrapper((void **)args);
+    extern void scaleKernelPfPKfi_wrapper(void *args);
 }
 
 vx_kernel_func_cb callbacks[] = {
-    cuda_bpnn_layerforward_CUDAPfS_S_S_ii_wrapper, 
-    cuda_bpnn_adjust_weights_cudaPfiS_iS_S__wrapper, 
+    (vx_kernel_func_cb)scaleKernelPfPKfi_wrapper, 
 };
 
 int main() {
@@ -99,27 +52,29 @@ int main() {
     auto num_args = kernel_arg->num_args;
     auto args = (uint64_t*)kernel_arg->args;
     auto memcpy_symbol_array = (uint64_t*)kernel_arg->args + num_args;
-    grid_size_x = ctx->num_groups[0];
-    grid_size_y = ctx->num_groups[1];
-    grid_size_z = ctx->num_groups[2];
-
-    block_size_x = ctx->local_size[0];
-    block_size_y = ctx->local_size[1];
-    block_size_z = ctx->local_size[2];
-
     dyn_shared_mem_size = ctx->dyn_shared_mem_size;
-    block_size = ctx->local_size[0] * ctx->local_size[1];
 
+//NOTE: old format — (dst_addr, staging_dev_addr, size) per symbol
+//if (memcpy_symbol_array[0] != 0) {
+//    int memcpy_symbol_idx = 0;
+//    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {
+//        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];
+//        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];
+//        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];
+//        memcpy(dst_addr, src_addr, size);
+//        memcpy_symbol_idx++;}}
+// New format: [count | dst_addr, size, inline_data... | ...]
 if (memcpy_symbol_array[0] != 0) {
-    vx_printf("CHECK: cudamemcpytosymbol, number of cudamemcpytosymbol=%d \n", memcpy_symbol_array[0]);
-    int memcpy_symbol_idx = 0;
-    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {
-        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];
-        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];
-        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];
-        memcpy(dst_addr, src_addr, size);
-        //vx_printf("memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\n", memcpy_symbol_idx, dst_addr, src_addr, size);
-        memcpy_symbol_idx++;}}
+    vx_printf("CHECK: cudamemcpytosymbol, number=%d\n", memcpy_symbol_array[0]);
+    uint64_t* slot = &memcpy_symbol_array[1];
+    for (int i = 0; i < (int)memcpy_symbol_array[0]; i++) {
+        auto dst_addr = (void*)slot[0];
+        auto size = (size_t)slot[1];
+        auto src_data = (void*)&slot[2];
+        memcpy(dst_addr, src_data, size);
+        size_t data_slots = (size + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+        slot += 2 + data_slots;
+    }}
     //vx_printf("sizeof everything %d %d %d\n", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); 
     //vx_printf("base: 0x%lx\n", KERNEL_ARG_BASE_ADDR); 
     //vx_printf("kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n", 

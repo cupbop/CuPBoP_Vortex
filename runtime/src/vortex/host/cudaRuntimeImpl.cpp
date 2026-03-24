@@ -21,8 +21,15 @@
 #include <map>
 
 // Global variable to support CudaMemcpytoSymbol
-std::vector<std::vector<uint64_t> >  memcpy_symbol;
-std::vector<uint64_t> memcpy_symbol_single;
+//NOTE: old approach used staging device buffer — replaced with inline args
+//std::vector<std::vector<uint64_t> >  memcpy_symbol;
+//std::vector<uint64_t> memcpy_symbol_single;
+struct MemcpySymbolEntry {
+  uint64_t dst_addr;   // symbol device address
+  size_t   size;       // data size in bytes
+  std::vector<uint8_t> data; // raw host bytes
+};
+std::vector<MemcpySymbolEntry> memcpy_symbol;
 //create string vector
 std::vector<std::string> symbol_name_vector;
 
@@ -80,13 +87,15 @@ typedef void (*pfn_workgroup_func) (
 
 class DeviceContext {
 private:
-  DeviceContext() 
+  DeviceContext()
     : device_(nullptr)
     , staging_buf_(std::vector<uint8_t>())
     , staging_size_(0)
     , krnl_buffer_(nullptr)
     , args_buffer_(nullptr)
-  {}
+  {
+    RT_CHECK(vx_dev_open(&device_));
+  }
 
   ~DeviceContext() {
     if (device_ != nullptr) {
@@ -100,19 +109,14 @@ private:
     }
   }
 
-  void initialize() {
-    if (device_ == nullptr) {
-      RT_CHECK(vx_dev_open(&device_));
-    } else {
-      // Cleanup the internal buffers
-      if (krnl_buffer_ != nullptr) 
-        vx_mem_free(krnl_buffer_);
-      krnl_buffer_ = nullptr;
-      if (args_buffer_ != nullptr)
-        vx_mem_free(args_buffer_);
+public:
+  void cleanup_args() {
+    if (args_buffer_ != nullptr) {
+      vx_mem_free(args_buffer_);
       args_buffer_ = nullptr;
     }
   }
+private:
 
   vx_device_h device_;
   std::vector<uint8_t> staging_buf_;
@@ -128,7 +132,6 @@ private:
 public:
   static DeviceContext* instance() {
     static DeviceContext s_inst;
-    s_inst.initialize();
     return &s_inst;
   }
 
@@ -358,6 +361,7 @@ cudaError_t cudaMemcpyFromSymbol(void *dst,
                                  size_t offset, 
                                  cudaMemcpyKind kind) {
 
+// 2026 Feb 26, Currently not working!!!
     if (kind != cudaMemcpyDeviceToHost) {
         return cudaErrorInvalidValue;
     }
@@ -472,40 +476,36 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
     }
   }
 
-  int vx_err; 
+  int vx_err;
   //cast string(in hex) to uint64_t
   uint64_t symbol_addr = std::stoull(symbol_addr_tmp, nullptr, 16);
 
   // print symbol_addr_tmp, and compare it with dst
   printf("symbol_addr_tmp: %p, dst: %p\n", symbol_addr, dst);
 
-  // allocate a device memory(temporary) and copy the data from host to device
-  auto DC = DeviceContext::instance();
-  uint64_t mem_addr;  
-  // RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_TYPE_GLOBAL, &mem_addr));
+  //NOTE: old approach — allocate staging device memory and copy host data there
+  //auto DC = DeviceContext::instance();
+  //uint64_t mem_addr;
+  //DC->dev_mem_alloc(count, VX_MEM_READ_WRITE, &mem_addr);
+  //auto staging_buf = DC->staging_alloc(count);
+  //auto host_ptr = staging_buf.data();
+  //memcpy((char *)host_ptr, src, count);
+  //DC->copy_to_dev(mem_addr, host_ptr, count);
+  //memcpy_symbol_single.push_back(std::stoull(symbol_addr_tmp, nullptr, 16));
+  //memcpy_symbol_single.push_back((uint64_t)mem_addr);
+  //memcpy_symbol_single.push_back((uint64_t)count);
+  //memcpy_symbol_single.push_back((uint64_t)offset);
+  //memcpy_symbol.push_back(memcpy_symbol_single);
+  //memcpy_symbol_single.clear();
 
-  // May 20 수정
-  // RT_CHECK(vx_mem_alloc(DC->device(), count, VX_MEM_READ_WRITE, (void** )&mem_addr));
-  DC->dev_mem_alloc(count, VX_MEM_READ_WRITE, &mem_addr);
-  
-  printf("(cudamemcpytosymbol) cudaMalloc: size=%ld, mem_addr=%p\n", count, mem_addr);
-    
-  // copy the host data to device
-  auto staging_buf = DC->staging_alloc(count);
-  auto host_ptr = staging_buf.data();
-
-  memcpy((char *)host_ptr, src, count);
-  // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
-  DC->copy_to_dev(mem_addr, host_ptr, count);
-  
-  printf("(cudamemcpytosymbol) cudaMemcpyHostToDevice: src=%p, dst=%p, count=%ld\n", src, mem_addr, count);
-
-  memcpy_symbol_single.push_back(std::stoull(symbol_addr_tmp, nullptr, 16)); // actual device variable address
-  memcpy_symbol_single.push_back((uint64_t)mem_addr); // staging buffer address
-  memcpy_symbol_single.push_back((uint64_t)count); // size of the data
-  memcpy_symbol_single.push_back((uint64_t)offset); // offset
-  memcpy_symbol.push_back(memcpy_symbol_single);
-  memcpy_symbol_single.clear();
+  // New approach: store raw bytes in host memory, inline into args at launch
+  MemcpySymbolEntry entry;
+  entry.dst_addr = symbol_addr;
+  entry.size = count;
+  entry.data.resize(count);
+  memcpy(entry.data.data(), src, count);
+  memcpy_symbol.push_back(std::move(entry));
+  printf("(cudamemcpytosymbol) saved inline: dst=0x%lx, size=%ld\n", symbol_addr, count);
               
   return cudaSuccess;
 }
@@ -613,9 +613,9 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
-// cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
-//   return cudaGetDeviceProperties(deviceProp, device);
-// }
+cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
+  return cudaGetDeviceProperties(deviceProp, device);
+}
 
 
 static cudaError_t lastError = cudaSuccess;
@@ -730,16 +730,27 @@ cudaError_t cudaLaunchKernel_vortex(
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
   auto DC = DeviceContext::instance();
-  
+  DC->cleanup_args();
+
   int status = C_RUN;
-  // upload kernel to device
-  RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.vxbin", DC->krnl_buffer()));
-  
+  // upload kernel to device (cached across launches)
+  if (DC->get_krnl_buf() == nullptr) {
+    RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.vxbin", DC->krnl_buffer()));
+  }
+
+
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   printf("(debug) abuf_size = %ld\n", abuf_size);
 
-  size_t abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
+  //NOTE: old size calculation — 3 uint64_t per symbol (dst_addr, staging_addr, size)
+  //size_t abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
+  // New: count + per symbol (dst_addr, size, inline data padded to uint64_t)
+  size_t abuf_size_additional = sizeof(uint64_t); // count field
+  for (auto &entry : memcpy_symbol) {
+    size_t data_slots = (entry.size + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    abuf_size_additional += (2 + data_slots) * sizeof(uint64_t); // dst_addr + size + data
+  }
 
   auto staging_buf = DC->staging_alloc(abuf_size+abuf_size_additional);
 
@@ -783,15 +794,30 @@ cudaError_t cudaLaunchKernel_vortex(
     printf("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
   }  
 
+  //NOTE: old packing — 3 uint64_t per symbol (dst_addr, staging_dev_addr, size)
+  //abuf_ptr->args[num_args] = memcpy_symbol.size();
+  //int memcpy_symbol_idx = 0;
+  //for (int i=num_args+1; i < num_args + (1 + memcpy_symbol.size() * 3); i+=3)
+  //{
+  //  memcpy(&abuf_ptr->args[i], &memcpy_symbol[memcpy_symbol_idx][0], sizeof(uint64_t));
+  //  memcpy(&abuf_ptr->args[i+1], &memcpy_symbol[memcpy_symbol_idx][1], sizeof(uint64_t));
+  //  memcpy(&abuf_ptr->args[i+2], &memcpy_symbol[memcpy_symbol_idx][2], sizeof(uint64_t));
+  //  memcpy_symbol_idx++;
+  //}
+
+  // New packing: [count | dst_addr, size, inline_data... | dst_addr, size, inline_data... | ...]
   abuf_ptr->args[num_args] = memcpy_symbol.size();
-  int memcpy_symbol_idx = 0;
-  for (int i=num_args+1; i < num_args + (1 + memcpy_symbol.size() * 3); i+=3)
-  {
-    memcpy(&abuf_ptr->args[i], &memcpy_symbol[memcpy_symbol_idx][0], sizeof(uint64_t));
-    memcpy(&abuf_ptr->args[i+1], &memcpy_symbol[memcpy_symbol_idx][1], sizeof(uint64_t));
-    memcpy(&abuf_ptr->args[i+2], &memcpy_symbol[memcpy_symbol_idx][2], sizeof(uint64_t));
-    memcpy_symbol_idx++;
+  int slot = num_args + 1;
+  for (auto &entry : memcpy_symbol) {
+    abuf_ptr->args[slot++] = entry.dst_addr;
+    abuf_ptr->args[slot++] = entry.size;
+    size_t data_slots = (entry.size + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    abuf_ptr->args[slot + data_slots - 1] = 0; // zero-pad last slot
+    memcpy(&abuf_ptr->args[slot], entry.data.data(), entry.size);
+    slot += data_slots;
   }
+  // Fix #1: clear after packing so next launch doesn't repeat
+  memcpy_symbol.clear();
   // upload additional information for cudaMemcpytoSymbol
   
   

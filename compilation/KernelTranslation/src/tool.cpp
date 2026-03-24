@@ -334,26 +334,24 @@ void replace_built_in_function(llvm::Module *M) {
             auto func_name = Call->getCalledOperand()->getName().str();
             // Mark: Temporarily commented out the _ZN25 function, we don't
             // think it's being used in vortex
-            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x") { //||
-              //     "_ZN25__cuda_builtin_blockDim_t17__fetch_builtin_xEv") {
-              auto block_size_addr = M->getGlobalVariable("block_size_x");
+            if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.x" ||
+                func_name == "llvm.nvvm.read.ptx.sreg.ntid.y" ||
+                func_name == "llvm.nvvm.read.ptx.sreg.ntid.z") {
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto val = createLoad(builder, block_size_addr);
-              Call->replaceAllUsesWith(val);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.y") {
-              auto block_size_addr = M->getGlobalVariable("block_size_y");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              auto val = createLoad(builder, block_size_addr);
-              Call->replaceAllUsesWith(val);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.ntid.z") {
-              auto block_size_addr = M->getGlobalVariable("block_size_z");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              auto val = createLoad(builder, block_size_addr);
+              Value *val;
+              if (schedule == 2) {
+                // Load from vx_spawn's blockDim struct field
+                int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
+                auto blockDimGV = M->getGlobalVariable("blockDim");
+                auto field_ptr = builder.CreateStructGEP(blockDimGV->getValueType(), blockDimGV, field);
+                val = builder.CreateLoad(I32, field_ptr);
+              } else {
+                const char *name = (func_name.back() == 'x') ? "block_size_x" :
+                                   (func_name.back() == 'y') ? "block_size_y" : "block_size_z";
+                auto block_size_addr = M->getGlobalVariable(name);
+                val = createLoad(builder, block_size_addr);
+              }
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
             }
@@ -362,13 +360,14 @@ void replace_built_in_function(llvm::Module *M) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
 
-                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
-                    M->getOrInsertGlobal("thread_id_x", I32));
-
-                auto threadLocalAddr = builder.CreateIntrinsic(
-                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
-                    {threadIdx}, nullptr);
-                auto tidx = builder.CreateLoad(I32, threadLocalAddr, "tidx");
+                // Load from vx_spawn's threadIdx.x struct field
+                auto threadIdxGV = M->getGlobalVariable("threadIdx");
+                auto tls_ptr = builder.CreateCall(
+                    Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                              {threadIdxGV->getType()}),
+                    {threadIdxGV});
+                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 0);
+                auto tidx = builder.CreateLoad(I32, field_ptr, "tidx");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -439,13 +438,14 @@ void replace_built_in_function(llvm::Module *M) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
 
-                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
-                    M->getOrInsertGlobal("thread_id_y", I32));
-
-                auto threadLocalAddr = builder.CreateIntrinsic(
-                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
-                    {threadIdx}, nullptr);
-                auto tidy = builder.CreateLoad(I32, threadLocalAddr, "tidy");
+                // Load from vx_spawn's threadIdx.y struct field
+                auto threadIdxGV = M->getGlobalVariable("threadIdx");
+                auto tls_ptr = builder.CreateCall(
+                    Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                              {threadIdxGV->getType()}),
+                    {threadIdxGV});
+                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 1);
+                auto tidy = builder.CreateLoad(I32, field_ptr, "tidy");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -484,13 +484,14 @@ void replace_built_in_function(llvm::Module *M) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
 
-                GlobalVariable *threadIdx = dyn_cast<GlobalVariable>(
-                    M->getOrInsertGlobal("thread_id_z", I32));
-
-                auto threadLocalAddr = builder.CreateIntrinsic(
-                    Intrinsic::threadlocal_address, {I32->getPointerTo()},
-                    {threadIdx}, nullptr);
-                auto tidz = builder.CreateLoad(I32, threadLocalAddr, "tidz");
+                // Load from vx_spawn's threadIdx.z struct field
+                auto threadIdxGV = M->getGlobalVariable("threadIdx");
+                auto tls_ptr = builder.CreateCall(
+                    Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                              {threadIdxGV->getType()}),
+                    {threadIdxGV});
+                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 2);
+                auto tidz = builder.CreateLoad(I32, field_ptr, "tidz");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -508,101 +509,58 @@ void replace_built_in_function(llvm::Module *M) {
             // Mark: Temporarily commented out the _ZN25 function, we don't
             // think it's being used in vortex
 
-            else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x") { //||
-              // func_name == "_ZN25__cuda_builtin_blockIdx_t17__fetch_"
-              //              "builtin_xEv") {
-              /* replace this with what??? */ // hyesoon
-              printf("block_Id-X is called\n");
-              auto block_index_addr = M->getGlobalVariable("block_index_x");
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
+                     func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
+                     func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
+              int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
+              printf("block_Id-%c is called\n", func_name.back());
               IRBuilder<> builder(context);
-              // MDNode* N = MDNode::get(context, MDString::get(context,
-              // "non-uniform"));
               builder.SetInsertPoint(Call);
 
-              //[Mark] fix try for divergence error
-              auto tls_ptr = builder.CreateCall(
-                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
-                                            {block_index_addr->getType()}),
-                  {block_index_addr});
-              auto block_idx =
-                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
-
-              // auto block_idx = createLoad(builder, block_index_addr);
-              //  print block_idx instruction
-
-              // block_idx->setMetadata("divergence", N);
-
-              llvm::errs() << "block_idx instruction\n";
-              block_idx->print(llvm::errs());
-
-              Call->replaceAllUsesWith(block_idx);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y") {
-              printf("block_Id-Y is called\n");
-              auto block_index_addr = M->getGlobalVariable("block_index_y");
-              IRBuilder<> builder(context);
-              MDNode *N =
-                  MDNode::get(context, MDString::get(context, "non-uniform"));
-              builder.SetInsertPoint(Call);
-
-              // auto block_idx = createLoad(builder, block_index_addr);
-              // block_idx->setMetadata("divergence", N);
-
-              //[Mark] fix try for divergence error
-              auto tls_ptr = builder.CreateCall(
-                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
-                                            {block_index_addr->getType()}),
-                  {block_index_addr});
-              auto block_idx =
-                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
-
-              Call->replaceAllUsesWith(block_idx);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
-              printf("block_Id-Z is called\n");
-              auto block_index_addr = M->getGlobalVariable("block_index_z");
-              IRBuilder<> builder(context);
-              MDNode *N =
-                  MDNode::get(context, MDString::get(context, "non-uniform"));
-              builder.SetInsertPoint(Call);
-
-              //[Mark] fix try for divergence error
-              auto tls_ptr = builder.CreateCall(
-                  Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
-                                            {block_index_addr->getType()}),
-                  {block_index_addr});
-              auto block_idx =
-                  builder.CreateLoad(Type::getInt32Ty(context), tls_ptr);
-
-              // auto block_idx = createLoad(builder, block_index_addr);
-              // block_idx->setMetadata("divergence", N);
+              Value *block_idx;
+              if (schedule == 2) {
+                // Load from vx_spawn's blockIdx struct field
+                auto blockIdxGV = M->getGlobalVariable("blockIdx");
+                auto tls_ptr = builder.CreateCall(
+                    Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                              {blockIdxGV->getType()}),
+                    {blockIdxGV});
+                auto field_ptr = builder.CreateStructGEP(blockIdxGV->getValueType(), tls_ptr, field);
+                block_idx = builder.CreateLoad(I32, field_ptr);
+              } else {
+                const char *name = (field == 0) ? "block_index_x" :
+                                   (field == 1) ? "block_index_y" : "block_index_z";
+                auto block_index_addr = M->getGlobalVariable(name);
+                auto tls_ptr = builder.CreateCall(
+                    Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                              {block_index_addr->getType()}),
+                    {block_index_addr});
+                block_idx = builder.CreateLoad(I32, tls_ptr);
+              }
 
               Call->replaceAllUsesWith(block_idx);
               need_remove.push_back(Call);
             }
             // Mark: Temporarily commented out the _ZN25 function, we don't
             // think it's being used in vortex
-            else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x") { // ||
-              // func_name == "_ZN24__cuda_builtin_gridDim_t17__fetch_"
-              //              "builtin_xEv") {
-              auto grid_size_addr = M->getGlobalVariable("grid_size_x");
+            else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x" ||
+                     func_name == "llvm.nvvm.read.ptx.sreg.nctaid.y" ||
+                     func_name == "llvm.nvvm.read.ptx.sreg.nctaid.z") {
+              int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto grid_size = createLoad(builder, grid_size_addr);
-              Call->replaceAllUsesWith(grid_size);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.y") {
-              auto grid_size_addr = M->getGlobalVariable("grid_size_y");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              auto grid_size = createLoad(builder, grid_size_addr);
-              Call->replaceAllUsesWith(grid_size);
-              need_remove.push_back(Call);
-            } else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.z") {
-              auto grid_size_addr = M->getGlobalVariable("grid_size_z");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              auto grid_size = createLoad(builder, grid_size_addr);
+              Value *grid_size;
+              if (schedule == 2) {
+                // Load from vx_spawn's gridDim struct field
+                auto gridDimGV = M->getGlobalVariable("gridDim");
+                auto field_ptr = builder.CreateStructGEP(gridDimGV->getValueType(), gridDimGV, field);
+                grid_size = builder.CreateLoad(I32, field_ptr);
+              } else {
+                const char *name = (field == 0) ? "grid_size_x" :
+                                   (field == 1) ? "grid_size_y" : "grid_size_z";
+                auto grid_size_addr = M->getGlobalVariable(name);
+                grid_size = createLoad(builder, grid_size_addr);
+              }
               Call->replaceAllUsesWith(grid_size);
               need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.barrier0") {
