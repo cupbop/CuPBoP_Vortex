@@ -214,6 +214,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
     std::vector<std::string> wrapper_name;
     //std::vector<int> kernel_idx;
 
+    int schedule = 0;
+    if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+      schedule = std::stoi(std::string(env));
+    }
+
     
     std::fstream outfile;
     outfile.open("lookup.txt", std::ios::out);
@@ -279,13 +284,14 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "#include <vx_print.h>\n"
           "#include <vx_intrinsics.h>\n"
           "#include <vx_spawn.h>\n"
-          "#include <stdint.h>\n" 
-          "#include <string.h>\n"         
+          "#include <stdint.h>\n"
+          "#include <string.h>\n"
           "\n"
 
           "#define KERNEL_ARG_BASE_ADDR "
           << KERNEL_ARG_BASE_ADDR <<
           "\n"
+          //memcpytosymbol: Implementation updated, we will not use the additional info base addr for now, but we can keep this macro for future use if needed
           //"#define KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR "
           //<< KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR <<
           "\n"
@@ -314,42 +320,45 @@ void create_kernel_wrapper_function(llvm::Module *M){
       "uint32_t dyn_shared_mem_size; \n"
       "}; \n"
       "\n"
-      
+
           "typedef struct {\n"
           "    context_t ctx;\n"
           "    int kernel_idx;\n"
           "    int num_args;\n"
           "    uint64_t args[0];\n"
-          "} kernel_arg_t;\n"          
-          "\n"
+          "} kernel_arg_t;\n"
+          "\n";
 
-          "int grid_size_x;\n"
-          "int grid_size_y;\n"
-          "int grid_size_z;\n"
-          "\n"
+    if (schedule != 2) {
+      // Schedule 0/1: CuPBoP's own globals (populated by cuda_*_wrapper)
+      ss << "int grid_size_x;\n"
+            "int grid_size_y;\n"
+            "int grid_size_z;\n"
+            "\n"
 
-          "int block_size_x;\n"
-          "int block_size_y;\n"
-          "int block_size_z;\n"
-          "\n"
+            "int block_size_x;\n"
+            "int block_size_y;\n"
+            "int block_size_z;\n"
+            "\n"
 
-          "int block_size;\n"
-          "\n"
+            "int block_size;\n"
+            "\n"
 
-          "int __thread block_index_x;\n"
-          "int __thread block_index_y;\n"
-          "int __thread block_index_z;\n"
+            "int __thread block_index_x;\n"
+            "int __thread block_index_y;\n"
+            "int __thread block_index_z;\n"
 
-          "int __thread *dynamic_shared_memory = NULL;\n"
+            "int __thread *dynamic_shared_memory = NULL;\n"
 
-          "int __thread thread_id_x;\n"
-          "int __thread thread_id_y;\n"
-          "int __thread thread_id_z;\n"
 
-          "\n"
+            "int __thread thread_id_x;\n"
+            "int __thread thread_id_y;\n"
+            "int __thread thread_id_z;\n"
+            "\n";
+    }
 
-          "int dyn_shared_mem_size;\n\n"
-    
+    ss << "int dyn_shared_mem_size;\n\n"
+
 
           "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
             "void* p = __local_mem(size);\n"
@@ -360,7 +369,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             // "vx_printf(\"local_group_id: %d\\n\", __local_group_id);\n"
             "return p;\n"
           "}\n"
-          
+
 
           "\n";
 
@@ -373,33 +382,40 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
     ss << "}\n"
           "\n";
-    
-    
-    for (auto f : wrapper_name) {
-	ss << "void cuda_" << f << "(void* args) {\n"   
-              "    block_index_x = blockIdx.x;\n"  
-              "    block_index_y = blockIdx.y;\n"  
-              "    block_index_z = blockIdx.z;\n" 
-              "\n"
-              "    thread_id_x = threadIdx.x;\n"
-              "    thread_id_y = threadIdx.y;\n"
-              "    thread_id_z = threadIdx.z;\n"
-              "\n" 
-              "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"  
-              "\n"     
-	  "    " << f << "((void **)args);\n" 
-            "}\n" 
-            "\n";   
+
+    if (schedule != 2) {
+      // Schedule 0/1: generate cuda_*_wrapper that copies vx_spawn TLS → CuPBoP TLS
+      for (auto f : wrapper_name) {
+        ss << "void cuda_" << f << "(void* args) {\n"
+                  "    block_index_x = blockIdx.x;\n"
+                  "    block_index_y = blockIdx.y;\n"
+                  "    block_index_z = blockIdx.z;\n"
+                  "\n"
+                  "    thread_id_x = threadIdx.x;\n"
+                  "    thread_id_y = threadIdx.y;\n"
+                  "    thread_id_z = threadIdx.z;\n"
+                  "\n"
+                  "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"
+                  "\n"
+              "    " << f << "((void **)args);\n"
+                "}\n"
+                "\n";
+      }
     }
-      
+
     ss << "vx_kernel_func_cb callbacks[] = {\n";
 
     for (auto f : wrapper_name) {
+      if (schedule == 2) {
+        // Schedule 2: call kernel wrapper directly — no TLS copy layer
+        ss << "    (vx_kernel_func_cb)" << f << ", \n";
+      } else {
         ss << "    cuda_" << f << ", \n";
+      }
     }
 
     ss << "};\n"
-          "\n" 
+          "\n"
 
           "int main() {\n"
           "//    vx_printf(\"kernel_wrapper: main\\n\");\n"
@@ -408,31 +424,46 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    auto num_args = kernel_arg->num_args;\n"
           "    auto args = (uint64_t*)kernel_arg->args;\n"
           "    auto memcpy_symbol_array = (uint64_t*)kernel_arg->args + num_args;"
+          "\n";
+
+    if (schedule != 2) {
+      // Schedule 0/1: populate CuPBoP globals from context
+      ss << "    grid_size_x = ctx->num_groups[0];\n"
+            "    grid_size_y = ctx->num_groups[1];\n"
+            "    grid_size_z = ctx->num_groups[2];\n"
+            "\n"
+
+            "    block_size_x = ctx->local_size[0];\n"
+            "    block_size_y = ctx->local_size[1];\n"
+            "    block_size_z = ctx->local_size[2];\n"
+            "\n"
+            "    block_size = ctx->local_size[0] * ctx->local_size[1];\n";
+    }
+
+    ss << "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
           "\n"
 
-          "    grid_size_x = ctx->num_groups[0];\n"
-          "    grid_size_y = ctx->num_groups[1];\n"
-          "    grid_size_z = ctx->num_groups[2];\n"
-          "\n"
-
-          "    block_size_x = ctx->local_size[0];\n"
-          "    block_size_y = ctx->local_size[1];\n"
-          "    block_size_z = ctx->local_size[2];\n"
-          "\n"
-          "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
-          "    block_size = ctx->local_size[0] * ctx->local_size[1];\n"
-          "\n"
-
+          "//NOTE: old format — (dst_addr, staging_dev_addr, size) per symbol\n"
+          "//if (memcpy_symbol_array[0] != 0) {\n"
+          "//    int memcpy_symbol_idx = 0;\n"
+          "//    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
+          "//        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
+          "//        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
+          "//        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
+          "//        memcpy(dst_addr, src_addr, size);\n"
+          "//        memcpy_symbol_idx++;}}\n"
+          "// New format: [count | dst_addr, size, inline_data... | ...]\n"
           "if (memcpy_symbol_array[0] != 0) {\n"
-          "    vx_printf(\"CHECK: cudamemcpytosymbol, number of cudamemcpytosymbol=%d \\n\", memcpy_symbol_array[0]);\n"
-          "    int memcpy_symbol_idx = 0;\n"
-          "    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
-          "        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
-          "        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
-          "        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
-          "        memcpy(dst_addr, src_addr, size);\n"
-          "        //vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
-          "        memcpy_symbol_idx++;}}\n"
+          "    vx_printf(\"CHECK: cudamemcpytosymbol, number=%d\\n\", memcpy_symbol_array[0]);\n"
+          "    uint64_t* slot = &memcpy_symbol_array[1];\n"
+          "    for (int i = 0; i < (int)memcpy_symbol_array[0]; i++) {\n"
+          "        auto dst_addr = (void*)slot[0];\n"
+          "        auto size = (size_t)slot[1];\n"
+          "        auto src_data = (void*)&slot[2];\n"
+          "        memcpy(dst_addr, src_data, size);\n"
+          "        size_t data_slots = (size + sizeof(uint64_t) - 1) / sizeof(uint64_t);\n"
+          "        slot += 2 + data_slots;\n"
+          "    }}\n"
 
 
           //      "    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; \n"
@@ -471,10 +502,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
     */
       
     // ss << "    return vx_spawn_threads(1, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[0], kernel_arg); \n";
-    int schedule = 0;
-    if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
-      schedule = std::stoi(std::string(env));
-    }
+
     
     if (schedule == 0) { // thread mapping
       ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
@@ -517,9 +545,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
     std::ofstream ofs;
 
-    ofs.open("../vortex_debug/kernel_wrapper.cpp");
+    //NOTE: was ../vortex_debug/kernel_wrapper.cpp — changed to cwd for per-example build
+    ofs.open("kernel_wrapper.cpp");
     ofs << ss.rdbuf();
-    ofs.close();    
+    ofs.close();
 
     return;
 }
