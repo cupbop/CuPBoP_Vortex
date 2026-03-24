@@ -4,6 +4,38 @@
 #include "structures.h"
 #include <stdint.h>
 
+/*
+ * When building the "torch" variant of the runtime, rename exported CUDA API
+ * symbols to *_vortex to avoid clashing with NVIDIA libcudart symbols.
+ *
+ * IMPORTANT:
+ *  - Enable this macro ONLY when compiling libvortexRuntime_torch.so
+ *  - Do NOT enable it in PyTorch/Triton translation units.
+ */
+#ifdef VORTEX_RENAME_CUDA_SYMBOLS
+  #define cudaGetDevice              cudaGetDevice_vortex
+  #define cudaGetErrorname           cudaGetErrorname_vortex
+  #define cudaDeviceReset            cudaDeviceReset_vortex
+  #define cudaDeviceSynchronize      cudaDeviceSynchronize_vortex
+  #define cudaThreadSynchronize      cudaThreadSynchronize_vortex
+  #define cudaFree                   cudaFree_vortex
+  #define cudaFreeHost               cudaFreeHost_vortex
+  #define cudaMalloc                 cudaMalloc_vortex
+  #define cudaMemcpy                 cudaMemcpy_vortex
+  #define cudaMemcpyToSymbol_host    cudaMemcpyToSymbol_host_vortex
+  #define cudaMemset                 cudaMemset_vortex
+  #define cudaSetDevice              cudaSetDevice_vortex
+  #define cudaStreamCopyAttributes   cudaStreamCopyAttributes_vortex
+  #define cudaStreamCreate           cudaStreamCreate_vortex
+  #define cudaStreamDestroy          cudaStreamDestroy_vortex
+  #define cudaStreamSynchronize      cudaStreamSynchronize_vortex
+  #define cudaGetDeviceCount         cudaGetDeviceCount_vortex
+  #define cudaGetDeviceProperties    cudaGetDeviceProperties_vortex
+  #define cudaGetDeviceProperties_v2 cudaGetDeviceProperties_v2_vortex
+  #define cudaGetErrorString         cudaGetErrorString_vortex
+  #define cudaGetLastError           cudaGetLastError_vortex
+#endif
+
 extern "C" {
 cudaError_t cudaGetDevice(int *devPtr);
 const char *cudaGetErrorname(cudaError_t);
