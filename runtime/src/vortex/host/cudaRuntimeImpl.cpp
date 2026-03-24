@@ -123,7 +123,16 @@ private:
   vx_buffer_h args_buffer_;
 
   // Pointer manager
-  std::map<void* , vx_buffer_h > ptr_map;
+  struct MemoryInfo {
+    vx_buffer_h buffer_handle;
+    size_t size;
+    uint64_t base_addr;
+
+    MemoryInfo() : buffer_handle(nullptr), size(0), base_addr(0) {}
+    MemoryInfo(vx_buffer_h handle, size_t sz, uint64_t base)
+        : buffer_handle(handle), size(sz), base_addr(base) {}
+  };
+  std::map<void*, MemoryInfo> ptr_map;
   
 public:
   static DeviceContext* instance() {
@@ -166,30 +175,59 @@ public:
     RT_CHECK(vx_mem_address(mem_buffer, mem_addr));  
 
     // Register pointer with its handler
-    ptr_map[(void* )(* mem_addr)] = mem_buffer;
+    ptr_map[(void*)(*mem_addr)] = MemoryInfo(mem_buffer, size, *mem_addr);
   }
 
   void dev_mem_free(void* mem_addr) {
     if (ptr_map.find(mem_addr) != ptr_map.end()) {
-      vx_buffer_h mem_buffer = ptr_map[mem_addr];
-      vx_mem_free(mem_buffer);
-
-      // Unregister pointer
+      MemoryInfo& info = ptr_map[mem_addr];
+      vx_mem_free(info.buffer_handle);
       ptr_map.erase(mem_addr);
     }
   }
 
   void copy_to_dev(uint64_t mem_addr, void* host_ptr, int count) {
-    if (ptr_map.find((void* )mem_addr) != ptr_map.end()) {
-      // RT_CHECK(vx_copy_to_dev(this->device(), ptr_map[(void* )mem_addr], (uint64_t)host_ptr, count));
-      RT_CHECK(vx_copy_to_dev(ptr_map[(void* )mem_addr], host_ptr, 0, count));
+    // 정확한 주소 매칭
+    auto it = ptr_map.find((void*)mem_addr);
+    if (it != ptr_map.end()) {
+      RT_CHECK(vx_copy_to_dev(it->second.buffer_handle, host_ptr, 0, count));
+      return;
     }
+    // 오프셋 기반 검색 (Triton: 할당 블록 내부 주소)
+    for (auto& pair : ptr_map) {
+      const MemoryInfo& info = pair.second;
+      if (mem_addr >= info.base_addr && mem_addr < (info.base_addr + info.size)) {
+        size_t offset = mem_addr - info.base_addr;
+        if (offset + count <= info.size) {
+          RT_CHECK(vx_copy_to_dev(info.buffer_handle, host_ptr, offset, count));
+          return;
+        }
+      }
+    }
+    printf("copy_to_dev: ERROR - mem_addr=0x%lx not found!\n", mem_addr);
+    std::abort();
   }
 
   void copy_from_dev(uint64_t mem_addr, void* host_ptr, int count) {
-    if (ptr_map.find((void* )mem_addr) != ptr_map.end()) {
-      RT_CHECK(vx_copy_from_dev(host_ptr, ptr_map[(void* )mem_addr], 0, count));
+    // 정확한 주소 매칭
+    if (ptr_map.find((void*)mem_addr) != ptr_map.end()) {
+      auto& info = ptr_map[(void*)mem_addr];
+      RT_CHECK(vx_copy_from_dev(host_ptr, info.buffer_handle, 0, count));
+      return;
     }
+    // 오프셋 기반 검색 (Triton: 할당 블록 내부 주소)
+    for (auto& pair : ptr_map) {
+      const MemoryInfo& info = pair.second;
+      if (mem_addr >= info.base_addr && mem_addr < (info.base_addr + info.size)) {
+        size_t offset = mem_addr - info.base_addr;
+        if (offset + count <= info.size) {
+          RT_CHECK(vx_copy_from_dev(host_ptr, info.buffer_handle, offset, count));
+          return;
+        }
+      }
+    }
+    printf("copy_from_dev: ERROR - mem_addr=0x%lx not found!\n", mem_addr);
+    std::abort();
   }
 
   void cleanup() {

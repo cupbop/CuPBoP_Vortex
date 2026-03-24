@@ -31,4 +31,5 @@ llvm::Value *createInBoundsGEP(llvm::IRBuilder<> &B, llvm::Value *ptr,
 llvm::Value *createGEP(llvm::IRBuilder<> &B, llvm::Value *ptr,
                        llvm::ArrayRef<llvm::Value *> idxlist);
 void printIR(llvm::Module *module_);
+bool triton_cupbop_enabled();
 #endif

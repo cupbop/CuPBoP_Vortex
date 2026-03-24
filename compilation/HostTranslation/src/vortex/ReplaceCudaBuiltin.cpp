@@ -352,7 +352,8 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
-            auto func_name = Call->getCalledOperand()->getName().str();
+              auto func_name = Call->getCalledFunction()->getName().str();
+
             if (func_name == "cudaMemcpyToSymbol") {
               
               llvm::Function *parentFunction = (Call->getParent()->getParent());
@@ -367,11 +368,12 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
                   for (auto PBI = PBB->begin(); PBI != PBB->end(); PBI++) {
                     if (auto Call_parent = dyn_cast<CallInst>(PBI)) {
                       if (Call_parent->getCalledFunction()) {
-                        auto func_name = Call_parent->getCalledOperand()->getName().str();
-                        if (func_name == parentFunction_name) {
-                          //get first argument of the called function of call_parent
-                          auto arg0 = Call_parent->getArgOperand(0);
-                          //print the name of the value that arg0 is pointing to
+                        if (auto *F = Call_parent->getCalledFunction()) {
+                          auto func_name = F->getName().str();
+                          if (func_name == parentFunction_name) {
+                            //get first argument of the called function of call_parent
+                            auto arg0 = Call_parent->getArgOperand(0);
+                            //print the name of the value that arg0 is pointing to
                           arg0_name += arg0->stripPointerCasts()->getName().str();
                           arg0_name += " ";
                           printf("arg0_name: %s\n", arg0_name.c_str());
@@ -386,6 +388,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
         }
       }
     }
+    }
   }
 
   printf("final arg0_name: %s\n", arg0_name.c_str());
@@ -395,8 +398,9 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->getCalledFunction()) {
-            auto func_name = Call->getCalledOperand()->getName().str();
-            if (func_name == "cudaMemcpyToSymbol") {
+            if (auto *F = Call->getCalledFunction()) {
+              auto func_name = F->getName().str();
+              if (func_name == "cudaMemcpyToSymbol") {
 
               // Create a constant for arg0_name
               auto arg0_name_constant = llvm::ConstantDataArray::getString(context, arg0_name, /*AddNull=*/true);
@@ -443,6 +447,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
               
             }
           }
+        }
         }
       }
     }

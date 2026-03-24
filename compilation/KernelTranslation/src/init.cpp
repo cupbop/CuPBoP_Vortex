@@ -7,6 +7,8 @@
 #include <iostream>
 
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -107,6 +109,15 @@ bool inline_func_with_tid(llvm::Module *M) {
     InlineFunction(*c, IFI);
   }
   return changed;
+}
+
+void remove_non_return_property(llvm::Module *M) {
+  for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i){
+    Function *F = &(*i);
+    if (F->hasFnAttribute(Attribute::NoReturn)){
+      F->removeFnAttr(Attribute::NoReturn);
+    }
+  }
 }
 
 void create_global_variable(llvm::Module *M) {
@@ -398,6 +409,12 @@ void replace_cuda_math_built_in(llvm::Module *M) {
 
 
 void init_block(llvm::Module *M, std::ofstream &fout) {
+  // triton update
+  bool triton_enabled = triton_cupbop_enabled();
+  if (triton_enabled) {
+    remove_non_return_property(M);
+  }
+
   // using official llvm preprocess
   llvm_preprocess(M);
   // remove useles Cuda function
@@ -466,5 +483,11 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   replace_asm_call(M);
 
   // replace dynamic shared memory
-  //replace_dynamic_shared_memory(M);
+  auto dynamic_shared_memory_addr =
+      M->getGlobalVariable("dynamic_shared_memory");
+
+  if (dynamic_shared_memory_addr) {
+    std::cout << "[DEBUG] replace dynamic shared memory found!" << std::endl;
+    replace_dynamic_shared_memory(M);
+  }
 }

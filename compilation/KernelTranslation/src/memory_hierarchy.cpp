@@ -53,13 +53,22 @@ void mem_share2global(llvm::Module *M) {
               // generate global type pointer
               PointerType *PointerTy =
                   PointerType::get(array_type->getElementType(), 0);
-              llvm::Constant *x1 = ConstantPointerNull::get(PointerTy);
-              llvm::GlobalVariable *global_ptr = new llvm::GlobalVariable(
-                  *M, PointerTy, false, llvm::GlobalValue::CommonLinkage, x1,
-                  "wrapper_global_data", NULL,
-                  llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-
-              global_ptr->setDSOLocal(true);
+              llvm::GlobalVariable *global_ptr;
+              if (triton_cupbop_enabled()) {
+                // Triton: ExternalLinkage, name must be "dynamic_shared_memory"
+                // so replace_dynamic_shared_memory() can find it
+                global_ptr = new llvm::GlobalVariable(
+                    *M, PointerTy, false, llvm::GlobalValue::ExternalLinkage,
+                    NULL, "dynamic_shared_memory", NULL,
+                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+              } else {
+                llvm::Constant *x1 = ConstantPointerNull::get(PointerTy);
+                global_ptr = new llvm::GlobalVariable(
+                    *M, PointerTy, false, llvm::GlobalValue::CommonLinkage, x1,
+                    "wrapper_global_data", NULL,
+                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+                global_ptr->setDSOLocal(true);
+              }
 
               corresponding_global_memory.insert(
                   std::pair<GlobalVariable *, GlobalVariable *>(share_memory,

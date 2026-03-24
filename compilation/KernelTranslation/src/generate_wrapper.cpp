@@ -63,16 +63,20 @@ void decode_input(llvm::Module *M) {
       continue;
 
     auto func_name = F->getName().str();
+    printf("function name: %s\n", func_name.c_str());
     
     // remove mangle prefix
     // remove _Z24
-    for (int pos = 2; pos < func_name.length(); pos++) {
+    // this only applies for nvcc compiled kernel (pass for triton)
+    bool triton_enabled = triton_cupbop_enabled();
+    if ((triton_enabled && func_name[0] == '_') || (!triton_enabled)) {
+      for (int pos = 2; pos < func_name.length(); pos++) {
       if (func_name[pos] >= '0' && func_name[pos] <= '9')
         continue;
       func_name = func_name.substr(pos);
       break;
+    } 
     }
-
     llvm::IRBuilder<> Builder(M->getContext());
 
     FunctionCallee fc =
@@ -102,6 +106,9 @@ void decode_input(llvm::Module *M) {
       Value *loadedValue = createLoad(Builder, global_mem);
 
       llvm::FunctionType *LaunchFun2 = FunctionType::get(PointerType::get(PointerType::get(Int32T, 0), 0), false);
+      // Triton version
+      // llvm::FunctionType *LaunchFun2 = FunctionType::get(
+          // PointerType::get(PointerType::get(Int32T, 0), 0), NULL);
 
       FunctionCallee fc2 =
           M->getOrInsertFunction("_wrapper_global_data", LaunchFun2);
@@ -226,6 +233,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
     */
 
     int kernel_idx = 0;
+    bool triton_enabled = triton_cupbop_enabled();
 
     for (auto F = M->begin(); F != M->end(); ++F) {
       for (auto BB = F->begin(); BB != F->end(); ++BB) {
@@ -242,13 +250,18 @@ void create_kernel_wrapper_function(llvm::Module *M){
             if(isKernelFunction(M, Call->getCalledFunction()) && std::find(wrapper_name.begin(), wrapper_name.end(), func_name+"_wrapper") == wrapper_name.end())
             {
               std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
-              // remove _Z24
-              for (int i = 2; i < func_name.length(); i++) {
-                if (func_name[i] >= '0' && func_name[i] <= '9')
-                  continue;
-                func_name = func_name.substr(i);
-                break;
+              
+              // remove _Z24, covers triton as well
+              if ((triton_enabled && func_name[0] == '_') || (!triton_enabled)) {
+                for (int i = 2; i < func_name.length(); i++) {
+                  if (func_name[i] >= '0' && func_name[i] <= '9')
+                    continue;
+                  func_name = func_name.substr(i);
+                  break;
+                }
               }
+
+              
               wrapper_name.push_back(func_name + "_wrapper");
               outfile.open("lookup.txt", std::ios::app);
               outfile << kernel_idx << " " << func_name << " " << func_arg_size << "\n";
@@ -326,7 +339,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "int __thread block_index_x;\n"
           "int __thread block_index_y;\n"
           "int __thread block_index_z;\n"
-          
+
+          "int __thread *dynamic_shared_memory = NULL;\n"
+
           "int __thread thread_id_x;\n"
           "int __thread thread_id_y;\n"
           "int __thread thread_id_z;\n"

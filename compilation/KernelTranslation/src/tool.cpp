@@ -33,6 +33,14 @@
 
 using namespace llvm;
 
+bool triton_cupbop_enabled() {
+  static bool enabled = []{
+    const char* v = std::getenv("TRITON_CUPBOP");
+    return (v != nullptr && std::strcmp(v, "1") == 0);
+  }();
+  return enabled;
+}
+
 llvm::Module *LoadModuleFromFilr(char *file_name) {
   llvm::SMDiagnostic Err;
   llvm::LLVMContext *globalContext = new llvm::LLVMContext;
@@ -265,7 +273,7 @@ void replace_dynamic_shared_memory(llvm::Module *M) {
         new BitCastInst(load_shared_memory,
                         dynamic_shared_memory_addr->getType(), "new_bit_cast");
     // CHECK NEEDED
-    //(new)new_bit_cast->insertAfter(load_shared_memory);
+    new_bit_cast->insertAfter(load_shared_memory);
     //(old)new_bit_cast->insertBefore(&*F->begin()->begin());
     //(old)load_shared_memory->insertBefore(new_bit_cast);
     dynamic_shared_memory_addr->replaceUsesWithIf(new_bit_cast, [&](Use &U) {
