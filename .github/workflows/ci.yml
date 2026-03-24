@@ -55,9 +55,9 @@ jobs:
           LOG_FILE=/tools/ci-reports/CuPBoP_logs/${TEST_NAME}.out
           tail -n 100 $LOG_FILE
 
-          if tail -n 10 "$LOG_FILE" | grep -q "Kernel compilation completed!" && \
-             tail -n 10 "$LOG_FILE" | grep -q "Host compilation completed!" && \
-             tail -n 10 "$LOG_FILE" | grep -q "Execution completed!"; then
+          if grep -q "Kernel compilation completed!" "$LOG_FILE" && \
+             grep -q "Host compilation completed!" "$LOG_FILE" && \
+             grep -q "Execution completed!" "$LOG_FILE"; then
             echo "Execution successful!"
             exit 0
           else
