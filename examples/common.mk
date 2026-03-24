@@ -77,7 +77,7 @@ DEVICE_BC  = $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_50.bc
 HOST_BC    = $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(EXTRA_C_SRCS))
 
-LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:../../build/runtime
+LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PATH)/runtime/lib:../../build/runtime
 
 # ─── Top-level targets ────────────────────────────────────────────────────────
 all: build run
@@ -167,7 +167,7 @@ host.out: host.o $(EXTRA_OBJS) kernel.vxbin lookup_global_symbols.txt
 	@echo "--- Linking host.out"
 	g++ -g -O0 -Wall \
 		-L../../build/runtime -L../../build/runtime/threadPool \
-		-L$(VORTEX_PATH)/runtime/ -I$(VORTEX_PATH)/kernel/include \
+		-L$(VORTEX_PATH)/runtime/ -L$(VORTEX_PATH)/runtime/lib/ -I$(VORTEX_PATH)/kernel/include \
 		-o $@ -fPIC -no-pie \
 		host.o $(EXTRA_OBJS) \
 		-lc -lvortexRuntime -lvortex -lThreadPool -lpthread
