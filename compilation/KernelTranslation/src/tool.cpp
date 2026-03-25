@@ -712,18 +712,14 @@ void replace_built_in_function(llvm::Module *M) {
               Call->getCalledFunction()->setName("__nvvm_add_rn_d");
             } else if (func_name == "llvm.nvvm.lohi.i2d") {
               Call->getCalledFunction()->setName("__nvvm_lohi_i2d");
-            } else if (func_name == "llvm.nvvm.fabs.f") {
-              Call->getCalledFunction()->setName("__nvvm_fabs_f");
+            } else if (func_name == "llvm.nvvm.fabs.f" ||
+                       func_name == "llvm.nvvm.fmin.ftz.f" ||
+                       func_name == "llvm.nvvm.fmin.f" ||
+                       func_name == "llvm.nvvm.fmax.ftz.f" ||
+                       func_name == "llvm.nvvm.fmax.f") {
+              // Handled in NVVM intrinsic replacement pass below
             } else if (func_name == "llvm.nvvm.mul24.i") {
               Call->getCalledFunction()->setName("__nvvm_mul24_i");
-            } else if (func_name == "llvm.nvvm.fmin.ftz.f") {
-              Call->getCalledFunction()->setName("__nvvm_fmin_ftz_f");
-            } else if (func_name == "llvm.nvvm.fmin.f") {
-              Call->getCalledFunction()->setName("__nvvm_fmin_f");
-            } else if (func_name == "llvm.nvvm.fmax.ftz.f") {
-              Call->getCalledFunction()->setName("__nvvm_fmax_ftz_f");
-            } else if (func_name == "llvm.nvvm.fmax.f") {
-              Call->getCalledFunction()->setName("__nvvm_fmax_f");
             } else if (func_name == "llvm.nvvm.membar.gl") {
               Call->getCalledFunction()->setName("__nvvm_membar_gl");
             } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") != std::string::npos) {
@@ -742,35 +738,298 @@ void replace_built_in_function(llvm::Module *M) {
   for (auto inst : need_remove) {
     inst->eraseFromParent();
   }
+
+  // Replace NVVM float intrinsics with standard LLVM IR operations.
+  // These intrinsics are not supported by the RISC-V backend and would
+  // cause "Don't know how to custom type legalize this intrinsic!" errors.
+  {
+    std::vector<CallInst *> to_replace;
+    for (auto &F : *M) {
+      for (auto &BB : F) {
+        for (auto &Inst : BB) {
+          if (auto *Call = dyn_cast<CallInst>(&Inst)) {
+            if (!Call->getCalledFunction())
+              continue;
+            auto name = Call->getCalledFunction()->getName().str();
+            if (name.find("llvm.nvvm.fma.") != std::string::npos ||
+                name.find("llvm.nvvm.mul.r") != std::string::npos ||
+                name.find("llvm.nvvm.add.r") != std::string::npos ||
+                name.find("llvm.nvvm.fabs.") != std::string::npos ||
+                name.find("llvm.nvvm.f2i.r") != std::string::npos ||
+                name.find("llvm.nvvm.f2ui.r") != std::string::npos ||
+                name.find("llvm.nvvm.i2f.r") != std::string::npos ||
+                name.find("llvm.nvvm.ui2f.r") != std::string::npos ||
+                name.find("llvm.nvvm.d2f.r") != std::string::npos ||
+                name.find("llvm.nvvm.f2ll.r") != std::string::npos ||
+                name.find("llvm.nvvm.f2ull.r") != std::string::npos ||
+                name.find("llvm.nvvm.ll2f.r") != std::string::npos ||
+                name.find("llvm.nvvm.ull2f.r") != std::string::npos ||
+                name.find("llvm.nvvm.d2i.r") != std::string::npos ||
+                name.find("llvm.nvvm.d2ui.r") != std::string::npos ||
+                name.find("llvm.nvvm.i2d.r") != std::string::npos ||
+                name.find("llvm.nvvm.ui2d.r") != std::string::npos ||
+                name.find("llvm.nvvm.d2ll.r") != std::string::npos ||
+                name.find("llvm.nvvm.d2ull.r") != std::string::npos ||
+                name.find("llvm.nvvm.ll2d.r") != std::string::npos ||
+                name.find("llvm.nvvm.ull2d.r") != std::string::npos ||
+                name.find("llvm.nvvm.sqrt.") != std::string::npos ||
+                name.find("llvm.nvvm.rsqrt.") != std::string::npos ||
+                name.find("llvm.nvvm.rcp.") != std::string::npos ||
+                name.find("llvm.nvvm.sin.") != std::string::npos ||
+                name.find("llvm.nvvm.cos.") != std::string::npos ||
+                name.find("llvm.nvvm.ex2.approx.f") != std::string::npos ||
+                name.find("llvm.nvvm.lg2.approx.f") != std::string::npos ||
+                name.find("llvm.nvvm.div.r") != std::string::npos ||
+                name.find("llvm.nvvm.fmin.") != std::string::npos ||
+                name.find("llvm.nvvm.fmax.") != std::string::npos ||
+                name.find("llvm.nvvm.saturate") != std::string::npos) {
+              to_replace.push_back(Call);
+            }
+          }
+        }
+      }
+    }
+
+    auto I32 = llvm::Type::getInt32Ty(M->getContext());
+    auto I64 = llvm::Type::getInt64Ty(M->getContext());
+    auto F32 = llvm::Type::getFloatTy(M->getContext());
+    auto F64 = llvm::Type::getDoubleTy(M->getContext());
+
+    for (auto *Call : to_replace) {
+      auto name = Call->getCalledFunction()->getName().str();
+      IRBuilder<> Builder(Call);
+
+      Value *replacement = nullptr;
+
+      // FMA: fma(a,b,c) = a*b+c
+      if (name.find("llvm.nvvm.fma.") != std::string::npos) {
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        Value *c = Call->getArgOperand(2);
+        auto *fma_func = Intrinsic::getDeclaration(M, Intrinsic::fma, {a->getType()});
+        replacement = Builder.CreateCall(fma_func, {a, b, c});
+
+      // Multiply: a*b
+      } else if (name.find("llvm.nvvm.mul.r") != std::string::npos) {
+        replacement = Builder.CreateFMul(Call->getArgOperand(0), Call->getArgOperand(1));
+
+      // Add: a+b
+      } else if (name.find("llvm.nvvm.add.r") != std::string::npos) {
+        replacement = Builder.CreateFAdd(Call->getArgOperand(0), Call->getArgOperand(1));
+
+      // Division: a/b
+      } else if (name.find("llvm.nvvm.div.r") != std::string::npos) {
+        replacement = Builder.CreateFDiv(Call->getArgOperand(0), Call->getArgOperand(1));
+
+      // Absolute value
+      } else if (name.find("llvm.nvvm.fabs.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::fabs, {x->getType()}), {x});
+
+      // Min/Max
+      } else if (name.find("llvm.nvvm.fmin.") != std::string::npos) {
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::minnum, {a->getType()}), {a, b});
+      } else if (name.find("llvm.nvvm.fmax.") != std::string::npos) {
+        Value *a = Call->getArgOperand(0);
+        Value *b = Call->getArgOperand(1);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {a->getType()}), {a, b});
+
+      // Square root
+      } else if (name.find("llvm.nvvm.sqrt.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::sqrt, {x->getType()}), {x});
+
+      // Reciprocal square root: 1/sqrt(x)
+      } else if (name.find("llvm.nvvm.rsqrt.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        Value *sq = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::sqrt, {x->getType()}), {x});
+        replacement = Builder.CreateFDiv(ConstantFP::get(x->getType(), 1.0), sq);
+
+      // Reciprocal: 1/x
+      } else if (name.find("llvm.nvvm.rcp.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateFDiv(ConstantFP::get(x->getType(), 1.0), x);
+
+      // sin/cos
+      } else if (name.find("llvm.nvvm.sin.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::sin, {x->getType()}), {x});
+      } else if (name.find("llvm.nvvm.cos.") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::cos, {x->getType()}), {x});
+
+      // exp2 / log2
+      } else if (name.find("llvm.nvvm.ex2.approx.f") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::exp2, {x->getType()}), {x});
+      } else if (name.find("llvm.nvvm.lg2.approx.f") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::log2, {x->getType()}), {x});
+
+      // Saturate: clamp to [0, 1]
+      } else if (name.find("llvm.nvvm.saturate") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        Value *zero = ConstantFP::get(x->getType(), 0.0);
+        Value *one = ConstantFP::get(x->getType(), 1.0);
+        Value *clamped_lo = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {x->getType()}), {x, zero});
+        replacement = Builder.CreateCall(
+            Intrinsic::getDeclaration(M, Intrinsic::minnum, {x->getType()}), {clamped_lo, one});
+
+      // Float-to-signed-int
+      } else if (name.find("llvm.nvvm.f2i.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        if (name.find(".rn") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+        } else if (name.find(".rm") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+        } else if (name.find(".rp") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+        }
+        replacement = Builder.CreateFPToSI(x, I32);
+
+      // Float-to-unsigned-int
+      } else if (name.find("llvm.nvvm.f2ui.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        if (name.find(".rn") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+        } else if (name.find(".rm") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+        } else if (name.find(".rp") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+        }
+        replacement = Builder.CreateFPToUI(x, I32);
+
+      // Float-to-long-long
+      } else if (name.find("llvm.nvvm.f2ll.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        if (name.find(".rn") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+        }
+        replacement = Builder.CreateFPToSI(x, I64);
+      } else if (name.find("llvm.nvvm.f2ull.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        if (name.find(".rn") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+        }
+        replacement = Builder.CreateFPToUI(x, I64);
+
+      // Double-to-int conversions
+      } else if (name.find("llvm.nvvm.d2i.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        if (name.find(".rn") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+        } else if (name.find(".rm") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+        } else if (name.find(".rp") != std::string::npos) {
+          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+        }
+        replacement = Builder.CreateFPToSI(x, I32);
+      } else if (name.find("llvm.nvvm.d2ui.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateFPToUI(x, I32);
+      } else if (name.find("llvm.nvvm.d2ll.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateFPToSI(x, I64);
+      } else if (name.find("llvm.nvvm.d2ull.r") != std::string::npos) {
+        Value *x = Call->getArgOperand(0);
+        replacement = Builder.CreateFPToUI(x, I64);
+
+      // Int-to-float conversions
+      } else if (name.find("llvm.nvvm.i2f.r") != std::string::npos) {
+        replacement = Builder.CreateSIToFP(Call->getArgOperand(0), F32);
+      } else if (name.find("llvm.nvvm.ui2f.r") != std::string::npos) {
+        replacement = Builder.CreateUIToFP(Call->getArgOperand(0), F32);
+      } else if (name.find("llvm.nvvm.ll2f.r") != std::string::npos) {
+        replacement = Builder.CreateSIToFP(Call->getArgOperand(0), F32);
+      } else if (name.find("llvm.nvvm.ull2f.r") != std::string::npos) {
+        replacement = Builder.CreateUIToFP(Call->getArgOperand(0), F32);
+      } else if (name.find("llvm.nvvm.i2d.r") != std::string::npos) {
+        replacement = Builder.CreateSIToFP(Call->getArgOperand(0), F64);
+      } else if (name.find("llvm.nvvm.ui2d.r") != std::string::npos) {
+        replacement = Builder.CreateUIToFP(Call->getArgOperand(0), F64);
+      } else if (name.find("llvm.nvvm.ll2d.r") != std::string::npos) {
+        replacement = Builder.CreateSIToFP(Call->getArgOperand(0), F64);
+      } else if (name.find("llvm.nvvm.ull2d.r") != std::string::npos) {
+        replacement = Builder.CreateUIToFP(Call->getArgOperand(0), F64);
+
+      // Double-to-float truncation
+      } else if (name.find("llvm.nvvm.d2f.r") != std::string::npos) {
+        replacement = Builder.CreateFPTrunc(Call->getArgOperand(0), F32);
+      }
+
+      if (replacement) {
+        Call->replaceAllUsesWith(replacement);
+        Call->eraseFromParent();
+      }
+    }
+  }
 }
 
 void replace_asm_call(llvm::Module *M) {
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
+  auto I64 = llvm::Type::getInt64Ty(context);
   std::vector<CallInst *> need_remove;
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
-    auto func_name = F->getName().str();
-    if (!isKernelFunction(M, F))
-      continue;
 
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
-            if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
-              printf("unknown InlineAsm\n");
-              exit(1);
+            auto asm_str = asm_inst->getAsmString();
+
+            if (asm_str == "mov.u32 $0, %laneid;") {
+              // return the rank within the warp
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              auto intra_warp_index_addr =
+                  M->getGlobalVariable("intra_warp_index");
+              auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
+              Call->replaceAllUsesWith(intra_warp_index);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("mad.lo.cc.u32") != std::string::npos &&
+                       asm_str.find("madc.hi.u32") != std::string::npos) {
+              // PTX: {lo, hi} = a * b + c (64-bit multiply-add)
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              Value *a = Call->getArgOperand(0);
+              Value *b = Call->getArgOperand(1);
+              Value *c = Call->getArgOperand(2);
+              Value *a64 = builder.CreateZExt(a, I64);
+              Value *b64 = builder.CreateZExt(b, I64);
+              Value *c64 = builder.CreateZExt(c, I64);
+              Value *prod = builder.CreateMul(a64, b64);
+              Value *sum = builder.CreateAdd(prod, c64);
+              Value *lo = builder.CreateTrunc(sum, I32);
+              Value *hi = builder.CreateTrunc(builder.CreateLShr(sum, 32), I32);
+              Value *result = UndefValue::get(Call->getType());
+              result = builder.CreateInsertValue(result, lo, 0);
+              result = builder.CreateInsertValue(result, hi, 1);
+              Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else {
+              printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              if (!Call->getType()->isVoidTy()) {
+                Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
+              }
+              need_remove.push_back(Call);
             }
-            // return the rank within the warp
-            IRBuilder<> builder(context);
-            builder.SetInsertPoint(Call);
-            auto intra_warp_index_addr =
-                M->getGlobalVariable("intra_warp_index");
-            auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
-            Call->replaceAllUsesWith(intra_warp_index);
-            need_remove.push_back(Call);
           }
         }
       }
