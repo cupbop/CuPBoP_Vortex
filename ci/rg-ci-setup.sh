@@ -45,6 +45,5 @@ export VORTEX_ARCHITECTURE=64
 # Running Vortex Configuration
 cd $VORTEX_PATH
 ../configure --xlen=64 --tooldir=$TOOLDIR
-./ci/blackbox.sh --cores=4 --warps=16 --threads=32
 
 cd $CuPBoP_PATH
