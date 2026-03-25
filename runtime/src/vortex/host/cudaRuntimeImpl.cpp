@@ -55,7 +55,7 @@ std::vector<std::string> symbol_name_vector;
     uint32_t work_dim;
     uint32_t dyn_shared_mem_size;
   };
-  
+
 #else
   struct alignas(4) context_t {
     uint32_t num_groups[3];
@@ -116,6 +116,17 @@ public:
       args_buffer_ = nullptr;
     }
   }
+
+  void cleanup_krnl() {
+    if (krnl_buffer_ != nullptr) {
+      vx_mem_free(krnl_buffer_);
+      krnl_buffer_ = nullptr;
+    }
+    last_krnl_path_.clear();
+  }
+
+  const std::string& last_krnl_path() const { return last_krnl_path_; }
+  void set_last_krnl_path(const std::string& p) { last_krnl_path_ = p; }
 private:
 
   vx_device_h device_;
@@ -125,6 +136,7 @@ private:
   // Buffers
   vx_buffer_h krnl_buffer_;
   vx_buffer_h args_buffer_;
+  std::string last_krnl_path_;
 
   // Pointer manager
   struct MemoryInfo {
@@ -772,9 +784,15 @@ cudaError_t cudaLaunchKernel_vortex(
   DC->cleanup_args();
 
   int status = C_RUN;
-  // upload kernel to device (cached across launches)
-  if (DC->get_krnl_buf() == nullptr) {
-    RT_CHECK(vx_upload_kernel_file(DC->device(), "./kernel.vxbin", DC->krnl_buffer()));
+  // upload kernel to device (reload when binary path changes)
+  {
+    // Use func as path if it looks like a file path (absolute or relative with /), else fallback
+    std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
+    if (DC->get_krnl_buf() == nullptr || krnl_path != DC->last_krnl_path()) {
+      DC->cleanup_krnl();
+      RT_CHECK(vx_upload_kernel_file(DC->device(), krnl_path.c_str(), DC->krnl_buffer()));
+      DC->set_last_krnl_path(krnl_path);
+    }
   }
 
 
