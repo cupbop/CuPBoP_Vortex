@@ -29,5 +29,5 @@ apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/
     make
 
     # Vortex sanity check
-    $VORTEX_HOME/ci/blackbox.sh --cores=4 --warps=16 --threads=32 --app=demo
+    $VORTEX_PATH/ci/blackbox.sh --cores=4 --warps=16 --threads=32 --app=demo
 EOF
