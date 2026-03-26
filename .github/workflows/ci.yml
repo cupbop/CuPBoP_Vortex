@@ -67,6 +67,9 @@ jobs:
       - name: Verify Correctness
         run: |
           export TEST_NAME="${{ matrix.name }}"
+          echo "PWD: $(pwd)"
+          ls -la ./examples/${TEST_NAME}/ci_output.txt || echo "ci_output.txt NOT FOUND"
+          ls -la ./examples/${TEST_NAME}/golden_output.txt || echo "golden_output.txt NOT FOUND"
           EXAMPLE_DIR="./examples/${TEST_NAME}"
           CI_OUTPUT="${EXAMPLE_DIR}/ci_output.txt"
 
