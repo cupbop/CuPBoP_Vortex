@@ -65,60 +65,99 @@ jobs:
           fi
 
       - name: Verify Correctness
+        if: always()
         run: |
           export TEST_NAME="${{ matrix.name }}"
+          export SCHEDULE="${{ matrix.scheduler }}"
           echo "PWD: $(pwd)"
           ls -la ./examples/${TEST_NAME}/ci_output.txt || echo "ci_output.txt NOT FOUND"
           ls -la ./examples/${TEST_NAME}/golden_output.txt || echo "golden_output.txt NOT FOUND"
           EXAMPLE_DIR="./examples/${TEST_NAME}"
           CI_OUTPUT="${EXAMPLE_DIR}/ci_output.txt"
+          STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}.txt"
 
+          RESULT="FAIL"
           case $TEST_NAME in
             saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test)
               if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
+                RESULT="PASS"
               else
                 echo "Correctness: FAIL (PASSED not found)"
                 [ -f "$CI_OUTPUT" ] && cat "$CI_OUTPUT"
-                exit 1
               fi
               ;;
             backprop|nn|pathfinder)
               GOLDEN="${EXAMPLE_DIR}/golden_output.txt"
               if [ -f "$GOLDEN" ] && [ -f "$CI_OUTPUT" ]; then
-                python3 ./ci/compare_golden.py "$GOLDEN" "$CI_OUTPUT" --tolerance=1e-4
+                if python3 ./ci/compare_golden.py "$GOLDEN" "$CI_OUTPUT" --tolerance=1e-4; then
+                  RESULT="PASS"
+                fi
               else
-                echo "Golden or CI output missing, skipping"
+                echo "Correctness: FAIL (golden or CI output missing)"
               fi
               ;;
             bfs)
               GOLDEN="${EXAMPLE_DIR}/golden_result_bfs.txt"
-              RESULT="${EXAMPLE_DIR}/result_vortex.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT" ]; then
-                diff -q "$GOLDEN" "$RESULT" && echo "Correctness: PASS" || { echo "Correctness: FAIL"; diff "$GOLDEN" "$RESULT" || true; exit 1; }
+              RESULT_FILE="${EXAMPLE_DIR}/result_vortex.txt"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                if diff -q "$GOLDEN" "$RESULT_FILE" > /dev/null 2>&1; then
+                  echo "Correctness: PASS"
+                  RESULT="PASS"
+                else
+                  echo "Correctness: FAIL"
+                  diff "$GOLDEN" "$RESULT_FILE" || true
+                fi
               else
-                echo "Golden or result file missing, skipping"
+                echo "Correctness: FAIL (golden or result file missing)"
               fi
               ;;
             btree)
               GOLDEN="${EXAMPLE_DIR}/golden_result_btree.txt"
-              RESULT="${EXAMPLE_DIR}/output.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT" ]; then
-                diff -q "$GOLDEN" "$RESULT" && echo "Correctness: PASS" || { echo "Correctness: FAIL"; diff "$GOLDEN" "$RESULT" || true; exit 1; }
+              RESULT_FILE="${EXAMPLE_DIR}/output.txt"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                if diff -q "$GOLDEN" "$RESULT_FILE" > /dev/null 2>&1; then
+                  echo "Correctness: PASS"
+                  RESULT="PASS"
+                else
+                  echo "Correctness: FAIL"
+                  diff "$GOLDEN" "$RESULT_FILE" || true
+                fi
               else
-                echo "Golden or result file missing, skipping"
+                echo "Correctness: FAIL (golden or result file missing)"
               fi
               ;;
             *)
               echo "No correctness check defined for $TEST_NAME"
+              RESULT="SKIP"
               ;;
           esac
+
+          echo "$RESULT" > "$STATUS_FILE"
+          if [ "$RESULT" = "FAIL" ]; then
+            exit 1
+          fi
+
+      - name: Report Performance
+        if: always()
+        run: |
+          export TEST_NAME="${{ matrix.name }}"
+          export SCHEDULE="${{ matrix.scheduler }}"
+          PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}*.txt 2>/dev/null | head -1)
+          if [ -n "$PERF_FILE" ]; then
+            python3 ./ci/perf_summary.py "$PERF_FILE" "$TEST_NAME" "$SCHEDULE" >> $GITHUB_STEP_SUMMARY
+          fi
 
   complete:
     runs-on: self-hosted
     needs: tests
+    if: always()
 
     steps:
       - name: Check Completion
         run: echo "All matrix jobs passed"
+
+      - name: Performance Summary
+        run: |
+          python3 ./ci/perf_summary_all.py ./examples >> $GITHUB_STEP_SUMMARY
 
