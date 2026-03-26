@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
   printIR(program);
   init_block(program, fout);
 
-  dumpFile(program, "0.ll");
+  // dumpFile(program, "0.ll");
   // Create pass infrastructure
   PassBuilder PB;
   ModuleAnalysisManager MAM;

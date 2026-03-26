@@ -663,10 +663,9 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
-// cudaGetDeviceProperties_v2 is already defined via macro in cuda_runtime_api.h (CUDA 12+)
-// cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
-//   return cudaGetDeviceProperties(deviceProp, device);
-// }
+cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
+  return cudaGetDeviceProperties(deviceProp, device);
+}
 
 
 static cudaError_t lastError = cudaSuccess;

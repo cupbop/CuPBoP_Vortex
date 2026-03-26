@@ -161,12 +161,18 @@ void create_global_variable(llvm::Module *M) {
     // dim3_t = union { struct {uint32_t x,y,z}; uint32_t m[3]; }
     auto Dim3Type = llvm::StructType::create(M->getContext(), {I32, I32, I32}, "dim3_t");
 
-    // Remove CUDA's dummy @blockIdx/@threadIdx declarations (non-TLS, addrspace(1))
-    // so we can create proper TLS globals matching vx_spawn's definitions.
+    // Remove CUDA's dummy declarations (non-TLS, addrspace(1), { i8 } types)
+    // so we can create proper globals matching vx_spawn's definitions.
     if (auto *existing = M->getGlobalVariable("blockIdx")) {
       existing->eraseFromParent();
     }
     if (auto *existing = M->getGlobalVariable("threadIdx")) {
+      existing->eraseFromParent();
+    }
+    if (auto *existing = M->getGlobalVariable("blockDim")) {
+      existing->eraseFromParent();
+    }
+    if (auto *existing = M->getGlobalVariable("gridDim")) {
       existing->eraseFromParent();
     }
 
