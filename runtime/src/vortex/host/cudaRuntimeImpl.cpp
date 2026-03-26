@@ -663,9 +663,12 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
   return cudaSuccess;
 }
 
+#ifndef cudaGetDeviceProperties
+// Only define _v2 separately when CUDA headers don't macro-expand it
 cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp *deviceProp, int device) {
   return cudaGetDeviceProperties(deviceProp, device);
 }
+#endif
 
 
 static cudaError_t lastError = cudaSuccess;
