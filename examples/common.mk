@@ -8,7 +8,7 @@
 # Override from command line:
 #   make ARCH=32 SCHEDULE=0 STARTUP_ADDR=0x80000000 LOG=result.txt
 
-.PHONY: all build run clean ci ci-run cuda-build cuda-run
+.PHONY: all build run clean clean-perf ci ci-run cuda-build cuda-run rebuild-ir
 
 # ─── Required env vars ────────────────────────────────────────────────────────
 ifndef VORTEX_PATH
@@ -115,12 +115,33 @@ cuda-run: cuda-build
 	./cuda_$(KERNEL).out $(CI_RUN_ARGS) | tee golden_output.txt
 	@echo "--- Golden output saved to golden_output.txt"
 
+# ─── Rebuild from modified kernel.ll ────────────────────────────────────────
+# Usage: edit kernel.ll, then run `make rebuild-ir`
+# Assembles kernel.ll → kernel.bc, then backend compile → link → run
+rebuild-ir:
+	@echo "--- Assembling kernel.ll -> kernel.bc"
+	$(LLVM_BIN)/llvm-as kernel.ll -o kernel.bc
+	@echo "--- Compiling kernel.bc -> kernel.o"
+	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) kernel.bc -c -o kernel.o > kernel.log 2>&1
+	@echo "--- Linking kernel.elf"
+	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) --gcc-toolchain=$(RISCV_FOLDER) \
+		kernel_wrapper.o kernel.o $(CUDA_KERNEL_IMPL) -lm $(VX_LDFLAGS) -o kernel.elf
+	@echo "--- Kernel compilation completed!"
+	OBJCOPY=$(LLVM_BIN)/llvm-objcopy $(VORTEX_HOME)/kernel/scripts/vxbin.py kernel.elf kernel.vxbin
+	$(LLVM_BIN)/llvm-objdump -D kernel.elf > kernel.dump
+	@echo "--- Running"
+	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 ./host.out $(RUN_ARGS)
+	@echo "--- Execution completed!"
+
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt
 	rm -f $(EXTRA_OBJS)
+
+clean-perf:
+	rm -f Perf_counter_*.txt
 
 # ─── Step 1: CUDA source -> bitcode ──────────────────────────────────────────
 $(DEVICE_BC): $(KERNEL_CU)
