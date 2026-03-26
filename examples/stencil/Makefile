@@ -1,3 +1,4 @@
 KERNEL_CU = stencil.cu
 RUN_ARGS  = 32 32 8 1 -i ../../data/stencil/32x32x8.bin
+CI_RUN_ARGS  = 32 32 8 1 -i ../../data/stencil/32x32x8.bin
 include ../common.mk

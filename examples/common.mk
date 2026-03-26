@@ -8,7 +8,7 @@
 # Override from command line:
 #   make ARCH=32 SCHEDULE=0 STARTUP_ADDR=0x80000000 LOG=result.txt
 
-.PHONY: all build run clean
+.PHONY: all build run clean ci ci-run cuda-build cuda-run
 
 # ─── Required env vars ────────────────────────────────────────────────────────
 ifndef VORTEX_PATH
@@ -82,6 +82,15 @@ LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PAT
 # ─── Top-level targets ────────────────────────────────────────────────────────
 all: build run
 
+ci: build ci-run
+
+ci-run: build
+	@echo "--- Running (CI)"
+	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 ./host.out $(CI_RUN_ARGS) | tee ci_output.txt
+	@echo "--- Execution completed!"
+
+CI_RUN_ARGS ?= $(RUN_ARGS)
+
 build: host.out kernel.vxbin kernel.dump
 
 ifdef LOG
@@ -96,11 +105,21 @@ run: build
 	@echo "--- Execution completed!"
 endif
 
+# ─── CUDA GPU golden reference ───────────────────────────────────────────────
+NVCC ?= nvcc
+
+cuda-build: $(KERNEL_CU) $(EXTRA_C_SRCS)
+	$(NVCC) -O2 -ccbin g++-11 -o cuda_$(KERNEL).out $(KERNEL_CU) $(EXTRA_C_SRCS)
+
+cuda-run: cuda-build
+	./cuda_$(KERNEL).out $(CI_RUN_ARGS) | tee golden_output.txt
+	@echo "--- Golden output saved to golden_output.txt"
+
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp
+	rm -f kernel_wrapper.cpp golden_output.txt ci_output.txt
 	rm -f $(EXTRA_OBJS)
 
 # ─── Step 1: CUDA source -> bitcode ──────────────────────────────────────────

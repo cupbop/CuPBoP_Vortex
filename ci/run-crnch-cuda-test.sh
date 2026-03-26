@@ -20,7 +20,7 @@ apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/
 
     cd ./examples
     make -C ${TEST_NAME} clean
-    make -C ${TEST_NAME} SCHEDULE=${VORTEX_SCHEDULE_FLAG}
+    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG}
     exit 0
 EOF
 

@@ -37,7 +37,7 @@ FORWARD_VARS = $(if $(ARCH),ARCH=$(ARCH)) \
                $(if $(STARTUP_ADDR),STARTUP_ADDR=$(STARTUP_ADDR)) \
                $(if $(LOG),LOG=$(LOG))
 
-.PHONY: all build run clean $(EXAMPLES)
+.PHONY: all build run clean ci cuda-run $(EXAMPLES)
 
 all: $(EXAMPLES)
 
@@ -49,3 +49,5 @@ $(EXAMPLES):
 build: $(EXAMPLES)
 run: $(EXAMPLES)
 clean: $(EXAMPLES)
+ci: $(EXAMPLES)
+cuda-run: $(EXAMPLES)
