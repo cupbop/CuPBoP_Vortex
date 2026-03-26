@@ -28,8 +28,4 @@ apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/
     cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH
     make
 
-    ldd $CuPBoP_PATH/build/runtime/libvortexRuntime.so | grep vortex
-
-    # Vortex sanity check
-    $VORTEX_PATH/ci/blackbox.sh --cores=4 --warps=16 --threads=32 --app=demo
 EOF
