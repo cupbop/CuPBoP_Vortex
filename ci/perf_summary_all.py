@@ -16,6 +16,8 @@ def parse_perf(filepath):
     entries = []
     with open(filepath, 'r') as f:
         for line in f:
+            if 'PERF: core' in line:
+                continue
             m = re.match(r'PERF:\s+instrs=(\d+),\s+cycles=(\d+),\s+IPC=([\d.]+)', line.strip())
             if m:
                 entries.append({
