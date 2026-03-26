@@ -1,0 +1,20 @@
+before all
+after before all
+maxGridX: 2147483647
+size check 8 4 42764
+before call
+gridDim.x: 669, gridDim.y: 1
+threadsPerBlock: 64
+after call
+before find
+after find
+1988 12 27  0 18 TONY       30.0  89.8  113   39 --> Distance=0.199997
+1980 10 22 18  3 ISAAC      30.1  90.4  110  778 --> Distance=0.412312
+1997 11 14 12 24 HELENE     30.5  89.8  134  529 --> Distance=0.538515
+2003  8 27 12 10 TONY       29.9  89.4  160  286 --> Distance=0.608275
+1974 12 22 18 24 JOYCE      30.6  89.9   80  593 --> Distance=0.608276
+1973  1 26 18  3 GORDON     30.5  90.5   98  651 --> Distance=0.707107
+1955  6 11 12  7 ALBERTO    29.6  90.6  134  346 --> Distance=0.721109
+1971  5  3  6 27 CHRIS      30.7  89.8   87  741 --> Distance=0.728011
+1995  8 10 12 11 PATTY      29.2  90.0   92   62 --> Distance=0.799999
+1958  2 22  0 15 CHRIS      30.1  89.2   49  802 --> Distance=0.806229
