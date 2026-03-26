@@ -119,7 +119,7 @@ clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp golden_output.txt ci_output.txt
+	rm -f kernel_wrapper.cpp ci_output.txt
 	rm -f $(EXTRA_OBJS)
 
 # ─── Step 1: CUDA source -> bitcode ──────────────────────────────────────────
