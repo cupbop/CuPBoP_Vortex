@@ -184,6 +184,7 @@ lud_verify(float *m, float *lu, int matrix_dim){
       }
   }
   printf("no_errors!\n");
+  printf("PASSED!\n");
   free(tmp);
 }
 

@@ -1,0 +1,12 @@
+CUDA initialized.
+CUDA! Starting VLC Tests!
+Parameters: num_elements: 262144, num_blocks: 1024, num_block_threads: 256
+----------------------------
+
+../../data/huffman/test1024_H2.206587175259.in, 1048576 bytes, entropy 2.206587
+
+CPU Encoding time (CPU): 4.223000 (ms)
+CPU Encoded to 291334 [B]
+Num_blocks to be passed to scan is 1024.
+Comparing vectors: 
+PASS! vectors are matching!

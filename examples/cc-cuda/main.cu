@@ -434,7 +434,7 @@ int main(int argc, char* argv[])
     ok = false;
   }
 
-  printf("%s\n", ok ? "PASS" : "FAIL");
+  printf("%s\n", ok ? "PASSED!" : "FAILED!");
   // cudaFreeHost(nodestatus);
   free(nodestatus);
   freeECLgraph(g);

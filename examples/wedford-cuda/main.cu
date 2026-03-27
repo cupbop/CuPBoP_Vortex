@@ -172,7 +172,7 @@ int main(int argc, char* argv[])
        break;
     }
   }
-  printf("%s\n", ok ? "PASS" : "FAIL");
+  printf("%s\n", ok ? "PASSED!" : "FAILED!");
 
   cudaFree(d_input);
   cudaFree(d_mean);

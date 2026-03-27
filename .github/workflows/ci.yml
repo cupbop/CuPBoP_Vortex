@@ -37,28 +37,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Full test matrix (uncomment when ready):
-        # name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
-        # scheduler: [2, 0]
-        # localmem: [1]
-        # include:
-        #   - name: backprop
-        #     scheduler: 2
-        #     localmem: 0
-        #   - name: dotproduct
-        #     scheduler: 2
-        #     localmem: 0
-        #   - name: pathfinder
-        #     scheduler: 2
-        #     localmem: 0
-        #   - name: psum
-        #     scheduler: 2
-        #     localmem: 0
-
-        # Temporary: test new benchmarks only (SCHE_2, LMEM=1)
-        name: [bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
-        scheduler: [2]
+        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        scheduler: [2, 0]
         localmem: [1]
+        include:
+          # SCHE_2 + LOCALMEM=0 for shared memory benchmarks
+          - name: backprop
+            scheduler: 2
+            localmem: 0
+          - name: dotproduct
+            scheduler: 2
+            localmem: 0
+          - name: pathfinder
+            scheduler: 2
+            localmem: 0
+          - name: psum
+            scheduler: 2
+            localmem: 0
+          - name: bh-cuda
+            scheduler: 2
+            localmem: 0
+          - name: cc-cuda
+            scheduler: 2
+            localmem: 0
+          - name: hotspot
+            scheduler: 2
+            localmem: 0
+          - name: jacobi-cuda
+            scheduler: 2
+            localmem: 0
+          - name: marchingCubes-cuda
+            scheduler: 2
+            localmem: 0
+          - name: score-cuda
+            scheduler: 2
+            localmem: 0
+          - name: wedford-cuda
+            scheduler: 2
+            localmem: 0
+        # Previous temporary config (new benchmarks only):
+        # name: [bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        # scheduler: [2]
+        # localmem: [1]
 
     steps:
   #     - name: Checkout code
@@ -98,7 +118,7 @@ jobs:
 
           RESULT="FAIL"
           case $TEST_NAME in
-            saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|jacobi-cuda|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
+            saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|jacobi-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
               if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
                 RESULT="PASS"

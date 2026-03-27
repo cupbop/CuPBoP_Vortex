@@ -202,10 +202,10 @@ int main () {
   // we succeeded. Otherwise, we failed.
 
   if (error <= tolerance && num_iters < max_iters) {
-    std::cout << "PASS" << std::endl;
+    std::cout << "PASSED!" << std::endl;
   }
   else {
-    std::cout << "FAIL" << std::endl;
+    std::cout << "FAILED!" << std::endl;
     return -1;
   }
 

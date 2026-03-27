@@ -554,7 +554,7 @@ int main(int argc, char* argv[])
   // specific to the problem size
   bool ok = (countedBlockNumLv1 == 8296 && countedBlockNumLv2 == 240380 &&
              countedVerticesNum == 4856560 && countedTrianglesNum == 6101640);
-  printf("%s\n", ok ? "PASS" : "FAIL");
+  printf("%s\n", ok ? "PASSED!" : "FAILED!");
 
   cudaFree(minMaxLv1Device);
   cudaFree(blockIndicesLv1Device);

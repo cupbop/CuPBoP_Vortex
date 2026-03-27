@@ -110,8 +110,9 @@ endif
 # ─── CUDA GPU golden reference ───────────────────────────────────────────────
 NVCC ?= nvcc
 
-cuda-build: $(KERNEL_CU) $(EXTRA_C_SRCS)
-	$(NVCC) -O2 -ccbin g++-11 $(EXTRA_CLANG_FLAGS) -o cuda_$(KERNEL).out $(KERNEL_CU) $(EXTRA_C_SRCS)
+EXTRA_NVCC_FLAGS ?=
+cuda-build: $(KERNEL_CU)
+	$(NVCC) -O2 -ccbin g++-11 $(EXTRA_NVCC_FLAGS) -o cuda_$(KERNEL).out $(KERNEL_CU) $(EXTRA_C_SRCS)
 
 cuda-run: cuda-build
 	./cuda_$(KERNEL).out $(CI_RUN_ARGS) | tee golden_output.txt

@@ -277,7 +277,7 @@ int main(int argc, char* argv[])
     }
   }
   checksum += memcmp(count, count_ref, count_size_bytes);
-  printf("%s\n", checksum == 0 ? "PASS" : "FAIL");
+  printf("%s\n", checksum == 0 ? "PASSED!" : "FAILED!");
 
   cudaFree(d_indices);
   cudaFree(d_count);
