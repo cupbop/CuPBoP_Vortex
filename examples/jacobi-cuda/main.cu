@@ -20,8 +20,11 @@
 #include <utility>
 #include <cuda.h>
 
-// A multiple of thread block size
-#define N 2048
+// A multiple of thread block size (default 2048, overridable via -DJACOBI_N=xxx)
+#ifndef JACOBI_N
+#define JACOBI_N 2048
+#endif
+#define N JACOBI_N
 
 #define IDX(i, j) ((i) + (j) * N)
 

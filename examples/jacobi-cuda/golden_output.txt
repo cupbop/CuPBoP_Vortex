@@ -1,0 +1,10 @@
+Error after iteration 0 = 0.0220539
+Error after iteration 1000 = 9.51044e-05
+Error after iteration 2000 = 4.86019e-05
+Error after iteration 3000 = 3.0824e-05
+Error after iteration 4000 = 2.14319e-05
+Error after iteration 5000 = 1.5784e-05
+Error after iteration 6000 = 1.21173e-05
+Average execution time per iteration: 1.93403e-05 (s)
+PASS
+Total elapsed time: 0.5826 seconds
