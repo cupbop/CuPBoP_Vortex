@@ -1003,7 +1003,20 @@ BasicBlock *insert_loop_init(llvm::BasicBlock *InsertInitBefore,
     builder.CreateStore(sche_data.outer_loop_init, inter_warp_index);
   } else { // intra warp
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
-    builder.CreateStore(sche_data.inner_loop_init, intra_warp_index);
+    // Add TLS divergent seed to loop init value so LLVM recognizes
+    // the warp loop counter as divergent (SCHE_0 only)
+    auto tls_seed = M->getGlobalVariable("sche_0_thread_idx_TLS");
+    if (tls_seed) {
+      auto tls_ptr = builder.CreateCall(
+          Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
+                                    {tls_seed->getType()}),
+          {tls_seed});
+      auto seed_val = builder.CreateLoad(I32, tls_ptr, "div_seed");
+      auto init_with_seed = builder.CreateAdd(sche_data.inner_loop_init, seed_val, "init_divergent");
+      builder.CreateStore(init_with_seed, intra_warp_index);
+    } else {
+      builder.CreateStore(sche_data.inner_loop_init, intra_warp_index);
+    }
   }
 
   builder.CreateBr(InsertInitBefore);

@@ -37,10 +37,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd]
-        # New benchmarks (not yet enabled):
-        # atomicAggregate-cuda, bscan-cuda, gc-cuda, memcpytosymbol_test, psort, shuffle-cuda, vote-cuda
-        scheduler: [2, 0]
+        # Full test matrix (uncomment when ready):
+        # name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, collision-cuda, gauss, hotspot, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        # scheduler: [2, 0]
+        # localmem: [1]
+        # include:
+        #   - name: backprop
+        #     scheduler: 2
+        #     localmem: 0
+        #   - name: dotproduct
+        #     scheduler: 2
+        #     localmem: 0
+        #   - name: pathfinder
+        #     scheduler: 2
+        #     localmem: 0
+        #   - name: psum
+        #     scheduler: 2
+        #     localmem: 0
+
+        # Temporary: test new benchmarks only (SCHE_2, LMEM=1)
+        name: [bh-cuda, blackscholes, cc-cuda, cfd, collision-cuda, gauss, hotspot, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        scheduler: [2]
+        localmem: [1]
 
     steps:
   #     - name: Checkout code
@@ -50,6 +68,7 @@ jobs:
         run: |
           export TEST_NAME="${{ matrix.name }}"
           export VORTEX_SCHEDULE_FLAG="${{ matrix.scheduler }}"
+          export VORTEX_LOCALMEM_FLAG="${{ matrix.localmem }}"
           chmod +x ./ci/run-crnch-cuda-test.sh && sbatch --wait --export=ALL ./ci/run-crnch-cuda-test.sh
           echo "Showing last 100 lines of log:"
           LOG_FILE=/tools/ci-reports/CuPBoP_logs/${TEST_NAME}.out
@@ -69,12 +88,13 @@ jobs:
         run: |
           export TEST_NAME="${{ matrix.name }}"
           export SCHEDULE="${{ matrix.scheduler }}"
+          export LMEM="${{ matrix.localmem }}"
           echo "PWD: $(pwd)"
           ls -la ./examples/${TEST_NAME}/ci_output.txt || echo "ci_output.txt NOT FOUND"
           ls -la ./examples/${TEST_NAME}/golden_output.txt || echo "golden_output.txt NOT FOUND"
           EXAMPLE_DIR="./examples/${TEST_NAME}"
           CI_OUTPUT="${EXAMPLE_DIR}/ci_output.txt"
-          STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}.txt"
+          STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}_LMEM_${LMEM}.txt"
 
           RESULT="FAIL"
           case $TEST_NAME in
@@ -143,9 +163,16 @@ jobs:
         run: |
           export TEST_NAME="${{ matrix.name }}"
           export SCHEDULE="${{ matrix.scheduler }}"
-          PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}*.txt 2>/dev/null | head -1)
+          export LMEM="${{ matrix.localmem }}"
+          if [ "$LMEM" = "0" ]; then
+            PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}_LOCAL_MEM_0*.txt 2>/dev/null | head -1)
+            LABEL="${TEST_NAME} (SCHE_${SCHEDULE}, LMEM=0)"
+          else
+            PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}*.txt 2>/dev/null | head -1)
+            LABEL="${TEST_NAME} (SCHE_${SCHEDULE})"
+          fi
           if [ -n "$PERF_FILE" ]; then
-            python3 ./ci/perf_summary.py "$PERF_FILE" "$TEST_NAME" "$SCHEDULE" >> $GITHUB_STEP_SUMMARY
+            python3 ./ci/perf_summary.py "$PERF_FILE" "$LABEL" "$SCHEDULE" >> $GITHUB_STEP_SUMMARY
           fi
 
   complete:

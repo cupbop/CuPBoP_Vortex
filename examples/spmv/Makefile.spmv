@@ -1,0 +1,17 @@
+
+# Makefile.spmv — build the CUDA CSR SpMV sample
+# Usage:
+#   make -f Makefile.spmv CUDA_ARCH=sm_80
+#   ./spmv -n 100000 -d 5
+
+NVCC ?= nvcc
+CUDA_ARCH ?= sm_80
+CXXFLAGS := -O3 -std=c++17
+
+all: spmv
+
+spmv: spmv.cu
+	$(NVCC) $(CXXFLAGS) -arch=$(CUDA_ARCH) -o $@ $<
+
+clean:
+	rm -f spmv

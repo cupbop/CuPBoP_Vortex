@@ -194,8 +194,16 @@ void create_global_variable(llvm::Module *M) {
     new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
                              NULL, "gridDim", NULL,
                              llvm::GlobalValue::NotThreadLocal, 0, false);
+
   } else {
     // Schedule 0/1: use CuPBoP's individual i32 globals (populated by cuda_*_wrapper)
+    // TLS seed for divergence tracking — value is always 0 but LLVM treats
+    // TLS loads as divergent sources, propagating to warp loop counters
+    auto sche0_tid_tls = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                             zero, "sche_0_thread_idx_TLS", NULL,
+                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+    sche0_tid_tls->setDSOLocal(true);
+
     new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                              NULL, "block_size", NULL,
                              llvm::GlobalValue::NotThreadLocal, 0, false);

@@ -1,0 +1,2 @@
+0 needle_cuda_shared_1PiS_iiii 6
+1 needle_cuda_shared_2PiS_iiii 6

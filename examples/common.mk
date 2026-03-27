@@ -27,6 +27,7 @@ endif
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 ARCH           ?= 64
 SCHEDULE       ?= 2
+LOCALMEM       ?= 1
 STARTUP_ADDR   ?= 0x080000000
 EXTRA_C_SRCS   ?=
 EXTRA_CLANG_FLAGS ?=
@@ -36,6 +37,7 @@ KERNEL          = $(basename $(notdir $(KERNEL_CU)))
 CUDA_PATH      ?= $(CuPBoP_PATH)/cuda-12.1
 
 export VORTEX_SCHEDULE_FLAG := $(SCHEDULE)
+export VORTEX_LOCALMEM_FLAG := $(LOCALMEM)
 
 # ─── Toolchain ────────────────────────────────────────────────────────────────
 LLVM_BIN = $(LLVM_PREFIX)/bin
@@ -118,13 +120,15 @@ cuda-run: cuda-build
 # ─── Rebuild from modified kernel.ll ────────────────────────────────────────
 # Usage: edit kernel.ll, then run `make rebuild-ir`
 # Assembles kernel.ll → kernel.bc, then backend compile → link → run
+REBUILD_OPT ?= -O3
 rebuild-ir:
+	rm -f kernel.bc kernel.o kernel.elf kernel.vxbin kernel.dump
 	@echo "--- Assembling kernel.ll -> kernel.bc"
 	$(LLVM_BIN)/llvm-as kernel.ll -o kernel.bc
-	@echo "--- Compiling kernel.bc -> kernel.o"
-	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) kernel.bc -c -o kernel.o > kernel.log 2>&1
+	@echo "--- Compiling kernel.bc -> kernel.o ($(REBUILD_OPT))"
+	$(LLVM_BIN)/clang++ $(subst -O3,$(REBUILD_OPT),$(VX_CFLAGS)) $(VX_VXFLAGS) kernel.bc -c -o kernel.o > kernel.log 2>&1
 	@echo "--- Linking kernel.elf"
-	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) --gcc-toolchain=$(RISCV_FOLDER) \
+	$(LLVM_BIN)/clang++ $(subst -O3,$(REBUILD_OPT),$(VX_CFLAGS)) $(VX_VXFLAGS) --gcc-toolchain=$(RISCV_FOLDER) \
 		kernel_wrapper.o kernel.o $(CUDA_KERNEL_IMPL) -lm $(VX_LDFLAGS) -o kernel.elf
 	@echo "--- Kernel compilation completed!"
 	OBJCOPY=$(LLVM_BIN)/llvm-objcopy $(VORTEX_HOME)/kernel/scripts/vxbin.py kernel.elf kernel.vxbin

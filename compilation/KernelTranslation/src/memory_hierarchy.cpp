@@ -336,30 +336,49 @@ void mem_share2global_sche_2(llvm::Module *M) {
 
   // 3) Utilities for rewriting uses
 
-  // (a) To load TLS globals (block_index_x/y), call llvm.threadlocal.address.p0
+  // (a) Load block index: individual TLS (SCHE_0) or blockIdx struct (SCHE_2)
   auto getTLSLoadI32 = [&](IRBuilder<> &B, const char *Name) -> Value* {
     auto *GV = M->getGlobalVariable(Name, /*AllowInternal*/true);
-    if (!GV) {
-      errs() << "[mem_share2global_sche_2] missing TLS global: " << Name << "\n";
-      report_fatal_error("missing TLS global");
+    if (GV) {
+      // SCHE_0: individual TLS global (block_index_x, block_index_y)
+      FunctionCallee tla = M->getOrInsertFunction(
+          "llvm.threadlocal.address.p0",
+          FunctionType::get(PointerType::get(C, /*AS=*/0),
+                            { PointerType::get(C, /*AS=*/0) }, false));
+      Value *tls_ptr = B.CreateCall(tla, {GV}, Twine(Name) + Twine("_tlsaddr"));
+      return B.CreateLoad(I32, tls_ptr, Name);
     }
-    // declare nonnull ptr @llvm.threadlocal.address.p0(ptr nonnull)
+    // SCHE_2: blockIdx is a TLS dim3_t struct
+    auto *blockIdxGV = M->getGlobalVariable("blockIdx", /*AllowInternal*/true);
+    if (!blockIdxGV) {
+      errs() << "[mem_share2global_sche_2] missing both " << Name << " and blockIdx\n";
+      report_fatal_error("missing block index global");
+    }
     FunctionCallee tla = M->getOrInsertFunction(
         "llvm.threadlocal.address.p0",
         FunctionType::get(PointerType::get(C, /*AS=*/0),
                           { PointerType::get(C, /*AS=*/0) }, false));
-    Value *tls_ptr = B.CreateCall(tla, {GV}, Twine(Name) + Twine("_tlsaddr"));
-    return B.CreateLoad(I32, tls_ptr, Name);
+    Value *tls_ptr = B.CreateCall(tla, {blockIdxGV}, "blockIdx_tlsaddr");
+    int field = (strcmp(Name, "block_index_x") == 0) ? 0 : 1;
+    Value *field_ptr = B.CreateStructGEP(blockIdxGV->getValueType(), tls_ptr, field);
+    return B.CreateLoad(I32, field_ptr, Name);
   };
 
-  // (b) grid_size_x is a non-TLS global, so just load directly
+  // (b) Load grid size: individual global (SCHE_0) or gridDim struct (SCHE_2)
   auto getGridLoadI32 = [&](IRBuilder<> &B, const char *Name) -> Value* {
     auto *GV = M->getGlobalVariable(Name, /*AllowInternal*/true);
-    if (!GV) {
-      errs() << "[mem_share2global_sche_2] missing global: " << Name << "\n";
-      report_fatal_error("missing global");
+    if (GV) {
+      return B.CreateLoad(I32, GV, Name);
     }
-    return B.CreateLoad(I32, GV, Name);
+    // SCHE_2: gridDim is a non-TLS dim3_t struct
+    auto *gridDimGV = M->getGlobalVariable("gridDim", /*AllowInternal*/true);
+    if (!gridDimGV) {
+      errs() << "[mem_share2global_sche_2] missing both " << Name << " and gridDim\n";
+      report_fatal_error("missing grid size global");
+    }
+    int field = (strcmp(Name, "grid_size_x") == 0) ? 0 : 1;
+    Value *field_ptr = B.CreateStructGEP(gridDimGV->getValueType(), gridDimGV, field);
+    return B.CreateLoad(I32, field_ptr, Name);
   };
 
   // (c) Expand ConstantExpr users safely into instructions

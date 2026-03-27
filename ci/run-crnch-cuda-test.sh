@@ -20,8 +20,11 @@ apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/
 
     cd ./examples
     make -C ${TEST_NAME} clean
-    rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}*.txt
-    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG}
+    LMEM_FLAG=${VORTEX_LOCALMEM_FLAG:-1}
+    rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}*LOCAL_MEM_${LMEM_FLAG}*.txt
+    rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}.txt
+    rm -f ${TEST_NAME}/ci_status_SCHE_${VORTEX_SCHEDULE_FLAG}_LMEM_${LMEM_FLAG}.txt
+    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG} LOCALMEM=${VORTEX_LOCALMEM_FLAG:-1}
     exit 0
 EOF
 

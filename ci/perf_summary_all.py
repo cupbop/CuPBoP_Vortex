@@ -4,8 +4,8 @@
 Usage:
     perf_summary_all.py <examples_dir>
 
-Scans examples_dir/*/Perf_counter_*.txt and produces one table per schedule.
-Reads ci_status_SCHE_*.txt to show PASS/FAIL status.
+Scans examples_dir/*/Perf_counter_*.txt and produces one table per schedule+localmem.
+Reads ci_status_SCHE_*_LMEM_*.txt to show PASS/FAIL status.
 """
 import sys
 import os
@@ -29,8 +29,8 @@ def parse_perf(filepath):
     total_ipc = total_instrs / total_cycles if total_cycles > 0 else 0
     return total_instrs, total_cycles, total_ipc
 
-def read_status(examples_dir, benchmark, schedule):
-    status_file = os.path.join(examples_dir, benchmark, f'ci_status_SCHE_{schedule}.txt')
+def read_status(examples_dir, benchmark, schedule, lmem):
+    status_file = os.path.join(examples_dir, benchmark, f'ci_status_SCHE_{schedule}_LMEM_{lmem}.txt')
     try:
         with open(status_file, 'r') as f:
             return f.read().strip()
@@ -49,37 +49,49 @@ def main():
         print("No Perf_counter files found.")
         sys.exit(0)
 
-    # Group by schedule
-    schedule_data = {}
+    # Group by (schedule, localmem)
+    group_data = {}
     for f in perf_files:
-        m = re.search(r'SCHE_(\d+)', os.path.basename(f))
-        if not m:
+        basename = os.path.basename(f)
+        m_sche = re.search(r'SCHE_(\d+)', basename)
+        if not m_sche:
             continue
-        schedule = m.group(1)
+        schedule = m_sche.group(1)
+
+        m_lmem = re.search(r'LOCAL_MEM_(\d+)', basename)
+        lmem = m_lmem.group(1) if m_lmem else "N/A"
+
         benchmark = os.path.basename(os.path.dirname(f))
 
         instrs, cycles, ipc = parse_perf(f)
         if instrs == 0:
             continue
 
-        if schedule not in schedule_data:
-            schedule_data[schedule] = []
-        schedule_data[schedule].append({
+        key = (schedule, lmem)
+        if key not in group_data:
+            group_data[key] = []
+        group_data[key].append({
             'benchmark': benchmark,
             'instrs': instrs,
             'cycles': cycles,
             'ipc': ipc,
-            'status': read_status(examples_dir, benchmark, schedule),
+            'status': read_status(examples_dir, benchmark, schedule, lmem),
         })
 
-    for schedule in sorted(schedule_data.keys()):
-        entries = sorted(schedule_data[schedule], key=lambda e: e['benchmark'])
+    for key in sorted(group_data.keys()):
+        schedule, lmem = key
+        entries = sorted(group_data[key], key=lambda e: e['benchmark'])
         pass_entries = [e for e in entries if e['status'] == 'PASS']
         total_instrs = sum(e['instrs'] for e in pass_entries)
         total_cycles = sum(e['cycles'] for e in pass_entries)
         total_ipc = total_instrs / total_cycles if total_cycles > 0 else 0
 
-        print(f"## Performance Summary (SCHE_{schedule})")
+        title = f"## Performance Summary (SCHE_{schedule}"
+        if lmem != "N/A":
+            title += f", LMEM={lmem}"
+        title += ")"
+
+        print(title)
         print()
         print("| Status | Benchmark | Instructions | Cycles | IPC |")
         print("|--------|-----------|-------------|--------|-----|")

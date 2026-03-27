@@ -34,6 +34,7 @@ EXAMPLES = \
 # Forward these variables to sub-makes
 FORWARD_VARS = $(if $(ARCH),ARCH=$(ARCH)) \
                $(if $(SCHEDULE),SCHEDULE=$(SCHEDULE)) \
+               $(if $(LOCALMEM),LOCALMEM=$(LOCALMEM)) \
                $(if $(STARTUP_ADDR),STARTUP_ADDR=$(STARTUP_ADDR)) \
                $(if $(LOG),LOG=$(LOG))
 

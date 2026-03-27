@@ -1,0 +1,283 @@
+WG size of kernel 1 = 512, WG size of kernel 2= 1 X 1
+128 concurrent threads are supported.
+Total Device found: 1
+Device Name 		 - pthread 
+**************************************
+Total Global Memory			 - 0 KB
+Shared memory available per block 	 - 0 KB
+Number of registers per thread block 	 - 0
+Warp size in threads 			 - 0
+Memory Pitch 				 - 0 bytes
+Maximum threads per block 		 - 0
+Maximum Thread Dimension (block) 	 - 1 1 1
+Maximum Thread Dimension (grid) 	 - 1 1 1
+Total constant memory 			 - 0 bytes
+CUDA ver 				 - 0.0
+Clock rate 				 - 0 KHz
+Texture Alignment 			 - 0 bytes
+Device Overlap 				 - Not Allowed
+Number of Multi processors 		 - 0
+
+Read file from ../../data/gaussian/matrix4.txt 
+The file name is: ../../data/gaussian/matrix4.txt
+The input matrix a is:
+The input array b is:
+-0.85 -0.68 0.24 -0.53 
+
+cudaMalloc: size=64, mem_addr=65536
+cudaMalloc: size=64, mem_addr=69632
+cudaMalloc: size=16, mem_addr=73728
+(memcpy_) host_ptr value: 0 0, addr: 786651344
+cudaMemcpyHostToDevice: src=0x2ee642d0, dst=65536, count=64
+(memcpy_) host_ptr value: -102 -102, addr: 786651344
+cudaMemcpyHostToDevice: src=0x2ee1e130, dst=69632, count=64
+(memcpy_) host_ptr value: -102 -102, addr: 786659792
+cudaMemcpyHostToDevice: src=0x2ee642b0, dst=73728, count=16
+1d grid size: 1
+BlockXY: 1 
+first grid size: 1 second: 4
+RUNTIME FUNCTION
+kernel_name: Fan1PfS_ii
+number of arguments: 4
+debug : Fan1PfS_ii vs Fan1PfS_ii
+found the kernel name in the lookup file, it is Fan1PfS_ii with the index of 0
+cudaLaunchKernel: gridDim=(1, 1, 1), blockDim=(512, 1, 1), sharedMem=0, num_args = 4
+(debug) abuf_size = 152
+*** kernel arg=0x2ee38ca0, size=152
+*** kernel ctx: num_groups[0]=1, num_groups[1]=1
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x4
+*** cuda kernel args[3]=0xe713cca000000000
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#0 (callback:0x180000094): gridDim=(1, 1, 1), blockDim=(512, 1, 1), args=(0x10000, 0x11000, 0x4, 0xe713cca000000000, 0x0, 0x0)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 0
+#0: remaining tasks: 1
+#0: thread_id: 0, task_id: 0
+#0: kernel_warpper: group=(0, 0)
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+RUNTIME FUNCTION
+kernel_name: Fan2PfS_S_iii
+number of arguments: 6
+debug : Fan2PfS_S_iii vs Fan1PfS_ii
+debug : Fan2PfS_S_iii vs Fan2PfS_S_iii
+found the kernel name in the lookup file, it is Fan2PfS_S_iii with the index of 1
+cudaLaunchKernel: gridDim=(4, 4, 1), blockDim=(1, 1, 1), sharedMem=0, num_args = 6
+(debug) abuf_size = 168
+*** kernel arg=0x2ee17c90, size=168
+*** kernel ctx: num_groups[0]=4, num_groups[1]=4
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x12000
+*** cuda kernel args[3]=0x400000004
+*** cuda kernel args[4]=0x4
+*** cuda kernel args[5]=0xe713cca000000000
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#1 (callback:0x1800000e8): gridDim=(4, 4, 1), blockDim=(1, 1, 1), args=(0x10000, 0x11000, 0x12000, 0x400000004, 0x4, 0xe713cca000000000)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 16
+#0: kernel_warpper: group=(0, 0)
+#4: kernel_warpper: group=(0, 1)
+#8: kernel_warpper: group=(0, 2)
+#12: kernel_warpper: group=(0, 3)
+#1: kernel_warpper: group=(1, 0)
+#5: kernel_warpper: group=(1, 1)
+#9: kernel_warpper: group=(1, 2)
+#13: kernel_warpper: group=(1, 3)
+#6: kernel_warpper: group=(2, 1)
+#2: kernel_warpper: group=(2, 0)
+#10: kernel_warpper: group=(2, 2)
+#14: kernel_warpper: group=(2, 3)
+#7: kernel_warpper: group=(3, 1)
+#11: kernel_warpper: group=(3, 2)
+#3: kernel_warpper: group=(3, 0)
+#15: kernel_warpper: group=(3, 3)
+#0: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#4: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#8: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 2, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#12: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 3, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#1: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#5: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#9: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 2, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#13: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 3, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#2: blockIdx.x: 2, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#6: blockIdx.x: 2, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#10: blockIdx.x: 2, threadIdx.x: 0, blockIdx.y: 2, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#14: blockIdx.x: 2, threadIdx.x: 0, blockIdx.y: 3, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#0: remaining tasks: 0
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+RUNTIME FUNCTION
+kernel_name: Fan1PfS_ii
+number of arguments: 4
+debug : Fan1PfS_ii vs Fan1PfS_ii
+found the kernel name in the lookup file, it is Fan1PfS_ii with the index of 0
+cudaLaunchKernel: gridDim=(1, 1, 1), blockDim=(512, 1, 1), sharedMem=0, num_args = 4
+(debug) abuf_size = 152
+*** kernel arg=0x2ee38c00, size=152
+*** kernel ctx: num_groups[0]=1, num_groups[1]=1
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x100000004
+*** cuda kernel args[3]=0xe713cca000000001
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#0 (callback:0x180000094): gridDim=(1, 1, 1), blockDim=(512, 1, 1), args=(0x10000, 0x11000, 0x100000004, 0xe713cca000000001, 0x0, 0x0)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 0
+#0: remaining tasks: 1
+#0: thread_id: 0, task_id: 0
+#0: kernel_warpper: group=(0, 0)
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+RUNTIME FUNCTION
+kernel_name: Fan2PfS_S_iii
+number of arguments: 6
+debug : Fan2PfS_S_iii vs Fan1PfS_ii
+debug : Fan2PfS_S_iii vs Fan2PfS_S_iii
+found the kernel name in the lookup file, it is Fan2PfS_S_iii with the index of 1
+cudaLaunchKernel: gridDim=(4, 4, 1), blockDim=(1, 1, 1), sharedMem=0, num_args = 6
+(debug) abuf_size = 168
+*** kernel arg=0x2ee17c90, size=168
+*** kernel ctx: num_groups[0]=4, num_groups[1]=4
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x12000
+*** cuda kernel args[3]=0x300000004
+*** cuda kernel args[4]=0x100000003
+*** cuda kernel args[5]=0xe713cca000000001
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#1 (callback:0x1800000e8): gridDim=(4, 4, 1), blockDim=(1, 1, 1), args=(0x10000, 0x11000, 0x12000, 0x300000004, 0x100000003, 0xe713cca000000001)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 16
+#0: kernel_warpper: group=(0, 0)
+#4: kernel_warpper: group=(0, 1)
+#8: kernel_warpper: group=(0, 2)
+#12: kernel_warpper: group=(0, 3)
+#1: kernel_warpper: group=(1, 0)
+#5: kernel_warpper: group=(1, 1)
+#9: kernel_warpper: group=(1, 2)
+#13: kernel_warpper: group=(1, 3)
+#6: kernel_warpper: group=(2, 1)
+#2: kernel_warpper: group=(2, 0)
+#10: kernel_warpper: group=(2, 2)
+#14: kernel_warpper: group=(2, 3)
+#7: kernel_warpper: group=(3, 1)
+#11: kernel_warpper: group=(3, 2)
+#3: kernel_warpper: group=(3, 0)
+#15: kernel_warpper: group=(3, 3)
+#4: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#8: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 2, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#0: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#5: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#9: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 2, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#1: blockIdx.x: 1, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#0: remaining tasks: 0
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+RUNTIME FUNCTION
+kernel_name: Fan1PfS_ii
+number of arguments: 4
+debug : Fan1PfS_ii vs Fan1PfS_ii
+found the kernel name in the lookup file, it is Fan1PfS_ii with the index of 0
+cudaLaunchKernel: gridDim=(1, 1, 1), blockDim=(512, 1, 1), sharedMem=0, num_args = 4
+(debug) abuf_size = 152
+*** kernel arg=0x2ee38c00, size=152
+*** kernel ctx: num_groups[0]=1, num_groups[1]=1
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x200000004
+*** cuda kernel args[3]=0xe713cca000000002
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#0 (callback:0x180000094): gridDim=(1, 1, 1), blockDim=(512, 1, 1), args=(0x10000, 0x11000, 0x200000004, 0xe713cca000000002, 0x0, 0x0)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 0
+#0: remaining tasks: 1
+#0: thread_id: 0, task_id: 0
+#0: kernel_warpper: group=(0, 0)
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+RUNTIME FUNCTION
+kernel_name: Fan2PfS_S_iii
+number of arguments: 6
+debug : Fan2PfS_S_iii vs Fan1PfS_ii
+debug : Fan2PfS_S_iii vs Fan2PfS_S_iii
+found the kernel name in the lookup file, it is Fan2PfS_S_iii with the index of 1
+cudaLaunchKernel: gridDim=(4, 4, 1), blockDim=(1, 1, 1), sharedMem=0, num_args = 6
+(debug) abuf_size = 168
+*** kernel arg=0x2ee17c90, size=168
+*** kernel ctx: num_groups[0]=4, num_groups[1]=4
+*** cuda kernel args[0]=0x10000
+*** cuda kernel args[1]=0x11000
+*** cuda kernel args[2]=0x12000
+*** cuda kernel args[3]=0x200000004
+*** cuda kernel args[4]=0x200000002
+*** cuda kernel args[5]=0xe713cca000000002
+uploaded args
+wait device
+#0: sizeof everything 72 64 8
+#0: base: 0x17ffff000
+#0: kernel#1 (callback:0x1800000e8): gridDim=(4, 4, 1), blockDim=(1, 1, 1), args=(0x10000, 0x11000, 0x12000, 0x200000004, 0x200000002, 0xe713cca000000002)
+#0: workdim=0
+#0: execute something
+#0: all_tasks_offset: 0, remain_tasks_offset: 16
+#0: kernel_warpper: group=(0, 0)
+#4: kernel_warpper: group=(0, 1)
+#8: kernel_warpper: group=(0, 2)
+#12: kernel_warpper: group=(0, 3)
+#1: kernel_warpper: group=(1, 0)
+#5: kernel_warpper: group=(1, 1)
+#9: kernel_warpper: group=(1, 2)
+#13: kernel_warpper: group=(1, 3)
+#6: kernel_warpper: group=(2, 1)
+#2: kernel_warpper: group=(2, 0)
+#10: kernel_warpper: group=(2, 2)
+#14: kernel_warpper: group=(2, 3)
+#7: kernel_warpper: group=(3, 1)
+#11: kernel_warpper: group=(3, 2)
+#3: kernel_warpper: group=(3, 0)
+#15: kernel_warpper: group=(3, 3)
+#4: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 1, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#0: blockIdx.x: 0, threadIdx.x: 0, blockIdx.y: 0, threadIdx.y: 0, blockDim.x: 1, blockDim.y: 1
+#0: remaining tasks: 0
+sync device
+output file: perf_counter_1C_4W_4T_thread_map_mem.txt
+cudamemcpyDeviceToHost: src=65536, dst=0x2ee642d0, count=64
+cudamemcpyDeviceToHost: src=69632, dst=0x2ee1e130, count=64
+cudamemcpyDeviceToHost: src=73728, dst=0x2ee642b0, count=16
+cudaFree: mem_addr=65536
+cudaFree: mem_addr=69632
+cudaFree: mem_addr=73728
+Matrix m is: 
+Matrix a is: 
+Array b is: 
+-0.85 -0.25 0.87 -0.25 
+
+The final solution is: 
+0.70 0.00 -0.40 -0.50 
+
+
+Time total (including memory transfers)	2.113466 sec
+Time for CUDA kernels:	2.113315 sec
+PERF: instrs=39298, cycles=210160, IPC=0.186991

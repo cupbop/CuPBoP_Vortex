@@ -1,0 +1,10 @@
+PERF: core0: instrs=23121, cycles=110882, IPC=0.208519
+PERF: core1: instrs=23121, cycles=110454, IPC=0.209327
+PERF: core2: instrs=23121, cycles=110368, IPC=0.209490
+PERF: core3: instrs=23121, cycles=110923, IPC=0.208442
+PERF: instrs=92484, cycles=110923, IPC=0.833768
+PERF: core0: instrs=4009188, cycles=4161655, IPC=0.963364
+PERF: core1: instrs=4009188, cycles=4211700, IPC=0.951917
+PERF: core2: instrs=3978152, cycles=4187525, IPC=0.950001
+PERF: core3: instrs=3978152, cycles=4276535, IPC=0.930228
+PERF: instrs=15974680, cycles=4276535, IPC=3.735426

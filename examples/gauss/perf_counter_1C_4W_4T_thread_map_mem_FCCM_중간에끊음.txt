@@ -1,0 +1,6 @@
+PERF: instrs=21467, cycles=248023, IPC=0.086552
+PERF: instrs=68234, cycles=274500, IPC=0.248576
+PERF: instrs=21687, cycles=250965, IPC=0.086414
+PERF: instrs=50981, cycles=244636, IPC=0.208395
+PERF: instrs=21675, cycles=250796, IPC=0.086425
+PERF: instrs=39300, cycles=210172, IPC=0.186990

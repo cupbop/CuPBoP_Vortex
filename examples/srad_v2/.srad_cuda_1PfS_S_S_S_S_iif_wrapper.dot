@@ -1,0 +1,5 @@
+digraph "CFG for 'srad_cuda_1PfS_S_S_S_S_iif_wrapper' function" {
+	label="CFG for 'srad_cuda_1PfS_S_S_S_S_iif_wrapper' function";
+
+	Node0x558cb33f16e0 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870" fontname="Courier",label="{1:\l|  %2 = load ptr, ptr %0, align 8\l  %3 = getelementptr ptr, ptr %0, i64 1\l  %4 = load ptr, ptr %3, align 8\l  %5 = getelementptr ptr, ptr %0, i64 2\l  %6 = load ptr, ptr %5, align 8\l  %7 = getelementptr ptr, ptr %0, i64 3\l  %8 = load ptr, ptr %7, align 8\l  %9 = getelementptr ptr, ptr %0, i64 4\l  %10 = load ptr, ptr %9, align 8\l  %11 = getelementptr ptr, ptr %0, i64 5\l  %12 = load ptr, ptr %11, align 8\l  %13 = getelementptr ptr, ptr %0, i64 6\l  %14 = load i32, ptr %13, align 4\l  %15 = getelementptr ptr, ptr %0, i64 8\l  %16 = load float, ptr %15, align 4\l  tail call void @_Z11srad_cuda_1PfS_S_S_S_S_iif(ptr %2, ptr %4, ptr %6, ptr\l... %8, ptr %10, ptr %12, i32 %14, i32 poison, float %16)\l  ret void\l}"];
+}

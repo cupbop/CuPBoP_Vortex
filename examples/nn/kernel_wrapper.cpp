@@ -29,6 +29,24 @@ typedef struct {
     uint64_t args[0];
 } kernel_arg_t;
 
+int grid_size_x;
+int grid_size_y;
+int grid_size_z;
+
+int block_size_x;
+int block_size_y;
+int block_size_z;
+
+int block_size;
+
+int __thread block_index_x;
+int __thread block_index_y;
+int __thread block_index_z;
+int __thread *dynamic_shared_memory = NULL;
+int __thread thread_id_x;
+int __thread thread_id_y;
+int __thread thread_id_z;
+
 int dyn_shared_mem_size;
 
 extern "C" void* vx_local_alloc(uint32_t size) {
@@ -41,8 +59,22 @@ return p;
     extern void euclidP7latLongPfiff_wrapper(void *args);
 }
 
+void cuda_euclidP7latLongPfiff_wrapper(void* args) {
+    block_index_x = blockIdx.x;
+    block_index_y = blockIdx.y;
+    block_index_z = blockIdx.z;
+
+    thread_id_x = threadIdx.x;
+    thread_id_y = threadIdx.y;
+    thread_id_z = threadIdx.z;
+
+//    vx_printf("kernel_warpper: group=(%d, %d) thread=(%d, %d)\n", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);
+
+    euclidP7latLongPfiff_wrapper((void **)args);
+}
+
 vx_kernel_func_cb callbacks[] = {
-    (vx_kernel_func_cb)euclidP7latLongPfiff_wrapper, 
+    cuda_euclidP7latLongPfiff_wrapper, 
 };
 
 int main() {
@@ -52,6 +84,15 @@ int main() {
     auto num_args = kernel_arg->num_args;
     auto args = (uint64_t*)kernel_arg->args;
     auto memcpy_symbol_array = (uint64_t*)kernel_arg->args + num_args;
+    grid_size_x = ctx->num_groups[0];
+    grid_size_y = ctx->num_groups[1];
+    grid_size_z = ctx->num_groups[2];
+
+    block_size_x = ctx->local_size[0];
+    block_size_y = ctx->local_size[1];
+    block_size_z = ctx->local_size[2];
+
+    block_size = ctx->local_size[0] * ctx->local_size[1];
     dyn_shared_mem_size = ctx->dyn_shared_mem_size;
 
 //NOTE: old format — (dst_addr, staging_dev_addr, size) per symbol
@@ -84,7 +125,7 @@ if (memcpy_symbol_array[0] != 0) {
     //vx_printf("workdim=%d\n", ctx->work_dim);
     //vx_printf("threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\n", threadIdx.x, threadIdx.y, threadIdx.z);
 //vx_printf("execute something\n");
-    return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); 
+    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); 
 
 }
 

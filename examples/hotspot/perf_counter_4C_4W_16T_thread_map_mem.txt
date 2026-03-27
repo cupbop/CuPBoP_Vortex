@@ -1,0 +1,30 @@
+PERF: core0: instrs=289098, cycles=429407, IPC=0.673249
+PERF: core1: instrs=29007, cycles=181443, IPC=0.159868
+PERF: core2: instrs=29007, cycles=181444, IPC=0.159868
+PERF: core3: instrs=29007, cycles=181445, IPC=0.159867
+PERF: instrs=376119, cycles=429407, IPC=0.875903
+PERF: core0: instrs=179998, cycles=711848, IPC=0.252860
+PERF: core1: instrs=183001, cycles=712650, IPC=0.256789
+PERF: core2: instrs=183001, cycles=717349, IPC=0.255107
+PERF: core3: instrs=180957, cycles=715977, IPC=0.252741
+PERF: instrs=726957, cycles=717349, IPC=1.013394
+PERF: core0: instrs=179998, cycles=711848, IPC=0.252860
+PERF: core1: instrs=183001, cycles=712650, IPC=0.256789
+PERF: core2: instrs=183001, cycles=717349, IPC=0.255107
+PERF: core3: instrs=180957, cycles=715977, IPC=0.252741
+PERF: instrs=726957, cycles=717349, IPC=1.013394
+PERF: core0: instrs=1456013, cycles=5877995, IPC=0.247706
+PERF: core1: instrs=1458969, cycles=5746360, IPC=0.253894
+PERF: core2: instrs=1458969, cycles=5736154, IPC=0.254346
+PERF: core3: instrs=1457037, cycles=5880239, IPC=0.247785
+PERF: instrs=5830988, cycles=5880239, IPC=0.991624
+PERF: core0: instrs=641516, cycles=2556145, IPC=0.250970
+PERF: core1: instrs=644472, cycles=2494710, IPC=0.258335
+PERF: core2: instrs=644472, cycles=2448718, IPC=0.263188
+PERF: core3: instrs=642540, cycles=2555790, IPC=0.251406
+PERF: instrs=2573000, cycles=2556145, IPC=1.006594
+PERF: core0: instrs=172012, cycles=596061, IPC=0.288581
+PERF: core1: instrs=174968, cycles=597433, IPC=0.292866
+PERF: core2: instrs=174968, cycles=582376, IPC=0.300438
+PERF: core3: instrs=173036, cycles=590461, IPC=0.293052
+PERF: instrs=694984, cycles=597433, IPC=1.163284
