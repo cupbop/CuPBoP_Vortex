@@ -38,7 +38,7 @@ jobs:
       fail-fast: false
       matrix:
         # Full test matrix (uncomment when ready):
-        # name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, collision-cuda, gauss, hotspot, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        # name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
         # scheduler: [2, 0]
         # localmem: [1]
         # include:
@@ -56,7 +56,7 @@ jobs:
         #     localmem: 0
 
         # Temporary: test new benchmarks only (SCHE_2, LMEM=1)
-        name: [bh-cuda, blackscholes, cc-cuda, cfd, collision-cuda, gauss, hotspot, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        name: [bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
         scheduler: [2]
         localmem: [1]
 
@@ -98,7 +98,7 @@ jobs:
 
           RESULT="FAIL"
           case $TEST_NAME in
-            saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test)
+            saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|jacobi-cuda|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
               if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
                 RESULT="PASS"
@@ -107,7 +107,7 @@ jobs:
                 [ -f "$CI_OUTPUT" ] && cat "$CI_OUTPUT"
               fi
               ;;
-            backprop|nn|pathfinder)
+            backprop|nn|pathfinder|gauss|srad_v2)
               GOLDEN="${EXAMPLE_DIR}/golden_output.txt"
               if [ -f "$GOLDEN" ] && [ -f "$CI_OUTPUT" ]; then
                 if python3 ./ci/compare_golden.py "$GOLDEN" "$CI_OUTPUT" --tolerance=1e-4; then
@@ -115,6 +115,26 @@ jobs:
                 fi
               else
                 echo "Correctness: FAIL (golden or CI output missing)"
+              fi
+              ;;
+            nw)
+              GOLDEN="${EXAMPLE_DIR}/golden_result_nw.txt"
+              RESULT_FILE="${EXAMPLE_DIR}/result_vortex.txt"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                diff -q "$GOLDEN" "$RESULT_FILE" && echo "Correctness: PASS" && RESULT="PASS" || { echo "Correctness: FAIL"; diff "$GOLDEN" "$RESULT_FILE" || true; }
+              else
+                echo "Correctness: FAIL (golden or result file missing)"
+              fi
+              ;;
+            hotspot)
+              GOLDEN="${EXAMPLE_DIR}/golden_output_hotspot.txt"
+              RESULT_FILE="${EXAMPLE_DIR}/output.out"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                if python3 ./ci/compare_golden.py "$GOLDEN" "$RESULT_FILE" --tolerance=1e-4; then
+                  RESULT="PASS"
+                fi
+              else
+                echo "Correctness: FAIL (golden or output file missing)"
               fi
               ;;
             bfs)
@@ -127,6 +147,17 @@ jobs:
                 else
                   echo "Correctness: FAIL"
                   diff "$GOLDEN" "$RESULT_FILE" || true
+                fi
+              else
+                echo "Correctness: FAIL (golden or result file missing)"
+              fi
+              ;;
+            streamcluster)
+              GOLDEN="${EXAMPLE_DIR}/golden_result_streamcluster.txt"
+              RESULT_FILE="${EXAMPLE_DIR}/output.txt"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                if python3 ./ci/compare_golden.py "$GOLDEN" "$RESULT_FILE" --tolerance=1e-4; then
+                  RESULT="PASS"
                 fi
               else
                 echo "Correctness: FAIL (golden or result file missing)"

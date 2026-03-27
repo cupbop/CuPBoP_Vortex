@@ -962,5 +962,6 @@ int main(int argc, char* argv[])
   cudaFree(d_bottom);
   cudaFree(d_radius);
 
+  printf("PASSED!\n");
   return 0;
 }

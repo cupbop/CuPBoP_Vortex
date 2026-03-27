@@ -55,7 +55,7 @@ CMakeCache.txt
 
 .vscode
 
-# tests
+# Build intermediates
 *.ll
 *.ii
 *.cubin
@@ -65,8 +65,14 @@ CMakeCache.txt
 *.ch*
 *.elf
 *.vxbin
-*.txt
 *.fatbin
+kernel_wrapper.cpp
+kernel_meta.log
+lookup.txt
+lookup_global_symbols.txt
+ci_output.txt
+ci_status_*.txt
+Perf_counter_*.txt
 
 # Other CUDA header files
 cuda-header.tar.gz

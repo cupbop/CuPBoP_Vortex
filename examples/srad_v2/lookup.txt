@@ -1,2 +1,0 @@
-0 srad_cuda_1PfS_S_S_S_S_iif 9
-1 srad_cuda_2PfS_S_S_S_S_iiff 10

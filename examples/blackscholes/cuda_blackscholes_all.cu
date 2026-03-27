@@ -195,6 +195,12 @@ int main(int argc, char** argv) {
     std::printf("CPU time: %.3f ms\n", ms_cpu);
     std::printf("Avg |err|  call: %.6f, put: %.6f\n", errC, errP);
 
+    if (errC < 0.01 && errP < 0.01) {
+        std::printf("PASSED!\n");
+    } else {
+        std::printf("FAILED!\n");
+    }
+
     return 0;
 }
 

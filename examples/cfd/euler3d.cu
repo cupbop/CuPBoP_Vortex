@@ -789,6 +789,31 @@ int main(int argc, char **argv) {
   dump(variables, nel, nelr);
   std::cout << "Saved solution..." << std::endl;
 
+  // Verify against golden files
+  {
+    auto compare_file = [](const char* actual, const char* golden, float tol) -> bool {
+      std::ifstream fa(actual), fg(golden);
+      if (!fa.is_open() || !fg.is_open()) return false;
+      float va, vg;
+      int errors = 0, count = 0;
+      // skip header line
+      std::string ha, hg;
+      std::getline(fa, ha); std::getline(fg, hg);
+      while (fa >> va && fg >> vg) {
+        if (std::abs(va - vg) > tol * std::max(1.0f, std::abs(vg))) errors++;
+        count++;
+      }
+      if (errors > 0)
+        std::cout << actual << ": " << errors << "/" << count << " mismatches" << std::endl;
+      return errors == 0;
+    };
+    bool ok = true;
+    ok &= compare_file("density", "golden_density", 1e-4f);
+    ok &= compare_file("momentum", "golden_momentum", 1e-4f);
+    ok &= compare_file("density_energy", "golden_density_energy", 1e-4f);
+    std::cout << (ok ? "PASSED!" : "FAILED!") << std::endl;
+  }
+
   std::cout << "Cleaning up..." << std::endl;
   dealloc<float>(areas);
   dealloc<int>(elements_surrounding_elements);

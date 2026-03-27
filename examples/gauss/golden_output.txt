@@ -1,0 +1,2 @@
+The final solution is:
+0.70 0.00 -0.40 -0.50

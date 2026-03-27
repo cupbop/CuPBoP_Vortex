@@ -1,3 +1,0 @@
-0 lud_diagonalPfii 3
-1 lud_perimeterPfii 3
-2 lud_internalPfii 3
