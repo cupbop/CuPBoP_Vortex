@@ -203,9 +203,21 @@ int main(int argc, char* argv[])
 
   const float threshold = 0.4f;
   const int classwise_topK = 10;
+#ifndef SCORE_NUM_CLASSES
   const size_t num_classes = 1000;
+#else
+  const size_t num_classes = SCORE_NUM_CLASSES;
+#endif
+#ifndef SCORE_NUM_PRIORS
   const size_t num_priors = 4096;
+#else
+  const size_t num_priors = SCORE_NUM_PRIORS;
+#endif
+#ifndef SCORE_BATCH_SIZE
   const int batch_size = 128;
+#else
+  const int batch_size = SCORE_BATCH_SIZE;
+#endif
   const int block_size = 256; 
   
   dim3 grids (num_classes, batch_size);

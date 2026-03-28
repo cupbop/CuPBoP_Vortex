@@ -50,29 +50,18 @@ void mem_share2global(llvm::Module *M) {
             if (share_memory->hasExternalLinkage() &&
                 array_type->getArrayNumElements() == 0) {
               // external shared memory of [] (dynamic shared memory)
-              // generate global type pointer
-              PointerType *PointerTy =
-                  PointerType::get(array_type->getElementType(), 0);
-              llvm::GlobalVariable *global_ptr;
-              if (triton_cupbop_enabled()) {
-                // Triton: ExternalLinkage, name must be "dynamic_shared_memory"
-                // so replace_dynamic_shared_memory() can find it
-                global_ptr = new llvm::GlobalVariable(
-                    *M, PointerTy, false, llvm::GlobalValue::ExternalLinkage,
-                    NULL, "dynamic_shared_memory", NULL,
-                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-              } else {
-                llvm::Constant *x1 = ConstantPointerNull::get(PointerTy);
-                global_ptr = new llvm::GlobalVariable(
-                    *M, PointerTy, false, llvm::GlobalValue::CommonLinkage, x1,
-                    "wrapper_global_data", NULL,
-                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-                global_ptr->setDSOLocal(true);
-              }
+              // Allocate as TLS global i8 array (same approach as static shared)
+              const uint64_t MaxDynBytes = 64 * 1024;
+              auto *DynArrTy = ArrayType::get(Int8T, MaxDynBytes);
+              auto *global_buf = new llvm::GlobalVariable(
+                  *M, DynArrTy, false, llvm::GlobalValue::ExternalLinkage,
+                  NULL, "wrapper_global_dynshared", NULL,
+                  llvm::GlobalValue::LocalExecTLSModel, 1);
+              global_buf->setInitializer(ConstantAggregateZero::get(DynArrTy));
 
               corresponding_global_memory.insert(
                   std::pair<GlobalVariable *, GlobalVariable *>(share_memory,
-                                                                global_ptr));
+                                                                global_buf));
             } else {
               //llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
               //    *M, array_type, false, llvm::GlobalValue::ExternalLinkage,

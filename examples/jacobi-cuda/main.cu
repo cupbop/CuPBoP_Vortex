@@ -159,7 +159,10 @@ int main () {
 
   // Iterate until we're converged (but set a cap on the maximum number of
   // iterations to avoid any possible hangs)
-  const int max_iters = 10000;
+#ifndef MAX_ITERS
+#define MAX_ITERS 10000
+#endif
+  const int max_iters = MAX_ITERS;
   int num_iters = 0;
 
   dim3 grid (N/16, N/16);

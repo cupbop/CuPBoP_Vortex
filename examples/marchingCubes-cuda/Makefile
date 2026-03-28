@@ -1,3 +1,5 @@
 KERNEL_CU = main.cu
 RUN_ARGS  = 1
+EXTRA_CLANG_FLAGS += -DMARCHING_N=128
+EXTRA_NVCC_FLAGS += -DMARCHING_N=128
 include ../common.mk
