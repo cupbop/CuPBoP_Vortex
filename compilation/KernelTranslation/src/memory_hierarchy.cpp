@@ -213,6 +213,9 @@ static uint64_t decideNumCTAsByBench(const llvm::Module &M) {
   // psort [grid=(64,1,1)]
   if (contains("psort"))        return 64ull;
 
+  // srad_v2 [grid=(32,32,1)]
+  if (contains("srad"))         return 32ull * 32ull;
+
   // Default fallback
   return 256ull;
 }

@@ -14,6 +14,7 @@ __attribute__((always_inline)) float __nv_log10f(float v) { return log10f(v); }
 __attribute__((always_inline)) float __nv_fast_log2f(float v) { return log2f(v); }
 __attribute__((always_inline)) double __nv_powi(double base, int exp) { return pow(base, exp); }
 __attribute__((always_inline)) float __nv_powf(float base, float exp) { return pow(base, exp); }
+extern "C" __attribute__((always_inline)) float __nv_erfcf(float v) { return erfcf(v); }
 __attribute__((always_inline)) float __nv_fast_powf(float base, float exp) { return pow(base, exp); }
 __attribute__((always_inline)) float __nv_fmodf(float x, float y) { return fmod(x, y); }
 __attribute__((always_inline)) int __nv_isnanf(float v) { return isnan(v); }

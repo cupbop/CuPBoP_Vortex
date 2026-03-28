@@ -699,6 +699,7 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "__nv_isnanf" ||
                        func_name == "__nv_isinff" || func_name == "__nv_powi" ||
                        func_name == "__nv_powif" ||
+                       func_name == "__nv_erfcf" ||
                        func_name == "__nv_ffs" || func_name == "__nv_popc") {
               dbgs() << "Removing call to " << func_name << "\n";
               Call->getCalledFunction()->deleteBody();

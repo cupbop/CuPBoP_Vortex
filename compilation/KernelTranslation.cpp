@@ -59,7 +59,12 @@ int main(int argc, char **argv) {
 
   // Create pass manager and add your pass
   ModulePassManager MPM;
-  MPM.addPass(ReplaceWarpLevelPrimitive(MAPPING_1TO1));
+  MapOpt warp_mapping = MAPPING_1TO1;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    int schedule = std::stoi(std::string(env));
+    if (schedule == 0) warp_mapping = MAPPING_FLAT;
+  }
+  MPM.addPass(ReplaceWarpLevelPrimitive(warp_mapping));
   MPM.run(*program, MAM);
 
   // insert sync
