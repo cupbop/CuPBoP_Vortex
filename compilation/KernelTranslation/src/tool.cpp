@@ -1018,6 +1018,36 @@ void replace_asm_call(llvm::Module *M) {
   };
   std::map<Value*, LdMatrixInfo> ldmatrix_map;
 
+  // Helper: strip thread-dependent GEP indices to get the tile base address.
+  // Triton IR pattern:
+  //   %ptr = GEP @global_smem, %thread_dep_offset   ← strip variable index
+  //   %ptr2 = GEP %ptr, 0                           ← strip constant-zero index
+  // Returns: @global_smem (for A) or ConstExpr GEP(@global_smem + offset) (for B)
+  auto getSmemTileBase = [](Value *smem_ptr) -> Value* {
+    Value *cur = smem_ptr;
+    while (auto *GEP = dyn_cast<GetElementPtrInst>(cur)) {
+      bool all_const = true;
+      for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
+        if (!isa<ConstantInt>(*idx)) { all_const = false; break; }
+      }
+      if (all_const) {
+        // Check if it's a no-op GEP (constant 0 index) — strip it too
+        bool all_zero = true;
+        for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
+          if (!cast<ConstantInt>(*idx)->isZero()) { all_zero = false; break; }
+        }
+        if (all_zero) {
+          cur = GEP->getPointerOperand();
+          continue;
+        }
+        break; // Non-zero constant offset — keep it (e.g., B tile offset)
+      }
+      // Variable index — strip this GEP (thread-dependent offset)
+      cur = GEP->getPointerOperand();
+    }
+    return cur;
+  };
+
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
 
@@ -1175,6 +1205,19 @@ void replace_asm_call(llvm::Module *M) {
               builder.SetInsertPoint(Call);
 
               if (smem_A && smem_B) {
+                // ── Strip per-thread GEP to get tile base address ──
+                // ldmatrix operand is per-thread: GEP @global_smem, %thread_offset
+                // WGMMA needs tile base: @global_smem (A) or @global_smem+1024 (B)
+                Value *tile_base_A = getSmemTileBase(smem_A);
+                Value *tile_base_B = getSmemTileBase(smem_B);
+
+                if (cupbop_debug()) {
+                  printf("[TCU] A tile base: ");
+                  tile_base_A->print(errs()); errs() << "\n"; errs().flush();
+                  printf("[TCU] B tile base: ");
+                  tile_base_B->print(errs()); errs() << "\n"; errs().flush();
+                }
+
                 // Allocate stack arrays for TCU fragments (8 floats each for NR=8)
                 // NOTE: Vortex TCU is m16n16k16. This mma.sync covers m16n8k16.
                 // We compute the full m16n16k16 but only use first 4 results.
@@ -1194,20 +1237,21 @@ void replace_asm_call(llvm::Module *M) {
                   builder.CreateStore(ConstantFP::get(F32, 0.0), gep);
                 }
 
-                // Encode A descriptor metadata
-                // smem_A is ptr addrspace(3). Cast to i64 for base_addr.
-                // For fp16 A tile [16 x K]: leading = K * sizeof(half), stride = M_tile * K * sizeof(half)
-                // For 16x16 matmul: leading = 16*2 = 32, stride = 16*16*2 = 512
-                // TODO: extract these from the IR instead of hardcoding
-                Value *smem_A_i64 = builder.CreatePtrToInt(smem_A, I64);
+                // ── Encode A descriptor metadata ──
+                // Use TILE BASE (not per-thread) address for WGMMA descriptor.
+                // For fp16 A tile [M_tile × K_tile] stored row-major:
+                //   ldm = K_tile (leading dimension in elements)
+                //   TCU load_smem_word: addr = base + (row * ldm + col) * sizeof(half)
+                // For 16x16 tile: ldm=16, is_col_major=0
+                Value *smem_A_base_i64 = builder.CreatePtrToInt(tile_base_A, I64);
                 Value *a_word = builder.CreateCall(cast<Function>(wgmma_encode_fn), {
-                    smem_A_i64,
-                    ConstantInt::get(I32, 32),   // leading_bytes: K_tile * sizeof(half) = 16*2
-                    ConstantInt::get(I32, 512),  // stride_bytes: M_tile * K * sizeof(half) = 16*16*2
-                    ConstantInt::get(I32, 0),    // mn_idx
-                    ConstantInt::get(I32, 0),    // k_idx
-                    ConstantInt::get(I32, 16),   // ldm
-                    ConstantInt::get(I32, 0)     // is_col_major
+                    smem_A_base_i64,
+                    ConstantInt::get(I32, 32),   // leading_bytes (unused by bugfix TCU, kept for compat)
+                    ConstantInt::get(I32, 512),  // stride_bytes (unused by bugfix TCU, kept for compat)
+                    ConstantInt::get(I32, 0),    // mn_idx (tile at position 0)
+                    ConstantInt::get(I32, 0),    // k_idx (tile at position 0)
+                    ConstantInt::get(I32, 16),   // ldm (K_tile = 16 elements)
+                    ConstantInt::get(I32, 0)     // is_col_major (A is row-major)
                 }, "a_desc_word");
 
                 // Fill all 8 A fragment regs with the same metadata word
@@ -1217,16 +1261,22 @@ void replace_asm_call(llvm::Module *M) {
                   builder.CreateStore(a_meta_f, gep);
                 }
 
-                // Encode B descriptor metadata (transposed)
-                Value *smem_B_i64 = builder.CreatePtrToInt(smem_B, I64);
+                // ── Encode B descriptor metadata ──
+                // B tile stored as [K_tile × N_tile] row-major in shared memory.
+                // Triton ldmatrix.trans transposes during load, but physical storage
+                // is K-major (rows = K, cols = N).
+                // TCU accesses B as: load_smem_word(meta_b, k, n, ...)
+                // With is_col_major=0: addr = base + (k * ldm + n) * sizeof(half)
+                // ldm = N_tile = 16 for [K=16 × N=16] tile
+                Value *smem_B_base_i64 = builder.CreatePtrToInt(tile_base_B, I64);
                 Value *b_word = builder.CreateCall(cast<Function>(wgmma_encode_fn), {
-                    smem_B_i64,
-                    ConstantInt::get(I32, 32),   // leading_bytes
-                    ConstantInt::get(I32, 512),  // stride_bytes
+                    smem_B_base_i64,
+                    ConstantInt::get(I32, 32),   // leading_bytes (unused by bugfix TCU)
+                    ConstantInt::get(I32, 512),  // stride_bytes (unused by bugfix TCU)
                     ConstantInt::get(I32, 0),    // mn_idx
                     ConstantInt::get(I32, 0),    // k_idx
-                    ConstantInt::get(I32, 16),   // ldm
-                    ConstantInt::get(I32, 0)     // is_col_major (B was transposed by ldmatrix.trans)
+                    ConstantInt::get(I32, 16),   // ldm (N_tile = 16 elements)
+                    ConstantInt::get(I32, 0)     // is_col_major (B stored row-major [K×N])
                 }, "b_desc_word");
 
                 Value *b_meta_f = builder.CreateBitCast(b_word, F32, "b_meta_f");
@@ -1239,6 +1289,11 @@ void replace_asm_call(llvm::Module *M) {
                 builder.CreateCall(cast<Function>(wgmma_mma_fn), {fragC_arr, fragA_arr, fragB_arr});
 
                 // Extract results: first 4 floats from fragC (Vortex layout)
+                // Vortex TCU C/D layout: thread t owns elements:
+                //   fragC[i*tcN + j] for i in [0,tcM), j in [0,tcN)
+                //   where thread t is at row=(t/tcN), col=(t%tcN) in the output tile
+                // NVIDIA mma.sync m16n8 layout: each thread owns 4 elements
+                //   mapped to specific (row,col) positions in the output
                 // TODO: C/D layout shuffle NVIDIA ↔ Vortex (for now, take as-is)
                 Value *result = UndefValue::get(Call->getType());
                 for (int ri = 0; ri < 4; ri++) {
@@ -1248,7 +1303,7 @@ void replace_asm_call(llvm::Module *M) {
                 }
                 Call->replaceAllUsesWith(result);
 
-                if (cupbop_debug()) printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync\n");
+                if (cupbop_debug()) printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync (tile base fixed)\n");
               } else {
                 // Fallback: smem pointers not found, replace with undef
                 if (cupbop_debug()) printf("[TCU] WARNING: smem pointers not found, using undef\n");
