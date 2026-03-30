@@ -16,7 +16,7 @@ export VORTEX_HOME="/projects/ci-runners/CuPBoP-Vortex/tools/vortex_bugfix_branc
 export VORTEX_PATH=$VORTEX_HOME/build
 export VORTEX_DRIVER_INC=$VORTEX_HOME/runtime/include
 export VORTEX_DRIVER_LIB=$VORTEX_HOME/runtime/stub/libvortex.so
-export LD_LIBRARY_PATH=${VORTEX_PATH}/runtime/:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=${VORTEX_PATH}/runtime/:${VORTEX_HOME}/third_party/ramulator:${LD_LIBRARY_PATH}
 
 # Setting Tooldir and Tooldir Paths
 export TOOLDIR="/projects/ci-runners/CuPBoP-Vortex/tools/tooldir" # Hardcoded path for rg servers ONLY
