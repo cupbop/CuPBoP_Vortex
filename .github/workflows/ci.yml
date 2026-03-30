@@ -37,9 +37,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda, sgemm_tcu, sgemm_dxa, sgemm_tcu_dxa]
         scheduler: [2, 0]
         localmem: [1]
+        exclude:
+          # TCU/DXA benchmarks only run on SCHE_2 (require parallel threads)
+          - name: sgemm_tcu
+            scheduler: 0
+          - name: sgemm_dxa
+            scheduler: 0
+          - name: sgemm_tcu_dxa
+            scheduler: 0
         include:
           # SCHE_2 + LOCALMEM=0 for shared memory benchmarks
           - name: backprop
@@ -118,7 +126,7 @@ jobs:
 
           RESULT="FAIL"
           case $TEST_NAME in
-            saxpy|sgemm|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|jacobi-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
+            saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|jacobi-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
               if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
                 RESULT="PASS"
