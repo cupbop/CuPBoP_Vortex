@@ -1431,7 +1431,7 @@ public:
         for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
 
           llvm::Value *v = I.getOperand(i);
-          if (llvm::dyn_cast<llvm::Constant>(v) != nullptr) {
+          if (!v || llvm::dyn_cast<llvm::Constant>(v) != nullptr) {
             continue;
           }
           // v->print(llvm::errs());
