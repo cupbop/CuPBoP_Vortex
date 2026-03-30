@@ -11,7 +11,8 @@ export CuPBoP_PATH=$PWD
 export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$LD_LIBRARY_PATH
 
 # Setting Vortex Paths
-export VORTEX_HOME="/projects/ci-runners/CuPBoP-Vortex/tools/vortex" # Hardcoded path for rg servers ONLY
+# export VORTEX_HOME="/projects/ci-runners/CuPBoP-Vortex/tools/vortex" # OLD: upstream vortex (has local_mem truncation bug)
+export VORTEX_HOME="/net/projects/ci-runners/CuPBoP-Vortex/tools/vortex_bugfix_branch" # bugfix branch (local_mem fix + TCU/DXA/WGMMA)
 export VORTEX_PATH=$VORTEX_HOME/build
 export VORTEX_DRIVER_INC=$VORTEX_HOME/runtime/include
 export VORTEX_DRIVER_LIB=$VORTEX_HOME/runtime/stub/libvortex.so
