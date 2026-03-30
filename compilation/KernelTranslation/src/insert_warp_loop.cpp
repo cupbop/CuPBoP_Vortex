@@ -74,7 +74,7 @@ public:
 
   void analyze(Function &F) {
 
-    printf("analyze divergence\n");
+    //printf("analyze divergence\n");
     // Identify divergence sources
     for (Instruction &I : instructions(F)) {
       // print instruction
@@ -536,7 +536,9 @@ void handle_alloc(llvm::Function *F) {
     std::set<Instruction *> replace_user;
     for (Instruction::use_iterator ui = inst->use_begin(), ue = inst->use_end();
          ui != ue; ++ui) {
-      replace_user.insert(dyn_cast<Instruction>(ui->getUser()));
+      auto *cast_user = dyn_cast<Instruction>(ui->getUser());
+      if (cast_user)  // skip ConstantExpr and other non-Instruction users
+        replace_user.insert(cast_user);
     }
     for (auto user : replace_user) {
 
@@ -591,8 +593,13 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
             ui->getUser()->print(llvm::errs());
             llvm::errs() << "\n";
             // before fix 
-            llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());          
-            if (isa<StoreInst>(user)) {  
+            llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());
+            if (!user) {
+              // skip ConstantExpr and other non-Instruction users
+              allStoreNonDivergence = false;
+              break;
+            }
+            if (isa<StoreInst>(user)) {
 
             // Mark's fix (wrong)
               // llvm::User *user_cast = ui->getUser();
@@ -611,8 +618,8 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
             }
           }
           if (allStoreNonDivergence) {
-            printf("all store non-divergence\n");
-            printf("alloc name: %s\n", alloc->getName().str().c_str());
+            //printf("all store non-divergence\n");
+            //printf("alloc name: %s\n", alloc->getName().str().c_str());
             // print all users
             for (Instruction::use_iterator ui = alloc->use_begin(),
                                              ue = alloc->use_end();
@@ -634,6 +641,7 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
                                          ue = alloc->use_end();
                ui != ue; ++ui) {
             llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());
+            if (!user) continue;  // skip ConstantExpr and other non-Instruction users
             auto user_block = user->getParent();
             bool find_in_PR = false;
             for (auto PR : PRs) {
@@ -949,7 +957,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
           builder.CreateAdd(tid, builder.CreateMul(wid, nHT, "hw_"), "hw_tlid");
       sche_data.inner_loop_inc = builder.CreateMul(nHT, nHW, "hw_tpc");
       sche_data.inner_loop_cond = sw_block_size;
-      printf("SCHEDULE DEBUG: no nested loop!\n");
+      //printf("SCHEDULE DEBUG: no nested loop!\n");
     } else {
       // sche_data.inner_loop_init = M->getGlobalVariable("intra_warp_index");
       sche_data.inner_loop_init = tid;
@@ -962,7 +970,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
           builder.CreateSub(builder.CreateAdd(sw_block_size, sw_warp_size),
                             builder.getInt32(1)),
           sw_warp_size, "warp_number");
-              printf("SCHEDULE DEBUG: nested loop!\n");
+              //printf("SCHEDULE DEBUG: nested loop!\n");
     }
   } else { // Schedule 0 
     if (!need_nested_loop) {
@@ -1159,16 +1167,16 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
 }
 
 void print_parallel_region(std::vector<ParallelRegion> parallel_regions) {
-  printf("get PR:\n");
+  //printf("get PR:\n");
   for (auto region : parallel_regions) {
     auto start = region.start_block;
     auto end = region.end_block;
     auto next = region.successor_block;
-    printf("parallel region: %s->%s next: %s\n", start->getName().str().c_str(),
-           end->getName().str().c_str(), next->getName().str().c_str());
-    printf("have: \n");
+    //printf("parallel region: %s->%s next: %s\n", start->getName().str().c_str(),
+//           end->getName().str().c_str(), next->getName().str().c_str());
+    //printf("have: \n");
     for (auto b : region.wrapped_block) {
-      printf("%s\n", b->getName().str().c_str());
+      //printf("%s\n", b->getName().str().c_str());
     }
   }
 }
@@ -1256,10 +1264,10 @@ public:
       pending_blocks.push_back(Pred);
     }
     if (pending_blocks.size() > 1) {
-      printf("[WARNING] multiple predecessor for B\n");
+      //printf("[WARNING] multiple predecessor for B\n");
       // print all pending blocks
       for (auto bb : pending_blocks) {
-        printf("%s\n", bb->getName().str().c_str());
+        //printf("%s\n", bb->getName().str().c_str());
       }
       // becuase we have insert the sync and split by them,
       // so if B has several income edges, it must be a merge point
@@ -1294,10 +1302,10 @@ public:
         }
       }
       // print current block
-      printf("getParallelRegionbefore: current block: ");
+      //printf("getParallelRegionbefore: current block: ");
       current->print(llvm::errs());
       // print has barrier value
-      printf("has_barrier: %d\n", has_barrier);
+      //printf("has_barrier: %d\n", has_barrier);
 
       // if we reach a block which only has a single condtional branch,
       // it is the start point of a B-condition, we have to stop here
@@ -1308,8 +1316,8 @@ public:
             is_single_conditional_branch_block = 1;
           } else {
             // generate by replicate local variable
-            printf(
-                "[WARNING] match single conditional branch with HARD CODE\n");
+            //printf(
+//                "[WARNING] match single conditional branch with HARD CODE\n");
             bool branch_to_intra_init = false;
             for (unsigned suc = 0; suc < br->getNumSuccessors(); ++suc) {
               llvm::BasicBlock *entryCandidate = br->getSuccessor(suc);
@@ -1491,7 +1499,7 @@ public:
         if (func_name == "llvm.nvvm.barrier0" ||
             func_name == "llvm.nvvm.barrier.sync") {
               // print the whole function(s)
-              printf("found the barrier in function (initial)");
+              //printf("found the barrier in function (initial)");
               call_inst->getParent()->getParent()->print(llvm::errs());
               
           exit_blocks.push_back(&(*s));
@@ -1570,14 +1578,14 @@ public:
 
     // find parallel region we need to wrap
     // print Function name
-    printf("Function name: %s\n", func_name.c_str());
+    //printf("Function name: %s\n", func_name.c_str());
     // print function
     F.print(llvm::errs());
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
-    printf("print parallel region\n");
+    //printf("print parallel region\n");
     print_parallel_region(parallel_regions);
     // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
-    printf("print parallel region done!\n");
+    //printf("print parallel region done!\n");
     if (parallel_regions.empty()) {
       remove_barrier(&F, intra_warp_loop, schedule_flag);
       return 1;      
@@ -1633,11 +1641,11 @@ void insert_warp_loop(llvm::Module *M) {
 
   int need_loop_serialize = (schedule != 2);
 
-  printf("SCHEDULE FLAG: %d\n", schedule);
+  //printf("SCHEDULE FLAG: %d\n", schedule);
   // no loop serialization performed for one on one mapping
-  printf("NEED LOOP SERIALIZE: %d\n", need_loop_serialize);
+  //printf("NEED LOOP SERIALIZE: %d\n", need_loop_serialize);
   // use nested loop only when there are warp-level barrier
-  printf("NEED NESTED LOOP: %d\n", need_nested_loop);
+  //printf("NEED NESTED LOOP: %d\n", need_nested_loop);
 
   if (need_loop_serialize) {
     if (need_nested_loop) {
@@ -1645,17 +1653,17 @@ void insert_warp_loop(llvm::Module *M) {
       Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
       // insert inter warp loop
       Passes.add(new InsertWarpLoopPass(!intra_warp, schedule));
-      printf("insert both intra and inter warp loop\n");
+      //printf("insert both intra and inter warp loop\n");
       Passes.run(*M);
     } else {
       bool intra_warp = true;
       // only need a single loop, with size=block_size
       Passes.add(new InsertWarpLoopPass(intra_warp, schedule));
-      printf("insert intra warp loop\n");
+      //printf("insert intra warp loop\n");
       Passes.run(*M);
     }
     // remove all barriers
-    printf("remove all barriers\n");
+    //printf("remove all barriers\n");
     for (auto F = M->begin(); F != M->end(); ++F)
       remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
   }

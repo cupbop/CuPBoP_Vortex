@@ -93,7 +93,7 @@ public:
         }
 
         // 위 예외에 걸리지 않으면, 여기에 barrier 삽입
-        printf("inserting intra warp barrier before instruction:\n");
+        //printf("inserting intra warp barrier before instruction:\n");
         I->print(llvm::errs());
         insert_inter_warp_sync_before.push_back(I);
         break;
@@ -106,7 +106,7 @@ public:
       for (; BI != I->end(); BI++) {
         llvm::ReturnInst *Ret = llvm::dyn_cast<llvm::ReturnInst>(&(*BI));
         if (Ret) {
-          printf("inserting intra warp barrier before instruction: ReturnInst\n");
+          //printf("inserting intra warp barrier before instruction: ReturnInst\n");
           Ret->print(llvm::errs());
           insert_inter_warp_sync_before.push_back(&(*BI));
         }
@@ -183,7 +183,7 @@ public:
       // Unconditional barrier postdominates the entry node.
       if (PDT->getPostDomTree().dominates(b, &F.getEntryBlock()))
         continue;
-      printf("insert barrier at the beginning of block(conditional barrier): %s\n", b->getName().str().c_str());
+      //printf("insert barrier at the beginning of block(conditional barrier): %s\n", b->getName().str().c_str());
       // print block
       b->print(llvm::errs());
       conditionalBarriers.push_back(b);
@@ -214,11 +214,11 @@ public:
       }
 
       // print pred and b
-      printf("pred and b check\n");
+      //printf("pred and b check\n");
       // print block
-      printf("pred: %s\n", pred->getName().str().c_str());
+      //printf("pred: %s\n", pred->getName().str().c_str());
       pred->print(llvm::errs());
-      printf("b: %s\n", b->getName().str().c_str());
+      //printf("b: %s\n", b->getName().str().c_str());
       b->print(llvm::errs());
 
 
@@ -272,7 +272,7 @@ public:
         }
       }
       // print perge point
-      printf("merge point: \n");
+      //printf("merge point: \n");
       merge_point->print(llvm::errs());
       assert(merge_point && "do not find merge point\n");
       changed = true;
@@ -291,7 +291,7 @@ public:
         if (!post_dominate_all)
         {
           conditionalBarriers.push_back(pred);
-          printf("insert barrier at the beginning of block(conditional barrier pred): %s\n", pred->getName().str().c_str());
+          //printf("insert barrier at the beginning of block(conditional barrier pred): %s\n", pred->getName().str().c_str());
           // print block
           pred->print(llvm::errs());
 
@@ -317,17 +317,17 @@ public:
             PDT->getPostDomTree().dominates(merge_point, curr)) {
           // we should insert barrier at the beginning and
           // end of its predecessor
-          printf("insert [255]: %s\n", curr->getName().str().c_str());
+          //printf("insert [255]: %s\n", curr->getName().str().c_str());
           if (has_warp_barrier(b)) {
             CreateIntraWarpBarrier(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
-              printf("insert [262]: %s\n", Pred->getName().str().c_str());
+              //printf("insert [262]: %s\n", Pred->getName().str().c_str());
               CreateIntraWarpBarrier(&(*Pred->getTerminator()));
             }
           } else {
             CreateInterWarpBarrier(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
-              printf("insert [268]: %s\n", Pred->getName().str().c_str());
+              //printf("insert [268]: %s\n", Pred->getName().str().c_str());
               CreateInterWarpBarrier(&(*Pred->getTerminator()));
             }
           }
@@ -414,8 +414,8 @@ public:
       BasicBlock *merge_point = find_merge_point(head, PDT->getPostDomTree());
       assert(PDT->getPostDomTree().dominates(merge_point, head));
       if (!find_barrier_in_region(head, merge_point)) {
-        printf("do not need to handle tri-income if: %s\n",
-               merge_point->getName().str().c_str());
+        //printf("do not need to handle tri-income if: %s\n",
+               //merge_point->getName().str().c_str());
         continue;
       }
 
@@ -474,11 +474,11 @@ public:
           if (func_name == "llvm.nvvm.barrier0" ||
               isWarpSync(func_name) ||
               func_name == "llvm.nvvm.barrier.sync") {
-                printf("found barrier inst new!\n");
+                //printf("found barrier inst new!\n");
                 // print the whole block
                 (*i)->print(errs());
                 // print the whole function
-                printf("-----------------\n");
+                //printf("-----------------\n");
                 L->getHeader()->getParent()->print(errs());
             is_conditional_loop = true;
             if (isWarpSync(func_name)) {
@@ -543,7 +543,7 @@ public:
       }
     } else {
       // handle break in for-loop
-      printf("loop has multiply exists\n");
+      //printf("loop has multiply exists\n");
       // this time, we have also insert sync before the for-body
       auto header_block = L->getHeader();
       assert(header_block->getTerminator()->getNumSuccessors() == 2 &&

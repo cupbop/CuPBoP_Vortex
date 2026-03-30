@@ -12,6 +12,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 void split_block_by_sync(llvm::Function *F) {
   std::set<llvm::Instruction *> sync_inst;
   // Jumping the first sync has been removed in LLVM 18 CPU CuPBoP
@@ -40,9 +45,11 @@ void split_block_by_sync(llvm::Function *F) {
             isCGSync(func_name)) {
           //print whole block(b)
           
-          printf("found barrier inst!\n");
-          i->print(llvm::errs());
-          b->print(errs());
+          if (cupbop_debug()) {
+            printf("found barrier inst!\n");
+            i->print(llvm::errs());
+            b->print(errs());
+          }
           sync_inst.insert(Call);
           // we should also sync the next instruction
           // so that we can get a block with sync inst only
@@ -54,11 +61,13 @@ void split_block_by_sync(llvm::Function *F) {
   }
   int _tmp = 0;
   for (auto inst : sync_inst) {
-    printf("temp=%d\n", _tmp);
-    printf("sync inst:");
-    inst->print(errs());
-    printf("block to be split:\n");
-    inst->getParent()->print(errs());
+    if (cupbop_debug()) {
+      printf("temp=%d\n", _tmp);
+      printf("sync inst:");
+      inst->print(errs());
+      printf("block to be split:\n");
+      inst->getParent()->print(errs());
+    }
     inst->getParent()->splitBasicBlock(
         inst, inst->getParent()->getName().str() + "_after_block_sync_" +
                   std::to_string(_tmp++));
@@ -84,6 +93,6 @@ void split_block_by_sync(llvm::Module *M) {
     //printf("printing the whole module after splitting the block\n");
     //printIR(M);
   } else {
-    printf("no need to split block by sync\n");
+    if (cupbop_debug()) printf("no need to split block by sync\n");
   }
 }

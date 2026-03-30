@@ -75,8 +75,8 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
              -mllvm -disable-loop-idiom-all
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
-DEVICE_BC  = $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_50.bc
-HOST_BC    = $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
+DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_50.bc
+HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(EXTRA_C_SRCS))
 
 LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PATH)/runtime/lib:../../build/runtime

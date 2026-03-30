@@ -19,6 +19,11 @@
 #include <vector>
 
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 //Previous approach (Shared mem -> Global mem)
 void mem_share2global(llvm::Module *M) {
   LLVMContext *C = &M->getContext();
@@ -261,18 +266,20 @@ void mem_share2global_sche_2(llvm::Module *M) {
   // (fallback)
   uint64_t Fallback = decideNumCTAsByBench(*M);
   uint64_t NumCTAForType = NumCTAConst ? NumCTAConst : Fallback;
-  printf("mem_share2global_sche_2");
-  std::cout << "[mem_share2global_sche_2] NumCTA = "
-             << (NumCTAConst ? "from const grid_size" : "from bench switch")
-             << " : " << NumCTAForType << "\n";
+  if (cupbop_debug()) {
+    printf("mem_share2global_sche_2");
+    std::cout << "[mem_share2global_sche_2] NumCTA = "
+               << (NumCTAConst ? "from const grid_size" : "from bench switch")
+               << " : " << NumCTAForType << "\n";
 
-  if (!NumCTAConst) {
-    std::cout << "[mem_share2global_sche_2] grid_size_{x,y} are not compile-time constants. "
-              "Declaring global type size as " << NumCTAForType
-           << " and computing indexing at runtime.\n";
-  } else {
-    std::cout << "[mem_share2global_sche_2] NumCTA = grid_size_x * grid_size_y = "
-           << NumCTAForType << "\n";
+    if (!NumCTAConst) {
+      std::cout << "[mem_share2global_sche_2] grid_size_{x,y} are not compile-time constants. "
+                "Declaring global type size as " << NumCTAForType
+             << " and computing indexing at runtime.\n";
+    } else {
+      std::cout << "[mem_share2global_sche_2] NumCTA = grid_size_x * grid_size_y = "
+             << NumCTAForType << "\n";
+    }
   }
 
   // 1) Find globals in addrspace(3) (shared)
@@ -768,7 +775,7 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
           // generate the corresponding global memory variable
           auto new_name = "wrapper_global_" + constant_memory->getName().str();
           // printf new_name
-          std::cout <<"(debug) const mem, "<< new_name<< std::endl;
+          if (cupbop_debug()) std::cout <<"(debug) const mem, "<< new_name<< std::endl;
 
           //LLVM 18
           //auto element_type = PT->getElementType();
@@ -777,7 +784,7 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
           if (auto array_type = dyn_cast<ArrayType>(element_type)) {
             if (constant_memory->hasExternalLinkage() &&
                 array_type->getArrayNumElements() == 0) {
-                  std::cout << "(debug) const mem case 1"<< std::endl;
+                  if (cupbop_debug()) std::cout << "(debug) const mem case 1"<< std::endl;
      
               // external shared memory of []
               // generate global type pointer
@@ -793,11 +800,11 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
                   std::pair<GlobalVariable *, GlobalVariable *>(constant_memory,
                                                                 global_ptr));
             } else {
-              std::cout << "(debug) const mem case 2"<< constant_memory->hasExternalLinkage() << " " << array_type->getArrayNumElements() <<std::endl;
+              if (cupbop_debug()) std::cout << "(debug) const mem case 2"<< constant_memory->hasExternalLinkage() << " " << array_type->getArrayNumElements() <<std::endl;
 
               Type *elementType = array_type->getElementType();
               uint64_t numElements = array_type->getArrayNumElements();
-              elementType->print(llvm::outs(), true);
+              if (cupbop_debug()) elementType->print(llvm::outs(), true);
               //print the type of the elementType
 
               llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
@@ -810,7 +817,7 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
           }
           else if (element_type->isStructTy() || element_type->isIntegerTy() || element_type->isFloatTy() || element_type->isDoubleTy() || element_type->isPointerTy()) {
             // TODO:  need to implement structure type definition for kernel wrapper
-            std::cout << "(debug) const mem case 3"<< std::endl;
+            if (cupbop_debug()) std::cout << "(debug) const mem case 3"<< std::endl;
 
             llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
                 *M, element_type, false, llvm::GlobalValue::ExternalLinkage,

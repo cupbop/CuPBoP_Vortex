@@ -1,0 +1,3 @@
+# kernel_name slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes
+_Z14sgemm_cp_asyncPKfS0_Pfi 0 0 3 3 8 8 4
+_Z14sgemm_cp_asyncPKfS0_Pfi 1 1 3 3 8 8 4
