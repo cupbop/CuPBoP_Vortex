@@ -55,9 +55,9 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
           continue;
         auto name_callee = ci->getCalledOperand()->getName();
         if (voteFuncs.count(name_callee.str())) {
-          dbgs() << "\nvote detected: ";
+          //dbgs() << "\nvote detected: ";
           ci->print(dbgs(), true);
-          dbgs() << "\n";
+          //dbgs() << "\n";
           replace.insert(ci);
         }
       }
@@ -180,7 +180,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
     } else if (callee_name.find(".ballot.") != string::npos) {
       call = builder.CreateCall(fn_ballot, {mask, pred});
     } else {
-      dbgs() << "Unknown vote variant: " << callee_name << "\n";
+      //dbgs() << "Unknown vote variant: " << callee_name << "\n";
       continue;
     }
 
@@ -211,7 +211,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
     // if (isKernelFunction(&m, &f))
     //   continue;
     auto name_caller = f.getName().str();
-    dbgs() << "Processing function: " << name_caller << "\n";
+    //dbgs() << "Processing function: " << name_caller << "\n";
     for (auto &bb : f) {
       for (auto &i : bb) {
         auto ci = dyn_cast<CallInst>(&i);
@@ -219,9 +219,9 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
           continue;
         auto name_callee = ci->getCalledOperand()->getName();
         if (shflFuncs.count(name_callee.str())) {
-          dbgs() << "\nshfl detected: ";
+          //dbgs() << "\nshfl detected: ";
           ci->print(dbgs(), true);
-          dbgs() << "\n";
+          //dbgs() << "\n";
           replace.insert(ci);
         }
       }
@@ -267,10 +267,15 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 
     auto shfl_variable = shfl_inst->getArgOperand(1);
     auto shfl_offset = shfl_inst->getArgOperand(2);
+    bool isFloat = shfl_variable->getType()->isFloatTy();
 
     auto intra_warp_index =
         createLoad(builder, m.getGlobalVariable("intra_warp_index"));
-    builder.CreateStore(shfl_variable, createGEP(builder, warp_shfl_ptr,
+    // warp_shfl is [32 x i32], so bitcast float→i32 before store
+    Value *val_to_store = shfl_variable;
+    if (isFloat)
+        val_to_store = builder.CreateBitCast(val_to_store, I32);
+    builder.CreateStore(val_to_store, createGEP(builder, warp_shfl_ptr,
                                                  {C0, intra_warp_index}));
     // we should create barrier before store
     CreateIntraWarpBarrier(intra_warp_index);
@@ -278,42 +283,36 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
     auto new_intra_warp_index =
         createLoad(builder, m.getGlobalVariable("intra_warp_index"));
     auto shfl_name = shfl_inst->getCalledOperand()->getName().str();
+    // Helper: load from warp_shfl, bitcast i32→f32 if needed, then replace
+    auto loadAndReplace = [&](Value *index) {
+      auto gep = createGEP(builder, warp_shfl_ptr, {C0, index});
+      Value *load_inst = createLoad(builder, gep);
+      // warp_shfl stores i32, bitcast back to float if original shfl was float
+      if (isFloat)
+        load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
+      CreateIntraWarpBarrier(new_intra_warp_index);
+      shfl_inst->replaceAllUsesWith(load_inst);
+      shfl_inst->eraseFromParent();
+    };
+
     if (shfl_name.find("down") != shfl_name.npos) {
       auto calculate_offset = builder.CreateBinOp(
           Instruction::Add, new_intra_warp_index, shfl_offset);
       auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
                                            ConstantInt::get(I32, 32));
-      auto gep = createGEP(builder, warp_shfl_ptr, {C0, new_index});
-      auto load_inst = createLoad(builder, gep);
-
-      // create barrier
-      CreateIntraWarpBarrier(new_intra_warp_index);
-      shfl_inst->replaceAllUsesWith(load_inst);
-      shfl_inst->eraseFromParent();
+      loadAndReplace(new_index);
     } else if (shfl_name.find("up") != shfl_name.npos) {
       auto calculate_offset = builder.CreateBinOp(
           Instruction::Sub, new_intra_warp_index, shfl_offset);
       auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
                                            ConstantInt::get(I32, 32));
-      auto gep = createGEP(builder, warp_shfl_ptr, {C0, new_index});
-      auto load_inst = createLoad(builder, gep);
-
-      // create barrier
-      CreateIntraWarpBarrier(new_intra_warp_index);
-      shfl_inst->replaceAllUsesWith(load_inst);
-      shfl_inst->eraseFromParent();
+      loadAndReplace(new_index);
     } else if (shfl_name.find("bfly") != shfl_name.npos) {
       auto calculate_offset = builder.CreateBinOp(
           Instruction::Xor, new_intra_warp_index, shfl_offset);
       auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
                                            ConstantInt::get(I32, 32));
-      auto gep = createGEP(builder, warp_shfl_ptr, {C0, new_index});
-      auto load_inst = createLoad(builder, gep);
-
-      // create barrier
-      CreateIntraWarpBarrier(new_intra_warp_index);
-      shfl_inst->replaceAllUsesWith(load_inst);
-      shfl_inst->eraseFromParent();
+      loadAndReplace(new_index);
     }
   }
 }

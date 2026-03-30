@@ -15,6 +15,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 /*
 insert sync after cudaKernel launch
   call void @_Z13staticReversePii(i32* %55, i32 64)
@@ -138,7 +143,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
 
   */
 
-  std::cout << "Does it come here?" << std::endl;
+  if (cupbop_debug()) std::cout << "Does it come here?" << std::endl;
   Function *f_register_global = M->getFunction("__cuda_register_globals");
   if (f_register_global) {
     for (Function::iterator b = f_register_global->begin();
@@ -163,7 +168,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
 
                 cuda_register_kernel_names.insert(
                     functionOperand->getName().str());
-                std::cout << "Cuda Register Global Kernel: "
+                if (cupbop_debug()) std::cout << "Cuda Register Global Kernel: "
                           << functionOperand->getName().str() << std::endl;
               }
             }
@@ -193,10 +198,10 @@ int kernel_idx = 0;
           llvm::CallInst *callInst_inst = llvm::dyn_cast<llvm::CallInst>(inst);
           if (Function *calledFunction = callInst->getCalledFunction()) {
             //print function name
-            std::cout << "function_name: " << calledFunction->getName().str() << std::endl;
+            if (cupbop_debug()) std::cout << "function_name: " << calledFunction->getName().str() << std::endl;
             if (calledFunction->getName().starts_with("cudaLaunchKernel")) {
               //print function name
-              std::cout << "function_name2: " << calledFunction->getName().str() << std::endl;
+              if (cupbop_debug()) std::cout << "function_name2: " << calledFunction->getName().str() << std::endl;
 
               Value *callOperand = callInst->getArgOperand(0);
 
@@ -212,7 +217,7 @@ int kernel_idx = 0;
               }
 
                 FunctionType *ft = calledFunction->getFunctionType();
-                std::cout << " Parent (Caller) Function Name: " << func_name
+                if (cupbop_debug()) std::cout << " Parent (Caller) Function Name: " << func_name
                           << ", cudaLaunchKernel Function: "
                           << functionOperand->getName().str() << ", args "
                           << functionOperand->arg_size() << std::endl;
@@ -261,7 +266,7 @@ int kernel_idx = 0;
                   break;
                 }
 
-                std::cout << "Change Kernel Name to: " << newName << std::endl;
+                if (cupbop_debug()) std::cout << "Change Kernel Name to: " << newName << std::endl;
                 
                 // FROM HERE
                 /* wrapper function, removed since vortex doesn't require wrapper function
@@ -323,8 +328,8 @@ int kernel_idx = 0;
               
               host_changed = true;
               calledFunction->setName(calledFunction->getName() + "_host");
-              std::cout << std::endl;
-              std::cout << "Change Host Function Name To: "
+              if (cupbop_debug()) std::cout << std::endl;
+              if (cupbop_debug()) std::cout << "Change Host Function Name To: "
                         << calledFunction->getName().str() << std::endl;
             }
           }
@@ -360,7 +365,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
 
               //get the name of the function
               auto parentFunction_name = parentFunction->getName().str();
-              printf("parentFunction_name: %s\n", parentFunction_name.c_str());
+              if (cupbop_debug()) printf("parentFunction_name: %s\n", parentFunction_name.c_str());
 
               //Go through every instruction in every module to find function call with the name of parentFunction_name
               for (Module::iterator PF = M->begin(); PF != M->end(); ++PF) {
@@ -376,7 +381,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
                             //print the name of the value that arg0 is pointing to
                           arg0_name += arg0->stripPointerCasts()->getName().str();
                           arg0_name += " ";
-                          printf("arg0_name: %s\n", arg0_name.c_str());
+                          if (cupbop_debug()) printf("arg0_name: %s\n", arg0_name.c_str());
                         }
                       }
                     }
@@ -391,7 +396,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
     }
   }
 
-  printf("final arg0_name: %s\n", arg0_name.c_str());
+  if (cupbop_debug()) printf("final arg0_name: %s\n", arg0_name.c_str());
 
   for (Module::iterator F = M->begin(); F != M->end(); ++F) {
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
@@ -423,7 +428,7 @@ void ReplaceMemcpyToSymbol(llvm::Module *M) {
               llvm::FunctionType *func_Type =
                   FunctionType::get(I32, args, false);
 
-              printf("inserting cudamemcpytosymbol function\n");
+              if (cupbop_debug()) printf("inserting cudamemcpytosymbol function\n");
 
               llvm::FunctionCallee _f =
                   M->getOrInsertFunction("cudaMemcpyToSymbol_host", func_Type);
