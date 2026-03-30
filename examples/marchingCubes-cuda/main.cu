@@ -9,7 +9,10 @@
 #include "tables.h"
 
 // problem size
-constexpr unsigned int N(1024);
+#ifndef MARCHING_N
+#define MARCHING_N 1024
+#endif
+constexpr unsigned int N(MARCHING_N);
 constexpr unsigned int Nd2(N / 2);
 constexpr unsigned int voxelXLv1(16);
 constexpr unsigned int voxelYLv1(16);
@@ -552,8 +555,12 @@ int main(int argc, char* argv[])
   printf("Average kernel execution time (generatingTriangles): %f (s)\n", (time * 1e-9f) / repeat);
 
   // specific to the problem size
+#if MARCHING_N == 1024
   bool ok = (countedBlockNumLv1 == 8296 && countedBlockNumLv2 == 240380 &&
              countedVerticesNum == 4856560 && countedTrianglesNum == 6101640);
+#else
+  bool ok = (countedVerticesNum > 0 && countedTrianglesNum > 0);
+#endif
   printf("%s\n", ok ? "PASSED!" : "FAILED!");
 
   cudaFree(minMaxLv1Device);

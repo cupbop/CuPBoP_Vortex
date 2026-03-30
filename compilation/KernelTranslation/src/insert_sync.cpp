@@ -32,6 +32,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 class InsertBuiltInBarrier : public llvm::FunctionPass {
 
 public:
@@ -93,7 +98,7 @@ public:
         }
 
         // 위 예외에 걸리지 않으면, 여기에 barrier 삽입
-        //printf("inserting intra warp barrier before instruction:\n");
+        if (cupbop_debug()) printf("inserting intra warp barrier before instruction:\n");
         I->print(llvm::errs());
         insert_inter_warp_sync_before.push_back(I);
         break;
@@ -106,7 +111,7 @@ public:
       for (; BI != I->end(); BI++) {
         llvm::ReturnInst *Ret = llvm::dyn_cast<llvm::ReturnInst>(&(*BI));
         if (Ret) {
-          //printf("inserting intra warp barrier before instruction: ReturnInst\n");
+          if (cupbop_debug()) printf("inserting intra warp barrier before instruction: ReturnInst\n");
           Ret->print(llvm::errs());
           insert_inter_warp_sync_before.push_back(&(*BI));
         }
@@ -183,7 +188,7 @@ public:
       // Unconditional barrier postdominates the entry node.
       if (PDT->getPostDomTree().dominates(b, &F.getEntryBlock()))
         continue;
-      //printf("insert barrier at the beginning of block(conditional barrier): %s\n", b->getName().str().c_str());
+      if (cupbop_debug()) printf("insert barrier at the beginning of block(conditional barrier): %s\n", b->getName().str().c_str());
       // print block
       b->print(llvm::errs());
       conditionalBarriers.push_back(b);
@@ -214,9 +219,9 @@ public:
       }
 
       // print pred and b
-      //printf("pred and b check\n");
+      if (cupbop_debug()) printf("pred and b check\n");
       // print block
-      //printf("pred: %s\n", pred->getName().str().c_str());
+      if (cupbop_debug()) printf("pred: %s\n", pred->getName().str().c_str());
       pred->print(llvm::errs());
       //printf("b: %s\n", b->getName().str().c_str());
       b->print(llvm::errs());
@@ -291,7 +296,7 @@ public:
         if (!post_dominate_all)
         {
           conditionalBarriers.push_back(pred);
-          //printf("insert barrier at the beginning of block(conditional barrier pred): %s\n", pred->getName().str().c_str());
+          if (cupbop_debug()) printf("insert barrier at the beginning of block(conditional barrier pred): %s\n", pred->getName().str().c_str());
           // print block
           pred->print(llvm::errs());
 

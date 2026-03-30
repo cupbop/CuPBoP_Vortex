@@ -77,7 +77,7 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
 # ─── Derived ──────────────────────────────────────────────────────────────────
 DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_50.bc
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
-EXTRA_OBJS = $(patsubst %.c,%.o,$(EXTRA_C_SRCS))
+EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
 
 LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PATH)/runtime/lib:../../build/runtime
 
@@ -153,7 +153,7 @@ $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate bitcode files for host and device"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) \
 		./$(KERNEL_CU) --sysroot=/ --target=x86_64-linux-gnu \
-		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=sm_50 \
+		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=sm_70 \
 		-lcudart_static -ldl -lrt -pthread -save-temps -v 2>&1 || true
 
 $(HOST_BC): $(DEVICE_BC)
@@ -178,6 +178,9 @@ host.o: host.bc
 # ─── Step 4: Extra C sources ─────────────────────────────────────────────────
 %.o: %.c
 	gcc -g -O0 $< -c -o $@
+
+%.o: %.cpp
+	g++ -g -O0 $< -c -o $@
 
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 kernel.o: kernel.bc

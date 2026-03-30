@@ -259,7 +259,7 @@ void compute_step_factor(int nelr, float *variables, float *areas,
   for (int j = 0; j < NNB; j++) {
     if (elements_surrounding_elements[i + j * nelr] > nelr || elements_surrounding_elements[i + j * nelr] < -3)
       {
-        printf("elements[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
+        // printf("elements[%d]=%d \n", i + j * nelr, elements_surrounding_elements[i + j * nelr]);
       }
  }
 
@@ -294,9 +294,8 @@ __global__ void cuda_compute_flux(int nelr, int *elements_surrounding_elements,
 
 
   float3 velocity_i;
-  if (threadIdx.x == 0)
-    {printf("%d, compute_velocity\n", blockIdx.x);
-                                  }
+  // if (threadIdx.x == 0)
+  //   {printf("%d, compute_velocity\n", blockIdx.x); }
   compute_velocity(density_i, momentum_i, velocity_i);
   // if (threadIdx.x == 0)
   //   {printf("%d, compute_speed_sqd\n", blockIdx.x);

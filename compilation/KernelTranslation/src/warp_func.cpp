@@ -288,6 +288,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
     auto loadAndReplace = [&](Value *index) {
       auto gep = createGEP(builder, warp_shfl_ptr, {C0, index});
       Value *load_inst = createLoad(builder, gep);
+      // warp_shfl stores i32, bitcast back to float if original shfl was float
       if (isFloat)
         load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
       CreateIntraWarpBarrier(new_intra_warp_index);

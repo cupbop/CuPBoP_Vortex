@@ -1055,6 +1055,7 @@ cudaError_t cudaLaunchKernel_vortex(
     vx_dcr_write(DC->device(), dcr_base + 20, 0);
   }
 
+
   // start execution
   RT_CHECK(vx_start(DC->device(), DC->get_krnl_buf(), DC->get_args_buf()));
 

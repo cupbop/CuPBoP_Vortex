@@ -55,29 +55,18 @@ void mem_share2global(llvm::Module *M) {
             if (share_memory->hasExternalLinkage() &&
                 array_type->getArrayNumElements() == 0) {
               // external shared memory of [] (dynamic shared memory)
-              // generate global type pointer
-              PointerType *PointerTy =
-                  PointerType::get(array_type->getElementType(), 0);
-              llvm::GlobalVariable *global_ptr;
-              if (triton_cupbop_enabled()) {
-                // Triton: ExternalLinkage, name must be "dynamic_shared_memory"
-                // so replace_dynamic_shared_memory() can find it
-                global_ptr = new llvm::GlobalVariable(
-                    *M, PointerTy, false, llvm::GlobalValue::ExternalLinkage,
-                    NULL, "dynamic_shared_memory", NULL,
-                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-              } else {
-                llvm::Constant *x1 = ConstantPointerNull::get(PointerTy);
-                global_ptr = new llvm::GlobalVariable(
-                    *M, PointerTy, false, llvm::GlobalValue::CommonLinkage, x1,
-                    "wrapper_global_data", NULL,
-                    llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-                global_ptr->setDSOLocal(true);
-              }
+              // Allocate as TLS global i8 array (same approach as static shared)
+              const uint64_t MaxDynBytes = 64 * 1024;
+              auto *DynArrTy = ArrayType::get(Int8T, MaxDynBytes);
+              auto *global_buf = new llvm::GlobalVariable(
+                  *M, DynArrTy, false, llvm::GlobalValue::ExternalLinkage,
+                  NULL, "wrapper_global_dynshared", NULL,
+                  llvm::GlobalValue::LocalExecTLSModel, 1);
+              global_buf->setInitializer(ConstantAggregateZero::get(DynArrTy));
 
               corresponding_global_memory.insert(
                   std::pair<GlobalVariable *, GlobalVariable *>(share_memory,
-                                                                global_ptr));
+                                                                global_buf));
             } else {
               //llvm::GlobalVariable *global_memory = new llvm::GlobalVariable(
               //    *M, array_type, false, llvm::GlobalValue::ExternalLinkage,
@@ -217,6 +206,9 @@ static uint64_t decideNumCTAsByBench(const llvm::Module &M) {
 
   // psort [grid=(64,1,1)]
   if (contains("psort"))        return 64ull;
+
+  // srad_v2 [grid=(32,32,1)]
+  if (contains("srad"))         return 32ull * 32ull;
 
   // Default fallback
   return 256ull;
@@ -489,10 +481,27 @@ static void breakConstantExprUses(llvm::Value *V, llvm::Function *F) {
   for (User *U : Users) {
     if (auto *CE = dyn_cast<ConstantExpr>(U)) {
       breakConstantExprUses(CE, F);
-      Instruction *I = CE->getAsInstruction();
-      I->insertBefore(&*F->begin()->begin());
-      CE->replaceAllUsesWith(I);
-      CE->destroyConstant();
+      // Insert a separate instruction before each use (not at entry block)
+      // to avoid dominance violations when the replacement value is defined
+      // in a block that doesn't dominate the entry block.
+      SmallVector<Use*, 8> CEUses;
+      for (Use &UU : CE->uses())
+        if (auto *UI = dyn_cast<Instruction>(UU.getUser()))
+          if (UI->getFunction() == F)
+            CEUses.push_back(&UU);
+      for (Use *UU : CEUses) {
+        Instruction *UserInst = cast<Instruction>(UU->getUser());
+        Instruction *NewI = CE->getAsInstruction();
+        if (auto *PN = dyn_cast<PHINode>(UserInst)) {
+          BasicBlock *InBB = PN->getIncomingBlock(*UU);
+          NewI->insertBefore(InBB->getTerminator());
+        } else {
+          NewI->insertBefore(UserInst);
+        }
+        UU->set(NewI);
+      }
+      if (CE->use_empty())
+        CE->destroyConstant();
     }
   }
 }

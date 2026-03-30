@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
   DBG_LOG("replace_cp_async_dxa\n");
   replace_cp_async_with_dxa(program);
 
+
   DBG_LOG("init_block\n");
   init_block(program, fout);
   dumpFile(program, "0_after_init_block.ll");
@@ -67,7 +68,12 @@ int main(int argc, char **argv) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   ModulePassManager MPM;
-  MPM.addPass(ReplaceWarpLevelPrimitive(MAPPING_1TO1));
+  MapOpt warp_mapping = MAPPING_1TO1;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    int schedule = std::stoi(std::string(env));
+    if (schedule == 0) warp_mapping = MAPPING_FLAT;
+  }
+  MPM.addPass(ReplaceWarpLevelPrimitive(warp_mapping));
   MPM.run(*program, MAM);
 
   VerifyModule(program);

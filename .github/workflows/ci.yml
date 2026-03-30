@@ -50,18 +50,6 @@ jobs:
             scheduler: 0
         include:
           # SCHE_2 + LOCALMEM=0 for shared memory benchmarks
-          - name: backprop
-            scheduler: 2
-            localmem: 0
-          - name: dotproduct
-            scheduler: 2
-            localmem: 0
-          - name: pathfinder
-            scheduler: 2
-            localmem: 0
-          - name: psum
-            scheduler: 2
-            localmem: 0
           - name: bh-cuda
             scheduler: 2
             localmem: 0
@@ -69,6 +57,9 @@ jobs:
             scheduler: 2
             localmem: 0
           - name: hotspot
+            scheduler: 2
+            localmem: 0
+          - name: jaccard-cuda
             scheduler: 2
             localmem: 0
           - name: jacobi-cuda

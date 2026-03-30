@@ -59,7 +59,7 @@ def main():
         schedule = m_sche.group(1)
 
         m_lmem = re.search(r'LOCAL_MEM_(\d+)', basename)
-        lmem = m_lmem.group(1) if m_lmem else "N/A"
+        lmem = m_lmem.group(1) if m_lmem else "1"
 
         benchmark = os.path.basename(os.path.dirname(f))
 
@@ -87,7 +87,7 @@ def main():
         total_ipc = total_instrs / total_cycles if total_cycles > 0 else 0
 
         title = f"## Performance Summary (SCHE_{schedule}"
-        if lmem != "N/A":
+        if schedule == "2" and lmem == "0":
             title += f", LMEM={lmem}"
         title += ")"
 
