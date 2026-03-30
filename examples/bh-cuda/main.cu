@@ -769,7 +769,7 @@ int main(int argc, char* argv[])
   double rsc, vsc, r, v, x, y, z, sq, scale;
 
   // the number of thread blocks may be adjusted for higher performance
-  const int blocks = 24;
+  const int blocks = 1;  // reduced from 24 for Vortex simulation
 
   nnodes = nbodies * 2;
   if (nnodes < 1024*blocks) nnodes = 1024*blocks;
