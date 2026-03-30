@@ -28,6 +28,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 bool inline_warp_level_func(llvm::Module *M) {
   bool changed = false;
   std::set<llvm::Function *> need_remove;
@@ -91,7 +96,7 @@ bool inline_func_with_tid(llvm::Module *M) {
         if (CallInst *c = dyn_cast<CallInst>(BI++)) {
           if (c->getCalledFunction()) {
             if (find_sreg_inst(c->getCalledFunction())) {
-              printf("inline: %s\n",
+              if (cupbop_debug()) printf("inline: %s\n",
                      c->getCalledOperand()->getName().str().c_str());
               need_inline.insert(c);
               need_remove.insert(c->getCalledFunction());
@@ -381,7 +386,7 @@ void llvm_preprocess(llvm::Module *M) {
       Pass *thispass = PIs->createPass();
       Passes.add(thispass);
     } else {
-      printf("Pass: %s not found\n", pass.c_str());
+      if (cupbop_debug()) printf("Pass: %s not found\n", pass.c_str());
     }
   }
   Passes.run(*M);
@@ -552,7 +557,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
       M->getGlobalVariable("dynamic_shared_memory");
 
   if (dynamic_shared_memory_addr) {
-    std::cout << "[DEBUG] replace dynamic shared memory found!" << std::endl;
+    if (cupbop_debug()) std::cout << "[DEBUG] replace dynamic shared memory found!" << std::endl;
     replace_dynamic_shared_memory(M);
   }
 }

@@ -25,6 +25,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 void set_meta_data(llvm::Module *M) {
   std::string arch = std::getenv("VORTEX_ARCHITECTURE");
 
@@ -63,7 +68,7 @@ void decode_input(llvm::Module *M) {
       continue;
 
     auto func_name = F->getName().str();
-    printf("function name: %s\n", func_name.c_str());
+    if (cupbop_debug()) printf("function name: %s\n", func_name.c_str());
     
     // remove mangle prefix
     // remove _Z24
@@ -249,12 +254,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
             auto func_name = Call->getCalledOperand()->getName().str();
             auto func_arg_size = Call->getCalledFunction()->arg_size();
-            std::cout << "currently looking function is " << func_name << std::endl;
+            if (cupbop_debug()) std::cout << "currently looking function is " << func_name << std::endl;
 
             // Find the kernel function name
             if(isKernelFunction(M, Call->getCalledFunction()) && std::find(wrapper_name.begin(), wrapper_name.end(), func_name+"_wrapper") == wrapper_name.end())
             {
-              std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
+              if (cupbop_debug()) std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               
               // remove _Z24, covers triton as well
               if ((triton_enabled && func_name[0] == '_') || (!triton_enabled)) {

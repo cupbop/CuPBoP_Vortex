@@ -33,6 +33,14 @@ std::vector<MemcpySymbolEntry> memcpy_symbol;
 //create string vector
 std::vector<std::string> symbol_name_vector;
 
+// Debug print macros — enabled by setting CUPBOP_DEBUG=1 environment variable
+static bool cupbop_debug_enabled() {
+    static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+    return enabled;
+}
+#define DBG_PRINT(...) do { if (cupbop_debug_enabled()) printf(__VA_ARGS__); } while(0)
+#define DBG_COUT(x) do { if (cupbop_debug_enabled()) std::cout << x; } while(0)
+
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
      int _ret = _expr;                                          \
@@ -304,7 +312,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
   // RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_READ_WRITE, (void** )&mem_addr));
   DC->dev_mem_alloc(size, VX_MEM_READ_WRITE, &mem_addr);
   
-  printf("cudaMalloc: size=%ld, mem_addr=%p\n", size, mem_addr);
+  DBG_PRINT("cudaMalloc: size=%ld, mem_addr=%p\n", size, mem_addr);
   *devPtr = (void*)mem_addr;
    return cudaSuccess;
 }
@@ -315,7 +323,7 @@ cudaError_t cudaFree(void *devPtr) {
   // vx_mem_free(DC->device(), mem_addr);
   DC->dev_mem_free(devPtr);
   
-  printf("cudaFree: mem_addr=%lu\n", mem_addr);
+  DBG_PRINT("cudaFree: mem_addr=%lu\n", mem_addr);
   return cudaSuccess;
 }
 
@@ -333,7 +341,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
   // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
   DC->copy_to_dev(mem_addr, host_ptr, count);
   
-  printf("cudaMemset: value=%d, dst=%lu, count=%ld\n", value, mem_addr, count);
+  DBG_PRINT("cudaMemset: value=%d, dst=%lu, count=%ld\n", value, mem_addr, count);
   free(tmp_ptr);
   return cudaSuccess;
 }
@@ -373,18 +381,18 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     //  RT_CHECK(vx_copy_from_dev(DC->device(), host_ptr, mem_addr, count));
     DC->copy_from_dev(mem_addr, host_ptr, count);
     memcpy(dst, (char*)host_ptr, count);
-    printf("cudamemcpyDeviceToHost: src=%lu, dst=%p, count=%ld\n", mem_addr, dst, count);
+    DBG_PRINT("cudamemcpyDeviceToHost: src=%lu, dst=%p, count=%ld\n", mem_addr, dst, count);
   } else if (kind == cudaMemcpyHostToDevice) {
     auto DC = DeviceContext::instance();
     auto staging_buf = DC->staging_alloc(count);
     auto host_ptr = staging_buf.data();
     memcpy((char *)host_ptr, src, count);
     uint64_t mem_addr = (uint64_t)dst;
-    printf("(memcpy_) host_ptr value: %d %d, addr: %ld\n", *(char *)src, *(char *)host_ptr, host_ptr);
+    DBG_PRINT("(memcpy_) host_ptr value: %d %d, addr: %ld\n", *(char *)src, *(char *)host_ptr, host_ptr);
     // RT_CHECK(vx_copy_to_dev(DC->device(), mem_addr, host_ptr, count));
     DC->copy_to_dev(mem_addr, host_ptr, count);
 
-    printf("cudaMemcpyHostToDevice: src=%p, dst=%lu, count=%ld\n", src, mem_addr, count);
+    DBG_PRINT("cudaMemcpyHostToDevice: src=%p, dst=%lu, count=%ld\n", src, mem_addr, count);
   } else if (kind == cudaMemcpyDeviceToDevice) {
     auto DC = DeviceContext::instance();
     auto staging_buf = DC->staging_alloc(count);
@@ -397,7 +405,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
     // RT_CHECK(vx_copy_to_dev(DC->device(), mem_dst_addr, host_ptr, count));
     DC->copy_to_dev(mem_dst_addr, host_ptr, count);
     
-    printf("cudaMemcpyDeviceToDevice: src=%lu, dst=%lu, count=%ld\n", mem_src_addr, mem_dst_addr, count);
+    DBG_PRINT("cudaMemcpyDeviceToDevice: src=%lu, dst=%lu, count=%ld\n", mem_src_addr, mem_dst_addr, count);
   } else if (kind == cudaMemcpyDefault) {
     std::abort(); // not supported!
   }
@@ -417,7 +425,7 @@ cudaError_t cudaMemcpyFromSymbol(void *dst,
     }
 
     std::string symbolName((char*)symbol);
-    printf("cudaMemcpyFromSymbol: Looking for symbol '%s'\n", symbolName.c_str());
+    DBG_PRINT("cudaMemcpyFromSymbol: Looking for symbol '%s'\n", symbolName.c_str());
 
     std::fstream readfile;
     readfile.open("lookup_global_symbols.txt", std::ios::in);
@@ -455,7 +463,7 @@ cudaError_t cudaMemcpyFromSymbol(void *dst,
     auto DC = DeviceContext::instance();
     uint64_t source_address = device_symbol_address + offset;
 
-    printf("cudaMemcpyFromSymbol: Copying %zu bytes from device address 0x%llx to host address %p\n",
+    DBG_PRINT("cudaMemcpyFromSymbol: Copying %zu bytes from device address 0x%llx to host address %p\n",
            count, source_address, dst);
     
     DC->copy_from_dev(source_address, dst, count);
@@ -475,7 +483,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
 
   //symbol is a pointer to a string 
   //print the string that symbol points to
-  printf("(CudaMemcpytoSymbol) symbol name: %s\n", symbol);
+  DBG_PRINT("(CudaMemcpytoSymbol) symbol name: %s\n", symbol);
 
   // if vector length of symbol_name_vector == 0
   //printf("symbol_name_vector.size(): %lu\n", symbol_name_vector.size());
@@ -496,7 +504,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
 
   //pop first element in symbol_name_vector
   std::string symbol_name_looking = symbol_name_vector[0];
-  printf("symbol name looking: %s\n", symbol_name_looking);  
+  DBG_PRINT("symbol name looking: %s\n", symbol_name_looking);  
   
   //open file lookup_global_symbols.txt to read
   std::fstream readfile;
@@ -506,8 +514,8 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   std::string symbol_addr_tmp;
   
   //print src value
-  printf("src value at initial memcpytosymbol, addr: %p\n", src);
-  printf("src value at initial memcpytosymbol %f\n", *((float*)src+1));
+  DBG_PRINT("src value at initial memcpytosymbol, addr: %p\n", src);
+  DBG_PRINT("src value at initial memcpytosymbol %f\n", *((float*)src+1));
 
   while(readfile >> symbol_addr_tmp)
   {
@@ -515,11 +523,11 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
     std::getline(readfile, symbol_name_tmp);
     symbol_name_tmp = symbol_name_tmp.substr(1, symbol_name_tmp.size()-1);  
   
-    std::cout << "debug : " << symbol_name_looking << " vs " << symbol_name_tmp << std::endl;
+    DBG_COUT("debug : " << symbol_name_looking << " vs " << symbol_name_tmp << std::endl);
 
     if(symbol_name_looking == symbol_name_tmp)
     {
-      std::cout << "found the symbol name in the lookup file, it is " << symbol_name_looking << " with the address of " << symbol_addr_tmp << std::endl;
+      DBG_COUT("found the symbol name in the lookup file, it is " << symbol_name_looking << " with the address of " << symbol_addr_tmp << std::endl);
       readfile.close();
       symbol_name_vector.erase(symbol_name_vector.begin());
       break;
@@ -531,7 +539,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   uint64_t symbol_addr = std::stoull(symbol_addr_tmp, nullptr, 16);
 
   // print symbol_addr_tmp, and compare it with dst
-  printf("symbol_addr_tmp: %p, dst: %p\n", symbol_addr, dst);
+  DBG_PRINT("symbol_addr_tmp: %p, dst: %p\n", symbol_addr, dst);
 
   //NOTE: old approach — allocate staging device memory and copy host data there
   //auto DC = DeviceContext::instance();
@@ -555,7 +563,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   entry.data.resize(count);
   memcpy(entry.data.data(), src, count);
   memcpy_symbol.push_back(std::move(entry));
-  printf("(cudamemcpytosymbol) saved inline: dst=0x%lx, size=%ld\n", symbol_addr, count);
+  DBG_PRINT("(cudamemcpytosymbol) saved inline: dst=0x%lx, size=%ld\n", symbol_addr, count);
               
   return cudaSuccess;
 }
@@ -759,9 +767,9 @@ cudaError_t cudaLaunchKernel_vortex(
   //cpp hash table, look for the kernel name, and retrieve the kerenl index
   
   //DEBUG PURPOSE
-  std::cout << "RUNTIME FUNCTION" << std::endl;
-  std::cout << "kernel_name: " << func << std::endl;
-  std::cout << "number of arguments: " << num_args << std::endl;
+  DBG_COUT("RUNTIME FUNCTION" << std::endl);
+  DBG_COUT("kernel_name: " << func << std::endl);
+  DBG_COUT("number of arguments: " << num_args << std::endl);
   //reading lookup.txt
   std::fstream readfile;
   readfile.open("lookup.txt", std::ios::in);
@@ -771,15 +779,15 @@ cudaError_t cudaLaunchKernel_vortex(
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
     readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    std::cout << "debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl;
+    DBG_COUT("debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl);
     if(std::string(func) == kernel_name_tmp) {
-      std::cout << "found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl;
+      DBG_COUT("found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl);
       break;
     }
   }
   readfile.close();                    
                       
-  printf("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
+  DBG_PRINT("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
   auto DC = DeviceContext::instance();
@@ -800,7 +808,7 @@ cudaError_t cudaLaunchKernel_vortex(
 
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
-  printf("(debug) abuf_size = %ld\n", abuf_size);
+  DBG_PRINT("(debug) abuf_size = %ld\n", abuf_size);
 
   //NOTE: old size calculation — 3 uint64_t per symbol (dst_addr, staging_addr, size)
   //size_t abuf_size_additional = (1 + memcpy_symbol.size() * 3) * sizeof(uint64_t);
@@ -817,7 +825,7 @@ cudaError_t cudaLaunchKernel_vortex(
   //auto abuf_ptr = (kernel_arg_t*)vx_host_ptr(staging_buf);
   assert(abuf_ptr);
 
-  printf("*** kernel arg=%p, size=%ld\n", abuf_ptr, abuf_size);
+  DBG_PRINT("*** kernel arg=%p, size=%ld\n", abuf_ptr, abuf_size);
 
   // write context
   context_t ctx;
@@ -845,12 +853,12 @@ cudaError_t cudaLaunchKernel_vortex(
   //printf("address_check 0x%x, 0x%x, %d\n", &(ctx.global_offset[1]), &(ctx.global_offset[2]), &(ctx.global_offset[0])-&(ctx.num_groups[2]));
   //printf("global_offset 0x%x, 0x%x, %x\n", ctx.global_offset[0], ctx.global_offset[1], ctx.global_offset[2]);
 
-  printf("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
+  DBG_PRINT("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
 
   // write arguments
   for (int i = 0; i < num_args; ++i) {    
     memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
-    printf("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
+    DBG_PRINT("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
   }  
 
   //NOTE: old packing — 3 uint64_t per symbol (dst_addr, staging_dev_addr, size)
@@ -897,7 +905,7 @@ cudaError_t cudaLaunchKernel_vortex(
   // upload kernel arguments
   // RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
   RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size+abuf_size_additional, DC->args_buffer()));
-  printf("args_buffer: %p\n", DC->args_buffer());
+  DBG_PRINT("args_buffer: %p\n", DC->args_buffer());
   
 
 
@@ -906,16 +914,16 @@ cudaError_t cudaLaunchKernel_vortex(
   //RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr_additional, abuf_size_additional, (void**)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR));
   
 
-  printf("uploaded args\n");
+  DBG_PRINT("uploaded args\n");
   
   // start execution
   RT_CHECK(vx_start(DC->device(), DC->get_krnl_buf(), DC->get_args_buf()));
 
-  printf("wait device\n");
+  DBG_PRINT("wait device\n");
   // wait for the execution to complete
   RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
 
-  printf("sync device\n");
+  DBG_PRINT("sync device\n");
   
   // dump performance counters for every kernel to a file
   

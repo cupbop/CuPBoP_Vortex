@@ -24,11 +24,19 @@ using namespace cupbop;
 
 std::string PATH = "kernel_meta.log";
 
-static void dumpFile(llvm::Module * program, std::string name) {
+static bool debug_mode() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
+static void dumpFile(llvm::Module *program, std::string name) {
+  if (!debug_mode()) return;
   std::error_code EC;
   raw_fd_ostream OutFile(name, EC);
   program->print(OutFile, nullptr);
 }
+
+#define DBG_LOG(msg) do { if (debug_mode()) std::cout << msg << std::flush; } while(0)
 
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
@@ -37,12 +45,10 @@ int main(int argc, char **argv) {
   std::ofstream fout;
   fout.open(PATH);
 
-  // inline, and create auxiliary global variables
-  std::cout << "init_block\n" << std::flush;
-  printIR(program);
+  DBG_LOG("init_block\n");
   init_block(program, fout);
+  dumpFile(program, "0_after_init_block.ll");
 
-  // dumpFile(program, "0.ll");
   // Create pass infrastructure
   PassBuilder PB;
   ModuleAnalysisManager MAM;
@@ -50,14 +56,12 @@ int main(int argc, char **argv) {
   LoopAnalysisManager LAM;
   CGSCCAnalysisManager CGAM;
 
-  // Register analyses
   PB.registerModuleAnalyses(MAM);
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
   PB.registerCGSCCAnalyses(CGAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  // Create pass manager and add your pass
   ModulePassManager MPM;
   MapOpt warp_mapping = MAPPING_1TO1;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
@@ -67,56 +71,36 @@ int main(int argc, char **argv) {
   MPM.addPass(ReplaceWarpLevelPrimitive(warp_mapping));
   MPM.run(*program, MAM);
 
-  // insert sync
   VerifyModule(program);
   insert_sync(program);
+  dumpFile(program, "1_after_insert_sync.ll");
 
-  //dumpFile(program, "3.ll");
-
-  // split block by sync
   VerifyModule(program);
-
-
-  std::cout << "split\n" << std::flush;
-  //print the proogram
-  //printIR(program);
+  DBG_LOG("split_block_by_sync\n");
   split_block_by_sync(program);
-  // add loop for intra&intera thread
+  dumpFile(program, "2_after_split_sync.ll");
 
-
-  //dumpFile(program, "4.ll");
-  
-  // VerifyModule(program);
-  std::cout << "insert_warp_loop\n" << std::flush;
-  printIR(program);
+  DBG_LOG("insert_warp_loop\n");
   insert_warp_loop(program);
-
-  //dumpFile(program, "5.ll");
+  dumpFile(program, "3_after_warp_loop.ll");
 
   VerifyModule(program);
 
-  // (TODO): replace this patch
-  std::cout << "replace\n" << std::flush;
-  //printIR(program);
+  DBG_LOG("replace_built_in_function\n");
   replace_built_in_function(program);
+  dumpFile(program, "4_after_replace_builtin.ll");
 
-  //dumpFile(program, "6.ll");
   VerifyModule(program);
-  std::cout << "generate\n" << std::flush;
-  //printIR(program);
+  DBG_LOG("generate_wrapper\n");
   generate_wrapper(program);
-  //dumpFile(program, "7.ll");
-  // VerifyModule(program);
-  std::cout << "performance opt\n" << std::flush;
-  //printIR(program);
-  // performance optimization
+  dumpFile(program, "5_after_generate_wrapper.ll");
+
+  DBG_LOG("performance_optimization\n");
   performance_optimization(program);
-  //dumpFile(program, "8.ll");
-  std::cout << "verify\n" << std::flush;
-  //printIR(program);
+  dumpFile(program, "6_after_perf_opt.ll");
+
   VerifyModule(program);
 
-  std::cout << "dump\n" << std::flush;
   DumpModule(program, argv[2]);
 
   fout.close();

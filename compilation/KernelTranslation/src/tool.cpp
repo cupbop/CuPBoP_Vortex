@@ -33,6 +33,11 @@
 
 using namespace llvm;
 
+static bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
+
 bool triton_cupbop_enabled() {
   static bool enabled = []{
     const char* v = std::getenv("TRITON_CUPBOP");
@@ -242,8 +247,8 @@ static void breakConstantExpressions(llvm::Value *Val, llvm::Function *Func) {
       // Convert this constant expression to an instruction.
       llvm::Instruction *I = CE->getAsInstruction();
       I->insertBefore(&*Func->begin()->begin());
-      printf("--------------------\n");
-      std::cout << I << std::endl;
+      if (cupbop_debug()) printf("--------------------\n");
+      if (cupbop_debug()) std::cout << I << std::endl;
       CE->replaceAllUsesWith(I);
       CE->destroyConstant();
     }
@@ -297,9 +302,9 @@ void replace_built_in_function(llvm::Module *M) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
 
-    printf("Function name: %s\n", func_name.c_str());
-    printf("iskernel=%d\n", isKernelFunction(M, F));
-    printf("isdevice=%d\n", isDeviceFunction(M, F));
+    if (cupbop_debug()) printf("Function name: %s\n", func_name.c_str());
+    if (cupbop_debug()) printf("iskernel=%d\n", isKernelFunction(M, F));
+    if (cupbop_debug()) printf("isdevice=%d\n", isDeviceFunction(M, F));
     if (!(isKernelFunction(M, F) || isDeviceFunction(M, F)))
       continue;
 
@@ -406,9 +411,9 @@ void replace_built_in_function(llvm::Module *M) {
                 int32_t int_inter_warp_idx = con_inter_warp_idx->getSExtValue();
                 // int64_t int_block_size_x = con_block_size_x->getSExtValue();
 
-                printf("intra warp corresponding value is : %d \n",
+                if (cupbop_debug()) printf("intra warp corresponding value is : %d \n",
                        int_intra_warp_idx);
-                printf("inter warp corresponding value is : %d \n",
+                if (cupbop_debug()) printf("inter warp corresponding value is : %d \n",
                        int_inter_warp_idx);
                 // printf("block size x corresponding value is : %ld \n",
                 // int_block_size_x);
@@ -507,7 +512,7 @@ void replace_built_in_function(llvm::Module *M) {
                 Call->replaceAllUsesWith(tidz);
                 need_remove.push_back(Call);
               } else {
-                printf("[WARNING] We DO NOT support triple-dim block\n");
+                if (cupbop_debug()) printf("[WARNING] We DO NOT support triple-dim block\n");
                 exit(1);
                 auto zero = ConstantInt::get(I32, 0);
                 Call->replaceAllUsesWith(zero);
@@ -521,7 +526,7 @@ void replace_built_in_function(llvm::Module *M) {
                      func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
                      func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
               int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
-              printf("block_Id-%c is called\n", func_name.back());
+              if (cupbop_debug()) printf("block_Id-%c is called\n", func_name.back());
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
 
@@ -616,7 +621,7 @@ void replace_built_in_function(llvm::Module *M) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
             if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
-              printf("Warning: unhandled InlineAsm: %s\n",
+              if (cupbop_debug()) printf("Warning: unhandled InlineAsm: %s\n",
                      asm_inst->getAsmString().c_str());
               continue;
             }
@@ -1023,7 +1028,7 @@ void replace_asm_call(llvm::Module *M) {
               Call->replaceAllUsesWith(result);
               need_remove.push_back(Call);
             } else {
-              printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
+              if (cupbop_debug()) printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               if (!Call->getType()->isVoidTy()) {
