@@ -557,13 +557,26 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   //memcpy_symbol_single.clear();
 
   // New approach: store raw bytes in host memory, inline into args at launch
-  MemcpySymbolEntry entry;
-  entry.dst_addr = symbol_addr;
-  entry.size = count;
-  entry.data.resize(count);
-  memcpy(entry.data.data(), src, count);
-  memcpy_symbol.push_back(std::move(entry));
-  DBG_PRINT("(cudamemcpytosymbol) saved inline: dst=0x%lx, size=%ld\n", symbol_addr, count);
+  // Update existing entry for same dst_addr (dedup), or add new entry.
+  // Entries persist across kernel launches so BSS zeroing doesn't lose data.
+  bool found_existing = false;
+  for (auto &existing : memcpy_symbol) {
+    if (existing.dst_addr == symbol_addr && existing.size == count) {
+      memcpy(existing.data.data(), src, count);
+      found_existing = true;
+      DBG_PRINT("(cudamemcpytosymbol) updated existing: dst=0x%lx, size=%ld\n", symbol_addr, count);
+      break;
+    }
+  }
+  if (!found_existing) {
+    MemcpySymbolEntry entry;
+    entry.dst_addr = symbol_addr;
+    entry.size = count;
+    entry.data.resize(count);
+    memcpy(entry.data.data(), src, count);
+    memcpy_symbol.push_back(std::move(entry));
+    DBG_PRINT("(cudamemcpytosymbol) saved inline: dst=0x%lx, size=%ld\n", symbol_addr, count);
+  }
               
   return cudaSuccess;
 }
@@ -883,8 +896,13 @@ cudaError_t cudaLaunchKernel_vortex(
     memcpy(&abuf_ptr->args[slot], entry.data.data(), entry.size);
     slot += data_slots;
   }
-  // Fix #1: clear after packing so next launch doesn't repeat
-  memcpy_symbol.clear();
+  // NOTE: Do NOT clear memcpy_symbol here. Vortex's vx_start.S zeroes the BSS
+  // section on every kernel launch, which wipes device-side __device__ globals.
+  // By keeping the symbol data, we re-send it with every kernel launch so that
+  // the device-side memcpy in the wrapper restores the symbol values after BSS
+  // zeroing. This fixes cfd and any other benchmark using cudaMemcpyToSymbol
+  // with multiple kernel launches.
+  // memcpy_symbol.clear();
   // upload additional information for cudaMemcpytoSymbol
   
   

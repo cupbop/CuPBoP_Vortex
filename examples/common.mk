@@ -77,7 +77,7 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
 # ─── Derived ──────────────────────────────────────────────────────────────────
 DEVICE_BC  = $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_70.bc
 HOST_BC    = $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
-EXTRA_OBJS = $(patsubst %.c,%.o,$(EXTRA_C_SRCS))
+EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
 
 LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PATH)/runtime/lib:../../build/runtime
 
@@ -178,6 +178,9 @@ host.o: host.bc
 # ─── Step 4: Extra C sources ─────────────────────────────────────────────────
 %.o: %.c
 	gcc -g -O0 $< -c -o $@
+
+%.o: %.cpp
+	g++ -g -O0 $< -c -o $@
 
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 kernel.o: kernel.bc

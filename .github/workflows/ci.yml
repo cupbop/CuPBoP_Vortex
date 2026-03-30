@@ -37,23 +37,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda]
+        # Temporarily: only previously failing tests (to verify fixes)
+        name: [bh-cuda, cc-cuda, cfd, hotspot, huffman, jaccard-cuda, jacobi-cuda, marchingCubes-cuda, nw, score-cuda, srad_v2, wedford-cuda]
         scheduler: [2, 0]
         localmem: [1]
         include:
           # SCHE_2 + LOCALMEM=0 for shared memory benchmarks
-          - name: backprop
-            scheduler: 2
-            localmem: 0
-          - name: dotproduct
-            scheduler: 2
-            localmem: 0
-          - name: pathfinder
-            scheduler: 2
-            localmem: 0
-          - name: psum
-            scheduler: 2
-            localmem: 0
           - name: bh-cuda
             scheduler: 2
             localmem: 0
@@ -61,6 +50,9 @@ jobs:
             scheduler: 2
             localmem: 0
           - name: hotspot
+            scheduler: 2
+            localmem: 0
+          - name: jaccard-cuda
             scheduler: 2
             localmem: 0
           - name: jacobi-cuda

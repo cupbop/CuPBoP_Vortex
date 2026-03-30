@@ -94,9 +94,11 @@ bool isKernelFunction(llvm::Module *M, llvm::Function *F) {
     if (auto Str = llvm::cast<MDString>(Op)) {
       if (Str->getString().str() != "kernel")
         continue;
-      llvm::Value *meta =
-          dyn_cast<llvm::ValueAsMetadata>(MD->getOperand(0))->getValue();
-      Function *FF = llvm::cast<Function>(meta);
+      auto *VMD = dyn_cast<llvm::ValueAsMetadata>(MD->getOperand(0));
+      if (!VMD) continue;
+      llvm::Value *meta = VMD->getValue();
+      auto *FF = llvm::dyn_cast<Function>(meta);
+      if (!FF) continue;
       if (FF->getName().str() == F->getName().str())
         return true;
     }
@@ -399,10 +401,14 @@ void replace_built_in_function(llvm::Module *M) {
                 // Constant* const_block_size_x =
                 // block_size_x_tmp->getInitializer();
 
-                ConstantInt *con_intra_warp_idx =
-                    cast<ConstantInt>(const_intra_warp_idx);
-                ConstantInt *con_inter_warp_idx =
-                    cast<ConstantInt>(const_inter_warp_idx);
+                auto *con_intra_warp_idx =
+                    dyn_cast<ConstantInt>(const_intra_warp_idx);
+                auto *con_inter_warp_idx =
+                    dyn_cast<ConstantInt>(const_inter_warp_idx);
+                if (!con_intra_warp_idx || !con_inter_warp_idx) {
+                  if (cupbop_debug()) printf("warning: warp idx globals not ConstantInt, skipping\n");
+                  continue;
+                }
                 // ConstantInt* con_block_size_x =
                 // cast<ConstantInt>(const_block_size_x);
 
@@ -620,6 +626,7 @@ void replace_built_in_function(llvm::Module *M) {
           }
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
+            if (!asm_inst) continue;
             if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
               if (cupbop_debug()) printf("Warning: unhandled InlineAsm: %s\n",
                      asm_inst->getAsmString().c_str());

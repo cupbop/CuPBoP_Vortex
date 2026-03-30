@@ -479,8 +479,8 @@ void AddContextSaveRestore(llvm::Instruction *instruction,
   for (Instruction::use_iterator ui = instruction->use_begin(),
                                  ue = instruction->use_end();
        ui != ue; ++ui) {
-    llvm::Instruction *user = cast<Instruction>(ui->getUser());
-    if (user == NULL)
+    llvm::Instruction *user = dyn_cast<Instruction>(ui->getUser());
+    if (!user)
       continue;
     if (user == theStore)
       continue;
