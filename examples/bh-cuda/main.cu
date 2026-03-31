@@ -45,13 +45,13 @@ Emerald Edition, pp. 75-92. January 2011.
 #include <sys/time.h>
 #include <cuda.h>
 
-// threads per block
-#define THREADS1 256  // must be a power of 2
-#define THREADS2 256
-#define THREADS3 256 
-#define THREADS4 256
-#define THREADS5 256
-#define THREADS6 256
+// threads per block (reduced from 256 for Vortex simulation)
+#define THREADS1 32  // must be a power of 2
+#define THREADS2 32
+#define THREADS3 32
+#define THREADS4 32
+#define THREADS5 32
+#define THREADS6 32
 
 // block count = factor * #SMs
 #define FACTOR1 2
