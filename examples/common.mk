@@ -75,7 +75,7 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
              -mllvm -disable-loop-idiom-all
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
-DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_50.bc
+DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_70.bc
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
 
