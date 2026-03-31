@@ -11,6 +11,12 @@
 cd $GITHUB_WORKSPACE
 hostname
 
+# Clean previous CI results so summary only shows current run
+find examples/ -name "ci_status_*.txt" -delete 2>/dev/null
+find examples/ -name "ci_output.txt" -delete 2>/dev/null
+find examples/ -name "Perf_counter_*.txt" -delete 2>/dev/null
+find examples/ -name "result_vortex.txt" -delete 2>/dev/null
+
 rm -rf build
 
 apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBoP-Vortex/ /projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif /bin/bash << 'EOF'
