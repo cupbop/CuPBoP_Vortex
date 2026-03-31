@@ -34,10 +34,7 @@
 
 using namespace llvm;
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
+// cupbop_debug() defined in tool.h
 #define DBG_PRINT(...) do { if (cupbop_debug()) printf(__VA_ARGS__); } while(0)
 
 bool triton_cupbop_enabled() {

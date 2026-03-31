@@ -4,6 +4,12 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include <cstdlib>
+
+inline bool cupbop_debug() {
+  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
+  return enabled;
+}
 llvm::Module *LoadModuleFromFilr(char *file_name);
 void DumpModule(llvm::Module *M, char *file_name);
 bool isKernelFunction(llvm::Module *M, llvm::Function *F);
