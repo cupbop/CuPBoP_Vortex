@@ -128,7 +128,7 @@ struct PreserveDivergenceMetadataPass : public llvm::PassInfoMixin<PreserveDiver
 };
 
 void performance_optimization(llvm::Module *M) {
-  printf("performance optimization\n");
+  if (cupbop_debug()) printf("performance optimization\n");
   for (auto F = M->begin(); F != M->end(); F++) {
     for (auto I = F->arg_begin(); I != F->arg_end(); ++I) {
       if (I->getType()->isPointerTy()) {
@@ -143,17 +143,13 @@ void performance_optimization(llvm::Module *M) {
   llvm::CGSCCAnalysisManager CGAM;
   llvm::ModuleAnalysisManager MAM;
 
-  printf("registering analysis MAM\n");
+  if (cupbop_debug()) printf("registering analyses\n");
   PassBuilder.registerModuleAnalyses(MAM);
-  printf("registering analysi CGAM\n");
   PassBuilder.registerCGSCCAnalyses(CGAM);
-  printf("registering analysis FAM\n");
   PassBuilder.registerFunctionAnalyses(FAM);
-  printf("registering analysis LAM\n");
   PassBuilder.registerLoopAnalyses(LAM);
-  printf("registering analysis overall\n");
   PassBuilder.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  printf("registering analysis done\n");
+  if (cupbop_debug()) printf("registering analyses done\n");
 
   llvm::ModulePassManager MPM = llvm::ModulePassManager();;
   llvm::OptimizationLevel OptLevel = llvm::OptimizationLevel::O3;
@@ -173,11 +169,9 @@ void performance_optimization(llvm::Module *M) {
   */
 
 
-  printf("running analysis\n");
-  //print the entire IR
-  // M->print(llvm::errs(), nullptr);
+  if (cupbop_debug()) printf("running analysis\n");
   MPM.run(*M, MAM);
-  printf("analysis done\n");
+  if (cupbop_debug()) printf("analysis done\n");
 }
 
 
