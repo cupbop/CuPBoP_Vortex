@@ -32,9 +32,9 @@ void split_block_by_sync(llvm::Function *F) {
       // }
       llvm::CallInst *Call = llvm::dyn_cast<llvm::CallInst>(inst);
       if (Call) {
-        if (Call->isInlineAsm())
+        if (Call->isInlineAsm() || !Call->getCalledFunction())
           continue;
-        auto func_name = Call->getCalledOperand()->getName().str();
+        auto func_name = Call->getCalledFunction()->getName().str();
         if (func_name == "llvm.nvvm.barrier0" ||
             isWarpSync(func_name) ||
             func_name == "llvm.nvvm.barrier.sync" ||

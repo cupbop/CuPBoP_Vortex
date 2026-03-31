@@ -1054,6 +1054,7 @@ void replace_asm_call(llvm::Module *M) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
+            if (!asm_inst) continue;
             auto asm_str = asm_inst->getAsmString();
 
             if (asm_str == "mov.u32 $0, %laneid;") {
@@ -1346,7 +1347,7 @@ bool has_warp_barrier(llvm::BasicBlock *B) {
     Instruction *inst = &(*i);
     llvm::CallInst *Call = llvm::dyn_cast<llvm::CallInst>(inst);
     if (Call) {
-      if (Call->isInlineAsm())
+      if (Call->isInlineAsm() || !Call->getCalledFunction())
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
       if (isWarpSync(func_name)) {
@@ -1362,7 +1363,7 @@ bool has_barrier(llvm::BasicBlock *B) {
     Instruction *inst = &(*i);
     llvm::CallInst *Call = llvm::dyn_cast<llvm::CallInst>(inst);
     if (Call) {
-      if (Call->isInlineAsm())
+      if (Call->isInlineAsm() || !Call->getCalledFunction())
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
       if (func_name == "llvm.nvvm.barrier0" || isWarpSync(func_name) ||
@@ -1379,7 +1380,7 @@ bool has_block_barrier(llvm::BasicBlock *B) {
     Instruction *inst = &(*i);
     llvm::CallInst *Call = llvm::dyn_cast<llvm::CallInst>(inst);
     if (Call) {
-      if (Call->isInlineAsm())
+      if (Call->isInlineAsm() || !Call->getCalledFunction())
         continue;
       auto func_name = Call->getCalledFunction()->getName().str();
       if (func_name == "llvm.nvvm.barrier0" ||

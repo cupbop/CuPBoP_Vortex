@@ -469,9 +469,9 @@ public:
       for (BasicBlock::iterator j = (*i)->begin(), e = (*i)->end(); j != e;
            ++j) {
         if (auto Call = dyn_cast<CallInst>(j)) {
-          if (Call->isInlineAsm())
+          if (Call->isInlineAsm() || !Call->getCalledFunction())
             continue;
-          auto func_name = Call->getCalledOperand()->getName().str();
+          auto func_name = Call->getCalledFunction()->getName().str();
           if (func_name == "llvm.nvvm.barrier0" ||
               isWarpSync(func_name) ||
               func_name == "llvm.nvvm.barrier.sync") {

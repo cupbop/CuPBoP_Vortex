@@ -1291,9 +1291,9 @@ public:
       bool has_barrier = 0;
       for (auto i = current->begin(), e = current->end(); i != e; ++i) {
         if (llvm::CallInst *call_inst = llvm::dyn_cast<llvm::CallInst>(&(*i))) {
-          if (call_inst->isInlineAsm())
+          if (call_inst->isInlineAsm() || !call_inst->getCalledFunction())
             continue;
-          auto func_name = call_inst->getCalledOperand()->getName().str();
+          auto func_name = call_inst->getCalledFunction()->getName().str();
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync")
             has_barrier = 1;
@@ -1493,9 +1493,9 @@ public:
     for (Function::iterator s = F->begin(); s != F->end(); s++) {
       if (llvm::CallInst *call_inst =
               llvm::dyn_cast<llvm::CallInst>(s->begin())) {
-        if (call_inst->isInlineAsm())
+        if (call_inst->isInlineAsm() || !call_inst->getCalledFunction())
           continue;
-        auto func_name = call_inst->getCalledOperand()->getName().str();
+        auto func_name = call_inst->getCalledFunction()->getName().str();
         if (func_name == "llvm.nvvm.barrier0" ||
             func_name == "llvm.nvvm.barrier.sync") {
               // print the whole function(s)
