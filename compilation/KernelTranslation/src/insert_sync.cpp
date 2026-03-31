@@ -32,10 +32,6 @@
 
 using namespace llvm;
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
 
 class InsertBuiltInBarrier : public llvm::FunctionPass {
 

@@ -12,10 +12,6 @@
 
 using namespace llvm;
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
 
 void split_block_by_sync(llvm::Function *F) {
   std::set<llvm::Instruction *> sync_inst;

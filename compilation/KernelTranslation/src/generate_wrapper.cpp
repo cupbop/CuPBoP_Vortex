@@ -25,10 +25,6 @@
 
 using namespace llvm;
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
 
 void set_meta_data(llvm::Module *M) {
   std::string arch = std::getenv("VORTEX_ARCHITECTURE");

@@ -19,10 +19,6 @@
 #include <vector>
 
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
 
 //Previous approach (Shared mem -> Global mem)
 void mem_share2global(llvm::Module *M) {

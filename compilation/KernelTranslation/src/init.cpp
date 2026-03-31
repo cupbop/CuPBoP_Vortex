@@ -28,10 +28,6 @@
 
 using namespace llvm;
 
-static bool cupbop_debug() {
-  static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
-  return enabled;
-}
 
 bool inline_warp_level_func(llvm::Module *M) {
   bool changed = false;
