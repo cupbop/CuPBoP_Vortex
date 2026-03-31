@@ -137,13 +137,12 @@ jobs:
               fi
               ;;
             nw)
-              # CI uses smaller input (CI_RUN_ARGS=32) so golden (128) won't match
+              GOLDEN="${EXAMPLE_DIR}/golden_result_nw.txt"
               RESULT_FILE="${EXAMPLE_DIR}/result_vortex.txt"
-              if [ -f "$RESULT_FILE" ] && [ -s "$RESULT_FILE" ]; then
-                echo "Correctness: PASS (result file generated)"
-                RESULT="PASS"
+              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
+                diff -q "$GOLDEN" "$RESULT_FILE" && echo "Correctness: PASS" && RESULT="PASS" || { echo "Correctness: FAIL"; diff "$GOLDEN" "$RESULT_FILE" || true; }
               else
-                echo "Correctness: FAIL (result file missing or empty)"
+                echo "Correctness: FAIL (golden or result file missing)"
               fi
               ;;
             hotspot)
