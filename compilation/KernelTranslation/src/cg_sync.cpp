@@ -27,8 +27,6 @@ bool isCGThreadGroupSync(const std::string &FuncNameStr) {
 // @_ZNK18cooperative_groups12thread_group4syncEv(
 bool isCGSync(const std::string &name) {
     bool state = isCGThreadBlockSync(name) || isCGThreadGroupSync(name);
-    if (state && cupbop_debug())
-      printf("Found CG Sync: %s\n", name.c_str());
     return state;
 }
 
