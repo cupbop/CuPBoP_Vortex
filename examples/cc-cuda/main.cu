@@ -48,7 +48,7 @@ June 2018.
 #include <chrono>
 #include "graph.h"
 
-static const int ThreadsPerBlock = 1024;
+static const int ThreadsPerBlock = 256;  // reduced from 1024 for Vortex (512 threads/core limit)
 static const int warpsize = 32;
 
 static __device__ int topL, posL, topH, posH;
