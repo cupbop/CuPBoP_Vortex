@@ -924,10 +924,6 @@ ScheduleInfo sche_data;
 void add_mapping_variable(llvm::Function* F, bool intra_warp_loop, 
       bool need_nested_loop, int schedule_flag)
 {
-  // Define perform once in the outermost loop
-  if (need_nested_loop && intra_warp_loop)
-    return;
-
   IRBuilder<> builder(&*(F->getEntryBlock().getFirstInsertionPt()));
   auto M = F->getParent();
 
@@ -939,6 +935,28 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   // Load basic software info
   auto sw_block_size = createLoad(builder, M->getGlobalVariable("block_size"));
   auto sw_warp_size = builder.getInt32(SW_WARP_SIZE);
+
+  // For nested loops: intra_warp pass handles inner loop (warp-level),
+  // inter_warp pass handles outer loop (block-level).
+  // Skip full setup for intra_warp pass when nested — the inter_warp pass
+  // will set up outer loop variables. But still set inner loop variables.
+  if (need_nested_loop && intra_warp_loop) {
+    // Only set inner loop variables for intra_warp pass
+    if (schedule_flag == 1) {
+      FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
+      FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
+      auto tid = builder.CreateCall(tidC, {}, "hw_tid");
+      auto nHT = builder.CreateCall(nHTC, {}, "nHT");
+      sche_data.inner_loop_init = tid;
+      sche_data.inner_loop_inc = nHT;
+      sche_data.inner_loop_cond = sw_warp_size;
+    } else { // Schedule 0
+      sche_data.inner_loop_init = builder.getInt32(0);
+      sche_data.inner_loop_inc = builder.getInt32(1);
+      sche_data.inner_loop_cond = sw_warp_size;
+    }
+    return;
+  }
 
   if (schedule_flag == 1) {
       // Get hardware information
@@ -1189,9 +1207,9 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
   for (auto BB = F->begin(); BB != F->end(); ++BB) {
     for (auto BI = BB->begin(); BI != BB->end(); BI++) {
       if (auto Call = dyn_cast<CallInst>(BI)) {
-        if (Call->isInlineAsm())
+        if (Call->isInlineAsm() || !Call->getCalledFunction())
           continue;
-        auto func_name = Call->getCalledOperand()->getName().str();
+        auto func_name = Call->getCalledFunction()->getName().str();
         if (isWarpSync(func_name)) {
           barriers.push_back(Call);
         }
@@ -1617,9 +1635,9 @@ bool has_warp_barrier(llvm::Module *M) {
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
-          if (Call->isInlineAsm())
+          if (Call->isInlineAsm() || !Call->getCalledFunction())
             continue;
-          auto func_name = Call->getCalledOperand()->getName().str();
+          auto func_name = Call->getCalledFunction()->getName().str();
           if (isWarpSync(func_name)) {
             return true;
           }

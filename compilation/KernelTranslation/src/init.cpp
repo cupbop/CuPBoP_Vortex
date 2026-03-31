@@ -257,16 +257,19 @@ void create_global_variable(llvm::Module *M) {
   }
 
   // TLS variable used for warp-level collective operators
-  new llvm::GlobalVariable(
+  auto warp_shfl = new llvm::GlobalVariable(
       *M, WarpArrayType, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "warp_shfl", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  warp_shfl->setDSOLocal(true);
   auto warp_vote = new llvm::GlobalVariable(
       *M, VoteArrayType, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "warp_vote", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
   warp_vote->setAlignment(llvm::MaybeAlign(32));
+  warp_vote->setDSOLocal(true);
   auto vote_count = new llvm::GlobalVariable(
       *M, I32, false, llvm::GlobalValue::ExternalLinkage, NULL,
       "vote_count", NULL, llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
+  vote_count->setDSOLocal(true);
 }
 
 void remove_metadata(llvm::Module *M) {
