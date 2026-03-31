@@ -116,7 +116,7 @@ struct PreserveDivergenceMetadataPass : public llvm::PassInfoMixin<PreserveDiver
             for (auto &BB : F) {
                 for (auto &I : BB) {
                     if (I.hasMetadata("divergence")) {
-                        llvm::errs() << "Preserving metadata for instruction: " << I << "\n";
+                        // llvm::errs() << "Preserving metadata for instruction: " << I << "\n";
                         // 복사 로직 추가 (필요시)
                         I.setMetadata("divergence", I.getMetadata("divergence"));
                     }
@@ -175,7 +175,7 @@ void performance_optimization(llvm::Module *M) {
 
   printf("running analysis\n");
   //print the entire IR
-  M->print(llvm::errs(), nullptr);
+  // M->print(llvm::errs(), nullptr);
   MPM.run(*M, MAM);
   printf("analysis done\n");
 }

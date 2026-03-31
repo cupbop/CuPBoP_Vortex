@@ -326,7 +326,7 @@ void mem_share2global_sche_2(llvm::Module *M) {
       auto *SlicedTy = ArrayType::get(ElemTy, NumCTAForType);
       NewGV = createNoTLSGlobal(SlicedTy, "wrapper_global_" + SM->getName().str());
     } else {
-      errs() << "[mem_share2global_sche_2] Unsupported shared type: " << *ElemTy << "\n";
+      // errs() << "[mem_share2global_sche_2] Unsupported shared type: " << *ElemTy << "\n";
       report_fatal_error("Unsupported shared memory element type");
     }
 
@@ -350,7 +350,7 @@ void mem_share2global_sche_2(llvm::Module *M) {
     // SCHE_2: blockIdx is a TLS dim3_t struct
     auto *blockIdxGV = M->getGlobalVariable("blockIdx", /*AllowInternal*/true);
     if (!blockIdxGV) {
-      errs() << "[mem_share2global_sche_2] missing both " << Name << " and blockIdx\n";
+      // errs() << "[mem_share2global_sche_2] missing both " << Name << " and blockIdx\n";
       report_fatal_error("missing block index global");
     }
     FunctionCallee tla = M->getOrInsertFunction(
@@ -372,7 +372,7 @@ void mem_share2global_sche_2(llvm::Module *M) {
     // SCHE_2: gridDim is a non-TLS dim3_t struct
     auto *gridDimGV = M->getGlobalVariable("gridDim", /*AllowInternal*/true);
     if (!gridDimGV) {
-      errs() << "[mem_share2global_sche_2] missing both " << Name << " and gridDim\n";
+      // errs() << "[mem_share2global_sche_2] missing both " << Name << " and gridDim\n";
       report_fatal_error("missing grid size global");
     }
     int field = (strcmp(Name, "grid_size_x") == 0) ? 0 : 1;
@@ -462,15 +462,15 @@ void mem_share2global_sche_2(llvm::Module *M) {
   // 5) Delete original shared globals
   for (auto *G : ToErase) {
     if (!G->use_empty()) {
-      errs() << "[mem_share2global_sche_2] still used (BUG): " << G->getName() << "\n";
+      // errs() << "[mem_share2global_sche_2] still used (BUG): " << G->getName() << "\n";
     }
     G->dropAllReferences();
     G->eraseFromParent();
   }
 
   // 6) Debugging output
-  errs() << "[mem_share2global_sche_2] converted " << MapToSlicedGlobal.size()
-         << " shared globals; Declared per-CTA slices = " << NumCTAForType << "\n";
+  // errs() << "[mem_share2global_sche_2] converted " << MapToSlicedGlobal.size()
+  //        << " shared globals; Declared per-CTA slices = " << NumCTAForType << "\n";
 }
 
 

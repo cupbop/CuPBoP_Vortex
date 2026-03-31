@@ -481,10 +481,10 @@ public:
               func_name == "llvm.nvvm.barrier.sync") {
                 //printf("found barrier inst new!\n");
                 // print the whole block
-                (*i)->print(errs());
+                // (*i)->print(errs());
                 // print the whole function
                 //printf("-----------------\n");
-                L->getHeader()->getParent()->print(errs());
+                // L->getHeader()->getParent()->print(errs());
             is_conditional_loop = true;
             if (isWarpSync(func_name)) {
               is_warp = 1;
