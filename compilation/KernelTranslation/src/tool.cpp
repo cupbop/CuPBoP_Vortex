@@ -410,7 +410,6 @@ void replace_built_in_function(llvm::Module *M) {
                 need_remove.push_back(Call);
               } else {
                 auto block_size_x_tmp = M->getGlobalVariable("block_size_x");
-                errs() << block_size_x_tmp;
 
                 Constant *const_intra_warp_idx =
                     global_intra_warp_idx->getInitializer();
@@ -712,11 +711,6 @@ void replace_built_in_function(llvm::Module *M) {
                   llvm::CallInst::Create(func_printf, printf_args, "", Call);
               // insert
               Call->replaceAllUsesWith(c_printf_inst);
-              Call->print(errs());
-              // print Call->getArgOperand(1)
-              Call->getArgOperand(1)->print(errs());
-              // print the entire module
-              M->print(errs(), nullptr);
               need_remove.push_back(Call);
             } else if (func_name == "__nv_fast_log2f" ||
                        func_name == "__nv_log2f" ||
@@ -731,7 +725,6 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "__nv_powif" ||
                        func_name == "__nv_erfcf" ||
                        func_name == "__nv_ffs" || func_name == "__nv_popc") {
-              dbgs() << "Removing call to " << func_name << "\n";
               Call->getCalledFunction()->deleteBody();
             } else if (func_name == "llvm.nvvm.fma.rn.d") {
               Call->getCalledFunction()->setName("__nvvm_fma_rn_d");
