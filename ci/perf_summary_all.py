@@ -67,6 +67,10 @@ def main():
         if instrs == 0:
             continue
 
+        status = read_status(examples_dir, benchmark, schedule, lmem)
+        if status == "N/A":
+            continue  # skip stale perf files from previous runs
+
         key = (schedule, lmem)
         if key not in group_data:
             group_data[key] = []
@@ -75,7 +79,7 @@ def main():
             'instrs': instrs,
             'cycles': cycles,
             'ipc': ipc,
-            'status': read_status(examples_dir, benchmark, schedule, lmem),
+            'status': status,
         })
 
     for key in sorted(group_data.keys()):
