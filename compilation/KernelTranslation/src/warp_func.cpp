@@ -221,47 +221,20 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
 
   // get the callee functions to be replaced
   set<CallInst *> replace;
-  // For FLAT mode with C++ wrappers: collect wrapper calls (not NVVM intrinsics
-  // inside them). The wrapper calls have the same arg layout (mask, val, offset, width).
-  // NVVM intrinsics that are inside inlined wrapper code must NOT be replaced
-  // separately — they'd cause domination errors since the wrapper's control flow
-  // (sub, srem etc.) is already interleaved with kernel code.
-  bool hasCppWrappers = false;
-  if (mapping_ == MAPPING_FLAT) {
-    for (auto &f : m.functions()) {
-      // Detect C++ mangled __shfl*_sync functions (both declarations and definitions)
-      if (!shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
-        hasCppWrappers = true;
-    }
-  }
-
   for (auto &f : m.functions()) {
     if (f.isDeclaration())
-      continue;
-    // For FLAT mode: skip C++ shfl wrapper function bodies (we replace
-    // the calls to them, not the NVVM intrinsics inside them)
-    if (hasCppWrappers &&
-        !shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
       continue;
     for (auto &bb : f) {
       for (auto &i : bb) {
         auto ci = dyn_cast<CallInst>(&i);
         if (!ci || ci->isInlineAsm())
           continue;
-        auto *calledFunc = ci->getCalledFunction();
-        if (!calledFunc)
+        auto calledOp = ci->getCalledOperand();
+        if (!calledOp || !calledOp->hasName())
           continue;
-        auto calleeName = calledFunc->getName().str();
-        if (hasCppWrappers && mapping_ == MAPPING_FLAT) {
-          // FLAT + C++ wrappers: replace wrapper calls with warp_shfl emulation.
-          // Skip NVVM intrinsics (they're inside wrapper bodies).
-          if (!shflFuncs.count(calleeName) && isShflCall(calleeName))
-            replace.insert(ci);
-        } else {
-          // 1TO1/other modes, or no C++ wrappers: replace NVVM intrinsics.
-          // C++ wrapper calls are resolved at link time by cudaKernelImpl.
-          if (shflFuncs.count(calleeName))
-            replace.insert(ci);
+        auto name_callee = calledOp->getName().str();
+        if (shflFuncs.count(name_callee)) {
+          replace.insert(ci);
         }
       }
     }
@@ -279,21 +252,6 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
   case MAPPING_X86:
     replaceWarpShflX86(m, replace);
     break;
-  }
-
-  // For FLAT mode: remove now-unused C++ shfl wrapper functions and their
-  // NVVM intrinsic declarations. After replacement, these are dead code and
-  // would crash the RISC-V backend if left (NVVM intrinsics are not valid
-  // RISC-V ops). For 1TO1 mode, C++ wrappers are resolved at link time
-  // by cudaKernelImpl, so don't remove them.
-  if (mapping_ == MAPPING_FLAT) {
-    SmallVector<Function *, 8> toRemove;
-    for (auto &f : m.functions()) {
-      if (f.use_empty() && isShflCall(f.getName().str()))
-        toRemove.push_back(&f);
-    }
-    for (auto *f : toRemove)
-      f->eraseFromParent();
   }
 
   return !replace.empty();
