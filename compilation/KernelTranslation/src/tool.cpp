@@ -493,21 +493,20 @@ void replace_built_in_function(llvm::Module *M) {
 
                 auto thread_idx = builder.CreateBinOp(
                     Instruction::Mul, createLoad(builder, local_inter_warp_idx),
-                    ConstantInt::get(I32, 4),
-                    ""); // Mark temp  (changed 32 -> 4)
+                    ConstantInt::get(I32, 32),
+                    ""); // SW_WARP_SIZE = 32
                 thread_idx = builder.CreateBinOp(
                     Instruction::Add, createLoad(builder, local_intra_warp_idx),
                     thread_idx, "thread_idx");
-                // tidy = tid / block_dim.x
+                // tidy = (flat_tid / block_size_x) % block_size_y
                 thread_idx = builder.CreateBinOp(
                     Instruction::SDiv, thread_idx,
                     createLoad(builder, M->getGlobalVariable("block_size_x")),
+                    "");
+                thread_idx = builder.CreateBinOp(
+                    Instruction::SRem, thread_idx,
+                    createLoad(builder, M->getGlobalVariable("block_size_y")),
                     "thread_id_y");
-
-                // Add metadata to indicate non-uniformity
-                // MDNode* N = MDNode::get(context, MDString::get(context,
-                // "non-uniform"));
-                // cast<Instruction>(thread_idx)->setMetadata("divergence", N);
 
                 Call->replaceAllUsesWith(thread_idx);
                 need_remove.push_back(Call);
@@ -532,10 +531,27 @@ void replace_built_in_function(llvm::Module *M) {
                 Call->replaceAllUsesWith(tidz);
                 need_remove.push_back(Call);
               } else {
-                if (cupbop_debug()) printf("[WARNING] We DO NOT support triple-dim block\n");
-                exit(1);
-                auto zero = ConstantInt::get(I32, 0);
-                Call->replaceAllUsesWith(zero);
+                // tidz = flat_tid / (block_size_x * block_size_y)
+                IRBuilder<> builder(context);
+                builder.SetInsertPoint(Call);
+
+                auto thread_idx = builder.CreateBinOp(
+                    Instruction::Mul, createLoad(builder, local_inter_warp_idx),
+                    ConstantInt::get(I32, 32),
+                    ""); // SW_WARP_SIZE = 32
+                thread_idx = builder.CreateBinOp(
+                    Instruction::Add, createLoad(builder, local_intra_warp_idx),
+                    thread_idx, "thread_idx");
+                auto block_xy = builder.CreateBinOp(
+                    Instruction::Mul,
+                    createLoad(builder, M->getGlobalVariable("block_size_x")),
+                    createLoad(builder, M->getGlobalVariable("block_size_y")),
+                    "block_size_xy");
+                thread_idx = builder.CreateBinOp(
+                    Instruction::SDiv, thread_idx, block_xy,
+                    "thread_id_z");
+
+                Call->replaceAllUsesWith(thread_idx);
                 need_remove.push_back(Call);
               }
             }

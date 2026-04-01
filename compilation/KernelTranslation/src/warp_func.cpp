@@ -205,24 +205,63 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
                 "llvm.nvvm.shfl.sync.bfly.f32",
                 "llvm.nvvm.shfl.sync.idx.f32"};
 
+  // Also match C++ mangled __shfl*_sync functions for FLAT mode.
+  // These appear when CUDA code uses __shfl_sync() directly.
+  // The C++ wrappers have same arg layout as NVVM: (mask, val, offset, width).
+  auto isShflCall = [&](const string &name) -> bool {
+    if (shflFuncs.count(name))
+      return true;
+    if (name.find("__shfl_down_sync") != string::npos ||
+        name.find("__shfl_up_sync") != string::npos ||
+        name.find("__shfl_xor_sync") != string::npos ||
+        name.find("__shfl_sync") != string::npos)
+      return true;
+    return false;
+  };
+
   // get the callee functions to be replaced
   set<CallInst *> replace;
+  // For FLAT mode with C++ wrappers: collect wrapper calls (not NVVM intrinsics
+  // inside them). The wrapper calls have the same arg layout (mask, val, offset, width).
+  // NVVM intrinsics that are inside inlined wrapper code must NOT be replaced
+  // separately — they'd cause domination errors since the wrapper's control flow
+  // (sub, srem etc.) is already interleaved with kernel code.
+  bool hasCppWrappers = false;
+  if (mapping_ == MAPPING_FLAT) {
+    for (auto &f : m.functions()) {
+      // Detect C++ mangled __shfl*_sync functions (both declarations and definitions)
+      if (!shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
+        hasCppWrappers = true;
+    }
+  }
+
   for (auto &f : m.functions()) {
-    // if (isKernelFunction(&m, &f))
-    //   continue;
-    auto name_caller = f.getName().str();
-    //dbgs() << "Processing function: " << name_caller << "\n";
+    if (f.isDeclaration())
+      continue;
+    // For FLAT mode: skip C++ shfl wrapper function bodies (we replace
+    // the calls to them, not the NVVM intrinsics inside them)
+    if (hasCppWrappers &&
+        !shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
+      continue;
     for (auto &bb : f) {
       for (auto &i : bb) {
         auto ci = dyn_cast<CallInst>(&i);
         if (!ci || ci->isInlineAsm())
           continue;
-        auto name_callee = ci->getCalledOperand()->getName();
-        if (shflFuncs.count(name_callee.str())) {
-          //dbgs() << "\nshfl detected: ";
-          ci->print(dbgs(), true);
-          //dbgs() << "\n";
-          replace.insert(ci);
+        auto *calledFunc = ci->getCalledFunction();
+        if (!calledFunc)
+          continue;
+        auto calleeName = calledFunc->getName().str();
+        if (hasCppWrappers && mapping_ == MAPPING_FLAT) {
+          // FLAT + C++ wrappers: replace wrapper calls with warp_shfl emulation.
+          // Skip NVVM intrinsics (they're inside wrapper bodies).
+          if (!shflFuncs.count(calleeName) && isShflCall(calleeName))
+            replace.insert(ci);
+        } else {
+          // 1TO1/other modes, or no C++ wrappers: replace NVVM intrinsics.
+          // C++ wrapper calls are resolved at link time by cudaKernelImpl.
+          if (shflFuncs.count(calleeName))
+            replace.insert(ci);
         }
       }
     }
@@ -241,6 +280,22 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
     replaceWarpShflX86(m, replace);
     break;
   }
+
+  // For FLAT mode: remove now-unused C++ shfl wrapper functions and their
+  // NVVM intrinsic declarations. After replacement, these are dead code and
+  // would crash the RISC-V backend if left (NVVM intrinsics are not valid
+  // RISC-V ops). For 1TO1 mode, C++ wrappers are resolved at link time
+  // by cudaKernelImpl, so don't remove them.
+  if (mapping_ == MAPPING_FLAT) {
+    SmallVector<Function *, 8> toRemove;
+    for (auto &f : m.functions()) {
+      if (f.use_empty() && isShflCall(f.getName().str()))
+        toRemove.push_back(&f);
+    }
+    for (auto *f : toRemove)
+      f->eraseFromParent();
+  }
+
   return !replace.empty();
 }
 
@@ -308,10 +363,21 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
       auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
                                            ConstantInt::get(I32, 32));
       loadAndReplace(new_index);
-    } else if (shfl_name.find("bfly") != shfl_name.npos) {
+    } else if (shfl_name.find("bfly") != shfl_name.npos ||
+               shfl_name.find("xor") != shfl_name.npos) {
       auto calculate_offset = builder.CreateBinOp(
           Instruction::Xor, new_intra_warp_index, shfl_offset);
       auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
+                                           ConstantInt::get(I32, 32));
+      loadAndReplace(new_index);
+    } else if (shfl_name.find("idx") != shfl_name.npos) {
+      // shfl_sync idx: read from lane shfl_offset directly
+      auto new_index = builder.CreateBinOp(Instruction::SRem, shfl_offset,
+                                           ConstantInt::get(I32, 32));
+      loadAndReplace(new_index);
+    } else {
+      // Plain __shfl_sync (no down/up/xor/bfly/idx suffix) = idx variant
+      auto new_index = builder.CreateBinOp(Instruction::SRem, shfl_offset,
                                            ConstantInt::get(I32, 32));
       loadAndReplace(new_index);
     }

@@ -442,7 +442,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    block_size_y = ctx->local_size[1];\n"
             "    block_size_z = ctx->local_size[2];\n"
             "\n"
-            "    block_size = ctx->local_size[0] * ctx->local_size[1];\n";
+            "    block_size = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n";
     }
 
     ss << "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"

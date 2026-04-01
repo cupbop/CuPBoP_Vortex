@@ -32,7 +32,7 @@ constexpr unsigned int blockYLv2(5);
 constexpr unsigned int blockZLv2(9);
 constexpr unsigned int voxelNumLv2(blockXLv2* blockYLv2* blockZLv2);
 
-constexpr unsigned int countingThreadNumLv2(1024);
+constexpr unsigned int countingThreadNumLv2(256);
 constexpr unsigned int gridXLv2(gridXLv1* blockXLv2);
 constexpr unsigned int gridYLv2(gridYLv1* blockYLv2);
 //constexpr unsigned int gridZLv2(gridZLv1* blockZLv2);
