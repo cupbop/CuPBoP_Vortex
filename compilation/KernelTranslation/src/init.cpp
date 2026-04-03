@@ -607,18 +607,23 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
       break;
   }
   // Inline helper functions that transitively call shfl into kernel functions.
-  // This ensures warp_shfl emulation code ends up in the kernel body where
-  // split_block_by_sync and insert_warp_loop can properly wrap it.
-  while (1) {
-    if (!inline_shfl_helpers(M))
-      break;
-  }
-  // Re-run inline_func_with_tid after inline_shfl_helpers, because the
-  // inlined helper code may contain threadIdx wrapper calls (__fetch_builtin_xEv)
-  // that need to be inlined so tool.cpp can replace them with intra_warp_index.
-  while (1) {
-    if (!inline_func_with_tid(M))
-      break;
+  // Only needed for SCHE_0 (FLAT mode) where shfl is emulated via warp_shfl array.
+  // For SCHE_2, shfl wrappers are replaced in-place by replaceWarpShfl1to1.
+  int sched = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG"))
+    sched = std::stoi(std::string(env));
+  if (sched == 0) {
+    while (1) {
+      if (!inline_shfl_helpers(M))
+        break;
+    }
+    // Re-run inline_func_with_tid after inline_shfl_helpers, because the
+    // inlined helper code may contain threadIdx wrapper calls (__fetch_builtin_xEv)
+    // that need to be inlined so tool.cpp can replace them with intra_warp_index.
+    while (1) {
+      if (!inline_func_with_tid(M))
+        break;
+    }
   }
   // Re-run remove_cuda_built_in to replace any new threadIdx/blockDim
   // NVVM intrinsics exposed by the helper inlining above.

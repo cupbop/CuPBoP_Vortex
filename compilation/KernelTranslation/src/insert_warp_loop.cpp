@@ -604,9 +604,10 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
       for (auto ii = bb->begin(); ii != bb->end(); ii++) {
         if (isa<AllocaInst>(&(*ii))) {
           auto alloc = dyn_cast<AllocaInst>(&(*ii));
-          // Skip context arrays created by prior AddContextSaveRestore
+          // Skip context arrays and shfl emulation temporaries
           if (alloc->getName().contains("_intra_warp_") ||
-              alloc->getName().contains("_inter_warp_"))
+              alloc->getName().contains("_inter_warp_") ||
+              alloc->getName().starts_with("shfl_"))
             continue;
           // if this alloc's write are all non-divergence, then no need to
           // replicate
@@ -922,9 +923,10 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
     for (auto &F_inst : F->getEntryBlock()) {
       auto *AI = dyn_cast<AllocaInst>(&F_inst);
       if (!AI) continue;
-      // Skip context arrays created by prior AddContextSaveRestore calls
+      // Skip context arrays and shfl emulation temporaries
       if (AI->getName().contains("_intra_warp_") ||
-          AI->getName().contains("_inter_warp_"))
+          AI->getName().contains("_inter_warp_") ||
+          AI->getName().starts_with("shfl_"))
         continue;
       // Find which regions contain stores and loads to this alloca
       int store_region = -1, load_region = -1;

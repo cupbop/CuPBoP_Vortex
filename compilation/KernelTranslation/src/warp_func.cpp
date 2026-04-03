@@ -232,8 +232,11 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
     for (auto &f : m.functions()) {
       if (f.isDeclaration())
         continue;
-      // Skip wrapper function bodies
-      if (!shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
+      // Only replace in kernel functions — helper functions like
+      // parallel_prefix_sum have their shfl calls inlined into kernels
+      // by inline_shfl_helpers. Replacing in non-kernel functions causes
+      // domination errors because they aren't wrapped by warp loops.
+      if (!isKernelFunction(&m, const_cast<Function*>(&f)))
         continue;
       for (auto &bb : f) {
         for (auto &i : bb) {
@@ -334,69 +337,73 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
     auto shfl_variable = shfl_inst->getArgOperand(1);
     auto shfl_offset = shfl_inst->getArgOperand(2);
     bool isFloat = shfl_variable->getType()->isFloatTy();
+    auto shfl_name = shfl_inst->getCalledOperand()->getName().str();
+
+    // Always use allocas for shfl_offset — split_block_by_sync splits at
+    // barrier0 later, which can separate operand definition from use.
+    // The allocas are named "shfl_*" so insert_warp_loop skips them
+    // during context save (they're shfl emulation temporaries, not user data).
+    Function *F = shfl_inst->getParent()->getParent();
+    IRBuilder<> entryBuilder(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+    auto *offset_alloca = entryBuilder.CreateAlloca(I32, nullptr, "shfl_off");
+    auto *result_alloca = entryBuilder.CreateAlloca(
+        isFloat ? builder.getFloatTy() : I32, nullptr, "shfl_res");
+
+    // Store offset before barrier
+    builder.CreateStore(shfl_offset, offset_alloca);
 
     auto intra_warp_index =
         createLoad(builder, m.getGlobalVariable("intra_warp_index"));
-    // warp_shfl is [32 x i32], so bitcast float→i32 before store
     Value *val_to_store = shfl_variable;
     if (isFloat)
         val_to_store = builder.CreateBitCast(val_to_store, I32);
     auto store_gep = builder.CreateGEP(warp_shfl_ptr->getValueType(),
                                         warp_shfl_ptr, {C0, intra_warp_index});
     builder.CreateStore(val_to_store, store_gep);
-    // Use barrier0 (block-level) instead of bar.warp.sync so that
-    // insert_warp_loop's context save properly handles cross-region allocas.
-    // bar.warp.sync causes BB split but parallel region construction doesn't
-    // always pick up warp barriers for context save analysis.
-    CreateInterWarpBarrier(intra_warp_index);
-    // load shuffled data
+
+    // barrier0: all threads must store before any thread loads
+    CreateInterWarpBarrier(shfl_inst);
+
+    // After barrier: load offset from alloca (survives BB split)
+    auto safe_offset = builder.CreateLoad(I32, offset_alloca, "shfl_off_ld");
     auto new_intra_warp_index =
         createLoad(builder, m.getGlobalVariable("intra_warp_index"));
-    auto shfl_name = shfl_inst->getCalledOperand()->getName().str();
 
-    // Helper: load from warp_shfl, bitcast i32→f32 if needed, then replace
-    auto loadAndReplace = [&](Value *index) {
-      auto gep = builder.CreateGEP(warp_shfl_ptr->getValueType(), warp_shfl_ptr,
-                                    {C0, index});
-      Value *load_inst = builder.CreateLoad(I32, gep);
-      // warp_shfl stores i32, bitcast back to float if original shfl was float
-      if (isFloat)
-        load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
-      CreateInterWarpBarrier(new_intra_warp_index);
-      shfl_inst->replaceAllUsesWith(load_inst);
-      shfl_inst->eraseFromParent();
-    };
-
+    Value *load_index;
     if (shfl_name.find("down") != shfl_name.npos) {
-      auto calculate_offset = builder.CreateBinOp(
-          Instruction::Add, new_intra_warp_index, shfl_offset);
-      auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
-                                           ConstantInt::get(I32, 32));
-      loadAndReplace(new_index);
+      auto calc = builder.CreateAdd(new_intra_warp_index, safe_offset);
+      load_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
     } else if (shfl_name.find("up") != shfl_name.npos) {
-      auto calculate_offset = builder.CreateBinOp(
-          Instruction::Sub, new_intra_warp_index, shfl_offset);
-      auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
-                                           ConstantInt::get(I32, 32));
-      loadAndReplace(new_index);
+      auto calc = builder.CreateSub(new_intra_warp_index, safe_offset);
+      load_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
     } else if (shfl_name.find("bfly") != shfl_name.npos ||
                shfl_name.find("xor") != shfl_name.npos) {
-      auto calculate_offset = builder.CreateBinOp(
-          Instruction::Xor, new_intra_warp_index, shfl_offset);
-      auto new_index = builder.CreateBinOp(Instruction::SRem, calculate_offset,
-                                           ConstantInt::get(I32, 32));
-      loadAndReplace(new_index);
-    } else if (shfl_name.find("idx") != shfl_name.npos) {
-      // shfl_sync idx: read from lane shfl_offset directly
-      auto new_index = builder.CreateBinOp(Instruction::SRem, shfl_offset,
-                                           ConstantInt::get(I32, 32));
-      loadAndReplace(new_index);
+      auto calc = builder.CreateXor(new_intra_warp_index, safe_offset);
+      load_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
     } else {
-      // Plain __shfl_sync (no down/up/xor/bfly/idx suffix) = idx variant
-      auto new_index = builder.CreateBinOp(Instruction::SRem, shfl_offset,
-                                           ConstantInt::get(I32, 32));
-      loadAndReplace(new_index);
+      load_index = builder.CreateSRem(safe_offset, ConstantInt::get(I32, 32));
     }
+
+    auto gep = builder.CreateGEP(warp_shfl_ptr->getValueType(), warp_shfl_ptr,
+                                  {C0, load_index});
+    Value *load_inst = builder.CreateLoad(I32, gep);
+    if (isFloat)
+      load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
+
+    // Store result to alloca, replace uses with per-user loads
+    builder.CreateStore(load_inst, result_alloca);
+    CreateInterWarpBarrier(shfl_inst);
+    std::vector<Instruction *> users;
+    for (auto &U : shfl_inst->uses())
+      if (auto *I = dyn_cast<Instruction>(U.getUser()))
+        users.push_back(I);
+    for (auto *user : users) {
+      IRBuilder<> userBuilder(user);
+      auto *res_load = userBuilder.CreateLoad(
+          isFloat ? builder.getFloatTy() : I32, result_alloca, "shfl_res_ld");
+      user->replaceUsesOfWith(shfl_inst, res_load);
+    }
+    shfl_inst->eraseFromParent();
   }
 }
 
