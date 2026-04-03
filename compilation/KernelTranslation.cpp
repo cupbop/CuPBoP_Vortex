@@ -13,6 +13,8 @@
 #include <iostream>
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/PassManager.h"

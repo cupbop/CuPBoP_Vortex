@@ -33,6 +33,16 @@ bool inline_warp_level_func(llvm::Module *M) {
   bool changed = false;
   std::set<llvm::Function *> need_remove;
 
+  // For SCHE_0 (FLAT), skip inlining shfl wrappers — they will be
+  // replaced by ReplaceWarpLevelPrimitive with warp_shfl emulation.
+  // Inlining them would expose NVVM intrinsics in the kernel body
+  // which causes domination errors when replaceWarpShflFlat tries
+  // to insert store→barrier→load around them in complex control flow.
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG"))
+    schedule = std::stoi(std::string(env));
+  bool skip_shfl_inline = (schedule == 0);
+
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();
@@ -43,9 +53,10 @@ bool inline_warp_level_func(llvm::Module *M) {
       for (BasicBlock::iterator BI = I->begin(), BE = I->end(); BI != BE;) {
         if (CallInst *c = dyn_cast<CallInst>(BI++)) {
           if (c->getCalledFunction()) {
-            auto func_name = c->getCalledOperand()->getName().str();
-            if (func_name == "_Z10__any_syncji" ||
-                func_name.find("shfl_down_sync") != std::string::npos) {
+            auto callee_name = c->getCalledOperand()->getName().str();
+            bool is_any_sync = (callee_name == "_Z10__any_syncji");
+            bool is_shfl = (callee_name.find("shfl_down_sync") != std::string::npos);
+            if (is_any_sync || (is_shfl && !skip_shfl_inline)) {
               InlineFunctionInfo IFI;
               InlineFunction(*c, IFI);
               need_remove.insert(c->getCalledFunction());
@@ -57,8 +68,95 @@ bool inline_warp_level_func(llvm::Module *M) {
     }
   }
   for (auto f : need_remove) {
-    f->dropAllReferences();
-    f->eraseFromParent();
+    if (f->use_empty()) {
+      f->dropAllReferences();
+      f->eraseFromParent();
+    }
+  }
+  return changed;
+}
+
+// Check if a function transitively calls any shfl function
+static bool calls_shfl_transitively(llvm::Function *F,
+                                     std::set<llvm::Function *> &visited) {
+  if (!F || F->isDeclaration())
+    return false;
+  if (visited.count(F))
+    return false;
+  visited.insert(F);
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (CI->isInlineAsm() || !CI->getCalledFunction())
+          continue;
+        auto name = CI->getCalledFunction()->getName().str();
+        if (name.find("shfl_down_sync") != std::string::npos ||
+            name.find("shfl_up_sync") != std::string::npos ||
+            name.find("shfl_xor_sync") != std::string::npos ||
+            name.find("__shfl_sync") != std::string::npos ||
+            name.find("llvm.nvvm.shfl.sync") != std::string::npos)
+          return true;
+        if (calls_shfl_transitively(CI->getCalledFunction(), visited))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Inline functions that transitively contain shfl calls into kernel functions.
+// This ensures warp_shfl store→barrier→load ends up inside the kernel body,
+// where split_block_by_sync and insert_warp_loop can properly process it.
+bool inline_shfl_helpers(llvm::Module *M) {
+  bool changed = false;
+  // Collect inline targets first (avoid iterator invalidation)
+  SmallVector<CallInst *, 16> to_inline;
+  std::set<llvm::Function *> need_remove;
+  for (auto &F : *M) {
+    if (!isKernelFunction(M, &F))
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI || CI->isInlineAsm() || !CI->getCalledFunction())
+          continue;
+        auto *callee = CI->getCalledFunction();
+        auto name = callee->getName().str();
+        // Skip NVVM intrinsics and shfl wrappers (handled by replaceWarpShflFlat)
+        if (name.find("llvm.nvvm.") != std::string::npos)
+          continue;
+        if (name.find("shfl_down_sync") != std::string::npos ||
+            name.find("shfl_up_sync") != std::string::npos ||
+            name.find("shfl_xor_sync") != std::string::npos ||
+            name.find("__shfl_sync") != std::string::npos)
+          continue;
+        // Check if callee transitively calls shfl
+        std::set<llvm::Function *> visited;
+        if (calls_shfl_transitively(callee, visited)) {
+          to_inline.push_back(CI);
+          need_remove.insert(callee);
+        }
+      }
+    }
+  }
+  for (auto *CI : to_inline) {
+    // Save the next instruction after the call — this is where the
+    // inlined code ends and the original code resumes.
+    auto *nextInst = CI->getNextNode();
+    InlineFunctionInfo IFI;
+    InlineFunction(*CI, IFI);
+    // Insert barrier0 after the inlined helper code so that
+    // post-reduction code (e.g., `if (thread_id == 0)`) is in a
+    // separate parallel region for proper context save/restore.
+    if (nextInst)
+      CreateInterWarpBarrier(nextInst);
+    changed = true;
+  }
+  for (auto *F : need_remove) {
+    if (F->use_empty()) {
+      F->dropAllReferences();
+      F->eraseFromParent();
+    }
   }
   return changed;
 }
@@ -508,6 +606,23 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     if (!inline_func_with_tid(M))
       break;
   }
+  // Inline helper functions that transitively call shfl into kernel functions.
+  // This ensures warp_shfl emulation code ends up in the kernel body where
+  // split_block_by_sync and insert_warp_loop can properly wrap it.
+  while (1) {
+    if (!inline_shfl_helpers(M))
+      break;
+  }
+  // Re-run inline_func_with_tid after inline_shfl_helpers, because the
+  // inlined helper code may contain threadIdx wrapper calls (__fetch_builtin_xEv)
+  // that need to be inlined so tool.cpp can replace them with intra_warp_index.
+  while (1) {
+    if (!inline_func_with_tid(M))
+      break;
+  }
+  // Re-run remove_cuda_built_in to replace any new threadIdx/blockDim
+  // NVVM intrinsics exposed by the helper inlining above.
+  remove_cuda_built_in(M);
   // create global variable for warp and vote
   create_global_variable(M);
   // replace phi with data load

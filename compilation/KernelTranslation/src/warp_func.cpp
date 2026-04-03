@@ -221,20 +221,52 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
 
   // get the callee functions to be replaced
   set<CallInst *> replace;
-  for (auto &f : m.functions()) {
-    if (f.isDeclaration())
-      continue;
-    for (auto &bb : f) {
-      for (auto &i : bb) {
-        auto ci = dyn_cast<CallInst>(&i);
-        if (!ci || ci->isInlineAsm())
-          continue;
-        auto calledOp = ci->getCalledOperand();
-        if (!calledOp || !calledOp->hasName())
-          continue;
-        auto name_callee = calledOp->getName().str();
-        if (shflFuncs.count(name_callee)) {
-          replace.insert(ci);
+  if (mapping_ == MAPPING_FLAT) {
+    // FLAT mode: replace C++ wrapper CALLS in the kernel body directly.
+    // Replacing NVVM intrinsics inside wrapper bodies doesn't work because
+    // the wrapper function is not wrapped by the warp loop — only kernel
+    // functions are. So warp_shfl store→load would execute in the same
+    // thread iteration without synchronization.
+    // By replacing the wrapper call in the kernel, the warp_shfl code
+    // ends up inside the kernel body → properly wrapped by warp loop.
+    for (auto &f : m.functions()) {
+      if (f.isDeclaration())
+        continue;
+      // Skip wrapper function bodies
+      if (!shflFuncs.count(f.getName().str()) && isShflCall(f.getName().str()))
+        continue;
+      for (auto &bb : f) {
+        for (auto &i : bb) {
+          auto ci = dyn_cast<CallInst>(&i);
+          if (!ci || ci->isInlineAsm())
+            continue;
+          auto *calledFunc = ci->getCalledFunction();
+          if (!calledFunc)
+            continue;
+          auto name = calledFunc->getName().str();
+          // Match C++ wrapper calls (not NVVM intrinsics).
+          // For SCHE_0, inline_warp_level_func skips shfl inline, so
+          // C++ wrapper calls remain in the kernel body for us to replace.
+          if (!shflFuncs.count(name) && isShflCall(name))
+            replace.insert(ci);
+        }
+      }
+    }
+  } else {
+    // 1TO1/other modes: replace NVVM intrinsics inside wrapper bodies.
+    // The wrapper itself is called from kernel, and the hardware shfl
+    // call inside the wrapper executes correctly with real hardware warps.
+    for (auto &f : m.functions()) {
+      for (auto &bb : f) {
+        for (auto &i : bb) {
+          auto ci = dyn_cast<CallInst>(&i);
+          if (!ci || ci->isInlineAsm())
+            continue;
+          auto calledOp = ci->getCalledOperand();
+          if (!calledOp || !calledOp->hasName())
+            continue;
+          if (shflFuncs.count(calledOp->getName().str()))
+            replace.insert(ci);
         }
       }
     }
@@ -245,6 +277,23 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
     break;
   case MAPPING_FLAT:
     replaceWarpShflFlat(m, replace);
+    // Remove now-unused wrapper functions and NVVM intrinsic declarations
+    // to prevent RISC-V backend crashes on unknown NVVM ops.
+    {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        SmallVector<Function *, 8> toRemove;
+        for (auto &f : m.functions()) {
+          if (f.use_empty() && isShflCall(f.getName().str()))
+            toRemove.push_back(&f);
+        }
+        for (auto *f : toRemove) {
+          f->eraseFromParent();
+          changed = true;
+        }
+      }
+    }
     break;
   case MAPPING_1TO1:
     replaceWarpShfl1to1(m, replace);
@@ -267,7 +316,11 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
   auto C0 = ConstantInt::get(I32, 0, true);
   auto C1 = ConstantInt::get(I32, 1, true);
   GlobalVariable *warp_shfl_ptr = m.getNamedGlobal("warp_shfl");
+  fprintf(stderr, "[FLAT] replaceWarpShflFlat called, %zu to replace, warp_shfl_ptr=%p\n",
+          replace.size(), (void*)warp_shfl_ptr);
   for (auto shfl_inst : replace) {
+    fprintf(stderr, "[FLAT] processing shfl in %s\n",
+            shfl_inst->getParent()->getParent()->getName().str().c_str());
     /*
      * %10 = tail call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 %add32,
      * i32 16, i32 31)
@@ -288,10 +341,14 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
     Value *val_to_store = shfl_variable;
     if (isFloat)
         val_to_store = builder.CreateBitCast(val_to_store, I32);
-    builder.CreateStore(val_to_store, createGEP(builder, warp_shfl_ptr,
-                                                 {C0, intra_warp_index}));
-    // we should create barrier before store
-    CreateIntraWarpBarrier(intra_warp_index);
+    auto store_gep = builder.CreateGEP(warp_shfl_ptr->getValueType(),
+                                        warp_shfl_ptr, {C0, intra_warp_index});
+    builder.CreateStore(val_to_store, store_gep);
+    // Use barrier0 (block-level) instead of bar.warp.sync so that
+    // insert_warp_loop's context save properly handles cross-region allocas.
+    // bar.warp.sync causes BB split but parallel region construction doesn't
+    // always pick up warp barriers for context save analysis.
+    CreateInterWarpBarrier(intra_warp_index);
     // load shuffled data
     auto new_intra_warp_index =
         createLoad(builder, m.getGlobalVariable("intra_warp_index"));
@@ -299,12 +356,13 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 
     // Helper: load from warp_shfl, bitcast i32→f32 if needed, then replace
     auto loadAndReplace = [&](Value *index) {
-      auto gep = createGEP(builder, warp_shfl_ptr, {C0, index});
-      Value *load_inst = createLoad(builder, gep);
+      auto gep = builder.CreateGEP(warp_shfl_ptr->getValueType(), warp_shfl_ptr,
+                                    {C0, index});
+      Value *load_inst = builder.CreateLoad(I32, gep);
       // warp_shfl stores i32, bitcast back to float if original shfl was float
       if (isFloat)
         load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
-      CreateIntraWarpBarrier(new_intra_warp_index);
+      CreateInterWarpBarrier(new_intra_warp_index);
       shfl_inst->replaceAllUsesWith(load_inst);
       shfl_inst->eraseFromParent();
     };
