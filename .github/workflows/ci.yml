@@ -117,7 +117,7 @@ jobs:
 
           RESULT="FAIL"
           case $TEST_NAME in
-            saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|jacobi-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
+            saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
               if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT" && ! grep -q "^FAIL" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
                 RESULT="PASS"
@@ -126,7 +126,7 @@ jobs:
                 [ -f "$CI_OUTPUT" ] && tail -20 "$CI_OUTPUT"
               fi
               ;;
-            backprop|nn|pathfinder|gauss|srad_v2)
+            backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda)
               GOLDEN="${EXAMPLE_DIR}/golden_output.txt"
               if [ -f "$GOLDEN" ] && [ -f "$CI_OUTPUT" ]; then
                 if python3 ./ci/compare_golden.py "$GOLDEN" "$CI_OUTPUT" --tolerance=1e-4; then

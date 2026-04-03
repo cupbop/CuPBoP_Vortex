@@ -502,59 +502,16 @@ bool lower_constant_expr(llvm::Module *M) {
 
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
-        if (auto load_inst = dyn_cast<llvm::LoadInst>(BI)) {
-          auto load_from = load_inst->getOperand(0);
-          if (auto get_element_ptr = dyn_cast<llvm::ConstantExpr>(load_from)) {
+        Instruction *I = &*BI;
+        // Expand any ConstantExpr operand of the current instruction.
+        // Only replace for THIS instruction (not all users of the CE),
+        // to avoid cross-function domination errors.
+        for (unsigned op = 0; op < I->getNumOperands(); op++) {
+          if (auto ce = dyn_cast<llvm::ConstantExpr>(I->getOperand(op))) {
             modified = true;
-            std::vector<Instruction *> Users;
-            for (auto U : get_element_ptr->users()) {
-              if (auto InstUser = dyn_cast<Instruction>(U)) {
-                Users.push_back(InstUser);
-              }
-            }
-            for (auto &User : Users) {
-              auto ReplInst = get_element_ptr->getAsInstruction();
-              ReplInst->insertBefore(User);
-              User->replaceUsesOfWith(get_element_ptr, ReplInst);
-            }
-          }
-        } else if (auto store_inst = dyn_cast<llvm::StoreInst>(BI)) {
-          auto store_to = store_inst->getOperand(1);
-          if (auto addr_cast = dyn_cast<llvm::ConstantExpr>(store_to)) {
-            modified = true;
-
-            std::vector<Instruction *> Users;
-            // Do not replace use during iteration of use. Do it in another loop
-            for (auto U : addr_cast->users()) {
-              if (auto InstUser = dyn_cast<Instruction>(U)) {
-                Users.push_back(InstUser);
-              }
-            }
-            for (auto &User : Users) {
-              auto ReplInst = addr_cast->getAsInstruction();
-              ReplInst->insertBefore(User);
-              User->replaceUsesOfWith(addr_cast, ReplInst);
-            }
-          }
-        } else if (auto get_element_ptr =
-                       dyn_cast<llvm::GetElementPtrInst>(BI)) {
-          auto get_from = get_element_ptr->getOperand(0);
-          if (auto addr_cast = dyn_cast<llvm::ConstantExpr>(get_from)) {
-            modified = true;
-            // auto ReplInst = addr_cast->getAsInstruction();
-            // ReplInst->insertBefore(get_element_ptr);
-            std::vector<Instruction *> Users;
-            // Do not replace use during iteration of use. Do it in another loop
-            for (auto U : addr_cast->users()) {
-              if (auto InstUser = dyn_cast<Instruction>(U)) {
-                Users.push_back(InstUser);
-              }
-            }
-            for (auto &User : Users) {
-              auto ReplInst = addr_cast->getAsInstruction();
-              ReplInst->insertBefore(User);
-              User->replaceUsesOfWith(addr_cast, ReplInst);
-            }
+            auto ReplInst = ce->getAsInstruction();
+            ReplInst->insertBefore(I);
+            I->setOperand(op, ReplInst);
           }
         }
       }
