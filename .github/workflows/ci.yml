@@ -118,12 +118,12 @@ jobs:
           RESULT="FAIL"
           case $TEST_NAME in
             saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|jacobi-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
-              if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT"; then
+              if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT" && ! grep -q "^FAIL" "$CI_OUTPUT"; then
                 echo "Correctness: PASS"
                 RESULT="PASS"
               else
-                echo "Correctness: FAIL (PASSED not found)"
-                [ -f "$CI_OUTPUT" ] && cat "$CI_OUTPUT"
+                echo "Correctness: FAIL (PASSED not found or FAIL detected)"
+                [ -f "$CI_OUTPUT" ] && tail -20 "$CI_OUTPUT"
               fi
               ;;
             backprop|nn|pathfinder|gauss|srad_v2)
