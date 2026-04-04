@@ -29,6 +29,7 @@ ARCH           ?= 64
 SCHEDULE       ?= 2
 LOCALMEM       ?= 1
 STARTUP_ADDR   ?= 0x080000000
+KERNEL_OPT     ?= -O3
 EXTRA_C_SRCS   ?=
 EXTRA_CLANG_FLAGS ?=
 RUN_ARGS       ?=
@@ -163,6 +164,8 @@ $(HOST_BC): $(DEVICE_BC)
 kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC)
 	@echo "--- Translate kernel bitcode"
 	$(CuPBoP_PATH)/build/compilation/kernelTranslator $< kernel.bc
+	@echo "--- Lowering switch instructions"
+	$(LLVM_BIN)/opt -passes=lowerswitch kernel.bc -o kernel.bc.tmp && mv kernel.bc.tmp kernel.bc
 	llvm-dis kernel.bc
 
 # ─── Step 3: hostTranslator -> host.bc -> host.o ─────────────────────────────
@@ -184,8 +187,8 @@ host.o: host.bc
 
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 kernel.o: kernel.bc
-	@echo "--- Compiling kernel.bc"
-	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) $< -c -o $@ > kernel.log 2>&1
+	@echo "--- Compiling kernel.bc ($(KERNEL_OPT))"
+	$(LLVM_BIN)/clang++ $(subst -O3,$(KERNEL_OPT),$(VX_CFLAGS)) $(VX_VXFLAGS) $< -c -o $@ > kernel.log 2>&1
 
 # ─── Step 6: kernel_wrapper.o ────────────────────────────────────────────────
 kernel_wrapper.o: kernel_wrapper.cpp
