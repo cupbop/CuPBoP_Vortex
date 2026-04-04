@@ -859,3 +859,38 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
     i->eraseFromParent();
   }
 }
+
+// Convert __device__ variables from addrspace(1) to addrspace(0).
+// CUDA's __device__ qualifier puts globals in addrspace(1), but Vortex/RISC-V
+// uses a flat address space. Without this, addrspacecast produces invalid
+// pointers at runtime (e.g., cc-cuda's topL/posL/topH/posH).
+void mem_device2global(llvm::Module *M) {
+  using namespace llvm;
+  SmallVector<GlobalVariable *, 8> DeviceGVs;
+  for (auto &G : M->globals()) {
+    if (G.getAddressSpace() == 1 && !G.isDeclaration() &&
+        G.hasInitializer() && !G.hasExternalWeakLinkage() &&
+        !G.getName().starts_with("wrapper_global_"))
+      DeviceGVs.push_back(&G);
+  }
+  for (auto *GV : DeviceGVs) {
+    auto *NewGV = new GlobalVariable(
+        *M, GV->getValueType(), GV->isConstant(), GV->getLinkage(),
+        GV->getInitializer(), "", nullptr,
+        GV->getThreadLocalMode(), /*AddressSpace=*/0);
+    NewGV->setAlignment(GV->getAlign());
+    NewGV->takeName(GV);
+
+    // Replace addrspacecast ConstantExpr users
+    SmallVector<User *, 16> Users(GV->user_begin(), GV->user_end());
+    for (auto *U : Users) {
+      if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        if (CE->getOpcode() == Instruction::AddrSpaceCast)
+          CE->replaceAllUsesWith(NewGV);
+      }
+    }
+    // Replace any remaining direct uses
+    GV->replaceAllUsesWith(ConstantExpr::getPointerCast(NewGV, GV->getType()));
+    GV->eraseFromParent();
+  }
+}

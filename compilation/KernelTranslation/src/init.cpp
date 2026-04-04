@@ -623,8 +623,10 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0 or 2)\n";
     std::exit(1);
     }
-  // replace share memory
+  // replace constant memory (addrspace 4 → 0)
   mem_constant2global(M, fout);
+  // replace __device__ variables (addrspace 1 → 0)
+  mem_device2global(M);
   // replace asm Inline
   replace_asm_call(M);
 
