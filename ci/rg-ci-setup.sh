@@ -30,7 +30,7 @@ export GNU_RISCV_ROOT=${TOOLDIR}/riscv64-gnu-toolchain
 export LD_LIBRARY_PATH=${GNU_RISCV_ROOT}:$LD_LIBRARY_PATH
 
 # Setting LLVM-Vortex Paths
-export LLVM_VORTEX="/projects/ci-runners/CuPBoP-Vortex/tools/llvm/build" # Hardcoded path for rg servers ONLY
+export LLVM_VORTEX="/projects/ci-runners/CuPBoP-Vortex/tools/llvm_edited/build" # Hardcoded path for rg servers ONLY
 export LLVM_PREFIX=${LLVM_VORTEX}
 export LLVM_POCL=${LLVM_VORTEX}
 export PATH=$LLVM_VORTEX/bin:$PATH
