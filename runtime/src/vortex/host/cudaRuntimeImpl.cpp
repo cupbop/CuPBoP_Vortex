@@ -1121,11 +1121,39 @@ cudaError_t cudaLaunchKernel_vortex(
         device_vars_registered = true;
       }
     }
-    // Read back current values from device memory
-    for (auto &entry : memcpy_symbol) {
-      auto staging = DC->staging_alloc(entry.size);
-      vx_copy_from_dev(DC->device(), staging.data(), entry.dst_addr, entry.size);
-      memcpy(entry.data.data(), staging.data(), entry.size);
+    // Read back only __device__ variable entries (not cudaMemcpyToSymbol ones).
+    // device_var entries are appended at the end of memcpy_symbol by the
+    // registration code above. Only read back those entries.
+    static size_t device_var_start_idx = 0;
+    if (device_vars_registered && device_var_start_idx == 0 && !memcpy_symbol.empty()) {
+      // device vars were just registered — they're at the end
+      // Find where they start by checking kernel_meta.log count
+      std::ifstream meta2("kernel_meta.log");
+      std::string line2;
+      size_t dv_count = 0;
+      bool in_sec = false;
+      while (std::getline(meta2, line2)) {
+        if (line2 == "DeviceVariables") { in_sec = true; continue; }
+        if (line2 == "END_DeviceVariables") break;
+        if (in_sec) dv_count++;
+      }
+      device_var_start_idx = memcpy_symbol.size() - dv_count;
+    }
+    if (device_vars_registered) {
+      // Read back device vars using the kernel buffer handle.
+      // BSS globals reside within the kernel binary's memory region.
+      static uint64_t krnl_base_addr = 0;
+      if (krnl_base_addr == 0 && DC->get_krnl_buf()) {
+        vx_mem_address(DC->get_krnl_buf(), &krnl_base_addr);
+        DBG_PRINT("[device_var] kernel base addr=0x%lx\n", krnl_base_addr);
+      }
+      for (size_t i = device_var_start_idx; i < memcpy_symbol.size(); i++) {
+        auto &entry = memcpy_symbol[i];
+        uint64_t offset = entry.dst_addr - krnl_base_addr;
+        vx_copy_from_dev(entry.data.data(), DC->get_krnl_buf(), offset, entry.size);
+        DBG_PRINT("[device_var] read-back[%ld]: addr=0x%lx offset=0x%lx\n",
+               i, entry.dst_addr, offset);
+      }
     }
   }
 
