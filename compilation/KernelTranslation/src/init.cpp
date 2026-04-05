@@ -502,16 +502,35 @@ bool lower_constant_expr(llvm::Module *M) {
 
     for (auto BB = F->begin(); BB != F->end(); ++BB) {
       for (auto BI = BB->begin(); BI != BB->end(); BI++) {
-        Instruction *I = &*BI;
-        // Expand any ConstantExpr operand of the current instruction.
-        // Only replace for THIS instruction (not all users of the CE),
-        // to avoid cross-function domination errors.
-        for (unsigned op = 0; op < I->getNumOperands(); op++) {
-          if (auto ce = dyn_cast<llvm::ConstantExpr>(I->getOperand(op))) {
+        if (auto load_inst = dyn_cast<llvm::LoadInst>(BI)) {
+          if (auto ce = dyn_cast<llvm::ConstantExpr>(load_inst->getOperand(0))) {
             modified = true;
             auto ReplInst = ce->getAsInstruction();
-            ReplInst->insertBefore(I);
-            I->setOperand(op, ReplInst);
+            ReplInst->insertBefore(load_inst);
+            load_inst->setOperand(0, ReplInst);
+          }
+        } else if (auto store_inst = dyn_cast<llvm::StoreInst>(BI)) {
+          for (unsigned op = 0; op < 2; op++) {
+            if (auto ce = dyn_cast<llvm::ConstantExpr>(store_inst->getOperand(op))) {
+              modified = true;
+              auto ReplInst = ce->getAsInstruction();
+              ReplInst->insertBefore(store_inst);
+              store_inst->setOperand(op, ReplInst);
+            }
+          }
+        } else if (auto gep = dyn_cast<llvm::GetElementPtrInst>(BI)) {
+          if (auto ce = dyn_cast<llvm::ConstantExpr>(gep->getOperand(0))) {
+            modified = true;
+            auto ReplInst = ce->getAsInstruction();
+            ReplInst->insertBefore(gep);
+            gep->setOperand(0, ReplInst);
+          }
+        } else if (auto rmw = dyn_cast<llvm::AtomicRMWInst>(BI)) {
+          if (auto ce = dyn_cast<llvm::ConstantExpr>(rmw->getPointerOperand())) {
+            modified = true;
+            auto ReplInst = ce->getAsInstruction();
+            ReplInst->insertBefore(rmw);
+            rmw->setOperand(0, ReplInst);
           }
         }
       }

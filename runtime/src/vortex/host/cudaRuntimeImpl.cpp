@@ -1081,10 +1081,10 @@ cudaError_t cudaLaunchKernel_vortex(
   // before the next kernel launch (surviving BSS zeroing).
   {
     static bool device_vars_registered = false;
-    if (false && !device_vars_registered) { // temporarily disabled
+    if (!device_vars_registered) {
       // Parse kernel_meta.log for DeviceVariables section
       std::ifstream meta("kernel_meta.log");
-      printf("[device_var] meta file open=%d\n", meta.is_open());
+      DBG_PRINT("[device_var] meta file open=%d\n", meta.is_open());
       if (meta.is_open()) {
         std::string line;
         bool in_section = false;
@@ -1096,6 +1096,15 @@ cudaError_t cudaLaunchKernel_vortex(
             std::string name;
             uint64_t size;
             iss >> name >> size;
+            // Strip C++ mangling prefix from kernel_meta.log name
+            // e.g. _ZL4topL → topL (to match nm -C demangled names)
+            auto stripMangle = [](const std::string &s) -> std::string {
+              size_t i = 0;
+              if (s.size() > 2 && s[0] == '_' && s[1] == 'Z') i = 2;
+              while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
+              return s.substr(i);
+            };
+            std::string name_stripped = stripMangle(name);
             // Look up device address from lookup_global_symbols.txt
             std::ifstream sym("lookup_global_symbols.txt");
             std::string addr_s, type_s, sym_name;
@@ -1103,7 +1112,7 @@ cudaError_t cudaLaunchKernel_vortex(
               std::getline(sym, sym_name);
               if (!sym_name.empty() && sym_name[0] == ' ')
                 sym_name = sym_name.substr(1);
-              if (sym_name == name) {
+              if (sym_name == name_stripped) {
                 uint64_t addr = std::stoull(addr_s, nullptr, 16);
                 // Register as memcpy_symbol entry with current device value
                 MemcpySymbolEntry entry;
@@ -1111,8 +1120,8 @@ cudaError_t cudaLaunchKernel_vortex(
                 entry.size = size;
                 entry.data.resize(size, 0);
                 memcpy_symbol.push_back(std::move(entry));
-                DBG_PRINT("[device_var] registered: %s addr=0x%lx size=%ld\n",
-                          name.c_str(), addr, size);
+                DBG_PRINT("[device_var] registered: %s (stripped=%s) addr=0x%lx size=%ld\n",
+                          name.c_str(), name_stripped.c_str(), addr, size);
                 break;
               }
             }

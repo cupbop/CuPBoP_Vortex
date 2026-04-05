@@ -38,6 +38,7 @@
 // LLVM18
 // #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <map>
@@ -1790,6 +1791,36 @@ public:
 
     add_warp_loop(parallel_regions, intra_warp_loop);
     remove_barrier(&F, intra_warp_loop, schedule_flag);
+
+    // Fix domination errors created by warp loop insertion.
+    // When blocks are wrapped in inter/intra warp loops, SSA values
+    // defined inside the loop body may be used outside the loop,
+    // breaking domination. Demote such values to stack allocas.
+    {
+      DominatorTree FixDT(F);
+      std::vector<Instruction *> to_demote;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (I.use_empty() || isa<AllocaInst>(&I) || I.isTerminator())
+            continue;
+          for (auto *U : I.users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI) continue;
+            if (isa<PHINode>(UI)
+                ? !FixDT.dominates(&I, UI->getParent())
+                : !FixDT.dominates(&I, UI)) {
+              to_demote.push_back(&I);
+              break;
+            }
+          }
+        }
+      }
+      for (auto *I : to_demote) {
+        fprintf(stderr, "[fixdom] demoting to stack: ");
+        I->print(llvm::errs()); fprintf(stderr, "\n");
+        DemoteRegToStack(*I, false, nullptr);
+      }
+    }
 
     return 1;
   }
