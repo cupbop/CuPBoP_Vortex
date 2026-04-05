@@ -838,12 +838,25 @@ cudaError_t cudaLaunchKernel_vortex(
   readfile.open("lookup.txt", std::ios::in);
   std::string kernel_idx_tmp;
   std::string kernel_name_tmp;
-  
+
+  // Strip mangling prefix to get the bare function name for matching.
+  // Host func: _ZL19initiPKiS0_Pi → strip _Z, L, digits → initiPKiS0_Pi
+  // Lookup:    L4initiPKiS0_Pi   → strip L, digits → initiPKiS0_Pi
+  auto stripPrefix = [](const std::string &s) -> std::string {
+    size_t i = 0;
+    if (s.size() > 2 && s[0] == '_' && s[1] == 'Z') i = 2;
+    while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
+    return s.substr(i);
+  };
+  std::string func_stripped = stripPrefix(std::string(func));
+  DBG_COUT("func_stripped: " << func_stripped << std::endl);
+
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
     readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    DBG_COUT("debug : " << std::string(func) << " vs " << kernel_name_tmp << std::endl);
-    if(std::string(func) == kernel_name_tmp) {
+    std::string lookup_stripped = stripPrefix(kernel_name_tmp);
+    DBG_COUT("debug : " << func_stripped << " vs " << lookup_stripped << std::endl);
+    if(func_stripped == lookup_stripped) {
       DBG_COUT("found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl);
       break;
     }
@@ -1063,8 +1076,61 @@ cudaError_t cudaLaunchKernel_vortex(
   // wait for the execution to complete
   RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
 
+  // Read back __device__ variables from device memory after kernel execution.
+  // These are registered as memcpy_symbol entries so they get restored
+  // before the next kernel launch (surviving BSS zeroing).
+  {
+    static bool device_vars_registered = false;
+    if (false && !device_vars_registered) { // temporarily disabled
+      // Parse kernel_meta.log for DeviceVariables section
+      std::ifstream meta("kernel_meta.log");
+      printf("[device_var] meta file open=%d\n", meta.is_open());
+      if (meta.is_open()) {
+        std::string line;
+        bool in_section = false;
+        while (std::getline(meta, line)) {
+          if (line == "DeviceVariables") { in_section = true; continue; }
+          if (line == "END_DeviceVariables") { in_section = false; continue; }
+          if (in_section) {
+            std::istringstream iss(line);
+            std::string name;
+            uint64_t size;
+            iss >> name >> size;
+            // Look up device address from lookup_global_symbols.txt
+            std::ifstream sym("lookup_global_symbols.txt");
+            std::string addr_s, type_s, sym_name;
+            while (sym >> addr_s >> type_s) {
+              std::getline(sym, sym_name);
+              if (!sym_name.empty() && sym_name[0] == ' ')
+                sym_name = sym_name.substr(1);
+              if (sym_name == name) {
+                uint64_t addr = std::stoull(addr_s, nullptr, 16);
+                // Register as memcpy_symbol entry with current device value
+                MemcpySymbolEntry entry;
+                entry.dst_addr = addr;
+                entry.size = size;
+                entry.data.resize(size, 0);
+                memcpy_symbol.push_back(std::move(entry));
+                DBG_PRINT("[device_var] registered: %s addr=0x%lx size=%ld\n",
+                          name.c_str(), addr, size);
+                break;
+              }
+            }
+          }
+        }
+        device_vars_registered = true;
+      }
+    }
+    // Read back current values from device memory
+    for (auto &entry : memcpy_symbol) {
+      auto staging = DC->staging_alloc(entry.size);
+      vx_copy_from_dev(DC->device(), staging.data(), entry.dst_addr, entry.size);
+      memcpy(entry.data.data(), staging.data(), entry.size);
+    }
+  }
+
   DBG_PRINT("sync device\n");
-  
+
   // dump performance counters for every kernel to a file
   
   int schedule = 0;

@@ -626,7 +626,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   // replace constant memory (addrspace 4 → 0)
   mem_constant2global(M, fout);
   // replace __device__ variables (addrspace 1 → 0)
-  mem_device2global(M);
+  mem_device2global(M, fout);
   // replace asm Inline
   replace_asm_call(M);
 

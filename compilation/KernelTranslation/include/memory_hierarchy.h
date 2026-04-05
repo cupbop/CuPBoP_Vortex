@@ -8,7 +8,7 @@ void mem_share2global(llvm::Module *M);
 void mem_share2global_sche_2(llvm::Module *M);
 void mem_share2local(llvm::Module *M);
 void mem_constant2global(llvm::Module *M, std::ofstream &fout);
-void mem_device2global(llvm::Module *M);
+void mem_device2global(llvm::Module *M, std::ofstream &fout);
 
 
 #endif

@@ -279,6 +279,25 @@ void create_kernel_wrapper_function(llvm::Module *M){
       }
     }
 
+    // Read __device__ variable info from kernel_meta.log
+    struct DeviceVarInfo { std::string name; uint64_t size; };
+    std::vector<DeviceVarInfo> device_vars;
+    {
+      std::ifstream meta("kernel_meta.log");
+      std::string line;
+      bool in_device_section = false;
+      while (std::getline(meta, line)) {
+        if (line == "DeviceVariables") { in_device_section = true; continue; }
+        if (line == "END_DeviceVariables") { in_device_section = false; continue; }
+        if (in_device_section) {
+          std::istringstream iss(line);
+          DeviceVarInfo info;
+          iss >> info.name >> info.size;
+          device_vars.push_back(info);
+        }
+      }
+    }
+
     std::stringstream ss;
 
     ss << "#include <stdint.h>\n"
@@ -362,10 +381,13 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "\n";
     }
 
-    ss << "int dyn_shared_mem_size;\n\n"
+    ss << "int dyn_shared_mem_size;\n\n";
 
+    // __device__ variables are preserved across kernel launches by the host
+    // runtime (cudaRuntimeImpl.cpp) using the cudaMemcpyToSymbol mechanism.
+    // No device-side scratch needed.
 
-          "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
+    ss << "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
             "void* p = __local_mem(size);\n"
             //"vx_printf(\"local memory allocation with %d bytes, add 0x%p\\n\", size, p);\n"
             // "void* csr_read = (void*)csr_read(VX_CSR_LOCAL_MEM_BASE);\n"
@@ -496,24 +518,14 @@ void create_kernel_wrapper_function(llvm::Module *M){
       
 
       "//vx_printf(\"execute something\\n\");"
-      
+
           "\n";
 
-         
-    /*if(mapping_type == 1)
-      ss << "    vx_spawn_kernel_cm(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
-    else
-      ss << "    vx_spawn_kernel(ctx, callbacks[kernel_arg->kernel_idx], args);\n";
-    */
-      
-    // ss << "    return vx_spawn_threads(1, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[0], kernel_arg); \n";
-
-    
-    if (schedule == 0) { // thread mapping
+    if (schedule == 0) {
       ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
-    } else if (schedule == 1) { // block mapping
+    } else if (schedule == 1) {
       std::cerr << "Block mapping is not implemented yet\n";
-    } else { // one to one mapping
+    } else {
       ss << "    return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
     }
     ss << "\n" 

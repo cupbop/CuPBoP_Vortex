@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
   dumpFile(program, "5_after_wmma.ll");
 
   VerifyModule(program);
+  fout.flush(); // ensure kernel_meta.log is written before generate_wrapper reads it
   DBG_LOG("generate_wrapper\n");
   generate_wrapper(program);
   dumpFile(program, "6_after_generate_wrapper.ll");

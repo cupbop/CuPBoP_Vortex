@@ -864,8 +864,9 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
 // CUDA's __device__ qualifier puts globals in addrspace(1), but Vortex/RISC-V
 // uses a flat address space. Without this, addrspacecast produces invalid
 // pointers at runtime (e.g., cc-cuda's topL/posL/topH/posH).
-void mem_device2global(llvm::Module *M) {
+void mem_device2global(llvm::Module *M, std::ofstream &fout) {
   using namespace llvm;
+  const DataLayout &DL = M->getDataLayout();
   SmallVector<GlobalVariable *, 8> DeviceGVs;
   for (auto &G : M->globals()) {
     if (G.getAddressSpace() == 1 && !G.isDeclaration() &&
@@ -873,15 +874,27 @@ void mem_device2global(llvm::Module *M) {
         !G.getName().starts_with("wrapper_global_"))
       DeviceGVs.push_back(&G);
   }
+
+  // Write device variable info to kernel_meta.log for generate_wrapper
+  if (!DeviceGVs.empty()) {
+    fout << "DeviceVariables\n";
+    for (auto *GV : DeviceGVs) {
+      uint64_t size = DL.getTypeAllocSize(GV->getValueType());
+      fout << GV->getName().str() << " " << size << "\n";
+    }
+    fout << "END_DeviceVariables\n";
+  }
+
   for (auto *GV : DeviceGVs) {
+    // Use ExternalLinkage so wrapper can reference this symbol
     auto *NewGV = new GlobalVariable(
-        *M, GV->getValueType(), GV->isConstant(), GV->getLinkage(),
+        *M, GV->getValueType(), GV->isConstant(),
+        GlobalValue::ExternalLinkage,
         GV->getInitializer(), "", nullptr,
         GV->getThreadLocalMode(), /*AddressSpace=*/0);
     NewGV->setAlignment(GV->getAlign());
     NewGV->takeName(GV);
 
-    // Replace addrspacecast ConstantExpr users
     SmallVector<User *, 16> Users(GV->user_begin(), GV->user_end());
     for (auto *U : Users) {
       if (auto *CE = dyn_cast<ConstantExpr>(U)) {
@@ -889,7 +902,6 @@ void mem_device2global(llvm::Module *M) {
           CE->replaceAllUsesWith(NewGV);
       }
     }
-    // Replace any remaining direct uses
     GV->replaceAllUsesWith(ConstantExpr::getPointerCast(NewGV, GV->getType()));
     GV->eraseFromParent();
   }
