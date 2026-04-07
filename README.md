@@ -49,7 +49,7 @@ CuPBoP includes a subset of [Rodinia](https://github.com/yuhc/gpu-rodinia/tree/m
 
   While you can run a benchmark by running `cd/Cupbop/examples/[benchmark name] & ./kjrun_llvm18.sh`, you will generate a lot of files and directories in the process. It would take some time to remove all newly generated files and directories and there is a chance one can accidentally delete the wrong file(s). Please use the makefile in the `\examples` folder and you can refer to this guide: [Makefile Guide](./docs/Makefile.md)
 
-Take a look at this [list](.docs/BenchmarkList) to identify which benchmarks are and aren't supported.
+Take a look at this [list](./docs/BenchmarkList.md) to identify which benchmarks are and aren't supported.
 
 If you want to add more RODINIA benchmarks to the `examples/ folder`, please refer to the following guide to help you: [Benchmark Creation](./docs/BenchmarkCreation.md)
 
