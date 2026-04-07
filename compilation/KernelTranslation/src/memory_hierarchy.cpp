@@ -376,12 +376,25 @@ void mem_share2global_sche_2(llvm::Module *M) {
     return B.CreateLoad(I32, field_ptr, Name);
   };
 
-  // (c) Expand ConstantExpr users safely into instructions
+  // (c) Expand ConstantExpr users safely into instructions.
+  // Cannot use replaceAllUsesWith because CE may be used inside other
+  // ConstantExprs, which would fail the "non-constant" assertion.
+  // Instead, expand per-use-site.
   auto expandIfConstExpr = [&](User *U, Instruction *InsertBefore) -> Instruction* {
     if (auto *CE = dyn_cast<ConstantExpr>(U)) {
       Instruction *I = CE->getAsInstruction();
       I->insertBefore(InsertBefore);
-      U->replaceAllUsesWith(I);
+      // Replace only Instruction users of CE (skip constant users)
+      SmallVector<Use*, 8> usesToReplace;
+      for (auto &UU : CE->uses()) {
+        if (isa<Instruction>(UU.getUser()))
+          usesToReplace.push_back(&UU);
+      }
+      for (auto *use : usesToReplace) {
+        use->set(I);
+      }
+      if (CE->use_empty())
+        CE->destroyConstant();
       return I;
     }
     return dyn_cast<Instruction>(U);
