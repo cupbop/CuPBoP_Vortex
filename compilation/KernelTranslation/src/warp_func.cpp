@@ -361,8 +361,15 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
                                         warp_shfl_ptr, {C0, intra_warp_index});
     builder.CreateStore(val_to_store, store_gep);
 
-    // barrier0: all threads must store before any thread loads
-    CreateInterWarpBarrier(shfl_inst);
+    // Use a custom "shfl_barrier" marker instead of barrier0.
+    // barrier0 triggers split_block_by_sync which breaks if-guard structure.
+    // shfl_barrier is handled by insert_warp_loop as a parallel region
+    // boundary but NOT by split_block_by_sync.
+    {
+      auto FT = FunctionType::get(Type::getVoidTy(m.getContext()), {}, false);
+      auto callee = m.getOrInsertFunction("cupbop.shfl.barrier", FT);
+      builder.CreateCall(callee);
+    }
 
     // After barrier: load offset from alloca (survives BB split)
     auto safe_offset = builder.CreateLoad(I32, offset_alloca, "shfl_off_ld");
@@ -392,7 +399,12 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 
     // Store result to alloca, replace uses with per-user loads
     builder.CreateStore(load_inst, result_alloca);
-    CreateInterWarpBarrier(shfl_inst);
+    // Second shfl_barrier
+    {
+      auto FT = FunctionType::get(Type::getVoidTy(m.getContext()), {}, false);
+      auto callee = m.getOrInsertFunction("cupbop.shfl.barrier", FT);
+      builder.CreateCall(callee);
+    }
     std::vector<Instruction *> users;
     for (auto &U : shfl_inst->uses())
       if (auto *I = dyn_cast<Instruction>(U.getUser()))

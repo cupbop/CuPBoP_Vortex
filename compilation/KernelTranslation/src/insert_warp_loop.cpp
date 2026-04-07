@@ -1373,6 +1373,10 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
                                  func_name == "llvm.nvvm.barrier.sync")) {
           barriers.push_back(Call);
         }
+        if (func_name == "cupbop.shfl.barrier") {
+          // Collect for later replacement — can't modify while iterating
+          barriers.push_back(Call);
+        }
       }
     }
   }
@@ -1403,6 +1407,15 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
   }
 
   for (auto inst : barriers) {
+    if (auto *CI = dyn_cast<CallInst>(inst)) {
+      if (CI->getCalledFunction() &&
+          CI->getCalledFunction()->getName() == "cupbop.shfl.barrier") {
+        // Replace with real barrier0 — keeps intra_warp loop split working
+        CreateInterWarpBarrier(CI);
+        CI->eraseFromParent();
+        continue;
+      }
+    }
     inst->eraseFromParent();
   }  
 }
@@ -1469,6 +1482,9 @@ public:
             has_barrier = 1;
           if (isWarpSync(func_name) && intra_warp_loop)
             has_barrier = 1;
+          // cupbop.shfl.barrier is NOT treated as a region boundary here —
+          // it must stay inside the if guard's parallel region to preserve
+          // the conditional execution structure.
         }
       }
       // print current block
