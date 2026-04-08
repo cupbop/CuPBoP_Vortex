@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+.DS_Store
 
 # Clangd File
 .cache
@@ -77,4 +78,3 @@ Perf_counter_*.txt
 # Other CUDA header files
 cuda-header.tar.gz
 cuda_12.1.1_530.30.02_linux.run
-
