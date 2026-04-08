@@ -1,5 +1,5 @@
 KERNEL_CU = sgemm_tcu.cu
-RUN_ARGS  = -n 16
+RUN_ARGS  = -n 32
 
 # wmma requires sm_70 (sm_50 does not generate wmma intrinsics)
 DEVICE_BC = sgemm_tcu-cuda-nvptx64-nvidia-cuda-sm_70.bc

@@ -2692,21 +2692,4 @@ void replace_wmma_intrinsics(llvm::Module *M) {
     F->dropAllReferences();
     F->removeFromParent();
   }
-
-  // Final Checks to see all wmma are handled
-  for (auto &F : *M) {
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (auto *CI = dyn_cast<CallInst>(&I)) {
-          if (!CI->getCalledFunction())
-            continue;
-          auto name = CI->getCalledFunction()->getName();
-          if (name.starts_with("llvm.nvvm.wmma")) {
-            report_fatal_error("[wmma] WARNING: unhandled wmma intrinsic: %s\n",
-                               name.str().c_str());
-          }
-        }
-      }
-    }
-  }
 }

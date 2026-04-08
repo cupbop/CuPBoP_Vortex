@@ -40,14 +40,25 @@ int __nvvm_reflect(int *);
 float __nvvm_div_approx_ftz_f(float, float);
 float __nvvm_div_approx_f(float, float);
 void __vx_wmma_m16n16k16_load_a_row_f16(uint32_t *, const uint16_t *, int);
+
 void __vx_wmma_load_a_m16n16k16_row_f16(void *, const void *, int32_t);
+void __vx_wmma_load_a_m32n8k16_row_f16(void *, const void *, int32_t);
+
 void __vx_wmma_load_b_m16n16k16_row_f16(void *, const void *, int32_t);
+void __vx_wmma_load_b_m32n8k16_row_f16(void *, const void *, int32_t);
+
 void __vx_wmma_load_c_m16n16k16_row_f32(void *frag, const void *, int32_t);
+
 void __vx_wmma_store_d_m16n16k16_f32(float *, const float *, int32_t,
                                      WmmaLayout);
+void __vx_wmma_store_d_m32n8k16_f32(float *, const float *, int32_t,
+                                    WmmaLayout);
+
 void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *, const uint32_t *,
                                                  const uint32_t *,
                                                  const float *);
+void __vx_wmma_mma_m32n8k16_row_row_f16_f16_f32(float *, const uint32_t *,
+                                                const uint32_t *, const float *);
 }
 
 int __all_sync(int, int);
