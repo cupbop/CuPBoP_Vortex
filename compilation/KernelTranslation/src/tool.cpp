@@ -1,5 +1,6 @@
 #include "tool.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -11,6 +12,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 
 // LLVM 18
@@ -28,18 +30,29 @@
 #include "cg_sync.h"
 #include "llvm_type_utils.h"
 
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <set>
 
 using namespace llvm;
 
 // cupbop_debug() defined in tool.h
-#define DBG_PRINT(...) do { if (cupbop_debug()) printf(__VA_ARGS__); } while(0)
+#define DBG_PRINT(...)                                                         \
+  do {                                                                         \
+    if (cupbop_debug())                                                        \
+      printf(__VA_ARGS__);                                                     \
+  } while (0)
+
+#define DBG(BODY)                                                              \
+  do {                                                                         \
+    if (cupbop_debug()) {                                                      \
+      BODY                                                                     \
+    }                                                                          \
+  } while (0)
 
 bool triton_cupbop_enabled() {
-  static bool enabled = []{
-    const char* v = std::getenv("TRITON_CUPBOP");
+  static bool enabled = [] {
+    const char *v = std::getenv("TRITON_CUPBOP");
     return (v != nullptr && std::strcmp(v, "1") == 0);
   }();
   return enabled;
@@ -94,10 +107,12 @@ bool isKernelFunction(llvm::Module *M, llvm::Function *F) {
       if (Str->getString().str() != "kernel")
         continue;
       auto *VMD = dyn_cast<llvm::ValueAsMetadata>(MD->getOperand(0));
-      if (!VMD) continue;
+      if (!VMD)
+        continue;
       llvm::Value *meta = VMD->getValue();
       auto *FF = llvm::dyn_cast<Function>(meta);
-      if (!FF) continue;
+      if (!FF)
+        continue;
       if (FF->getName().str() == F->getName().str())
         return true;
     }
@@ -107,11 +122,14 @@ bool isKernelFunction(llvm::Module *M, llvm::Function *F) {
 
 bool isDeviceFunction(Module *M, Function *F) {
   // Must be device-side code
-  if (!(M->getTargetTriple().substr(0,5) == "nvptx")) return false;
+  if (!(M->getTargetTriple().substr(0, 5) == "nvptx"))
+    return false;
   // Skip declarations and intrinsics
-  if (F->isDeclaration() || F->isIntrinsic()) return false;
+  if (F->isDeclaration() || F->isIntrinsic())
+    return false;
   // Skip kernels
-  if (isKernelFunction(M, F)) return false;
+  if (isKernelFunction(M, F))
+    return false;
   return true;
 }
 
@@ -248,8 +266,10 @@ static void breakConstantExpressions(llvm::Value *Val, llvm::Function *Func) {
       // Convert this constant expression to an instruction.
       llvm::Instruction *I = CE->getAsInstruction();
       I->insertBefore(&*Func->begin()->begin());
-      if (cupbop_debug()) printf("--------------------\n");
-      if (cupbop_debug()) std::cout << I << std::endl;
+      if (cupbop_debug())
+        printf("--------------------\n");
+      if (cupbop_debug())
+        std::cout << I << std::endl;
       CE->replaceAllUsesWith(I);
       CE->destroyConstant();
     }
@@ -294,14 +314,15 @@ void replace_built_in_function(llvm::Module *M) {
   // Remove __vx_* stub function bodies (CUDA device stubs).
   // Real implementations are in cudaKernelImpl.o, linked later.
   {
-    std::vector<Function*> vx_stubs;
+    std::vector<Function *> vx_stubs;
     for (auto &F : *M) {
       if (F.getName().contains("__vx_") && !F.isDeclaration()) {
         vx_stubs.push_back(&F);
       }
     }
     for (auto *F : vx_stubs) {
-      if (cupbop_debug()) std::cout << "[DXA] Removing stub body: " << F->getName().str() << "\n";
+      if (cupbop_debug())
+        std::cout << "[DXA] Removing stub body: " << F->getName().str() << "\n";
       F->deleteBody();
       F->setLinkage(GlobalValue::ExternalLinkage);
     }
@@ -372,20 +393,23 @@ void replace_built_in_function(llvm::Module *M) {
               Value *val;
               if (schedule == 2) {
                 // Load from vx_spawn's blockDim struct field
-                int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
+                int field = (func_name.back() == 'x')   ? 0
+                            : (func_name.back() == 'y') ? 1
+                                                        : 2;
                 auto blockDimGV = M->getGlobalVariable("blockDim");
-                auto field_ptr = builder.CreateStructGEP(blockDimGV->getValueType(), blockDimGV, field);
+                auto field_ptr = builder.CreateStructGEP(
+                    blockDimGV->getValueType(), blockDimGV, field);
                 val = builder.CreateLoad(I32, field_ptr);
               } else {
-                const char *name = (func_name.back() == 'x') ? "block_size_x" :
-                                   (func_name.back() == 'y') ? "block_size_y" : "block_size_z";
+                const char *name = (func_name.back() == 'x')   ? "block_size_x"
+                                   : (func_name.back() == 'y') ? "block_size_y"
+                                                               : "block_size_z";
                 auto block_size_addr = M->getGlobalVariable(name);
                 val = createLoad(builder, block_size_addr);
               }
               Call->replaceAllUsesWith(val);
               need_remove.push_back(Call);
-            }
-            else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x") {
+            } else if (func_name == "llvm.nvvm.read.ptx.sreg.tid.x") {
               if (schedule == 2) {
                 IRBuilder<> builder(context);
                 builder.SetInsertPoint(Call);
@@ -396,7 +420,8 @@ void replace_built_in_function(llvm::Module *M) {
                     Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
                                               {threadIdxGV->getType()}),
                     {threadIdxGV});
-                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 0);
+                auto field_ptr = builder.CreateStructGEP(
+                    threadIdxGV->getValueType(), tls_ptr, 0);
                 auto tidx = builder.CreateLoad(I32, field_ptr, "tidx");
 
                 MDNode *N =
@@ -420,7 +445,9 @@ void replace_built_in_function(llvm::Module *M) {
                 auto *con_inter_warp_idx =
                     dyn_cast<ConstantInt>(const_inter_warp_idx);
                 if (!con_intra_warp_idx || !con_inter_warp_idx) {
-                  if (cupbop_debug()) printf("warning: warp idx globals not ConstantInt, skipping\n");
+                  if (cupbop_debug())
+                    printf("warning: warp idx globals not ConstantInt, "
+                           "skipping\n");
                   continue;
                 }
                 // ConstantInt* con_block_size_x =
@@ -432,9 +459,9 @@ void replace_built_in_function(llvm::Module *M) {
                 // int64_t int_block_size_x = con_block_size_x->getSExtValue();
 
                 DBG_PRINT("intra warp corresponding value is : %d \n",
-                       int_intra_warp_idx);
+                          int_intra_warp_idx);
                 DBG_PRINT("inter warp corresponding value is : %d \n",
-                       int_inter_warp_idx);
+                          int_inter_warp_idx);
                 // printf("block size x corresponding value is : %ld \n",
                 // int_block_size_x);
 
@@ -477,7 +504,8 @@ void replace_built_in_function(llvm::Module *M) {
                     Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
                                               {threadIdxGV->getType()}),
                     {threadIdxGV});
-                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 1);
+                auto field_ptr = builder.CreateStructGEP(
+                    threadIdxGV->getValueType(), tls_ptr, 1);
                 auto tidy = builder.CreateLoad(I32, field_ptr, "tidy");
 
                 MDNode *N =
@@ -522,7 +550,8 @@ void replace_built_in_function(llvm::Module *M) {
                     Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
                                               {threadIdxGV->getType()}),
                     {threadIdxGV});
-                auto field_ptr = builder.CreateStructGEP(threadIdxGV->getValueType(), tls_ptr, 2);
+                auto field_ptr = builder.CreateStructGEP(
+                    threadIdxGV->getValueType(), tls_ptr, 2);
                 auto tidz = builder.CreateLoad(I32, field_ptr, "tidz");
 
                 MDNode *N =
@@ -547,9 +576,8 @@ void replace_built_in_function(llvm::Module *M) {
                     createLoad(builder, M->getGlobalVariable("block_size_x")),
                     createLoad(builder, M->getGlobalVariable("block_size_y")),
                     "block_size_xy");
-                thread_idx = builder.CreateBinOp(
-                    Instruction::SDiv, thread_idx, block_xy,
-                    "thread_id_z");
+                thread_idx = builder.CreateBinOp(Instruction::SDiv, thread_idx,
+                                                 block_xy, "thread_id_z");
 
                 Call->replaceAllUsesWith(thread_idx);
                 need_remove.push_back(Call);
@@ -561,8 +589,11 @@ void replace_built_in_function(llvm::Module *M) {
             else if (func_name == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
                      func_name == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
                      func_name == "llvm.nvvm.read.ptx.sreg.ctaid.z") {
-              int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
-              if (cupbop_debug()) printf("block_Id-%c is called\n", func_name.back());
+              int field = (func_name.back() == 'x')   ? 0
+                          : (func_name.back() == 'y') ? 1
+                                                      : 2;
+              if (cupbop_debug())
+                printf("block_Id-%c is called\n", func_name.back());
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
 
@@ -574,11 +605,13 @@ void replace_built_in_function(llvm::Module *M) {
                     Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
                                               {blockIdxGV->getType()}),
                     {blockIdxGV});
-                auto field_ptr = builder.CreateStructGEP(blockIdxGV->getValueType(), tls_ptr, field);
+                auto field_ptr = builder.CreateStructGEP(
+                    blockIdxGV->getValueType(), tls_ptr, field);
                 block_idx = builder.CreateLoad(I32, field_ptr);
               } else {
-                const char *name = (field == 0) ? "block_index_x" :
-                                   (field == 1) ? "block_index_y" : "block_index_z";
+                const char *name = (field == 0)   ? "block_index_x"
+                                   : (field == 1) ? "block_index_y"
+                                                  : "block_index_z";
                 auto block_index_addr = M->getGlobalVariable(name);
                 auto tls_ptr = builder.CreateCall(
                     Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address,
@@ -595,18 +628,22 @@ void replace_built_in_function(llvm::Module *M) {
             else if (func_name == "llvm.nvvm.read.ptx.sreg.nctaid.x" ||
                      func_name == "llvm.nvvm.read.ptx.sreg.nctaid.y" ||
                      func_name == "llvm.nvvm.read.ptx.sreg.nctaid.z") {
-              int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
+              int field = (func_name.back() == 'x')   ? 0
+                          : (func_name.back() == 'y') ? 1
+                                                      : 2;
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               Value *grid_size;
               if (schedule == 2) {
                 // Load from vx_spawn's gridDim struct field
                 auto gridDimGV = M->getGlobalVariable("gridDim");
-                auto field_ptr = builder.CreateStructGEP(gridDimGV->getValueType(), gridDimGV, field);
+                auto field_ptr = builder.CreateStructGEP(
+                    gridDimGV->getValueType(), gridDimGV, field);
                 grid_size = builder.CreateLoad(I32, field_ptr);
               } else {
-                const char *name = (field == 0) ? "grid_size_x" :
-                                   (field == 1) ? "grid_size_y" : "grid_size_z";
+                const char *name = (field == 0)   ? "grid_size_x"
+                                   : (field == 1) ? "grid_size_y"
+                                                  : "grid_size_z";
                 auto grid_size_addr = M->getGlobalVariable(name);
                 grid_size = createLoad(builder, grid_size_addr);
               }
@@ -656,10 +693,12 @@ void replace_built_in_function(llvm::Module *M) {
           }
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
-            if (!asm_inst) continue;
+            if (!asm_inst)
+              continue;
             if (asm_inst->getAsmString() != "mov.u32 $0, %laneid;") {
-              if (cupbop_debug()) printf("Warning: unhandled InlineAsm: %s\n",
-                     asm_inst->getAsmString().c_str());
+              if (cupbop_debug())
+                printf("Warning: unhandled InlineAsm: %s\n",
+                       asm_inst->getAsmString().c_str());
               continue;
             }
             // return the rank within the warp
@@ -731,12 +770,12 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "__nv_powf" || func_name == "__nv_logf" ||
                        func_name == "__nv_expf" || func_name == "__nv_fabsf" ||
                        func_name == "__nv_log10f" ||
-                       func_name == "__nv_fmodf" || func_name == "__nv_sqrt" || func_name == "__nv_rsqrtf" ||
+                       func_name == "__nv_fmodf" || func_name == "__nv_sqrt" ||
+                       func_name == "__nv_rsqrtf" ||
                        func_name == "__nv_sqrtf" || func_name == "__nv_exp" ||
                        func_name == "__nv_isnanf" ||
                        func_name == "__nv_isinff" || func_name == "__nv_powi" ||
-                       func_name == "__nv_powif" ||
-                       func_name == "__nv_erfcf" ||
+                       func_name == "__nv_powif" || func_name == "__nv_erfcf" ||
                        func_name == "__nv_ffs" || func_name == "__nv_popc") {
               Call->getCalledFunction()->deleteBody();
             } else if (func_name == "llvm.nvvm.fma.rn.d") {
@@ -759,7 +798,8 @@ void replace_built_in_function(llvm::Module *M) {
               Call->getCalledFunction()->setName("__nvvm_mul24_i");
             } else if (func_name == "llvm.nvvm.membar.gl") {
               Call->getCalledFunction()->setName("__nvvm_membar_gl");
-            } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") != std::string::npos) {
+            } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") !=
+                       std::string::npos) {
               Call->getCalledFunction()->setName("__nvvm_atomic_load_inc_32");
             } else if (func_name == "llvm.nvvm.div.approx.ftz.f") {
               Call->getCalledFunction()->setName("__nvvm_div_approx_ftz_f");
@@ -843,58 +883,65 @@ void replace_built_in_function(llvm::Module *M) {
         Value *a = Call->getArgOperand(0);
         Value *b = Call->getArgOperand(1);
         Value *c = Call->getArgOperand(2);
-        auto *fma_func = Intrinsic::getDeclaration(M, Intrinsic::fma, {a->getType()});
+        auto *fma_func =
+            Intrinsic::getDeclaration(M, Intrinsic::fma, {a->getType()});
         replacement = Builder.CreateCall(fma_func, {a, b, c});
 
-      // Multiply: a*b
+        // Multiply: a*b
       } else if (name.find("llvm.nvvm.mul.r") != std::string::npos) {
-        replacement = Builder.CreateFMul(Call->getArgOperand(0), Call->getArgOperand(1));
+        replacement =
+            Builder.CreateFMul(Call->getArgOperand(0), Call->getArgOperand(1));
 
-      // Add: a+b
+        // Add: a+b
       } else if (name.find("llvm.nvvm.add.r") != std::string::npos) {
-        replacement = Builder.CreateFAdd(Call->getArgOperand(0), Call->getArgOperand(1));
+        replacement =
+            Builder.CreateFAdd(Call->getArgOperand(0), Call->getArgOperand(1));
 
-      // Division: a/b
+        // Division: a/b
       } else if (name.find("llvm.nvvm.div.r") != std::string::npos) {
-        replacement = Builder.CreateFDiv(Call->getArgOperand(0), Call->getArgOperand(1));
+        replacement =
+            Builder.CreateFDiv(Call->getArgOperand(0), Call->getArgOperand(1));
 
-      // Absolute value
+        // Absolute value
       } else if (name.find("llvm.nvvm.fabs.") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateCall(
             Intrinsic::getDeclaration(M, Intrinsic::fabs, {x->getType()}), {x});
 
-      // Min/Max
+        // Min/Max
       } else if (name.find("llvm.nvvm.fmin.") != std::string::npos) {
         Value *a = Call->getArgOperand(0);
         Value *b = Call->getArgOperand(1);
         replacement = Builder.CreateCall(
-            Intrinsic::getDeclaration(M, Intrinsic::minnum, {a->getType()}), {a, b});
+            Intrinsic::getDeclaration(M, Intrinsic::minnum, {a->getType()}),
+            {a, b});
       } else if (name.find("llvm.nvvm.fmax.") != std::string::npos) {
         Value *a = Call->getArgOperand(0);
         Value *b = Call->getArgOperand(1);
         replacement = Builder.CreateCall(
-            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {a->getType()}), {a, b});
+            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {a->getType()}),
+            {a, b});
 
-      // Square root
+        // Square root
       } else if (name.find("llvm.nvvm.sqrt.") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateCall(
             Intrinsic::getDeclaration(M, Intrinsic::sqrt, {x->getType()}), {x});
 
-      // Reciprocal square root: 1/sqrt(x)
+        // Reciprocal square root: 1/sqrt(x)
       } else if (name.find("llvm.nvvm.rsqrt.") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         Value *sq = Builder.CreateCall(
             Intrinsic::getDeclaration(M, Intrinsic::sqrt, {x->getType()}), {x});
-        replacement = Builder.CreateFDiv(ConstantFP::get(x->getType(), 1.0), sq);
+        replacement =
+            Builder.CreateFDiv(ConstantFP::get(x->getType(), 1.0), sq);
 
-      // Reciprocal: 1/x
+        // Reciprocal: 1/x
       } else if (name.find("llvm.nvvm.rcp.") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateFDiv(ConstantFP::get(x->getType(), 1.0), x);
 
-      // sin/cos
+        // sin/cos
       } else if (name.find("llvm.nvvm.sin.") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateCall(
@@ -904,7 +951,7 @@ void replace_built_in_function(llvm::Module *M) {
         replacement = Builder.CreateCall(
             Intrinsic::getDeclaration(M, Intrinsic::cos, {x->getType()}), {x});
 
-      // exp2 / log2
+        // exp2 / log2
       } else if (name.find("llvm.nvvm.ex2.approx.f") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateCall(
@@ -914,63 +961,87 @@ void replace_built_in_function(llvm::Module *M) {
         replacement = Builder.CreateCall(
             Intrinsic::getDeclaration(M, Intrinsic::log2, {x->getType()}), {x});
 
-      // Saturate: clamp to [0, 1]
+        // Saturate: clamp to [0, 1]
       } else if (name.find("llvm.nvvm.saturate") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         Value *zero = ConstantFP::get(x->getType(), 0.0);
         Value *one = ConstantFP::get(x->getType(), 1.0);
         Value *clamped_lo = Builder.CreateCall(
-            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {x->getType()}), {x, zero});
+            Intrinsic::getDeclaration(M, Intrinsic::maxnum, {x->getType()}),
+            {x, zero});
         replacement = Builder.CreateCall(
-            Intrinsic::getDeclaration(M, Intrinsic::minnum, {x->getType()}), {clamped_lo, one});
+            Intrinsic::getDeclaration(M, Intrinsic::minnum, {x->getType()}),
+            {clamped_lo, one});
 
-      // Float-to-signed-int
+        // Float-to-signed-int
       } else if (name.find("llvm.nvvm.f2i.r") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         if (name.find(".rn") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+          x = Builder.CreateCall(Intrinsic::getDeclaration(
+                                     M, Intrinsic::roundeven, {x->getType()}),
+                                 {x});
         } else if (name.find(".rm") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}),
+              {x});
         } else if (name.find(".rp") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}),
+              {x});
         }
         replacement = Builder.CreateFPToSI(x, I32);
 
-      // Float-to-unsigned-int
+        // Float-to-unsigned-int
       } else if (name.find("llvm.nvvm.f2ui.r") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         if (name.find(".rn") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+          x = Builder.CreateCall(Intrinsic::getDeclaration(
+                                     M, Intrinsic::roundeven, {x->getType()}),
+                                 {x});
         } else if (name.find(".rm") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}),
+              {x});
         } else if (name.find(".rp") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}),
+              {x});
         }
         replacement = Builder.CreateFPToUI(x, I32);
 
-      // Float-to-long-long
+        // Float-to-long-long
       } else if (name.find("llvm.nvvm.f2ll.r") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         if (name.find(".rn") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+          x = Builder.CreateCall(Intrinsic::getDeclaration(
+                                     M, Intrinsic::roundeven, {x->getType()}),
+                                 {x});
         }
         replacement = Builder.CreateFPToSI(x, I64);
       } else if (name.find("llvm.nvvm.f2ull.r") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         if (name.find(".rn") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+          x = Builder.CreateCall(Intrinsic::getDeclaration(
+                                     M, Intrinsic::roundeven, {x->getType()}),
+                                 {x});
         }
         replacement = Builder.CreateFPToUI(x, I64);
 
-      // Double-to-int conversions
+        // Double-to-int conversions
       } else if (name.find("llvm.nvvm.d2i.r") != std::string::npos) {
         Value *x = Call->getArgOperand(0);
         if (name.find(".rn") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::roundeven, {x->getType()}), {x});
+          x = Builder.CreateCall(Intrinsic::getDeclaration(
+                                     M, Intrinsic::roundeven, {x->getType()}),
+                                 {x});
         } else if (name.find(".rm") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::floor, {x->getType()}),
+              {x});
         } else if (name.find(".rp") != std::string::npos) {
-          x = Builder.CreateCall(Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}), {x});
+          x = Builder.CreateCall(
+              Intrinsic::getDeclaration(M, Intrinsic::ceil, {x->getType()}),
+              {x});
         }
         replacement = Builder.CreateFPToSI(x, I32);
       } else if (name.find("llvm.nvvm.d2ui.r") != std::string::npos) {
@@ -983,7 +1054,7 @@ void replace_built_in_function(llvm::Module *M) {
         Value *x = Call->getArgOperand(0);
         replacement = Builder.CreateFPToUI(x, I64);
 
-      // Int-to-float conversions
+        // Int-to-float conversions
       } else if (name.find("llvm.nvvm.i2f.r") != std::string::npos) {
         replacement = Builder.CreateSIToFP(Call->getArgOperand(0), F32);
       } else if (name.find("llvm.nvvm.ui2f.r") != std::string::npos) {
@@ -1001,7 +1072,7 @@ void replace_built_in_function(llvm::Module *M) {
       } else if (name.find("llvm.nvvm.ull2d.r") != std::string::npos) {
         replacement = Builder.CreateUIToFP(Call->getArgOperand(0), F64);
 
-      // Double-to-float truncation
+        // Double-to-float truncation
       } else if (name.find("llvm.nvvm.d2f.r") != std::string::npos) {
         replacement = Builder.CreateFPTrunc(Call->getArgOperand(0), F32);
       }
@@ -1030,25 +1101,32 @@ void replace_asm_call(llvm::Module *M) {
     Value *smem_ptr;    // ptr addrspace(3) operand
     bool is_transposed; // .trans variant (B tile)
   };
-  std::map<Value*, LdMatrixInfo> ldmatrix_map;
+  std::map<Value *, LdMatrixInfo> ldmatrix_map;
 
   // Helper: strip thread-dependent GEP indices to get the tile base address.
   // Triton IR pattern:
   //   %ptr = GEP @global_smem, %thread_dep_offset   ← strip variable index
   //   %ptr2 = GEP %ptr, 0                           ← strip constant-zero index
-  // Returns: @global_smem (for A) or ConstExpr GEP(@global_smem + offset) (for B)
-  auto getSmemTileBase = [](Value *smem_ptr) -> Value* {
+  // Returns: @global_smem (for A) or ConstExpr GEP(@global_smem + offset) (for
+  // B)
+  auto getSmemTileBase = [](Value *smem_ptr) -> Value * {
     Value *cur = smem_ptr;
     while (auto *GEP = dyn_cast<GetElementPtrInst>(cur)) {
       bool all_const = true;
       for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-        if (!isa<ConstantInt>(*idx)) { all_const = false; break; }
+        if (!isa<ConstantInt>(*idx)) {
+          all_const = false;
+          break;
+        }
       }
       if (all_const) {
         // Check if it's a no-op GEP (constant 0 index) — strip it too
         bool all_zero = true;
         for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-          if (!cast<ConstantInt>(*idx)->isZero()) { all_zero = false; break; }
+          if (!cast<ConstantInt>(*idx)->isZero()) {
+            all_zero = false;
+            break;
+          }
         }
         if (all_zero) {
           cur = GEP->getPointerOperand();
@@ -1070,7 +1148,8 @@ void replace_asm_call(llvm::Module *M) {
         if (auto Call = dyn_cast<CallInst>(BI)) {
           if (Call->isInlineAsm()) {
             auto asm_inst = dyn_cast<InlineAsm>(Call->getCalledOperand());
-            if (!asm_inst) continue;
+            if (!asm_inst)
+              continue;
             auto asm_str = asm_inst->getAsmString();
 
             if (asm_str == "mov.u32 $0, %laneid;") {
@@ -1079,7 +1158,8 @@ void replace_asm_call(llvm::Module *M) {
               builder.SetInsertPoint(Call);
               auto intra_warp_index_addr =
                   M->getGlobalVariable("intra_warp_index");
-              auto intra_warp_index = createLoad(builder, intra_warp_index_addr);
+              auto intra_warp_index =
+                  createLoad(builder, intra_warp_index_addr);
               Call->replaceAllUsesWith(intra_warp_index);
               need_remove.push_back(Call);
             } else if (asm_str.find("mad.lo.cc.u32") != std::string::npos &&
@@ -1103,21 +1183,26 @@ void replace_asm_call(llvm::Module *M) {
               Call->replaceAllUsesWith(result);
               need_remove.push_back(Call);
             } else if (asm_str.find("ldmatrix.sync") != std::string::npos) {
-              // ── Triton ldmatrix: loads from shared memory into MMA register fragments ──
-              // Pattern: ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {$0,$1,$2,$3}, [$4]
-              // Operands: 4 output i32 (packed fp16), 1 input ptr addrspace(3)
+              // ── Triton ldmatrix: loads from shared memory into MMA register
+              // fragments ── Pattern:
+              // ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {$0,$1,$2,$3},
+              // [$4] Operands: 4 output i32 (packed fp16), 1 input ptr
+              // addrspace(3)
               //
-              // For WGMMA_SS TCU path: ldmatrix is NOT needed — TCU reads directly
-              // from shared memory. But we save the shared memory pointer for later
-              // use by mma.sync conversion.
+              // For WGMMA_SS TCU path: ldmatrix is NOT needed — TCU reads
+              // directly from shared memory. But we save the shared memory
+              // pointer for later use by mma.sync conversion.
               //
-              // TODO(TCU): Instead of removing, save the smem pointer and associate
+              // TODO(TCU): Instead of removing, save the smem pointer and
+              // associate
               //            it with the mma.sync that consumes these fragments.
-              //            For now, replace with undef (TCU conversion pending).
+              //            For now, replace with undef (TCU conversion
+              //            pending).
               bool is_trans = asm_str.find(".trans.") != std::string::npos;
               Value *smem_ptr = Call->getArgOperand(0); // ptr addrspace(3)
-              if (cupbop_debug()) printf("[TCU] detected ldmatrix%s: smem_ptr operand found\n",
-                                         is_trans ? " (transposed, B tile)" : " (A tile)");
+              if (cupbop_debug())
+                printf("[TCU] detected ldmatrix%s: smem_ptr operand found\n",
+                       is_trans ? " (transposed, B tile)" : " (A tile)");
               // Save ldmatrix result → smem pointer mapping
               // Don't replace with undef yet — mma.sync needs to trace operands
               // back through extractvalue to this ldmatrix call.
@@ -1128,8 +1213,10 @@ void replace_asm_call(llvm::Module *M) {
               //
               // Triton IR pattern (Turing fp16, one asm block = m16n8k16):
               //   %result = call {f32,f32,f32,f32} asm "
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {$0,$1,$2,$3},{$8,$9},{$10},{$4,$5,$6,$7};
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {$0,$1,$2,$3},{$11,$12},{$13},{$4,$5,$6,$7};"
+              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+              //     {$0,$1,$2,$3},{$8,$9},{$10},{$4,$5,$6,$7};
+              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+              //     {$0,$1,$2,$3},{$11,$12},{$13},{$4,$5,$6,$7};"
               //   constraints: "=f,=f,=f,=f, 0,1,2,3, r,r,r,r,r,r"
               //   operands: (C0,C1,C2,C3, A0_k0,A1_k0,B_k0, A0_k1,A1_k1,B_k1)
               //
@@ -1141,7 +1228,8 @@ void replace_asm_call(llvm::Module *M) {
               // Vortex TCU (NT=32, NR=8): m16n16k16
               //   - Needs 2 mma.sync blocks in N direction (each covers n=8)
               //   - Uses WGMMA_SS (flags=6): TCU reads A,B from shared memory
-              //   - Register layout differs: NVIDIA 2x2 block vs Vortex quadrant
+              //   - Register layout differs: NVIDIA 2x2 block vs Vortex
+              //   quadrant
               //   - C/D need layout shuffle between NVIDIA and Vortex
               //
               // NOTE: If Vortex NR changes, tile sizes change:
@@ -1149,18 +1237,20 @@ void replace_asm_call(llvm::Module *M) {
               //   NR=4 → m16n8k8 (1:1 mapping, but still layout mismatch)
               //
               // Implementation plan:
-              //   1. Collect consecutive mma.sync calls covering full N dimension
+              //   1. Collect consecutive mma.sync calls covering full N
+              //   dimension
               //   2. Find shared memory base for A and B from ldmatrix trace
               //   3. Build WGMMA descriptors (smem addr, stride, layout)
               //   4. Emit Vortex TCU: .insn r 0x0b, 0, 2, x0, x1, x6
-              //   5. Shuffle C/D between NVIDIA ↔ Vortex layout via shared memory
+              //   5. Shuffle C/D between NVIDIA ↔ Vortex layout via shared
+              //   memory
               //
               // TODO(TCU): Replace undef with actual TCU instruction emission.
 
               // Trace A/B operands back to ldmatrix → shared memory pointers
-              // mma.sync operands: (C0-C3, A0_k0, A1_k0, B_k0, A0_k1, A1_k1, B_k1)
-              // A operands come from extractvalue of ldmatrix result
-              // B operands come from extractvalue of ldmatrix.trans result
+              // mma.sync operands: (C0-C3, A0_k0, A1_k0, B_k0, A0_k1, A1_k1,
+              // B_k1) A operands come from extractvalue of ldmatrix result B
+              // operands come from extractvalue of ldmatrix.trans result
               Value *smem_A = nullptr, *smem_B = nullptr;
 
               // Trace operand 4 (first A reg) back to ldmatrix
@@ -1170,7 +1260,8 @@ void replace_asm_call(llvm::Module *M) {
                   Value *agg = EV->getAggregateOperand();
                   if (ldmatrix_map.count(agg)) {
                     smem_A = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug()) printf("[TCU] traced A to shared memory\n");
+                    if (cupbop_debug())
+                      printf("[TCU] traced A to shared memory\n");
                   }
                 }
               }
@@ -1181,7 +1272,8 @@ void replace_asm_call(llvm::Module *M) {
                   Value *agg = EV->getAggregateOperand();
                   if (ldmatrix_map.count(agg)) {
                     smem_B = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug()) printf("[TCU] traced B to shared memory (transposed)\n");
+                    if (cupbop_debug())
+                      printf("[TCU] traced B to shared memory (transposed)\n");
                   }
                 }
               }
@@ -1202,53 +1294,73 @@ void replace_asm_call(llvm::Module *M) {
                 for (unsigned j = 0; j < num_args; j++) {
                   Value *op = Call->getArgOperand(j);
                   printf("  arg[%u]: ", j);
-                  op->getType()->print(errs()); errs() << "\n"; errs().flush();
+                  op->getType()->print(errs());
+                  errs() << "\n";
+                  errs().flush();
                 }
               }
 
               // ── TCU instruction emission via WGMMA_SS ──
-              // Declare external functions from cudaKernelImpl.cpp (linked at kernel.elf time)
+              // Declare external functions from cudaKernelImpl.cpp (linked at
+              // kernel.elf time)
               auto *VoidTy = Type::getVoidTy(context);
-              auto *wgmma_encode_fn = M->getOrInsertFunction(
-                  "_Z22__vx_wgmma_encode_descyjjjjjj",
-                  FunctionType::get(I32, {I64, I32, I32, I32, I32, I32, I32}, false)).getCallee();
-              auto *wgmma_mma_fn = M->getOrInsertFunction(
-                  "_Z17__vx_wgmma_mma_ssPfS_S_",
-                  FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy}, false)).getCallee();
+              auto *wgmma_encode_fn =
+                  M->getOrInsertFunction(
+                       "_Z22__vx_wgmma_encode_descyjjjjjj",
+                       FunctionType::get(
+                           I32, {I64, I32, I32, I32, I32, I32, I32}, false))
+                      .getCallee();
+              auto *wgmma_mma_fn =
+                  M->getOrInsertFunction(
+                       "_Z17__vx_wgmma_mma_ssPfS_S_",
+                       FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy}, false))
+                      .getCallee();
 
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
 
               if (smem_A && smem_B) {
                 // ── Strip per-thread GEP to get tile base address ──
-                // ldmatrix operand is per-thread: GEP @global_smem, %thread_offset
-                // WGMMA needs tile base: @global_smem (A) or @global_smem+1024 (B)
+                // ldmatrix operand is per-thread: GEP @global_smem,
+                // %thread_offset WGMMA needs tile base: @global_smem (A) or
+                // @global_smem+1024 (B)
                 Value *tile_base_A = getSmemTileBase(smem_A);
                 Value *tile_base_B = getSmemTileBase(smem_B);
 
                 if (cupbop_debug()) {
                   printf("[TCU] A tile base: ");
-                  tile_base_A->print(errs()); errs() << "\n"; errs().flush();
+                  tile_base_A->print(errs());
+                  errs() << "\n";
+                  errs().flush();
                   printf("[TCU] B tile base: ");
-                  tile_base_B->print(errs()); errs() << "\n"; errs().flush();
+                  tile_base_B->print(errs());
+                  errs() << "\n";
+                  errs().flush();
                 }
 
-                // Allocate stack arrays for TCU fragments (8 floats each for NR=8)
-                // NOTE: Vortex TCU is m16n16k16. This mma.sync covers m16n8k16.
-                // We compute the full m16n16k16 but only use first 4 results.
+                // Allocate stack arrays for TCU fragments (8 floats each for
+                // NR=8) NOTE: Vortex TCU is m16n16k16. This mma.sync covers
+                // m16n8k16. We compute the full m16n16k16 but only use first 4
+                // results.
                 // TODO: combine 2 mma.sync calls for full N=16.
-                auto *fragC_arr = builder.CreateAlloca(F32, ConstantInt::get(I32, 8), "tcu_fragC");
-                auto *fragA_arr = builder.CreateAlloca(F32, ConstantInt::get(I32, 8), "tcu_fragA");
-                auto *fragB_arr = builder.CreateAlloca(F32, ConstantInt::get(I32, 8), "tcu_fragB");
+                auto *fragC_arr = builder.CreateAlloca(
+                    F32, ConstantInt::get(I32, 8), "tcu_fragC");
+                auto *fragA_arr = builder.CreateAlloca(
+                    F32, ConstantInt::get(I32, 8), "tcu_fragA");
+                auto *fragB_arr = builder.CreateAlloca(
+                    F32, ConstantInt::get(I32, 8), "tcu_fragB");
 
-                // Initialize C accumulator from mma.sync input (first 4 operands)
-                // Remaining 4 slots zeroed (for the n=8..15 half that this mma.sync doesn't cover)
+                // Initialize C accumulator from mma.sync input (first 4
+                // operands) Remaining 4 slots zeroed (for the n=8..15 half that
+                // this mma.sync doesn't cover)
                 for (int ci = 0; ci < 4; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr, ConstantInt::get(I32, ci));
+                  auto *gep = builder.CreateGEP(F32, fragC_arr,
+                                                ConstantInt::get(I32, ci));
                   builder.CreateStore(Call->getArgOperand(ci), gep);
                 }
                 for (int ci = 4; ci < 8; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr, ConstantInt::get(I32, ci));
+                  auto *gep = builder.CreateGEP(F32, fragC_arr,
+                                                ConstantInt::get(I32, ci));
                   builder.CreateStore(ConstantFP::get(F32, 0.0), gep);
                 }
 
@@ -1256,72 +1368,102 @@ void replace_asm_call(llvm::Module *M) {
                 // Use TILE BASE (not per-thread) address for WGMMA descriptor.
                 // For fp16 A tile [M_tile × K_tile] stored row-major:
                 //   ldm = K_tile (leading dimension in elements)
-                //   TCU load_smem_word: addr = base + (row * ldm + col) * sizeof(half)
+                //   TCU load_smem_word: addr = base + (row * ldm + col) *
+                //   sizeof(half)
                 // For 16x16 tile: ldm=16, is_col_major=0
-                Value *smem_A_base_i64 = builder.CreatePtrToInt(tile_base_A, I64);
-                Value *a_word = builder.CreateCall(cast<Function>(wgmma_encode_fn), {
-                    smem_A_base_i64,
-                    ConstantInt::get(I32, 32),   // leading_bytes (unused by bugfix TCU, kept for compat)
-                    ConstantInt::get(I32, 512),  // stride_bytes (unused by bugfix TCU, kept for compat)
-                    ConstantInt::get(I32, 0),    // mn_idx (tile at position 0)
-                    ConstantInt::get(I32, 0),    // k_idx (tile at position 0)
-                    ConstantInt::get(I32, 16),   // ldm (K_tile = 16 elements)
-                    ConstantInt::get(I32, 0)     // is_col_major (A is row-major)
-                }, "a_desc_word");
+                Value *smem_A_base_i64 =
+                    builder.CreatePtrToInt(tile_base_A, I64);
+                Value *a_word = builder.CreateCall(
+                    cast<Function>(wgmma_encode_fn),
+                    {
+                        smem_A_base_i64,
+                        ConstantInt::get(I32,
+                                         32), // leading_bytes (unused by bugfix
+                                              // TCU, kept for compat)
+                        ConstantInt::get(I32,
+                                         512), // stride_bytes (unused by bugfix
+                                               // TCU, kept for compat)
+                        ConstantInt::get(I32, 0), // mn_idx (tile at position 0)
+                        ConstantInt::get(I32, 0), // k_idx (tile at position 0)
+                        ConstantInt::get(I32, 16), // ldm (K_tile = 16 elements)
+                        ConstantInt::get(I32,
+                                         0) // is_col_major (A is row-major)
+                    },
+                    "a_desc_word");
 
                 // Fill all 8 A fragment regs with the same metadata word
-                Value *a_meta_f = builder.CreateBitCast(a_word, F32, "a_meta_f");
+                Value *a_meta_f =
+                    builder.CreateBitCast(a_word, F32, "a_meta_f");
                 for (int ai = 0; ai < 8; ai++) {
-                  auto *gep = builder.CreateGEP(F32, fragA_arr, ConstantInt::get(I32, ai));
+                  auto *gep = builder.CreateGEP(F32, fragA_arr,
+                                                ConstantInt::get(I32, ai));
                   builder.CreateStore(a_meta_f, gep);
                 }
 
                 // ── Encode B descriptor metadata ──
-                // B tile stored as [K_tile × N_tile] row-major in shared memory.
-                // Triton ldmatrix.trans transposes during load, but physical storage
-                // is K-major (rows = K, cols = N).
-                // TCU accesses B as: load_smem_word(meta_b, k, n, ...)
-                // With is_col_major=0: addr = base + (k * ldm + n) * sizeof(half)
+                // B tile stored as [K_tile × N_tile] row-major in shared
+                // memory. Triton ldmatrix.trans transposes during load, but
+                // physical storage is K-major (rows = K, cols = N). TCU
+                // accesses B as: load_smem_word(meta_b, k, n, ...) With
+                // is_col_major=0: addr = base + (k * ldm + n) * sizeof(half)
                 // ldm = N_tile = 16 for [K=16 × N=16] tile
-                Value *smem_B_base_i64 = builder.CreatePtrToInt(tile_base_B, I64);
-                Value *b_word = builder.CreateCall(cast<Function>(wgmma_encode_fn), {
-                    smem_B_base_i64,
-                    ConstantInt::get(I32, 32),   // leading_bytes (unused by bugfix TCU)
-                    ConstantInt::get(I32, 512),  // stride_bytes (unused by bugfix TCU)
-                    ConstantInt::get(I32, 0),    // mn_idx
-                    ConstantInt::get(I32, 0),    // k_idx
-                    ConstantInt::get(I32, 16),   // ldm (N_tile = 16 elements)
-                    ConstantInt::get(I32, 0)     // is_col_major (B stored row-major [K×N])
-                }, "b_desc_word");
+                Value *smem_B_base_i64 =
+                    builder.CreatePtrToInt(tile_base_B, I64);
+                Value *b_word = builder.CreateCall(
+                    cast<Function>(wgmma_encode_fn),
+                    {
+                        smem_B_base_i64,
+                        ConstantInt::get(
+                            I32, 32), // leading_bytes (unused by bugfix TCU)
+                        ConstantInt::get(
+                            I32, 512), // stride_bytes (unused by bugfix TCU)
+                        ConstantInt::get(I32, 0),  // mn_idx
+                        ConstantInt::get(I32, 0),  // k_idx
+                        ConstantInt::get(I32, 16), // ldm (N_tile = 16 elements)
+                        ConstantInt::get(
+                            I32, 0) // is_col_major (B stored row-major [K×N])
+                    },
+                    "b_desc_word");
 
-                Value *b_meta_f = builder.CreateBitCast(b_word, F32, "b_meta_f");
+                Value *b_meta_f =
+                    builder.CreateBitCast(b_word, F32, "b_meta_f");
                 for (int bi = 0; bi < 8; bi++) {
-                  auto *gep = builder.CreateGEP(F32, fragB_arr, ConstantInt::get(I32, bi));
+                  auto *gep = builder.CreateGEP(F32, fragB_arr,
+                                                ConstantInt::get(I32, bi));
                   builder.CreateStore(b_meta_f, gep);
                 }
 
-                // Call WGMMA_SS: TCU reads A,B from shared memory via descriptors
-                builder.CreateCall(cast<Function>(wgmma_mma_fn), {fragC_arr, fragA_arr, fragB_arr});
+                // Call WGMMA_SS: TCU reads A,B from shared memory via
+                // descriptors
+                builder.CreateCall(cast<Function>(wgmma_mma_fn),
+                                   {fragC_arr, fragA_arr, fragB_arr});
 
                 // Extract results: first 4 floats from fragC (Vortex layout)
                 // Vortex TCU C/D layout: thread t owns elements:
                 //   fragC[i*tcN + j] for i in [0,tcM), j in [0,tcN)
-                //   where thread t is at row=(t/tcN), col=(t%tcN) in the output tile
+                //   where thread t is at row=(t/tcN), col=(t%tcN) in the output
+                //   tile
                 // NVIDIA mma.sync m16n8 layout: each thread owns 4 elements
                 //   mapped to specific (row,col) positions in the output
-                // TODO: C/D layout shuffle NVIDIA ↔ Vortex (for now, take as-is)
+                // TODO: C/D layout shuffle NVIDIA ↔ Vortex (for now, take
+                // as-is)
                 Value *result = UndefValue::get(Call->getType());
                 for (int ri = 0; ri < 4; ri++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr, ConstantInt::get(I32, ri));
+                  auto *gep = builder.CreateGEP(F32, fragC_arr,
+                                                ConstantInt::get(I32, ri));
                   Value *val = builder.CreateLoad(F32, gep, "tcu_result");
                   result = builder.CreateInsertValue(result, val, ri);
                 }
                 Call->replaceAllUsesWith(result);
 
-                if (cupbop_debug()) printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync (tile base fixed)\n");
+                if (cupbop_debug())
+                  printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync "
+                         "(tile base fixed)\n");
               } else {
                 // Fallback: smem pointers not found, replace with undef
-                if (cupbop_debug()) printf("[TCU] WARNING: smem pointers not found, using undef\n");
+                if (cupbop_debug())
+                  printf(
+                      "[TCU] WARNING: smem pointers not found, using undef\n");
                 if (!Call->getType()->isVoidTy()) {
                   Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
                 }
@@ -1340,7 +1482,9 @@ void replace_asm_call(llvm::Module *M) {
               ldmatrix_map.clear();
 
             } else {
-              if (cupbop_debug()) printf("warning: unknown PTX InlineAsm: %s (removing)\n", asm_str.c_str());
+              if (cupbop_debug())
+                printf("warning: unknown PTX InlineAsm: %s (removing)\n",
+                       asm_str.c_str());
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               if (!Call->getType()->isVoidTy()) {
@@ -1591,7 +1735,8 @@ Value *createGEP(IRBuilder<> &B, Value *ptr, ArrayRef<Value *> idxlist) {
 // Replaces CUDA cp.async intrinsics with Vortex DXA tile-copy calls.
 //
 // Pattern:
-//   call @llvm.nvvm.cp.async.ca.shared.global.{4,8,16}(ptr addrspace(3), ptr addrspace(1))
+//   call @llvm.nvvm.cp.async.ca.shared.global.{4,8,16}(ptr addrspace(3), ptr
+//   addrspace(1))
 //   ...
 //   call @llvm.nvvm.cp.async.commit.group()
 //   call @llvm.nvvm.cp.async.wait.group(i32 N)
@@ -1611,46 +1756,57 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
   auto *PtrTy = PointerType::getUnqual(ctx);
 
   // Declare __vx_* functions (C++ mangled names matching cudaKernelImpl.cpp)
-  auto *dxa_issue_fn = M->getOrInsertFunction(
-      "_Z17__vx_dxa_issue_2djjPvjj",
-      FunctionType::get(VoidTy, {I32, I32, PtrTy, I32, I32}, false)).getCallee();
-  auto *barrier_fn = M->getOrInsertFunction(
-      "_Z28__vx_barrier_arrive_and_waitjj",
-      FunctionType::get(VoidTy, {I32, I32}, false)).getCallee();
-  auto *barrier_id_fn = M->getOrInsertFunction(
-      "_Z19__vx_dxa_barrier_idj",
-      FunctionType::get(I32, {I32}, false)).getCallee();
-  auto *is_dxa_fn = M->getOrInsertFunction(
-      "_Z16__vx_is_dxa_warpv",
-      FunctionType::get(I32, {}, false)).getCallee();
-  auto *warps_fn = M->getOrInsertFunction(
-      "_Z20__vx_warps_per_groupv",
-      FunctionType::get(I32, {}, false)).getCallee();
-  auto *local_mem_fn = M->getOrInsertFunction(
-      "_Z21__vx_local_mem_offsetj",
-      FunctionType::get(PtrTy, {I32}, false)).getCallee();
+  auto *dxa_issue_fn =
+      M->getOrInsertFunction(
+           "_Z17__vx_dxa_issue_2djjPvjj",
+           FunctionType::get(VoidTy, {I32, I32, PtrTy, I32, I32}, false))
+          .getCallee();
+  auto *barrier_fn =
+      M->getOrInsertFunction("_Z28__vx_barrier_arrive_and_waitjj",
+                             FunctionType::get(VoidTy, {I32, I32}, false))
+          .getCallee();
+  auto *barrier_id_fn =
+      M->getOrInsertFunction("_Z19__vx_dxa_barrier_idj",
+                             FunctionType::get(I32, {I32}, false))
+          .getCallee();
+  auto *is_dxa_fn = M->getOrInsertFunction("_Z16__vx_is_dxa_warpv",
+                                           FunctionType::get(I32, {}, false))
+                        .getCallee();
+  auto *warps_fn = M->getOrInsertFunction("_Z20__vx_warps_per_groupv",
+                                          FunctionType::get(I32, {}, false))
+                       .getCallee();
+  auto *local_mem_fn =
+      M->getOrInsertFunction("_Z21__vx_local_mem_offsetj",
+                             FunctionType::get(PtrTy, {I32}, false))
+          .getCallee();
 
   // Collect all cp.async-related calls
   struct CpAsyncCopyInfo {
     CallInst *call;
-    Value *smem_dst;   // ptr addrspace(3)
-    Value *gmem_src;   // ptr addrspace(1)
-    unsigned bytes;    // 4, 8, or 16
+    Value *smem_dst; // ptr addrspace(3)
+    Value *gmem_src; // ptr addrspace(1)
+    unsigned bytes;  // 4, 8, or 16
   };
 
   std::vector<CpAsyncCopyInfo> copy_calls;
-  std::vector<CallInst*> commit_calls;
-  std::vector<CallInst*> wait_calls;
-  std::vector<CallInst*> wait_all_calls;
+  std::vector<CallInst *> commit_calls;
+  std::vector<CallInst *> wait_calls;
+  std::vector<CallInst *> wait_all_calls;
 
-  if (cupbop_debug()) std::cout << "[cp.async→DXA] Scanning module for cp.async patterns...\n" << std::flush;
+  if (cupbop_debug())
+    std::cout << "[cp.async→DXA] Scanning module for cp.async patterns...\n"
+              << std::flush;
 
   for (auto &F : *M) {
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Scanning function: " << F.getName().str() << "\n" << std::flush;
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Scanning function: " << F.getName().str()
+                << "\n"
+                << std::flush;
     for (auto &BB : F) {
       for (auto &I : BB) {
         auto *CI = dyn_cast<CallInst>(&I);
-        if (!CI) continue;
+        if (!CI)
+          continue;
 
         if (!CI->getCalledFunction()) {
           // Could be inline asm or indirect call — skip for approach A
@@ -1659,30 +1815,37 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
         auto name = CI->getCalledFunction()->getName();
 
         // Debug: print any call containing "async" or "pipeline"
-        if (name.contains("async") || name.contains("pipeline") || name.contains("cp_async")) {
-          if (cupbop_debug()) std::cout << "[cp.async→DXA] Candidate call: " << name.str() << " in " << F.getName().str() << "\n" << std::flush;
+        if (name.contains("async") || name.contains("pipeline") ||
+            name.contains("cp_async")) {
+          if (cupbop_debug())
+            std::cout << "[cp.async→DXA] Candidate call: " << name.str()
+                      << " in " << F.getName().str() << "\n"
+                      << std::flush;
         }
 
-        // Approach A: Function-level detection (wrapper functions like cp_async_4)
-        // Demangled patterns: cp_async_4(void*, void const*), cp_async_commit(), cp_async_wait()
-        // Also matches __pipeline_memcpy_async variants
-        // Skip kernel functions — filter by checking the callee is a small helper,
-        // not a kernel. Kernel functions have many args; cp_async helpers have 0-2.
-        if ((name.contains("cp_async") || name.contains("pipeline_memcpy_async") ||
-            name.contains("CpAsyncChooser")) &&
+        // Approach A: Function-level detection (wrapper functions like
+        // cp_async_4) Demangled patterns: cp_async_4(void*, void const*),
+        // cp_async_commit(), cp_async_wait() Also matches
+        // __pipeline_memcpy_async variants Skip kernel functions — filter by
+        // checking the callee is a small helper, not a kernel. Kernel functions
+        // have many args; cp_async helpers have 0-2.
+        if ((name.contains("cp_async") ||
+             name.contains("pipeline_memcpy_async") ||
+             name.contains("CpAsyncChooser")) &&
             CI->getCalledFunction()->arg_size() <= 2) {
           if (name.contains("commit") || name.contains("pipeline_commit")) {
             commit_calls.push_back(CI);
-          }
-          else if (name.contains("wait")) {
+          } else if (name.contains("wait")) {
             wait_calls.push_back(CI);
-          }
-          else if (CI->arg_size() >= 2) {
+          } else if (CI->arg_size() >= 2) {
             // Copy function: first arg = smem dst, second arg = gmem src
             unsigned bytes = 4; // default; could parse from name
-            if (name.contains("16")) bytes = 16;
-            else if (name.contains("8")) bytes = 8;
-            copy_calls.push_back({CI, CI->getArgOperand(0), CI->getArgOperand(1), bytes});
+            if (name.contains("16"))
+              bytes = 16;
+            else if (name.contains("8"))
+              bytes = 8;
+            copy_calls.push_back(
+                {CI, CI->getArgOperand(0), CI->getArgOperand(1), bytes});
           }
         }
 
@@ -1690,51 +1853,61 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
         else if (name.starts_with("llvm.nvvm.cp.async.ca.shared.global") ||
                  name.starts_with("llvm.nvvm.cp.async.cg.shared.global")) {
           unsigned bytes = 0;
-          if (name.contains(".16")) bytes = 16;
-          else if (name.contains(".8")) bytes = 8;
-          else if (name.contains(".4")) bytes = 4;
-          copy_calls.push_back({CI, CI->getArgOperand(0), CI->getArgOperand(1), bytes});
-        }
-        else if (name == "llvm.nvvm.cp.async.commit.group") {
+          if (name.contains(".16"))
+            bytes = 16;
+          else if (name.contains(".8"))
+            bytes = 8;
+          else if (name.contains(".4"))
+            bytes = 4;
+          copy_calls.push_back(
+              {CI, CI->getArgOperand(0), CI->getArgOperand(1), bytes});
+        } else if (name == "llvm.nvvm.cp.async.commit.group") {
           commit_calls.push_back(CI);
-        }
-        else if (name == "llvm.nvvm.cp.async.wait.group") {
+        } else if (name == "llvm.nvvm.cp.async.wait.group") {
           wait_calls.push_back(CI);
-        }
-        else if (name == "llvm.nvvm.cp.async.wait.all") {
+        } else if (name == "llvm.nvvm.cp.async.wait.all") {
           wait_all_calls.push_back(CI);
         }
       }
     }
   }
 
-  if (cupbop_debug()) std::cout << "[cp.async→DXA] Scan done. copy=" << copy_calls.size()
-            << " commit=" << commit_calls.size()
-            << " wait=" << wait_calls.size() << "\n" << std::flush;
+  if (cupbop_debug())
+    std::cout << "[cp.async→DXA] Scan done. copy=" << copy_calls.size()
+              << " commit=" << commit_calls.size()
+              << " wait=" << wait_calls.size() << "\n"
+              << std::flush;
 
-  if (copy_calls.empty() && commit_calls.empty() && wait_calls.empty() && wait_all_calls.empty()) {
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] No cp.async found, returning\n" << std::flush;
+  if (copy_calls.empty() && commit_calls.empty() && wait_calls.empty() &&
+      wait_all_calls.empty()) {
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] No cp.async found, returning\n"
+                << std::flush;
     return;
   }
 
   // Debug: print collected info
   for (size_t i = 0; i < copy_calls.size(); i++) {
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] copy[" << i << "]: smem=" << (void*)copy_calls[i].smem_dst
-              << " gmem=" << (void*)copy_calls[i].gmem_src
-              << " bytes=" << copy_calls[i].bytes << "\n" << std::flush;
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] copy[" << i
+                << "]: smem=" << (void *)copy_calls[i].smem_dst
+                << " gmem=" << (void *)copy_calls[i].gmem_src
+                << " bytes=" << copy_calls[i].bytes << "\n"
+                << std::flush;
   }
 
-  if (cupbop_debug()) std::cout << "[cp.async→DXA] Found " << copy_calls.size() << " copy, "
-            << commit_calls.size() << " commit, "
-            << wait_calls.size() << " wait.group, "
-            << wait_all_calls.size() << " wait.all calls\n";
+  if (cupbop_debug())
+    std::cout << "[cp.async→DXA] Found " << copy_calls.size() << " copy, "
+              << commit_calls.size() << " commit, " << wait_calls.size()
+              << " wait.group, " << wait_all_calls.size()
+              << " wait.all calls\n";
 
   // Track descriptor slots by tracing global pointer back to kernel arg
   // For each distinct global base pointer, assign a descriptor slot
   uint32_t next_desc_slot = 0;
-  std::map<Value*, uint32_t> ptr_to_slot;
+  std::map<Value *, uint32_t> ptr_to_slot;
 
-  auto getBasePtr = [](Value *V) -> Value* {
+  auto getBasePtr = [](Value *V) -> Value * {
     // Walk through GEPs, bitcasts, addrspacecasts to find the base pointer
     while (true) {
       if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
@@ -1755,17 +1928,22 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
   // Assign descriptor slots — one per copy for now (simplified)
   for (size_t i = 0; i < copy_calls.size(); i++) {
     ptr_to_slot[copy_calls[i].gmem_src] = i;
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Assigned desc slot " << i << "\n" << std::flush;
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Assigned desc slot " << i << "\n"
+                << std::flush;
   }
 
   // Collect wrapper functions before erasing calls (use-after-free prevention)
   // Save original copy info before eraseFromParent invalidates pointers
-  struct CpAsyncOrigInfo { Value *gmem_src; unsigned bytes; };
+  struct CpAsyncOrigInfo {
+    Value *gmem_src;
+    unsigned bytes;
+  };
   std::vector<CpAsyncOrigInfo> copy_calls_orig;
   for (auto &info : copy_calls)
     copy_calls_orig.push_back({info.gmem_src, info.bytes});
 
-  std::set<Function*> wrapper_fns;
+  std::set<Function *> wrapper_fns;
   for (auto &info : copy_calls) {
     if (info.call->getCalledFunction())
       wrapper_fns.insert(info.call->getCalledFunction());
@@ -1786,16 +1964,23 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
 
   auto getBlockIdxDim = [](Value *V) -> int {
     auto *CI = dyn_cast<CallInst>(V);
-    if (!CI || !CI->getCalledFunction()) return -1;
+    if (!CI || !CI->getCalledFunction())
+      return -1;
     auto name = CI->getCalledFunction()->getName();
     if (name.contains("blockIdx") && name.contains("fetch_builtin")) {
-      if (name.contains("_x")) return 0;
-      if (name.contains("_y")) return 1;
-      if (name.contains("_z")) return 2;
+      if (name.contains("_x"))
+        return 0;
+      if (name.contains("_y"))
+        return 1;
+      if (name.contains("_z"))
+        return 2;
     }
-    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.x") return 0;
-    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.y") return 1;
-    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.z") return 2;
+    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.x")
+      return 0;
+    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.y")
+      return 1;
+    if (name == "llvm.nvvm.read.ptx.sreg.ctaid.z")
+      return 2;
     return -1;
   };
 
@@ -1804,60 +1989,83 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
     if (auto *LI = dyn_cast<LoadInst>(V)) {
       if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
         auto n = AI->getName();
-        if (n.contains("k_base") || n.contains("k_tile") || n == "k" || n == "kk") return true;
+        if (n.contains("k_base") || n.contains("k_tile") || n == "k" ||
+            n == "kk")
+          return true;
       }
       auto bb = LI->getParent()->getName();
       if (bb.starts_with("for.cond") || bb.starts_with("for.body")) {
-        if (isa<AllocaInst>(LI->getPointerOperand())) return true;
+        if (isa<AllocaInst>(LI->getPointerOperand()))
+          return true;
       }
     }
     if (auto *PHI = dyn_cast<PHINode>(V)) {
       auto bb = PHI->getParent()->getName();
-      if (bb.starts_with("for.cond") || bb.contains("loop")) return true;
+      if (bb.starts_with("for.cond") || bb.contains("loop"))
+        return true;
     }
     return false;
   };
 
-  // Recursive classifier: given a Value in an offset expression, determine what it depends on
+  // Recursive classifier: given a Value in an offset expression, determine what
+  // it depends on
   enum class TK { BlockX, BlockY, LoopVar, ThreadIdx, Const, Unknown };
-  std::function<TK(Value*, int)> classify = [&](Value *V, int depth) -> TK {
-    if (depth > 20) return TK::Unknown;
-    if (isa<ConstantInt>(V)) return TK::Const;
+  std::function<TK(Value *, int)> classify = [&](Value *V, int depth) -> TK {
+    if (depth > 20)
+      return TK::Unknown;
+    if (isa<ConstantInt>(V))
+      return TK::Const;
     int dim = getBlockIdxDim(V);
-    if (dim == 0) return TK::BlockX;
-    if (dim == 1) return TK::BlockY;
-    { auto *CI = dyn_cast<CallInst>(V);
+    if (dim == 0)
+      return TK::BlockX;
+    if (dim == 1)
+      return TK::BlockY;
+    {
+      auto *CI = dyn_cast<CallInst>(V);
       if (CI && CI->getCalledFunction()) {
         auto n = CI->getCalledFunction()->getName();
-        if (n.contains("threadIdx") || n.starts_with("llvm.nvvm.read.ptx.sreg.tid.")) return TK::ThreadIdx;
+        if (n.contains("threadIdx") ||
+            n.starts_with("llvm.nvvm.read.ptx.sreg.tid."))
+          return TK::ThreadIdx;
       }
     }
-    if (isLoopVar(V)) return TK::LoopVar;
+    if (isLoopVar(V))
+      return TK::LoopVar;
     if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
-      auto k0 = classify(BinOp->getOperand(0), depth+1);
-      auto k1 = classify(BinOp->getOperand(1), depth+1);
-      if (BinOp->getOpcode() == Instruction::Add || BinOp->getOpcode() == Instruction::Or) {
-        if (k0 != TK::Const && k0 != TK::Unknown) return k0;
-        if (k1 != TK::Const && k1 != TK::Unknown) return k1;
+      auto k0 = classify(BinOp->getOperand(0), depth + 1);
+      auto k1 = classify(BinOp->getOperand(1), depth + 1);
+      if (BinOp->getOpcode() == Instruction::Add ||
+          BinOp->getOpcode() == Instruction::Or) {
+        if (k0 != TK::Const && k0 != TK::Unknown)
+          return k0;
+        if (k1 != TK::Const && k1 != TK::Unknown)
+          return k1;
         return (k0 == TK::Const && k1 == TK::Const) ? TK::Const : TK::Unknown;
       }
-      if (BinOp->getOpcode() == Instruction::Mul || BinOp->getOpcode() == Instruction::Shl) {
-        if (k0 == TK::Const || k0 == TK::Unknown) return k1;
-        if (k1 == TK::Const || k1 == TK::Unknown) return k0;
+      if (BinOp->getOpcode() == Instruction::Mul ||
+          BinOp->getOpcode() == Instruction::Shl) {
+        if (k0 == TK::Const || k0 == TK::Unknown)
+          return k1;
+        if (k1 == TK::Const || k1 == TK::Unknown)
+          return k0;
         return k0; // both non-trivial: prefer first operand
       }
     }
-    if (auto *CE = dyn_cast<CastInst>(V)) return classify(CE->getOperand(0), depth+1);
-    if (auto *PHI = dyn_cast<PHINode>(V)) return classify(PHI->getIncomingValue(0), depth+1);
+    if (auto *CE = dyn_cast<CastInst>(V))
+      return classify(CE->getOperand(0), depth + 1);
+    if (auto *PHI = dyn_cast<PHINode>(V))
+      return classify(PHI->getIncomingValue(0), depth + 1);
     if (auto *LI = dyn_cast<LoadInst>(V)) {
       if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
         auto n = AI->getName();
-        if (n.contains("k_base") || n == "k") return TK::LoopVar;
+        if (n.contains("k_base") || n == "k")
+          return TK::LoopVar;
         for (auto *U : AI->users()) {
           if (auto *SI = dyn_cast<StoreInst>(U)) {
             if (SI->getPointerOperand() == AI) {
-              auto k = classify(SI->getValueOperand(), depth+1);
-              if (k != TK::Unknown) return k;
+              auto k = classify(SI->getValueOperand(), depth + 1);
+              if (k != TK::Unknown)
+                return k;
             }
           }
         }
@@ -1867,7 +2075,7 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
   };
 
   // Collect all blockIdx*TILE and loop induction variable values in the kernel
-  std::map<int, Value*> blockIdxTile; // dim -> mul instruction
+  std::map<int, Value *> blockIdxTile; // dim -> mul instruction
   Value *loopVar = nullptr;
   for (auto &BB : *kernelFn) {
     for (auto &I : BB) {
@@ -1875,11 +2083,15 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
         if (Mul->getOpcode() == Instruction::Mul) {
           for (int op = 0; op < 2; op++) {
             int dim = getBlockIdxDim(Mul->getOperand(op));
-            if (dim >= 0 && isa<ConstantInt>(Mul->getOperand(1-op))) {
+            if (dim >= 0 && isa<ConstantInt>(Mul->getOperand(1 - op))) {
               if (blockIdxTile.find(dim) == blockIdxTile.end()) {
                 blockIdxTile[dim] = Mul;
-                auto tile = cast<ConstantInt>(Mul->getOperand(1-op))->getZExtValue();
-                if (cupbop_debug()) std::cout << "[cp.async→DXA] Found blockIdx." << "xyz"[dim] << " * " << tile << "\n" << std::flush;
+                auto tile =
+                    cast<ConstantInt>(Mul->getOperand(1 - op))->getZExtValue();
+                if (cupbop_debug())
+                  std::cout << "[cp.async→DXA] Found blockIdx." << "xyz"[dim]
+                            << " * " << tile << "\n"
+                            << std::flush;
               }
             }
           }
@@ -1887,18 +2099,23 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
       }
       if (!loopVar && isLoopVar(&I)) {
         loopVar = &I;
-        if (cupbop_debug()) std::cout << "[cp.async→DXA] Found loop var in " << BB.getName().str() << "\n" << std::flush;
+        if (cupbop_debug())
+          std::cout << "[cp.async→DXA] Found loop var in " << BB.getName().str()
+                    << "\n"
+                    << std::flush;
       }
     }
   }
 
-  // --- Replace copy calls with DXA issue using GEP-based coordinate extraction ---
+  // --- Replace copy calls with DXA issue using GEP-based coordinate extraction
+  // ---
   for (size_t i = 0; i < copy_calls.size(); i++) {
     auto *CI = copy_calls[i].call;
     IRBuilder<> builder(CI);
 
-    Value *bar_id = builder.CreateCall(
-        cast<Function>(barrier_id_fn), {ConstantInt::get(I32, 0)}, "dxa_bar_id");
+    Value *bar_id =
+        builder.CreateCall(cast<Function>(barrier_id_fn),
+                           {ConstantInt::get(I32, 0)}, "dxa_bar_id");
     Value *smem = copy_calls[i].smem_dst;
 
     Value *coord0 = ConstantInt::get(I32, 0);
@@ -1917,11 +2134,13 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
       bool hasBlockX = false, hasBlockY = false, hasLoop = false;
       Value *blockXVal = nullptr, *blockYVal = nullptr, *loopVal = nullptr;
 
-      std::vector<Value*> worklist = {offset};
-      std::set<Value*> visited;
+      std::vector<Value *> worklist = {offset};
+      std::set<Value *> visited;
       while (!worklist.empty()) {
-        Value *V = worklist.back(); worklist.pop_back();
-        if (visited.count(V)) continue;
+        Value *V = worklist.back();
+        worklist.pop_back();
+        if (visited.count(V))
+          continue;
         visited.insert(V);
         // Follow casts (sext, zext, trunc)
         if (auto *CE = dyn_cast<CastInst>(V)) {
@@ -1930,27 +2149,44 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
         }
         // Split additions
         if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
-          if (BinOp->getOpcode() == Instruction::Add || BinOp->getOpcode() == Instruction::Or) {
+          if (BinOp->getOpcode() == Instruction::Add ||
+              BinOp->getOpcode() == Instruction::Or) {
             worklist.push_back(BinOp->getOperand(0));
             worklist.push_back(BinOp->getOperand(1));
             continue;
           }
         }
         TK kind = classify(V, 0);
-        if (kind == TK::BlockX && !hasBlockX) { hasBlockX = true; blockXVal = V; }
-        if (kind == TK::BlockY && !hasBlockY) { hasBlockY = true; blockYVal = V; }
-        if (kind == TK::LoopVar && !hasLoop) { hasLoop = true; loopVal = V; }
+        if (kind == TK::BlockX && !hasBlockX) {
+          hasBlockX = true;
+          blockXVal = V;
+        }
+        if (kind == TK::BlockY && !hasBlockY) {
+          hasBlockY = true;
+          blockYVal = V;
+        }
+        if (kind == TK::LoopVar && !hasLoop) {
+          hasLoop = true;
+          loopVal = V;
+        }
       }
 
       // Map classified terms to DXA coordinates
-      // For A[row*K+col]: blockIdx.x (row) + loopVar (col) -> coord0=loopVar, coord1=blockIdx.x
-      // For B[row*N+col]: loopVar (row) + blockIdx.y (col) -> coord0=blockIdx.y, coord1=loopVar
+      // For A[row*K+col]: blockIdx.x (row) + loopVar (col) -> coord0=loopVar,
+      // coord1=blockIdx.x For B[row*N+col]: loopVar (row) + blockIdx.y (col) ->
+      // coord0=blockIdx.y, coord1=loopVar
       if (hasBlockX && hasLoop && !hasBlockY) {
-        coord0 = loopVal ? loopVal : (loopVar ? loopVar : ConstantInt::get(I32, 0));
-        coord1 = blockXVal ? blockXVal : (blockIdxTile.count(0) ? blockIdxTile[0] : ConstantInt::get(I32, 0));
+        coord0 =
+            loopVal ? loopVal : (loopVar ? loopVar : ConstantInt::get(I32, 0));
+        coord1 = blockXVal ? blockXVal
+                           : (blockIdxTile.count(0) ? blockIdxTile[0]
+                                                    : ConstantInt::get(I32, 0));
       } else if (hasBlockY && hasLoop && !hasBlockX) {
-        coord0 = blockYVal ? blockYVal : (blockIdxTile.count(1) ? blockIdxTile[1] : ConstantInt::get(I32, 0));
-        coord1 = loopVal ? loopVal : (loopVar ? loopVar : ConstantInt::get(I32, 0));
+        coord0 = blockYVal ? blockYVal
+                           : (blockIdxTile.count(1) ? blockIdxTile[1]
+                                                    : ConstantInt::get(I32, 0));
+        coord1 =
+            loopVal ? loopVal : (loopVar ? loopVar : ConstantInt::get(I32, 0));
       } else if (hasBlockX && hasBlockY) {
         coord0 = blockYVal ? blockYVal : ConstantInt::get(I32, 0);
         coord1 = blockXVal ? blockXVal : ConstantInt::get(I32, 0);
@@ -1958,8 +2194,10 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
         coord0 = loopVal ? loopVal : ConstantInt::get(I32, 0);
       }
 
-      if (cupbop_debug()) std::cout << "[cp.async→DXA] copy[" << i << "]: blockX=" << hasBlockX
-                << " blockY=" << hasBlockY << " loop=" << hasLoop << "\n" << std::flush;
+      if (cupbop_debug())
+        std::cout << "[cp.async→DXA] copy[" << i << "]: blockX=" << hasBlockX
+                  << " blockY=" << hasBlockY << " loop=" << hasLoop << "\n"
+                  << std::flush;
     }
 
 #endif // Phase 2
@@ -1970,71 +2208,95 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
       for (auto &BB2 : *kernelFn) {
         for (auto &I2 : BB2) {
           if (auto *Mul = dyn_cast<BinaryOperator>(&I2)) {
-            if (Mul->getOpcode() != Instruction::Mul) continue;
+            if (Mul->getOpcode() != Instruction::Mul)
+              continue;
             for (int op = 0; op < 2; op++) {
               int dim = getBlockIdxDim(Mul->getOperand(op));
-              if (dim == 0 && !rb && isa<ConstantInt>(Mul->getOperand(1-op))) rb = Mul;
-              if (dim == 1 && !cb && isa<ConstantInt>(Mul->getOperand(1-op))) cb = Mul;
+              if (dim == 0 && !rb && isa<ConstantInt>(Mul->getOperand(1 - op)))
+                rb = Mul;
+              if (dim == 1 && !cb && isa<ConstantInt>(Mul->getOperand(1 - op)))
+                cb = Mul;
             }
           }
           if (auto *LI = dyn_cast<LoadInst>(&I2)) {
             if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
               if (AI->getName() == "k_base" && !kb &&
-                  (BB2.getName().starts_with("for.cond") || BB2.getName().starts_with("for.body")))
+                  (BB2.getName().starts_with("for.cond") ||
+                   BB2.getName().starts_with("for.body")))
                 kb = LI;
             }
           }
         }
       }
-      if (!rb) rb = ConstantInt::get(I32, 0);
-      if (!cb) cb = ConstantInt::get(I32, 0);
-      if (!kb) kb = ConstantInt::get(I32, 0);
-      if (i == 0) { coord0 = kb; coord1 = rb; }
-      else { coord0 = cb; coord1 = kb; }
+      if (!rb)
+        rb = ConstantInt::get(I32, 0);
+      if (!cb)
+        cb = ConstantInt::get(I32, 0);
+      if (!kb)
+        kb = ConstantInt::get(I32, 0);
+      if (i == 0) {
+        coord0 = kb;
+        coord1 = rb;
+      } else {
+        coord0 = cb;
+        coord1 = kb;
+      }
     }
 
     // Ensure i32 type
-    auto ensureI32 = [&](Value *V) -> Value* {
-      if (V->getType() == I32) return V;
+    auto ensureI32 = [&](Value *V) -> Value * {
+      if (V->getType() == I32)
+        return V;
       if (V->getType()->isIntegerTy()) {
         return V->getType()->getIntegerBitWidth() > 32
-          ? builder.CreateTrunc(V, I32, "i32") : builder.CreateZExt(V, I32, "i32");
+                   ? builder.CreateTrunc(V, I32, "i32")
+                   : builder.CreateZExt(V, I32, "i32");
       }
       return ConstantInt::get(I32, 0);
     };
     coord0 = ensureI32(coord0);
     coord1 = ensureI32(coord1);
 
-    builder.CreateCall(cast<Function>(dxa_issue_fn),
+    builder.CreateCall(
+        cast<Function>(dxa_issue_fn),
         {ConstantInt::get(I32, (uint32_t)i), bar_id, smem, coord0, coord1});
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Replaced copy " << i << " with DXA issue\n" << std::flush;
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Replaced copy " << i << " with DXA issue\n"
+                << std::flush;
     CI->eraseFromParent();
   }
 
   // --- Remove commit.group calls (no-op for DXA) ---
   for (auto *CI : commit_calls) {
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Removing commit.group\n";
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Removing commit.group\n";
     CI->eraseFromParent();
   }
 
   // --- Replace wait.group / wait.all with barrier ---
   for (auto *CI : wait_calls) {
     IRBuilder<> builder(CI);
-    Value *bar_id = builder.CreateCall(
-        cast<Function>(barrier_id_fn), {ConstantInt::get(I32, 0)}, "dxa_bar_id");
-    Value *num_warps = builder.CreateCall(cast<Function>(warps_fn), {}, "num_warps");
+    Value *bar_id =
+        builder.CreateCall(cast<Function>(barrier_id_fn),
+                           {ConstantInt::get(I32, 0)}, "dxa_bar_id");
+    Value *num_warps =
+        builder.CreateCall(cast<Function>(warps_fn), {}, "num_warps");
     builder.CreateCall(cast<Function>(barrier_fn), {bar_id, num_warps});
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Replaced wait.group with barrier\n";
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Replaced wait.group with barrier\n";
     CI->eraseFromParent();
   }
 
   for (auto *CI : wait_all_calls) {
     IRBuilder<> builder(CI);
-    Value *bar_id = builder.CreateCall(
-        cast<Function>(barrier_id_fn), {ConstantInt::get(I32, 0)}, "dxa_bar_id");
-    Value *num_warps = builder.CreateCall(cast<Function>(warps_fn), {}, "num_warps");
+    Value *bar_id =
+        builder.CreateCall(cast<Function>(barrier_id_fn),
+                           {ConstantInt::get(I32, 0)}, "dxa_bar_id");
+    Value *num_warps =
+        builder.CreateCall(cast<Function>(warps_fn), {}, "num_warps");
     builder.CreateCall(cast<Function>(barrier_fn), {bar_id, num_warps});
-    if (cupbop_debug()) std::cout << "[cp.async→DXA] Replaced wait.all with barrier\n";
+    if (cupbop_debug())
+      std::cout << "[cp.async→DXA] Replaced wait.all with barrier\n";
     CI->eraseFromParent();
   }
 
@@ -2044,33 +2306,45 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
   {
     for (auto *F : wrapper_fns) {
       if (!F->isDeclaration()) {
-        if (cupbop_debug()) std::cout << "[cp.async→DXA] Removing wrapper body: " << F->getName().str() << "\n";
+        if (cupbop_debug())
+          std::cout << "[cp.async→DXA] Removing wrapper body: "
+                    << F->getName().str() << "\n";
         F->deleteBody();
       }
     }
   }
 
   // Emit descriptor metadata as sidecar file for runtime auto-programming.
-  // Traces gmem pointers to kernel args, writes dxa_descriptors.txt. TESTED+PASSED.
+  // Traces gmem pointers to kernel args, writes dxa_descriptors.txt.
+  // TESTED+PASSED.
   if (!copy_calls_orig.empty()) {
     // Trace global memory pointers back to kernel function arguments
     auto traceToArgIdx = [](Value *V) -> int {
-      std::set<Value*> visited;
+      std::set<Value *> visited;
       while (V && visited.insert(V).second) {
-        if (auto *Arg = dyn_cast<Argument>(V)) return Arg->getArgNo();
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) V = GEP->getPointerOperand();
-        else if (auto *BC = dyn_cast<BitCastInst>(V)) V = BC->getOperand(0);
-        else if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) V = ASC->getPointerOperand();
+        if (auto *Arg = dyn_cast<Argument>(V))
+          return Arg->getArgNo();
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+          V = GEP->getPointerOperand();
+        else if (auto *BC = dyn_cast<BitCastInst>(V))
+          V = BC->getOperand(0);
+        else if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V))
+          V = ASC->getPointerOperand();
         else if (auto *LI = dyn_cast<LoadInst>(V)) {
           auto *ptr = LI->getPointerOperand();
           if (auto *AI = dyn_cast<AllocaInst>(ptr)) {
             for (auto *U : AI->users()) {
-              if (auto *SI = dyn_cast<StoreInst>(U)) { V = SI->getValueOperand(); break; }
+              if (auto *SI = dyn_cast<StoreInst>(U)) {
+                V = SI->getValueOperand();
+                break;
+              }
             }
-          } else break;
-        }
-        else if (auto *PHI = dyn_cast<PHINode>(V)) V = PHI->getIncomingValue(0);
-        else break;
+          } else
+            break;
+        } else if (auto *PHI = dyn_cast<PHINode>(V))
+          V = PHI->getIncomingValue(0);
+        else
+          break;
       }
       return -1;
     };
@@ -2078,7 +2352,8 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
     // Find integer arguments (likely dimensions: M, N, K)
     std::vector<int> dim_args;
     for (auto &Arg : kernelFn->args()) {
-      if (Arg.getType()->isIntegerTy()) dim_args.push_back(Arg.getArgNo());
+      if (Arg.getType()->isIntegerTy())
+        dim_args.push_back(Arg.getArgNo());
     }
 
     // Extract tile size from blockIdxTile map
@@ -2097,313 +2372,341 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
 
     // Infer element bytes from kernel name
     uint32_t elem_bytes = 4;
-    if (kernelFn->getName().contains("half") || kernelFn->getName().contains("6__half"))
+    if (kernelFn->getName().contains("half") ||
+        kernelFn->getName().contains("6__half"))
       elem_bytes = 2;
 
     // Write sidecar file
     std::ofstream dxa_ofs("dxa_descriptors.txt");
     if (dxa_ofs.is_open()) {
-      dxa_ofs << "# kernel_name slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes\n";
+      dxa_ofs << "# kernel_name slot ptr_arg dim0_arg dim1_arg tile0 tile1 "
+                 "elem_bytes\n";
       for (size_t i = 0; i < copy_calls_orig.size(); i++) {
         int ptr_arg = traceToArgIdx(copy_calls_orig[i].gmem_src);
         int dim0_arg = -1, dim1_arg = -1;
         if (dim_args.size() >= 3) {
-          if (i == 0) { dim0_arg = dim_args[2]; dim1_arg = dim_args[0]; } // A: K, M
-          else { dim0_arg = dim_args[1]; dim1_arg = dim_args[2]; }        // B: N, K
+          if (i == 0) {
+            dim0_arg = dim_args[2];
+            dim1_arg = dim_args[0];
+          } // A: K, M
+          else {
+            dim0_arg = dim_args[1];
+            dim1_arg = dim_args[2];
+          } // B: N, K
         } else if (!dim_args.empty()) {
           dim0_arg = dim1_arg = dim_args[0]; // square
         }
-        dxa_ofs << kernelFn->getName().str() << " " << i << " " << ptr_arg << " "
-                << dim0_arg << " " << dim1_arg << " "
-                << tile_size << " " << tile_size << " " << elem_bytes << "\n";
-        if (cupbop_debug()) std::cout << "[cp.async→DXA] Desc meta: slot=" << i << " ptr_arg=" << ptr_arg
-                  << " dim0=" << dim0_arg << " dim1=" << dim1_arg
-                  << " tile=" << tile_size << " elem=" << elem_bytes << "\n" << std::flush;
+        dxa_ofs << kernelFn->getName().str() << " " << i << " " << ptr_arg
+                << " " << dim0_arg << " " << dim1_arg << " " << tile_size << " "
+                << tile_size << " " << elem_bytes << "\n";
+        if (cupbop_debug())
+          std::cout << "[cp.async→DXA] Desc meta: slot=" << i
+                    << " ptr_arg=" << ptr_arg << " dim0=" << dim0_arg
+                    << " dim1=" << dim1_arg << " tile=" << tile_size
+                    << " elem=" << elem_bytes << "\n"
+                    << std::flush;
       }
       dxa_ofs.close();
     }
   }
 }
 
-void replace_wmma_intrinsics(llvm::Module *M) {
-  using namespace llvm;
+// WMMA Section
 
-  LLVMContext &Ctx = M->getContext();
-  auto *F32Ty = Type::getFloatTy(Ctx);
+enum class WmmaOpKind { Unknown, Load, Store, Mma };
+enum class WmmaFragKind { Unknown, MatrixA, MatrixB, Accumulator };
+enum class WmmaElemKind { Unknown, F16, F32, U8, S8, S32 };
+enum class WmmaLayout { None, RowMajor, ColMajor, Dynamic };
 
-  // Collect all wmma intrinsic calls
-  std::vector<CallInst *> wmma_calls;
-  for (auto &F : *M) {
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (auto *CI = dyn_cast<CallInst>(&I)) {
-          if (!CI->getCalledFunction()) continue;
-          auto name = CI->getCalledFunction()->getName().str();
-          if (name.find("llvm.nvvm.wmma") != std::string::npos) {
-            wmma_calls.push_back(CI);
+struct FragmentSig {
+  WmmaFragKind Kind = WmmaFragKind::Unknown;
+  WmmaElemKind Elem = WmmaElemKind::Unknown;
+  WmmaLayout Layout = WmmaLayout::None;
+  int M = 0;
+  int N = 0;
+  int K = 0;
+
+  bool isValid() const {
+    return Kind != WmmaFragKind::Unknown && M > 0 && N > 0 && K > 0;
+  }
+};
+
+struct WmmaCallDesc {
+  WmmaOpKind Op = WmmaOpKind::Unknown;
+  SmallVector<FragmentSig, 4> OrderedFrags;
+
+  FragmentSig D;
+  FragmentSig A;
+  FragmentSig B;
+  FragmentSig C;
+
+  WmmaLayout StoreMemLayout = WmmaLayout::None;
+  std::string ReplacementName;
+};
+
+std::string maybeDemangle(StringRef Name) {
+  if (Name.starts_with("_Z") || Name.starts_with("?")) {
+    return demangle(Name.str());
+  }
+  return Name.str();
+}
+
+DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
+  DenseMap<CallInst *, WmmaCallDesc> CallToDesc;
+
+  auto toFragSuffix = [](WmmaFragKind K) -> const char * {
+    switch (K) {
+    case WmmaFragKind::MatrixA:
+      return "a";
+    case WmmaFragKind::MatrixB:
+      return "b";
+    case WmmaFragKind::Accumulator:
+      return "acc";
+    default:
+      return "unknown";
+    }
+  };
+
+  auto toElemSuffix = [](WmmaElemKind K) -> const char * {
+    switch (K) {
+    case WmmaElemKind::F16:
+      return "f16";
+    case WmmaElemKind::F32:
+      return "f32";
+    case WmmaElemKind::U8:
+      return "u8";
+    case WmmaElemKind::S8:
+      return "s8";
+    case WmmaElemKind::S32:
+      return "s32";
+    default:
+      return "unknown";
+    }
+  };
+
+  auto toLayoutSuffix = [](WmmaLayout L) -> const char * {
+    switch (L) {
+    case WmmaLayout::RowMajor:
+      return "row";
+    case WmmaLayout::ColMajor:
+      return "col";
+    case WmmaLayout::Dynamic:
+      return "dyn";
+    case WmmaLayout::None:
+      return "none";
+    default:
+      return "unknown";
+    }
+  };
+
+  for (Function &F : *M) {
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI)
+          continue;
+
+        Function *Callee = CI->getCalledFunction();
+        if (!Callee)
+          continue;
+
+        std::string Name = maybeDemangle(Callee->getName());
+        StringRef Demangled(Name);
+
+        if (!Demangled.contains("nvcuda::wmma::"))
+          continue;
+
+        WmmaCallDesc Desc;
+
+        if (Demangled.contains("load_matrix_sync("))
+          Desc.Op = WmmaOpKind::Load;
+        else if (Demangled.contains("store_matrix_sync("))
+          Desc.Op = WmmaOpKind::Store;
+        else if (Demangled.contains("mma_sync("))
+          Desc.Op = WmmaOpKind::Mma;
+        else
+          continue;
+
+        size_t SearchFrom = 0;
+        while (true) {
+          size_t Pos = Demangled.find("fragment<", SearchFrom);
+          if (Pos == StringRef::npos)
+            break;
+
+          size_t Start = Pos + strlen("fragment<");
+          int Depth = 1;
+          size_t End = Start;
+          for (; End < Demangled.size(); ++End) {
+            if (Demangled[End] == '<')
+              ++Depth;
+            else if (Demangled[End] == '>') {
+              --Depth;
+              if (Depth == 0)
+                break;
+            }
           }
+          if (End >= Demangled.size())
+            break;
+
+          StringRef Body = Demangled.slice(Start, End);
+
+          SmallVector<StringRef, 8> Parts;
+          size_t PartStart = 0;
+          int AngleDepth = 0;
+          for (size_t J = 0; J < Body.size(); ++J) {
+            if (Body[J] == '<')
+              ++AngleDepth;
+            else if (Body[J] == '>')
+              --AngleDepth;
+            else if (Body[J] == ',' && AngleDepth == 0) {
+              Parts.push_back(Body.slice(PartStart, J).trim());
+              PartStart = J + 1;
+            }
+          }
+          Parts.push_back(Body.drop_front(PartStart).trim());
+
+          if (Parts.size() == 6) {
+            FragmentSig Sig;
+
+            if (Parts[0].contains("matrix_a"))
+              Sig.Kind = WmmaFragKind::MatrixA;
+            else if (Parts[0].contains("matrix_b"))
+              Sig.Kind = WmmaFragKind::MatrixB;
+            else if (Parts[0].contains("accumulator"))
+              Sig.Kind = WmmaFragKind::Accumulator;
+
+            if (Parts[1].getAsInteger(10, Sig.M) ||
+                Parts[2].getAsInteger(10, Sig.N) ||
+                Parts[3].getAsInteger(10, Sig.K)) {
+              SearchFrom = End + 1;
+              continue;
+            }
+
+            if (Parts[4] == "__half" || Parts[4].ends_with("__half"))
+              Sig.Elem = WmmaElemKind::F16;
+            else if (Parts[4] == "float")
+              Sig.Elem = WmmaElemKind::F32;
+            else if (Parts[4] == "unsigned char")
+              Sig.Elem = WmmaElemKind::U8;
+            else if (Parts[4] == "signed char")
+              Sig.Elem = WmmaElemKind::S8;
+            else if (Parts[4] == "int")
+              Sig.Elem = WmmaElemKind::S32;
+
+            if (Parts[5] == "void")
+              Sig.Layout = WmmaLayout::None;
+            else if (Parts[5].contains("row_major"))
+              Sig.Layout = WmmaLayout::RowMajor;
+            else if (Parts[5].contains("col_major"))
+              Sig.Layout = WmmaLayout::ColMajor;
+
+            if (Sig.isValid())
+              Desc.OrderedFrags.push_back(Sig);
+          }
+
+          SearchFrom = End + 1;
         }
+
+        if (Desc.Op == WmmaOpKind::Load && Desc.OrderedFrags.size() == 1) {
+          if (Desc.OrderedFrags[0].Kind == WmmaFragKind::MatrixA)
+            Desc.A = Desc.OrderedFrags[0];
+          else if (Desc.OrderedFrags[0].Kind == WmmaFragKind::MatrixB)
+            Desc.B = Desc.OrderedFrags[0];
+        } else if (Desc.Op == WmmaOpKind::Store &&
+                   Desc.OrderedFrags.size() == 1) {
+          Desc.D = Desc.OrderedFrags[0];
+          if (CI->arg_size() >= 4) {
+            if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(3)))
+              Desc.StoreMemLayout =
+                  C->isZero() ? WmmaLayout::RowMajor : WmmaLayout::ColMajor;
+            else
+              Desc.StoreMemLayout = WmmaLayout::Dynamic;
+          }
+        } else if (Desc.Op == WmmaOpKind::Mma &&
+                   Desc.OrderedFrags.size() == 4) {
+          Desc.D = Desc.OrderedFrags[0];
+          Desc.A = Desc.OrderedFrags[1];
+          Desc.B = Desc.OrderedFrags[2];
+          Desc.C = Desc.OrderedFrags[3];
+        }
+
+        raw_string_ostream OS(Desc.ReplacementName);
+        if (Desc.Op == WmmaOpKind::Load) {
+          const FragmentSig &Frag = Desc.A.isValid() ? Desc.A : Desc.B;
+          OS << "__vx_wmma_load_" << toFragSuffix(Frag.Kind) << "_m" << Frag.M
+             << "n" << Frag.N << "k" << Frag.K << "_"
+             << toLayoutSuffix(Frag.Layout) << "_" << toElemSuffix(Frag.Elem);
+        } else if (Desc.Op == WmmaOpKind::Store) {
+          OS << "__vx_wmma_store_d"
+             << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
+             << toElemSuffix(Desc.D.Elem);
+        } else if (Desc.Op == WmmaOpKind::Mma) {
+          OS << "__vx_wmma_mma"
+             << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
+             << toLayoutSuffix(Desc.A.Layout) << "_"
+             << toLayoutSuffix(Desc.B.Layout) << "_"
+             << toElemSuffix(Desc.A.Elem) << "_" << toElemSuffix(Desc.B.Elem)
+             << "_" << toElemSuffix(Desc.D.Elem);
+        }
+        OS.flush();
+
+        CallToDesc[CI] = std::move(Desc);
       }
     }
   }
 
-  if (wmma_calls.empty()) return;
+  return CallToDesc;
+}
 
-  if (cupbop_debug()) printf("[wmma] Found %zu wmma intrinsic calls to translate\n", wmma_calls.size());
+void replace_wmma_intrinsics(llvm::Module *M) {
+  DenseMap<CallInst *, WmmaCallDesc> CallToDesc = collectWMMADesc(M);
+  SmallPtrSet<Function *, 8> ToErase;
 
-  // Helper: get thread lane ID for wmma cooperative load/store
-  // SCHE_2: threadIdx struct field 0, SCHE_0: thread_id_x TLS
-  auto getThreadLaneID = [&](IRBuilder<> &B) -> Value* {
-    auto *I32Ty = Type::getInt32Ty(Ctx);
-    // Try threadIdx struct (SCHE_2)
-    auto *threadIdxGV = M->getGlobalVariable("threadIdx");
-    if (threadIdxGV) {
-      auto tls = B.CreateCall(
-          Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {threadIdxGV->getType()}),
-          {threadIdxGV});
-      auto field_ptr = B.CreateStructGEP(threadIdxGV->getValueType(), tls, 0);
-      return B.CreateLoad(I32Ty, field_ptr, "lane");
+  DBG(for (auto &It : CallToDesc) {
+    CallInst *CI = It.first;
+    WmmaCallDesc &Desc = It.second;
+    errs() << "[wmma] " << maybeDemangle(CI->getCalledFunction()->getName())
+           << " -> " << Desc.ReplacementName << "\n";
+  });
+
+  for (auto &It : CallToDesc) {
+    CallInst *CI = It.first;
+    WmmaCallDesc &Desc = It.second;
+
+    Function *OldHelper = CI->getCalledFunction();
+
+    FunctionType *FTy = OldHelper->getFunctionType();
+    FunctionCallee NewHelperCallee =
+        M->getOrInsertFunction(Desc.ReplacementName, FTy);
+    Function *NewHelper = dyn_cast<Function>(NewHelperCallee.getCallee());
+    if (!NewHelper)
+      continue;
+    NewHelper->setCallingConv(CallingConv::C);
+    CI->setCalledFunction(NewHelperCallee);
+    if (OldHelper->use_empty()) {
+      ToErase.insert(OldHelper);
     }
-    // Fallback: thread_id_x TLS
-    auto *tidGV = M->getGlobalVariable("thread_id_x");
-    if (tidGV) {
-      if (tidGV->isThreadLocal()) {
-        auto tls = B.CreateCall(
-            Intrinsic::getDeclaration(M, Intrinsic::threadlocal_address, {tidGV->getType()}),
-            {tidGV});
-        return B.CreateLoad(I32Ty, tls, "lane");
+  }
+
+  for (Function *F : ToErase) {
+    F->dropAllReferences();
+    F->removeFromParent();
+  }
+
+  // Final Checks to see all wmma are handled
+  for (auto &F : *M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (!CI->getCalledFunction())
+            continue;
+          auto name = CI->getCalledFunction()->getName();
+          if (name.starts_with("llvm.nvvm.wmma")) {
+            report_fatal_error("[wmma] WARNING: unhandled wmma intrinsic: %s\n",
+                               name.str().c_str());
+          }
+        }
       }
-      return B.CreateLoad(I32Ty, tidGV, "lane");
-    }
-    return ConstantInt::get(I32Ty, 0);
-  };
-
-  for (auto *CI : wmma_calls) {
-    auto name = CI->getCalledFunction()->getName().str();
-    IRBuilder<> Builder(CI);
-
-    if (cupbop_debug()) printf("[wmma] Translating: %s\n", name.c_str());
-
-    if (name.find(".mma.") != std::string::npos) {
-      // mma_sync: the core TCU operation
-      // Intrinsic for m16n16k16.mma.row.row.f32.f32:
-      //   ({float x8}) @llvm.nvvm.wmma.m16n16k16.mma.row.row.f32.f32(
-      //     <2 x half> %a0..%a7, <2 x half> %b0..%b7, float %c0..%c7)
-      // Total: 8(A) + 8(B) + 8(C) = 24 args, returns {float x8}
-      //
-      // Translation to Vortex TCU:
-      // 1. Bitcast A values (<2 x half> -> float)
-      // 2. Bitcast B values (<2 x half> -> float)
-      // 3. Place in f0-f7(C), f10-f17(A), f24-f31(B)
-      // 4. Execute: .insn r 0x0B, 0, 2, x0, x1, x0
-      // 5. Read results from f0-f7
-
-      unsigned numArgs = CI->arg_size();
-      if (numArgs != 24) {
-        if (cupbop_debug()) printf("[wmma] WARNING: mma_sync has %u args (expected 24), skipping\n", numArgs);
-        continue;
-      }
-
-      // Extract A operands (args 0-7): <2 x half> -> bitcast to float
-      std::vector<Value *> a_regs(8);
-      for (int i = 0; i < 8; i++) {
-        Value *arg = CI->getArgOperand(i);
-        a_regs[i] = Builder.CreateBitCast(arg, F32Ty, "wmma.a." + std::to_string(i));
-      }
-
-      // Extract B operands (args 8-15): <2 x half> -> bitcast to float
-      std::vector<Value *> b_regs(8);
-      for (int i = 0; i < 8; i++) {
-        Value *arg = CI->getArgOperand(8 + i);
-        b_regs[i] = Builder.CreateBitCast(arg, F32Ty, "wmma.b." + std::to_string(i));
-      }
-
-      // Extract C operands (args 16-23): float
-      std::vector<Value *> c_regs(8);
-      for (int i = 0; i < 8; i++) {
-        c_regs[i] = CI->getArgOperand(16 + i);
-      }
-
-      // Build inline assembly for Vortex TCU custom instruction
-      // Register allocation: f0-f7(C/D), f10-f17(A), f24-f31(B)
-      std::string asmStr = ".insn r 0x0b, 0, 2, x0, x1, x0";
-
-      std::string constraints =
-        "=&{f0},=&{f1},=&{f2},=&{f3},=&{f4},=&{f5},=&{f6},=&{f7},"
-        "{f10},{f11},{f12},{f13},{f14},{f15},{f16},{f17},"
-        "{f24},{f25},{f26},{f27},{f28},{f29},{f30},{f31},"
-        "0,1,2,3,4,5,6,7";
-
-      std::vector<Type *> resultTypes(8, F32Ty);
-      auto *resultTy = StructType::get(Ctx, resultTypes);
-
-      std::vector<Value *> asmArgs;
-      for (int i = 0; i < 8; i++) asmArgs.push_back(a_regs[i]);
-      for (int i = 0; i < 8; i++) asmArgs.push_back(b_regs[i]);
-      for (int i = 0; i < 8; i++) asmArgs.push_back(c_regs[i]);
-
-      std::vector<Type *> inputTypes;
-      for (auto *v : asmArgs) inputTypes.push_back(v->getType());
-
-      auto *asmFTy = FunctionType::get(resultTy, inputTypes, false);
-      auto *inlineAsm = InlineAsm::get(asmFTy, asmStr, constraints, true);
-      auto *asmCall = Builder.CreateCall(inlineAsm, asmArgs, "wmma.mma.result");
-
-      CI->replaceAllUsesWith(asmCall);
-      CI->eraseFromParent();
-
-    } else if (name.find(".load.a.") != std::string::npos) {
-      // load_matrix_sync for A fragment (row-major, fp16)
-      // Intrinsic: (ptr, i32 stride) -> {<2 x half> x 8}
-      // Vortex layout (NT=32): block_row = lane/4, block_col = (lane%4)*2
-      // Per register r: row = block_row + (r/4)*8, col = block_col + (r%4)*2
-      // Load 2 contiguous fp16 as <2 x half>
-      if (cupbop_debug()) printf("[wmma] Translating load A\n");
-
-      Value *ptr = CI->getArgOperand(0);
-      Value *stride = CI->getArgOperand(1);
-      auto *I32Ty = Type::getInt32Ty(Ctx);
-      auto *I64Ty = Type::getInt64Ty(Ctx);
-      auto *HalfTy = Type::getHalfTy(Ctx);
-      auto *V2HalfTy = FixedVectorType::get(HalfTy, 2);
-
-      Value *lane = getThreadLaneID(Builder);
-
-      Value *block_row = Builder.CreateUDiv(lane, ConstantInt::get(I32Ty, 4), "block_row");
-      Value *block_col = Builder.CreateMul(
-          Builder.CreateURem(lane, ConstantInt::get(I32Ty, 4)), ConstantInt::get(I32Ty, 2), "block_col");
-
-      // Build result struct
-      Value *result = UndefValue::get(CI->getType());
-      for (int r = 0; r < 8; r++) {
-        Value *elem_row = Builder.CreateAdd(block_row,
-            ConstantInt::get(I32Ty, (r / 4) * 8), "erow");
-        Value *elem_col = Builder.CreateAdd(block_col,
-            ConstantInt::get(I32Ty, (r % 4) * 8), "ecol");
-        // offset = elem_row * stride + elem_col
-        Value *offset = Builder.CreateAdd(
-            Builder.CreateMul(elem_row, stride), elem_col, "off");
-        Value *offset64 = Builder.CreateSExt(offset, I64Ty);
-        Value *gep = Builder.CreateGEP(HalfTy, ptr, offset64, "gep");
-        // Load 2 contiguous fp16
-        Value *h0 = Builder.CreateLoad(HalfTy, gep, "h0");
-        Value *gep1 = Builder.CreateGEP(HalfTy, gep, ConstantInt::get(I64Ty, 1), "gep1");
-        Value *h1 = Builder.CreateLoad(HalfTy, gep1, "h1");
-        Value *vec = Builder.CreateInsertElement(UndefValue::get(V2HalfTy), h0, (uint64_t)0);
-        vec = Builder.CreateInsertElement(vec, h1, (uint64_t)1, "v2h");
-        result = Builder.CreateInsertValue(result, vec, r, "frag.a");
-      }
-      CI->replaceAllUsesWith(result);
-      CI->eraseFromParent();
-
-    } else if (name.find(".load.b.") != std::string::npos) {
-      // load_matrix_sync for B fragment (row-major, fp16)
-      // Vortex layout (NT=32): block_idx = lane/16, lane_in_blk = lane%16
-      // block_col = lane_in_blk/4 + block_idx*4, block_row = (lane_in_blk%4)*2
-      // Per register r: k_off = (r/2)*8, n_off = (r%2)*8
-      // Load 2 fp16 from consecutive rows
-      if (cupbop_debug()) printf("[wmma] Translating load B\n");
-
-      Value *ptr = CI->getArgOperand(0);
-      Value *stride = CI->getArgOperand(1);
-      auto *I32Ty = Type::getInt32Ty(Ctx);
-      auto *I64Ty = Type::getInt64Ty(Ctx);
-      auto *HalfTy = Type::getHalfTy(Ctx);
-      auto *V2HalfTy = FixedVectorType::get(HalfTy, 2);
-
-      Value *lane = getThreadLaneID(Builder);
-
-      Value *block_idx = Builder.CreateUDiv(lane, ConstantInt::get(I32Ty, 16), "bidx");
-      Value *lane_in_blk = Builder.CreateURem(lane, ConstantInt::get(I32Ty, 16), "linb");
-      Value *block_col = Builder.CreateAdd(
-          Builder.CreateUDiv(lane_in_blk, ConstantInt::get(I32Ty, 4)),
-          Builder.CreateMul(block_idx, ConstantInt::get(I32Ty, 4)), "bcol");
-      Value *block_row = Builder.CreateMul(
-          Builder.CreateURem(lane_in_blk, ConstantInt::get(I32Ty, 4)),
-          ConstantInt::get(I32Ty, 2), "brow");
-
-      Value *result = UndefValue::get(CI->getType());
-      for (int r = 0; r < 8; r++) {
-        Value *row = Builder.CreateAdd(block_row,
-            ConstantInt::get(I32Ty, (r / 2) * 8), "row");
-        Value *col = Builder.CreateAdd(block_col,
-            ConstantInt::get(I32Ty, (r % 2) * 8), "col");
-        // Load h0 at (row, col), h1 at (row+1, col)
-        Value *off0 = Builder.CreateAdd(Builder.CreateMul(row, stride), col);
-        Value *off0_64 = Builder.CreateSExt(off0, I64Ty);
-        Value *gep0 = Builder.CreateGEP(HalfTy, ptr, off0_64, "gep0");
-        Value *h0 = Builder.CreateLoad(HalfTy, gep0, "h0");
-        Value *off1 = Builder.CreateAdd(off0, stride); // next row
-        Value *off1_64 = Builder.CreateSExt(off1, I64Ty);
-        Value *gep1 = Builder.CreateGEP(HalfTy, ptr, off1_64, "gep1");
-        Value *h1 = Builder.CreateLoad(HalfTy, gep1, "h1");
-        Value *vec = Builder.CreateInsertElement(UndefValue::get(V2HalfTy), h0, (uint64_t)0);
-        vec = Builder.CreateInsertElement(vec, h1, (uint64_t)1, "v2h");
-        result = Builder.CreateInsertValue(result, vec, r, "frag.b");
-      }
-      CI->replaceAllUsesWith(result);
-      CI->eraseFromParent();
-
-    } else if (name.find(".load.c.") != std::string::npos) {
-      // load accumulator C (fp32)
-      // Layout: block_row = lane/4, block_col = lane%4
-      // Per register r: row = block_row + (r/4)*8, col = block_col + (r%4)*4
-      if (cupbop_debug()) printf("[wmma] Translating load C\n");
-
-      Value *ptr = CI->getArgOperand(0);
-      Value *stride = CI->getArgOperand(1);
-      auto *I32Ty = Type::getInt32Ty(Ctx);
-      auto *I64Ty = Type::getInt64Ty(Ctx);
-
-      Value *lane = getThreadLaneID(Builder);
-
-      Value *block_row = Builder.CreateUDiv(lane, ConstantInt::get(I32Ty, 4), "block_row");
-      Value *block_col = Builder.CreateURem(lane, ConstantInt::get(I32Ty, 4), "block_col");
-
-      Value *result = UndefValue::get(CI->getType());
-      for (int r = 0; r < 8; r++) {
-        Value *row = Builder.CreateAdd(block_row, ConstantInt::get(I32Ty, (r / 4) * 8), "row");
-        Value *col = Builder.CreateAdd(block_col, ConstantInt::get(I32Ty, (r % 4) * 4), "col");
-        Value *offset = Builder.CreateAdd(Builder.CreateMul(row, stride), col);
-        Value *offset64 = Builder.CreateSExt(offset, I64Ty);
-        Value *gep = Builder.CreateGEP(F32Ty, ptr, offset64, "gep");
-        Value *val = Builder.CreateLoad(F32Ty, gep, "c_val");
-        result = Builder.CreateInsertValue(result, val, r, "frag.c");
-      }
-      CI->replaceAllUsesWith(result);
-      CI->eraseFromParent();
-
-    } else if (name.find(".store.d.") != std::string::npos) {
-      // store_matrix_sync for D (fp32, row-major)
-      // Intrinsic: (ptr, float x8, i32 stride) -> void
-      // Same layout as load C
-      if (cupbop_debug()) printf("[wmma] Translating store D\n");
-
-      Value *ptr = CI->getArgOperand(0);
-      // Args 1-8 are the 8 float values, arg 9 is stride
-      unsigned numArgs = CI->arg_size();
-      Value *stride = CI->getArgOperand(numArgs - 1);
-      auto *I32Ty = Type::getInt32Ty(Ctx);
-      auto *I64Ty = Type::getInt64Ty(Ctx);
-
-      Value *lane = getThreadLaneID(Builder);
-
-      Value *block_row = Builder.CreateUDiv(lane, ConstantInt::get(I32Ty, 4), "block_row");
-      Value *block_col = Builder.CreateURem(lane, ConstantInt::get(I32Ty, 4), "block_col");
-
-      for (int r = 0; r < 8; r++) {
-        Value *val = CI->getArgOperand(1 + r); // float values start at arg 1
-        Value *row = Builder.CreateAdd(block_row, ConstantInt::get(I32Ty, (r / 4) * 8), "row");
-        Value *col = Builder.CreateAdd(block_col, ConstantInt::get(I32Ty, (r % 4) * 4), "col");
-        Value *offset = Builder.CreateAdd(Builder.CreateMul(row, stride), col);
-        Value *offset64 = Builder.CreateSExt(offset, I64Ty);
-        Value *gep = Builder.CreateGEP(F32Ty, ptr, offset64, "gep");
-        Builder.CreateStore(val, gep);
-      }
-      CI->eraseFromParent();
-
-    } else {
-      if (cupbop_debug()) printf("[wmma] WARNING: unhandled wmma intrinsic: %s\n", name.c_str());
     }
   }
 }
