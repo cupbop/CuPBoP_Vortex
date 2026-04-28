@@ -24,6 +24,7 @@ void replace_built_in_function(llvm::Module *M);
 void replace_warp_shfl_early(llvm::Module *M);
 void lower_cmpxchg_for_flat(llvm::Module *M);
 void lower_atomicrmw_fadd(llvm::Module *M);
+void lower_atomicrmw_add_i64(llvm::Module *M);
 void replace_asm_call(llvm::Module *M);
 bool find_block_barrier_in_region(llvm::BasicBlock *start,
                                   llvm::BasicBlock *end);

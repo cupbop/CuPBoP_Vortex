@@ -436,7 +436,8 @@ void lower_atomicrmw_fadd(llvm::Module *M) {
     }
 
     if (RMW->use_empty() && addr_uniform) {
-      B.CreateCall(HelperUniformVoid, {ptr, addend});
+      auto *call = B.CreateCall(HelperUniformVoid, {ptr, addend});
+      call->addFnAttr(Attribute::Convergent);
       RMW->eraseFromParent();
       nuniform++;
     } else {
@@ -448,6 +449,95 @@ void lower_atomicrmw_fadd(llvm::Module *M) {
   }
   fprintf(stderr, "[CuPBoP] lowered %zu atomicrmw fadd (%zu uniform-void + %zu general)\n",
           fadd_ops.size(), nuniform, ngeneral);
+}
+
+// Same pattern as lower_atomicrmw_fadd but for i64 atomicrmw add.
+// RV64 has native amoadd.d so no software lock is needed; the only point
+// is to collapse 32 lanes' atomics into 1 per warp via warp-reduce, which
+// is a big win for kernels like marchingCubes' generatingTriangles where
+// many lanes hammer a single uniform global counter inside a divergent
+// for-loop. Safe under divergence because the helper is convergent and
+// shfl-xor with inactive lanes returns 0 → those lanes contribute 0,
+// matching their "didn't execute the atomic" semantics.
+void lower_atomicrmw_add_i64(llvm::Module *M) {
+  int schedule = 0;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG"))
+    schedule = std::stoi(std::string(env));
+  if (schedule == 0) return; // SCHE_0 doesn't need this (sequential exec)
+
+  SmallVector<AtomicRMWInst *, 16> add_ops;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          if (RMW->getOperation() == AtomicRMWInst::Add &&
+              RMW->getValOperand()->getType()->isIntegerTy(64))
+            add_ops.push_back(RMW);
+
+  if (add_ops.empty())
+    return;
+
+  auto &Ctx = M->getContext();
+  auto *I64Ty = Type::getInt64Ty(Ctx);
+  auto *VoidTy = Type::getVoidTy(Ctx);
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  auto *VoidFnTy = FunctionType::get(VoidTy, {PtrTy, I64Ty}, false);
+  FunctionCallee HelperUniformVoid = M->getOrInsertFunction(
+      "__cuda_atomic_add_u64_uniform_void", VoidFnTy);
+  if (auto *fn = dyn_cast<Function>(HelperUniformVoid.getCallee()))
+    fn->addFnAttr(Attribute::Convergent);
+
+  size_t nuniform = 0;
+  for (auto *RMW : add_ops) {
+    if (!RMW->use_empty()) continue; // only optimize use_empty (return ignored)
+    IRBuilder<> B(RMW);
+    auto *ptr = RMW->getPointerOperand();
+    auto *addend = RMW->getValOperand();
+
+    // Same uniform-pointer detection as lower_atomicrmw_fadd
+    const Value *underlying = getUnderlyingObject(ptr);
+    bool addr_uniform = isa<Argument>(underlying) || isa<GlobalValue>(underlying);
+    if (!addr_uniform) {
+      const Value *cur = underlying;
+      for (int depth = 0; depth < 4 && !addr_uniform; ++depth) {
+        auto *L = dyn_cast<LoadInst>(cur);
+        if (!L) break;
+        auto *AI = dyn_cast<AllocaInst>(
+            getUnderlyingObject(L->getPointerOperand()));
+        if (!AI) break;
+        const Value *storedVal = nullptr;
+        bool all_uniform_stores = true;
+        int store_count = 0;
+        for (auto *U : AI->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            store_count++;
+            const Value *v = SI->getValueOperand();
+            if (!isa<Argument>(v) && !isa<GlobalValue>(v) &&
+                !(isa<LoadInst>(v))) {
+              all_uniform_stores = false;
+              break;
+            }
+            storedVal = v;
+          }
+        }
+        if (!storedVal || !all_uniform_stores) break;
+        if (isa<Argument>(storedVal) || isa<GlobalValue>(storedVal)) {
+          addr_uniform = true;
+          break;
+        }
+        cur = storedVal;
+      }
+    }
+
+    if (!addr_uniform) continue;
+
+    auto *call = B.CreateCall(HelperUniformVoid, {ptr, addend});
+    call->addFnAttr(Attribute::Convergent);
+    RMW->eraseFromParent();
+    nuniform++;
+  }
+  fprintf(stderr, "[CuPBoP] lowered %zu atomicrmw add i64 to uniform-void warp-reduce\n",
+          nuniform);
 }
 
 void lower_cmpxchg_for_flat(llvm::Module *M) {

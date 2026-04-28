@@ -93,6 +93,13 @@ int main(int argc, char **argv) {
   DBG_LOG("lower_atomicrmw_fadd\n");
   lower_atomicrmw_fadd(program);
 
+  // Same uniform-void warp-reduce fastpath for i64 atomicrmw add — RV64
+  // has native amoadd.d but cross-warp/cross-core contention on a single
+  // global counter still serializes; collapsing 32 atomics to 1 per warp
+  // is a big win for kernels like marchingCubes generatingTriangles.
+  DBG_LOG("lower_atomicrmw_add_i64\n");
+  lower_atomicrmw_add_i64(program);
+
   DBG_LOG("lower_cmpxchg_for_flat\n");
   lower_cmpxchg_for_flat(program);
 

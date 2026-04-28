@@ -738,3 +738,31 @@ void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
     __atomic_store_n((int *)&__cuda_atomic_fadd_lock, 0, __ATOMIC_RELEASE);
   }
 }
+
+// i64 atomic add fastpath: same pattern as the float version above.
+// RV64 has native amoadd.d so no software lock is needed — lane 0 just
+// issues a single hardware atomic with the warp-reduced sum.
+//
+// Called by lower_atomicrmw_add_i64 when RMW->use_empty() AND pointer is
+// uniform across the warp. Targets marchingCubes generatingTriangles'
+// `atomicAdd(triangles, ...)` (uniform addr, per-lane value, divergent
+// loop) — collapses up to 32 atomic ops into 1 per warp.
+//
+// Warp reduction operates on i64 by splitting into two i32 halves,
+// shfl-xoring each half independently, and recombining; the existing
+// __shfl_xor_sync wrapper only takes int.
+extern "C" __attribute__((noinline, convergent))
+void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
+                                        unsigned long long val) {
+  #pragma unroll
+  for (int i = 16; i > 0; i >>= 1) {
+    int lo = (int)(unsigned int)val;
+    int hi = (int)(unsigned int)(val >> 32);
+    unsigned int rlo = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, lo, i, 31);
+    unsigned int rhi = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, hi, i, 31);
+    val += ((unsigned long long)rhi << 32) | rlo;
+  }
+  if (vx_thread_id() == 0) {
+    __atomic_fetch_add(addr, val, __ATOMIC_RELAXED);
+  }
+}
