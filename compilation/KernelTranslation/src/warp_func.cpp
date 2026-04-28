@@ -188,6 +188,13 @@ void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
       continue;
     }
 
+    // Vote intrinsics (any/all/uni/ballot) are warp-synchronizing — need
+    // convergent so LoopUnswitch/LICM don't hoist code containing them
+    // across non-uniform branches. (Same root cause as the shfl convergent
+    // fix in replaceWarpShfl1to1.)
+    call->addFnAttr(Attribute::Convergent);
+    if (auto *fn = dyn_cast<Function>(call->getCalledFunction()))
+      fn->addFnAttr(Attribute::Convergent);
     ci->replaceAllUsesWith(call);
     ci->eraseFromParent();
   }
