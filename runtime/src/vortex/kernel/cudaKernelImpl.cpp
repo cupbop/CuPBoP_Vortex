@@ -731,7 +731,14 @@ void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
   for (int i = 16; i > 0; i >>= 1) {
     val += __shfl_xor_sync(0xFFFFFFFF, val, i, 31);
   }
-  if (vx_thread_id() == 0) {
+  // Use the lowest active lane to issue the atomic. If the helper is
+  // called from a divergent context where lane 0 is inactive, the
+  // partial warp-sum still has to be flushed by SOMEONE. Inactive
+  // lanes' shfl_xor returns 0 so they contribute 0 — but if we keyed
+  // off lane 0 alone, the entire active sum would be silently lost.
+  unsigned active = (unsigned)vx_active_threads();
+  unsigned issuer = (unsigned)__builtin_ctz(active);
+  if ((unsigned)vx_thread_id() == issuer) {
     while (__atomic_exchange_n((int *)&__cuda_atomic_fadd_lock, 1,
                                __ATOMIC_ACQUIRE) != 0) { }
     *addr = *addr + val;
@@ -762,7 +769,13 @@ void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
     unsigned int rhi = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, hi, i, 31);
     val += ((unsigned long long)rhi << 32) | rlo;
   }
-  if (vx_thread_id() == 0) {
+  // marchingCubes generatingTriangles calls this from inside a divergent
+  // `for c0 < numTriangles` loop. Lane 0 may be inactive (numTriangles=0)
+  // while lanes 1-31 are still iterating. Keying the atomic off lane 0
+  // would lose the warp-reduced sum entirely. Use the lowest active lane.
+  unsigned active = (unsigned)vx_active_threads();
+  unsigned issuer = (unsigned)__builtin_ctz(active);
+  if ((unsigned)vx_thread_id() == issuer) {
     __atomic_fetch_add(addr, val, __ATOMIC_RELAXED);
   }
 }
