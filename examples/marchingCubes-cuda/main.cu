@@ -489,7 +489,7 @@ int main(int argc, char* argv[])
   const dim3 BlockSizeLv2{ voxelXLv2 * voxelYLv2, blockXLv2 * blockYLv2, 1 };
   const dim3 BlockSizeGenerating{ voxelXLv2, voxelYLv2, voxelZLv2 };
 
-  float isoValue(-0.9f);
+  float isoValue(5.0f);
 
   unsigned int countedBlockNumLv1;
   unsigned int countedBlockNumLv2;
