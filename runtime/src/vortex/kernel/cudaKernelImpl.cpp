@@ -722,27 +722,31 @@ float __cuda_atomic_fadd_f32(float *addr, float val) {
 // pointer varies per lane.
 extern "C" __attribute__((noinline))
 void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
-  // Butterfly warp reduction. Wrapper takes the NVPTX-encoded `c`
-  // operand (clamp in c[4:0], segment_mask in c[12:8]); for default
-  // warp-wide shfl_xor c=31 (clamp=warpSize-1). Passing 32 silently
-  // decoded to clamp=0 → shfl returned own value → val *= 32 per iter,
-  // breaking any single-lane caller (e.g. jacobi-cuda).
+  // Butterfly warp reduction. NVPTX-encoded c=31 for warp-wide.
   #pragma unroll
   for (int i = 16; i > 0; i >>= 1) {
     val += __shfl_xor_sync(0xFFFFFFFF, val, i, 31);
   }
-  // Use the lowest active lane to issue the atomic. If the helper is
-  // called from a divergent context where lane 0 is inactive, the
-  // partial warp-sum still has to be flushed by SOMEONE. Inactive
-  // lanes' shfl_xor returns 0 so they contribute 0 — but if we keyed
-  // off lane 0 alone, the entire active sum would be silently lost.
+  // Lowest active lane issues lock-free CAS-based atomic add.
+  // Spinlock approach (originally here) deadlocks under multi-warp
+  // contention in simx — Vortex's vx_split_n + global spinlock interaction
+  // never releases the lock if the holder's vx_join is gated on lanes that
+  // are themselves spinning. CAS has no shared lock state so cannot deadlock.
+  // The cmpxchg-bnez divergence issue (per atomic_float_cas_hang.md) only
+  // applies when MANY lanes do cmpxchg concurrently; here only ONE lane
+  // executes the CAS, so no divergence.
   unsigned active = (unsigned)vx_active_threads();
   unsigned issuer = (unsigned)__builtin_ctz(active);
   if ((unsigned)vx_thread_id() == issuer) {
-    while (__atomic_exchange_n((int *)&__cuda_atomic_fadd_lock, 1,
-                               __ATOMIC_ACQUIRE) != 0) { }
-    *addr = *addr + val;
-    __atomic_store_n((int *)&__cuda_atomic_fadd_lock, 0, __ATOMIC_RELEASE);
+    int *iaddr = (int *)addr;
+    int expected = __atomic_load_n(iaddr, __ATOMIC_RELAXED);
+    int desired;
+    do {
+      float curr = *reinterpret_cast<float *>(&expected);
+      float next = curr + val;
+      desired = *reinterpret_cast<int *>(&next);
+    } while (!__atomic_compare_exchange_n(iaddr, &expected, desired, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
   }
 }
 
