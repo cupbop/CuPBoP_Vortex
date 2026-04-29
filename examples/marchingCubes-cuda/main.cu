@@ -22,7 +22,7 @@ constexpr unsigned int gridYLv1((N - 1) / (voxelYLv1 - 1));
 constexpr unsigned int gridZLv1((N - 1) / (voxelZLv1 - 1));
 constexpr unsigned int countingThreadNumLv1(128);
 constexpr unsigned int blockNum(gridXLv1* gridYLv1* gridZLv1);
-constexpr unsigned int countingBlockNumLv1(blockNum / countingThreadNumLv1);
+constexpr unsigned int countingBlockNumLv1((blockNum + countingThreadNumLv1 - 1) / countingThreadNumLv1);
 
 constexpr unsigned int voxelXLv2(4);
 constexpr unsigned int voxelYLv2(4);
@@ -125,7 +125,7 @@ __global__ void compactLv1(
   unsigned int bIdx(blockIdx.x * countingThreadNumLv1 + tid);
   unsigned int warpid(tid >> 5);
   unsigned int test;
-  if (minMax[2 * bIdx] <= isoValue && minMax[2 * bIdx + 1] >= isoValue)test = 1;
+  if (bIdx < blockNum && minMax[2 * bIdx] <= isoValue && minMax[2 * bIdx + 1] >= isoValue) test = 1;
   else test = 0;
   unsigned int testSum(test);
 #pragma unroll
