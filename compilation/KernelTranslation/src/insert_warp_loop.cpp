@@ -1345,9 +1345,452 @@ BasicBlock *insert_loop_inc(llvm::BasicBlock *InsertIncBefore,
   return loop_inc;
 }
 
+// Compute per-thread context-array index (block_index_x*1024 + intra +
+// inter*32 for ctx_pool path; intra + inter*32 for stack-alloca path).
+// Mirrors the logic in AddContextSave/Restore so saved cmp values are
+// indexed identically to other per-thread arrays.
+static llvm::Value *computeThreadIdxForCtx(llvm::IRBuilder<> &builder,
+                                            llvm::Module *M) {
+  auto I32 = llvm::Type::getInt32Ty(M->getContext());
+  auto inter_warp_index =
+      createLoad(builder, M->getGlobalVariable("inter_warp_index"));
+  auto intra_warp_index =
+      createLoad(builder, M->getGlobalVariable("intra_warp_index"));
+  llvm::Value *thread_idx_in_block = builder.CreateAdd(
+      intra_warp_index,
+      builder.CreateMul(inter_warp_index,
+                        ConstantInt::get(I32, SW_WARP_SIZE)),
+      "thread_idx_in_block");
+  if (g_schedule_flag == 0 && need_nested_loop) {
+    auto block_index_x =
+        createLoad(builder, M->getGlobalVariable("block_index_x"));
+    auto block_offset = builder.CreateMul(
+        block_index_x, ConstantInt::get(I32, 1024));
+    return builder.CreateAdd(thread_idx_in_block, block_offset, "thread_idx");
+  }
+  return thread_idx_in_block;
+}
+
+// Cross-region predicate gating for SCHE_0 FLAT.
+//
+// Problem: Without gating, divergent `if (cond) { ... barriers ... }` patterns
+// run downstream regions (after each barrier) for ALL threads in SCHE_0 FLAT —
+// including those whose `cond` was false. They execute the body with garbage
+// data and corrupt accumulators (jacobi: ty!=0 threads write garbage into
+// ctx_pool slots that the final atomicAdd reads).
+//
+// Solution: Per-thread predicate save+restore. When we detect a divergent
+// if-guard whose false branch crosses out of the warp_loop:
+//   1. Allocate per-thread cmp_array (i1 typed, sized like other ctx_pool
+//      slots: bid*1024 + intra + inter*32).
+//   2. Save cmp value at its def site to cmp_array[thread_idx].
+//   3. Redirect the false branch to loop_inc (skip body for false threads
+//      this iteration; allow them to continue iterating in the warp_loop).
+//   4. Inject a gate at each downstream region's start: load cmp_array[tid],
+//      branch to loop_inc if false, original body if true.
+//
+// "Downstream" = regions reachable from the guard's true-branch up to the
+// post-dominator (the convergence point). Computed via PDT.
+//
+// Performance: only triggers when divergent if-guard detected. Passing
+// benchmarks without this pattern see no transformation. False threads
+// short-circuit at gate (FASTER than executing garbage body in original).
+struct DivergentIfGuard {
+  size_t guard_region_idx;
+  llvm::BranchInst *cond_br;
+  unsigned outside_idx;
+  llvm::Value *cond;
+  llvm::Instruction *cmp_array;            // ctx_pool array base
+  std::set<size_t> downstream_region_idxs; // regions to gate
+};
+
+// Cross-pass guard registry: INTRA pass detects guards and saves cmps;
+// INTER pass needs the guard's bb + cmp_array to compute its own
+// downstream regions and inject gates. After INTRA modifies the cond br
+// (false → loop_inc), INTER's findDivergentIfGuard would fail to detect
+// (false target now inside wrapped_block). So we persist (bb, cmp_array)
+// here, keyed by cond instruction.
+struct PersistedGuard {
+  llvm::BasicBlock *guard_bb;
+  llvm::BranchInst *cond_br;
+  unsigned outside_idx;
+  llvm::Value *cond;
+  llvm::Instruction *cmp_array;
+  llvm::BasicBlock *original_outside_target;
+  llvm::BasicBlock *original_inside_target;
+  // Reachable blocks computed by INTRA pass on pre-wrap CFG; used by
+  // INTER pass to identify downstream regions even after INTRA wrap
+  // changes the CFG.
+  std::set<llvm::BasicBlock *> intra_reachable;
+};
+static std::map<llvm::Function *, std::vector<PersistedGuard>>
+    g_persisted_guards;
+
+static llvm::Instruction *
+allocateCmpContextArray(llvm::Function *F, llvm::Instruction *cmp_inst,
+                        bool intra_warp_loop) {
+  // Allocate an i1 context array indexed by thread_idx, parallel to
+  // GetContextArray's logic but explicitly sized for i1 (1 byte per slot
+  // in ctx_pool, padded to elemSize alignment).
+  std::ostringstream var;
+  if (cmp_inst->getName().empty())
+    var << "cmpguard_" << (uintptr_t)cmp_inst;
+  else
+    var << cmp_inst->getName().str();
+  var << (intra_warp_loop ? "_intra_warp_" : "_inter_warp_");
+  std::string varName = var.str();
+  if (contextArrays.count(varName))
+    return contextArrays[varName];
+
+  llvm::Module *M = F->getParent();
+  llvm::LLVMContext &C = M->getContext();
+  llvm::Type *I1 = llvm::Type::getInt1Ty(C);
+  llvm::IRBuilder<> builder(&*F->getEntryBlock().getFirstInsertionPt());
+  llvm::Instruction *Result = nullptr;
+
+  if (g_schedule_flag == 0 && need_nested_loop) {
+    constexpr int MAX_BLOCKS = 8;
+    constexpr int MAX_BLK = 1024 * MAX_BLOCKS;
+    const llvm::DataLayout &Layout = M->getDataLayout();
+    int elemSize = std::max<int>(1, Layout.getTypeAllocSize(I1));
+    int elemOffset = g_ctx_pool_offset / elemSize;
+
+    auto *CachedLoad = ctxPoolLoadCache[F];
+    if (!CachedLoad) {
+      auto *PoolPtr = M->getGlobalVariable("__ctx_pool");
+      CachedLoad = builder.CreateLoad(
+          llvm::PointerType::getUnqual(C), PoolPtr, "__ctx_pool_ld");
+      llvm::cast<llvm::LoadInst>(CachedLoad)->setVolatile(true);
+      ctxPoolLoadCache[F] = CachedLoad;
+    }
+    builder.SetInsertPoint(CachedLoad->getNextNode());
+    Result = llvm::dyn_cast<llvm::Instruction>(builder.CreateGEP(
+        I1, CachedLoad,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(C), elemOffset),
+        varName + "_base"));
+    g_ctx_pool_offset += MAX_BLK * elemSize;
+  } else {
+    auto block_size_addr = M->getGlobalVariable("block_size");
+    auto block_size = createLoad(builder, block_size_addr);
+    Result = builder.CreateAlloca(I1, block_size, varName);
+  }
+  contextArrays[varName] = Result;
+  return Result;
+}
+
+// Find conditional brs in `region` whose condition is divergent and whose
+// targets straddle the wrapped_block boundary (one inside, one outside).
+// Skip user for/while loop conditions (LoopInfo says bb is loop-exiting).
+// Also computes the outside-target index and condition value.
+static bool findDivergentIfGuard(const ParallelRegion &region,
+                                  llvm::BasicBlock *tail_block,
+                                  CustomDivergenceAnalysis &DI,
+                                  llvm::LoopInfo &OrigLI,
+                                  llvm::BranchInst *&out_br,
+                                  unsigned &out_outside_idx,
+                                  llvm::Value *&out_cond) {
+  for (auto *bb : region.wrapped_block) {
+    if (bb == tail_block) continue;
+    auto *term = bb->getTerminator();
+    auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
+    if (!br || !br->isConditional()) continue;
+
+    bool has_inside = false, has_outside = false;
+    unsigned outside_idx = 0;
+    for (unsigned i = 0; i < br->getNumSuccessors(); i++) {
+      auto *succ = br->getSuccessor(i);
+      if (region.wrapped_block.count(succ))
+        has_inside = true;
+      else {
+        has_outside = true;
+        outside_idx = i;
+      }
+    }
+    if (!has_inside || !has_outside) continue;
+
+    // Skip warp loop infrastructure
+    auto name = bb->getName();
+    if (name.starts_with("intra_warp") || name.starts_with("inter_warp") ||
+        name.starts_with("intra_reset") || name.starts_with("inter_reset"))
+      continue;
+
+    // Skip user for/while loops (LoopInfo from pre-wrap CFG)
+    if (auto *L = OrigLI.getLoopFor(bb)) {
+      if (L->isLoopExiting(bb)) continue;
+    }
+
+    // Require divergent condition (depends on threadIdx).
+    // Without divergence, gate is unnecessary — preserve.
+    llvm::Value *cond = br->getCondition();
+    if (!DI.isDivergent(cond)) continue;
+
+    out_br = br;
+    out_outside_idx = outside_idx;
+    out_cond = cond;
+    return true;
+  }
+  return false;
+}
+
+// Compute the set of regions that lie on the divergent TRUE-path between
+// the guard and the convergence point. We do this with a forward CFG walk
+// from the guard's inside-target (TRUE branch), tracking blocks reachable
+// without crossing the guard's outside-target. Stops at:
+//   - the outside-target itself (convergence — both paths meet here)
+//   - the function exit / ret (paths diverge to different exits)
+//   - blocks dominated only by guard_bb's parent (not by guard_bb itself —
+//     reached via paths that don't go through the guard)
+// The set is intersected with each region's wrapped_block. Regions with
+// any block in the divergent set are flagged downstream.
+//
+// PDT-based approach was tried first but failed: in CFGs where both
+// branches reach distinct ret points (no intermediate convergence block),
+// PDT's immediate post-dominator is the virtual exit node (getBlock()
+// returns null). Forward walk avoids this.
+static std::set<size_t>
+computeDownstreamRegions(const std::vector<ParallelRegion> &parallel_regions,
+                          size_t guard_idx, llvm::BasicBlock *guard_bb,
+                          llvm::BasicBlock *inside_target,
+                          llvm::BasicBlock *outside_target,
+                          llvm::DominatorTree &DT,
+                          bool use_dom_filter,
+                          std::set<llvm::BasicBlock *> *out_reachable = nullptr) {
+  std::set<size_t> result;
+
+  // Forward BFS from inside_target. A block is in the divergent set iff:
+  //   1. reachable forward from inside_target without crossing
+  //      outside_target (which represents the false-path entry — beyond
+  //      it is convergent code that runs for everyone).
+  //   2. dominated by guard_bb (i.e., reachable ONLY through the guard).
+  //      This excludes blocks reachable via other paths that bypass the
+  //      guard (e.g., in irreducible CFGs or fall-throughs).
+  std::set<llvm::BasicBlock *> reachable;
+  std::vector<llvm::BasicBlock *> worklist;
+  worklist.push_back(inside_target);
+  while (!worklist.empty()) {
+    auto *bb = worklist.back();
+    worklist.pop_back();
+    if (bb == outside_target) continue;
+    if (!reachable.insert(bb).second) continue;
+    // Dominator check (INTRA pass only): if bb is not dominated by
+    // guard_bb, it's reachable from outside the guard's true-path —
+    // exclude it. INTER pass skips this filter because INTRA's wrap
+    // changes dominance (warp_loop infrastructure introduces new edges).
+    if (use_dom_filter && !DT.dominates(guard_bb, bb)) continue;
+    for (auto *succ : llvm::successors(bb))
+      worklist.push_back(succ);
+  }
+
+  if (cupbop_debug()) {
+    fprintf(stderr, "[downstream] guard_bb=%s, inside=%s, outside=%s, "
+                    "reachable=%zu\n",
+            guard_bb->getName().str().c_str(),
+            inside_target->getName().str().c_str(),
+            outside_target->getName().str().c_str(), reachable.size());
+  }
+
+  // A region is downstream if any of its wrapped_block is in `reachable`.
+  for (size_t i = 0; i < parallel_regions.size(); i++) {
+    if (i == guard_idx) continue;
+    bool found = false;
+    for (auto *bb : parallel_regions[i].wrapped_block) {
+      if (reachable.count(bb)) {
+        found = true;
+        break;
+      }
+    }
+    if (found) result.insert(i);
+  }
+
+  if (out_reachable) *out_reachable = std::move(reachable);
+  return result;
+}
+
+// Compute downstream regions in INTER pass using the PERSISTED reachable
+// set from INTRA pass. Each region in INTER's parallel_regions is checked
+// against the persisted set: if any of its wrapped_block was in INTRA's
+// downstream-of-guard set, this region is also downstream in INTER.
+static std::set<size_t> computeDownstreamFromPersisted(
+    const std::vector<ParallelRegion> &parallel_regions, size_t guard_idx,
+    const std::set<llvm::BasicBlock *> &intra_reachable) {
+  std::set<size_t> result;
+  for (size_t i = 0; i < parallel_regions.size(); i++) {
+    if (i == guard_idx) continue;
+    for (auto *bb : parallel_regions[i].wrapped_block) {
+      if (intra_reachable.count(bb)) {
+        result.insert(i);
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+// Inject a predicate gate at the start of `region`. The gate loads
+// cmp_array[thread_idx] and branches to loop_inc if false, else to
+// the original start_block body. Inserted between loop_init and
+// start_block by splitting start_block.
+static void injectGate(llvm::BasicBlock *start_block,
+                        llvm::BasicBlock *loop_inc,
+                        llvm::Instruction *cmp_array) {
+  llvm::Module *M = start_block->getParent()->getParent();
+  llvm::LLVMContext &C = M->getContext();
+  llvm::Type *I1 = llvm::Type::getInt1Ty(C);
+
+  // Create gate block before start_block's body.
+  auto *gate_block = llvm::BasicBlock::Create(
+      C, start_block->getName() + ".gate",
+      start_block->getParent(), start_block);
+
+  // Redirect predecessors of start_block (typically loop_init) to gate_block.
+  // start_block's body (PHIs and instructions) stays.
+  std::vector<llvm::BasicBlock *> preds;
+  for (auto *p : llvm::predecessors(start_block))
+    preds.push_back(p);
+  for (auto *p : preds) {
+    p->getTerminator()->replaceUsesOfWith(start_block, gate_block);
+  }
+
+  // Update PHI nodes in start_block: incoming edges from preds now come
+  // from gate_block.
+  for (auto &phi : start_block->phis()) {
+    for (unsigned i = 0; i < phi.getNumIncomingValues(); i++) {
+      if (std::find(preds.begin(), preds.end(),
+                    phi.getIncomingBlock(i)) != preds.end()) {
+        phi.setIncomingBlock(i, gate_block);
+      }
+    }
+  }
+
+  // Build gate: load cmp[thread_idx]; if true → start_block, else → loop_inc.
+  llvm::IRBuilder<> b(gate_block);
+  llvm::Value *tid = computeThreadIdxForCtx(b, M);
+  llvm::Value *gep = b.CreateGEP(I1, cmp_array, tid, "gate_gep");
+  llvm::Value *pred = b.CreateLoad(I1, gep, "gate_pred");
+  b.CreateCondBr(pred, start_block, loop_inc);
+}
+
 void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
-                   bool intra_warp_loop) {
-  for (auto region : parallel_regions) {
+                   bool intra_warp_loop, CustomDivergenceAnalysis &DI,
+                   llvm::LoopInfo &OrigLI,
+                   llvm::DominatorTree &DT) {
+  // === PRE-PASS: Detect divergent if-guards and save cmps. ===
+  //
+  // For each region, find a conditional br with divergent cond + one-in/
+  // one-out targets (and not a user loop). For each found guard:
+  //   - Allocate per-thread cmp_array (i1) in ctx_pool
+  //   - Insert store of cmp value to cmp_array[thread_idx] right after cmp def
+  //   - Compute the set of downstream regions (between guard and post-dom)
+  //
+  // Result: vector<DivergentIfGuard> guards, used in the wrap loop below.
+  std::vector<DivergentIfGuard> guards;
+  if (!parallel_regions.empty()) {
+    llvm::Function *F = parallel_regions[0].start_block->getParent();
+
+    // INTRA pass: fresh detection. INTER pass: replay guards persisted
+    // from INTRA pass (since INTRA modifies cond br, making INTER's
+    // detection fail) AND also detect any new guards INTER pass identifies.
+    auto &persisted = g_persisted_guards[F];
+    if (intra_warp_loop) {
+      persisted.clear();  // start fresh for INTRA pass
+    }
+
+    auto register_guard = [&](llvm::BasicBlock *guard_bb,
+                                llvm::BranchInst *br, unsigned outside_idx,
+                                llvm::Value *cond,
+                                llvm::Instruction *cmp_array,
+                                size_t guard_region_idx,
+                                std::set<size_t> downstream) {
+      DivergentIfGuard g;
+      g.guard_region_idx = guard_region_idx;
+      g.cond_br = br;
+      g.outside_idx = outside_idx;
+      g.cond = cond;
+      g.cmp_array = cmp_array;
+      g.downstream_region_idxs = std::move(downstream);
+
+      if (cupbop_debug()) {
+        fprintf(stderr,
+                "[guard] %s region %zu (bb=%s): cond=%s, downstream={",
+                intra_warp_loop ? "INTRA" : "INTER", guard_region_idx,
+                guard_bb->getName().str().c_str(),
+                cond->hasName() ? cond->getName().str().c_str() : "?");
+        for (auto idx : g.downstream_region_idxs)
+          fprintf(stderr, " %zu", idx);
+        fprintf(stderr, " }\n");
+      }
+
+      guards.push_back(g);
+    };
+
+    if (intra_warp_loop) {
+      // INTRA: fresh detection per region.
+      for (size_t r = 0; r < parallel_regions.size(); r++) {
+        const auto &region = parallel_regions[r];
+        llvm::BranchInst *br = nullptr;
+        unsigned outside_idx = 0;
+        llvm::Value *cond = nullptr;
+        if (!findDivergentIfGuard(region, region.end_block, DI, OrigLI,
+                                   br, outside_idx, cond))
+          continue;
+
+        auto *cond_inst = llvm::dyn_cast<llvm::Instruction>(cond);
+        if (!cond_inst) continue;
+
+        llvm::Instruction *cmp_array =
+            allocateCmpContextArray(F, cond_inst, intra_warp_loop);
+
+        llvm::IRBuilder<> save_b(cond_inst->getNextNode());
+        llvm::Value *tid = computeThreadIdxForCtx(save_b, F->getParent());
+        llvm::Type *I1 = llvm::Type::getInt1Ty(F->getContext());
+        llvm::Value *gep =
+            save_b.CreateGEP(I1, cmp_array, tid, "cmp_save_gep");
+        save_b.CreateStore(cond, gep);
+
+        // Compute downstream now (use_dom_filter=true for INTRA pass).
+        unsigned inside_idx = (outside_idx == 0) ? 1 : 0;
+        std::set<llvm::BasicBlock *> reachable;
+        auto downstream = computeDownstreamRegions(
+            parallel_regions, r, br->getParent(),
+            br->getSuccessor(inside_idx), br->getSuccessor(outside_idx),
+            DT, /*use_dom_filter=*/true, &reachable);
+
+        // Persist for INTER pass — capture targets BEFORE INTRA's redirect
+        // and the reachable block set computed on the pre-wrap CFG.
+        PersistedGuard pg{br->getParent(), br, outside_idx, cond, cmp_array,
+                          br->getSuccessor(outside_idx),
+                          br->getSuccessor(inside_idx),
+                          reachable};
+        persisted.push_back(pg);
+
+        register_guard(br->getParent(), br, outside_idx, cond,
+                       cmp_array, r, std::move(downstream));
+      }
+    } else {
+      // INTER: replay persisted guards. Use the persisted reachable set
+      // (from INTRA's pre-wrap CFG walk) to identify which INTER regions
+      // are downstream — this is more reliable than walking the
+      // INTRA-modified CFG, where wrap infrastructure has reshaped paths.
+      for (auto &pg : persisted) {
+        size_t guard_idx = (size_t)-1;
+        for (size_t r = 0; r < parallel_regions.size(); r++) {
+          if (parallel_regions[r].wrapped_block.count(pg.guard_bb)) {
+            guard_idx = r;
+            break;
+          }
+        }
+        auto downstream = computeDownstreamFromPersisted(
+            parallel_regions, guard_idx, pg.intra_reachable);
+        register_guard(pg.guard_bb, pg.cond_br, pg.outside_idx, pg.cond,
+                       pg.cmp_array, guard_idx, std::move(downstream));
+      }
+    }
+  }
+
+  // === WRAP PASS: per region, build warp loop infra; inject gate / redirect. ===
+  for (size_t region_idx = 0; region_idx < parallel_regions.size();
+       region_idx++) {
+    auto region = parallel_regions[region_idx];
     auto start_block = region.start_block;
     auto tail_block = region.end_block;
     auto next_block = region.successor_block;
@@ -1396,99 +1839,35 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     builder.CreateBr(next_block);
     loop_cond->getTerminator()->replaceUsesOfWith(next_block, reset_index);
 
-    // TODO: Handle conditional exits from wrapped blocks that go outside
-    // the loop. This is needed for patterns like:
-    //   if (threadIdx.x < WARP_SIZE) { /* warp shuffles */ }
-    // where the false-branch exits the warp loop prematurely.
-    // Currently disabled because it also catches for/while loop conditions,
-    // breaking their body entry. Needs a way to distinguish if-guards from
-    // loop conditions.
-    if (false) {
-      SmallPtrSet<BasicBlock *, 16> loop_blocks;
-      loop_blocks.insert(loop_init);
-      loop_blocks.insert(loop_cond);
-      loop_blocks.insert(loop_inc);
-      loop_blocks.insert(reset_index);
-      for (auto *bb : region.wrapped_block)
-        loop_blocks.insert(bb);
-
-      for (auto *bb : region.wrapped_block) {
-        if (bb == tail_block) continue;
-        auto *term = bb->getTerminator();
-        if (!isa<BranchInst>(term)) continue;
-        auto *br = cast<BranchInst>(term);
-        if (!br->isConditional()) continue;
-        bool has_inside = false, has_outside = false;
-        unsigned outside_idx = 0;
-        BasicBlock *outside_target = nullptr;
-        BasicBlock *inside_target = nullptr;
-        for (unsigned i = 0; i < br->getNumSuccessors(); i++) {
-          if (loop_blocks.count(br->getSuccessor(i))) {
-            has_inside = true;
-            inside_target = br->getSuccessor(i);
-          } else {
-            has_outside = true;
-            outside_idx = i;
-            outside_target = br->getSuccessor(i);
-          }
-        }
-        if (!has_inside || !has_outside) continue;
-        // Skip warp loop infrastructure blocks (cond, init, inc, reset)
-        if (bb->getName().starts_with("intra_warp") ||
-            bb->getName().starts_with("inter_warp") ||
-            bb->getName().starts_with("intra_reset") ||
-            bb->getName().starts_with("inter_reset")) continue;
-
-        // Find the context array pointer from the condition's load chain:
-        // cond = load i1, ptr (gep cmp*_intra_warp_, thread_idx)
-        Value *cond = br->getCondition();
-        Value *ctx_base = nullptr;
-        Type *ctx_elem_type = nullptr;
-        if (auto *LI = dyn_cast<LoadInst>(cond)) {
-          if (auto *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand())) {
-            ctx_base = GEP->getPointerOperand();
-            ctx_elem_type = GEP->getSourceElementType();
-          }
-        }
-        if (!ctx_base && !intra_warp_loop) continue;  // inter_warp needs context array
-
-        if (intra_warp_loop) {
-          // INTRA_WARP: just redirect outside target to loop_inc.
-          // Each lane still evaluates the condition; true-path stays inside.
-          if (cupbop_debug())
-            fprintf(stderr, "[warp_loop] redirect exit: %s -> %s => loop_inc\n",
-                    bb->getName().str().c_str(),
-                    outside_target->getName().str().c_str());
-          br->setSuccessor(outside_idx, loop_inc);
-        } else {
-          // INTER_WARP: replace conditional with unconditional br to loop_inc,
-          // then add post-loop decision block using cond[0].
-          if (cupbop_debug())
-            fprintf(stderr, "[warp_loop] split condBr: %s -> %s (outside)\n",
-                    bb->getName().str().c_str(),
-                    outside_target->getName().str().c_str());
-
-          br->eraseFromParent();
-          IRBuilder<> bb_builder(bb);
-          bb_builder.CreateBr(loop_inc);
-
-          BasicBlock *decision = BasicBlock::Create(
-              context, "warp_loop_decision", F, next_block);
-          IRBuilder<> db(decision);
-          Value *gep0 = db.CreateConstInBoundsGEP1_32(ctx_elem_type, ctx_base, 0);
-          Value *cond0 = db.CreateLoad(ctx_elem_type, gep0, "cond_zero");
-          if (outside_idx == 0) {
-            db.CreateCondBr(cond0, outside_target, next_block);
-          } else {
-            db.CreateCondBr(cond0, next_block, outside_target);
-          }
-
-          reset_index->getTerminator()->eraseFromParent();
-          IRBuilder<> rb(reset_index);
-          rb.CreateBr(decision);
-        }
-
-        break;  // one per region
+    // === Predicate gating ===
+    //
+    // (a) If this region is a guard: redirect false branch to loop_inc so
+    //     false-cmp threads continue iterating without exiting the warp_loop.
+    // (b) If this region is a downstream of any guard: inject a gate that
+    //     loads cmp_array[thread_idx] and short-circuits to loop_inc when
+    //     the saved cmp is false. Multiple gates chain (one per ancestor
+    //     guard); nested ifs are handled implicitly.
+    //
+    // Order matters: gates first (modify start_block predecessors), then
+    // guard redirect (changes existing cond br successor). Both operate on
+    // CFG that already has loop_init / loop_cond / loop_inc.
+    for (auto &g : guards) {
+      if (g.downstream_region_idxs.count(region_idx)) {
+        if (cupbop_debug())
+          fprintf(stderr, "[gate] inject @ region %zu (downstream of %zu)\n",
+                  region_idx, g.guard_region_idx);
+        injectGate(start_block, loop_inc, g.cmp_array);
+      }
+    }
+    for (auto &g : guards) {
+      // INTRA pass: redirect when this region is the guard.
+      // INTER pass: skip — INTRA already redirected; modifying again would
+      // break the now-corrected control flow.
+      if (intra_warp_loop && g.guard_region_idx == region_idx) {
+        if (cupbop_debug())
+          fprintf(stderr, "[guard-redirect] region %zu: outside %u → loop_inc\n",
+                  region_idx, g.outside_idx);
+        g.cond_br->setSuccessor(g.outside_idx, loop_inc);
       }
     }
 
@@ -1994,7 +2373,7 @@ public:
     // llvm::errs() << "handle_local_variable_intra_warp: \n";
     // F.print(llvm::errs());
 
-    add_warp_loop(parallel_regions, intra_warp_loop);
+    add_warp_loop(parallel_regions, intra_warp_loop, DI, LI, *DT);
     remove_barrier(&F, intra_warp_loop, schedule_flag);
 
     // Fix domination errors created by warp loop insertion.
