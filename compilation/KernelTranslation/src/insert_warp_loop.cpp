@@ -1684,7 +1684,14 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
   //
   // Result: vector<DivergentIfGuard> guards, used in the wrap loop below.
   std::vector<DivergentIfGuard> guards;
-  if (!parallel_regions.empty()) {
+  // Predicated execution is currently scoped to SCHE_0 with nested loops
+  // (need_nested_loop). SCHE_2 uses native SIMT semantics — the divergent
+  // branch is handled by hardware predication, so injecting gates would
+  // be pure overhead with no correctness benefit. Bailing out for non-
+  // SCHE_0 keeps SCHE_2 behavior unchanged.
+  bool predicated_exec_enabled =
+      (g_schedule_flag == 0 && need_nested_loop);
+  if (predicated_exec_enabled && !parallel_regions.empty()) {
     llvm::Function *F = parallel_regions[0].start_block->getParent();
 
     // INTRA pass: fresh detection. INTER pass: replay guards persisted
