@@ -365,21 +365,21 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "int block_size;\n"
             "\n"
 
-            "int __thread block_index_x;\n"
-            "int __thread block_index_y;\n"
-            "int __thread block_index_z;\n"
+            "__attribute__((used)) int __thread block_index_x;\n"
+            "__attribute__((used)) int __thread block_index_y;\n"
+            "__attribute__((used)) int __thread block_index_z;\n"
 
-            "int __thread *dynamic_shared_memory = NULL;\n"
+            "__attribute__((used)) int __thread *dynamic_shared_memory = NULL;\n"
 
 
-            "int __thread thread_id_x;\n"
-            "int __thread thread_id_y;\n"
-            "int __thread thread_id_z;\n"
+            "__attribute__((used)) int __thread thread_id_x;\n"
+            "__attribute__((used)) int __thread thread_id_y;\n"
+            "__attribute__((used)) int __thread thread_id_z;\n"
             "\n"
             "#include <VX_config.h>\n"
-            "int __thread warp_shfl[NUM_WARPS * NUM_THREADS] = {0};\n"
-            "char __thread warp_vote[32] = {0};\n"
-            "int __thread vote_count = 0;\n"
+            "__attribute__((used)) int __thread warp_shfl[NUM_WARPS * NUM_THREADS] = {0};\n"
+            "__attribute__((used)) char __thread warp_vote[32] = {0};\n"
+            "__attribute__((used)) int __thread vote_count = 0;\n"
             "\n";
     }
 
