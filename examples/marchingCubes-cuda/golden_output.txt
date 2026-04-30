@@ -4,5 +4,4 @@ Vertices Size: 6080
 Triangles Size: 18900
 Vertices: 160
 Triangles: 120
-Average kernel execution time (generatingTriangles): 0.000046 (s)
 PASSED!
