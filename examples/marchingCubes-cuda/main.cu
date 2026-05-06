@@ -128,6 +128,16 @@ __global__ void compactLv1(
   if (bIdx < blockNum && minMax[2 * bIdx] <= isoValue && minMax[2 * bIdx + 1] >= isoValue) test = 1;
   else test = 0;
   unsigned int testSum(test);
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+  __shared__ unsigned int prefixLv1[countingThreadNumLv1];
+  prefixLv1[tid] = test;
+  __syncthreads();
+  testSum = 0;
+  for (unsigned int i = 0; i <= tid; i++) {
+    testSum += prefixLv1[i];
+  }
+  __syncthreads();
+#else
 #pragma unroll
   for (int c0(1); c0 < 32; c0 *= 2)
   {
@@ -149,6 +159,7 @@ __global__ void compactLv1(
   }
   __syncthreads();
   if (warpid != 0)testSum += sums[warpid - 1];
+#endif
   if (tid == countingThreadNumLv1 - 1 && testSum != 0)
     sums[31] = atomicAdd(countedBlockNum, testSum);
   __syncthreads();
@@ -159,6 +170,10 @@ __global__ void computeMinMaxLv2(
   const unsigned int*__restrict__ blockIndicesLv1,
   float*__restrict__ minMax)
 {
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+  __shared__ float minBufLv2[16 * 25];
+  __shared__ float maxBufLv2[16 * 25];
+#endif
   unsigned int tid(threadIdx.x);
   unsigned int voxelOffset(threadIdx.y);
   unsigned int blockIndex(blockIndicesLv1[blockIdx.x]);
@@ -180,6 +195,24 @@ __global__ void computeMinMaxLv2(
       if (v > maxV)maxV = v;
     }
     z += voxelZLv2 - 1;
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+    {
+      unsigned int slot = voxelOffset * 16 + tid;
+      minBufLv2[slot] = minV;
+      maxBufLv2[slot] = maxV;
+      __syncthreads();
+      // Each thread independently reduces all 16 values for its voxelOffset
+      minV = minBufLv2[voxelOffset * 16];
+      maxV = maxBufLv2[voxelOffset * 16];
+      for (int i = 1; i < 16; i++) {
+        float mn = minBufLv2[voxelOffset * 16 + i];
+        float mx = maxBufLv2[voxelOffset * 16 + i];
+        if (mn < minV) minV = mn;
+        if (mx > maxV) maxV = mx;
+      }
+      __syncthreads();
+    }
+#else
 #pragma unroll
     for (int c1(8); c1 > 0; c1 /= 2)
     {
@@ -189,10 +222,13 @@ __global__ void computeMinMaxLv2(
       if (t0 < minV)minV = t0;
       if (t1 > maxV)maxV = t1;
     }
+#endif
     if (tid == 0)
     {
       minMax[idx] = minV;
       minMax[idx + 1] = maxV;
+    }
+    {
       constexpr unsigned int offsetSize(2 * blockXLv2 * blockYLv2);
       idx += offsetSize;
     }
@@ -226,6 +262,16 @@ __global__ void compactLv2(
   }
   else test = 0;
   unsigned int testSum(test);
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+  __shared__ unsigned int prefixLv2[countingThreadNumLv2];
+  prefixLv2[tid] = test;
+  __syncthreads();
+  testSum = 0;
+  for (unsigned int i = 0; i <= tid; i++) {
+    testSum += prefixLv2[i];
+  }
+  __syncthreads();
+#else
 #pragma unroll
   for (int c0(1); c0 < 32; c0 *= 2)
   {
@@ -247,8 +293,10 @@ __global__ void compactLv2(
   }
   __syncthreads();
   if (warpid != 0)testSum += sums[warpid - 1];
-  if (tid == countingThreadNumLv2 - 1)
+#endif
+  if (tid == countingThreadNumLv2 - 1) {
     sums[31] = atomicAdd(countedBlockNumLv2, testSum);
+  }
   __syncthreads();
 
   if (test)
@@ -342,6 +390,23 @@ __global__ void generatingTriangles(
   unsigned int sumVertices(numVertices);
   unsigned int sumTriangles(numTriangles);
 
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+  {
+    __shared__ unsigned int prefixV[threadNum];
+    __shared__ unsigned int prefixT[threadNum];
+    unsigned int linTid = threadIdx.x + voxelXLv2 * (threadIdx.y + voxelYLv2 * threadIdx.z);
+    prefixV[linTid] = numVertices;
+    prefixT[linTid] = numTriangles;
+    __syncthreads();
+    sumVertices = 0;
+    sumTriangles = 0;
+    for (unsigned int i = 0; i <= linTid; i++) {
+      sumVertices += prefixV[i];
+      sumTriangles += prefixT[i];
+    }
+    __syncthreads();
+  }
+#else
 #pragma unroll
   for (int c0(1); c0 < 32; c0 *= 2)
   {
@@ -383,6 +448,7 @@ __global__ void generatingTriangles(
     sumVertices += sumsVertices[warpid - 1];
     sumTriangles += sumsTriangles[warpid - 1];
   }
+#endif
   if (eds == 0)
   {
     sumsVertices[31] = atomicAdd(countedVerticesNum, sumVertices);
