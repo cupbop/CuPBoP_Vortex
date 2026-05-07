@@ -3,7 +3,7 @@ name: Runner Heartbeat
 on:
   schedule:
     # This runs at 00:00 on the 1st and 15th of every month
-    - cron: '0 0 1,15 * *'
+    - cron: '0 0 * * 0'
   workflow_dispatch: # Allows you to run it manually to test
 
 jobs:
