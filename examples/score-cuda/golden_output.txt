@@ -1,6 +1,2 @@
-[host-dbg] pre-kernel count=0
-Average kernel execution time: 41.865398 (ms)
-[host-dbg] count[0] gpu=0 ref=10
-[host-dbg] bins[0..7]:   0 1 2 3 4 5 6 7
-[host-dbg] bins[32..39]: 0 0 0 0 0 0 0 0
-FAILED!
+[dbg] hist=10 scan=16 final_count=10 ref=10 idx0=44 ref0=44
+PASSED!
