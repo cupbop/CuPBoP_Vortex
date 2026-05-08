@@ -690,6 +690,13 @@ int main(int argc, char* argv[])
 #if MARCHING_N == 1024
   bool ok = (countedBlockNumLv1 == 8296 && countedBlockNumLv2 == 240380 &&
              countedVerticesNum == 4856560 && countedTrianglesNum == 6101640);
+#elif MARCHING_N == 64
+  // Strict check for the CI default size: catches buggy outputs that the
+  // permissive `>0` check would let through (e.g. SCHE_0 LICM-hoist bug
+  // produced Block Lv2=100 + corrupted Vertices=532854583, but the bench
+  // still printed PASSED!). Values match golden_output.txt.
+  bool ok = (countedBlockNumLv1 == 4 && countedBlockNumLv2 == 20 &&
+             countedVerticesNum == 160 && countedTrianglesNum == 120);
 #else
   bool ok = (countedVerticesNum > 0 && countedTrianglesNum > 0);
 #endif
