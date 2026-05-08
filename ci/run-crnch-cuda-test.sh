@@ -4,7 +4,7 @@
 #SBATCH -p rg-nextgen-hpc
 #SBATCH -w dash[1-4]
 #SBATCH -N 1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
 # GPU not needed: Vortex simx is a pure CPU emulator. Removing --gres=gpu:1
 # lets multiple matrix jobs share a node (allocated by CPU/memory only)
