@@ -166,6 +166,63 @@ __global__ void compactLv1(
   if (test)blockIndices[testSum + sums[31] - 1] = bIdx;
 }
 
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+// SCHE_0 multi-kernel-launch variant of computeMinMaxLv2.
+// Original kernel has outer for-loop `for (c0=0; c0<blockZLv2; c0++) { ... __syncthreads ... }`.
+// SCHE_0 + nested warp_loop hoists the c0 increment via LICM into
+// `c0 += warp_number` (instead of `c0 += 1`), exiting the loop after one iter.
+// Result: 1 iter's data written, others stay zero → Block Lv2=100 vs golden 20.
+// Workaround: drop the outer for-loop in the kernel and let the host launch
+// one kernel call per c0 iteration. Per-c0 idx and z are derived from c0_iter.
+// See memory sche0_for_iv_corruption_bug.md.
+__global__ void computeMinMaxLv2_one(
+  unsigned int c0_iter,
+  const unsigned int*__restrict__ blockIndicesLv1,
+  float*__restrict__ minMax)
+{
+  __shared__ float minBufLv2[16 * 25];
+  __shared__ float maxBufLv2[16 * 25];
+  unsigned int tid(threadIdx.x);
+  unsigned int voxelOffset(threadIdx.y);
+  unsigned int blockIndex(blockIndicesLv1[blockIdx.x]);
+  unsigned int tp(blockIndex);
+  unsigned int x((blockIndex % gridXLv1) * (voxelXLv1 - 1) + (voxelOffset % 5) * (voxelXLv2 - 1) + (tid & 3));
+  tp /= gridXLv1;
+  unsigned int y((tp % gridYLv1) * (voxelYLv1 - 1) + (voxelOffset / 5) * (voxelYLv2 - 1) + (tid >> 2));
+  tp /= gridYLv1;
+  // z = base + c0_iter * (voxelZLv2 - 1)
+  unsigned int z(tp * (voxelZLv1 - 1) + c0_iter * (voxelZLv2 - 1));
+  float v(f(x, y, z));
+  float minV(v), maxV(v);
+  for (int c1(1); c1 < voxelZLv2; ++c1)
+  {
+    v = f(x, y, z + c1);
+    if (v < minV)minV = v;
+    if (v > maxV)maxV = v;
+  }
+  // Per-thread independent reduction (jaccard-style workaround pattern).
+  unsigned int slot = voxelOffset * 16 + tid;
+  minBufLv2[slot] = minV;
+  maxBufLv2[slot] = maxV;
+  __syncthreads();
+  minV = minBufLv2[voxelOffset * 16];
+  maxV = maxBufLv2[voxelOffset * 16];
+  for (int i = 1; i < 16; i++) {
+    float mn = minBufLv2[voxelOffset * 16 + i];
+    float mx = maxBufLv2[voxelOffset * 16 + i];
+    if (mn < minV) minV = mn;
+    if (mx > maxV) maxV = mx;
+  }
+  if (tid == 0)
+  {
+    constexpr unsigned int offsetSize(2 * blockXLv2 * blockYLv2);
+    unsigned int idx(2 * (voxelOffset + voxelNumLv2 * blockIdx.x) + c0_iter * offsetSize);
+    minMax[idx] = minV;
+    minMax[idx + 1] = maxV;
+  }
+}
+#endif
+
 __global__ void computeMinMaxLv2(
   const unsigned int*__restrict__ blockIndicesLv1,
   float*__restrict__ minMax)
@@ -584,7 +641,16 @@ int main(int argc, char* argv[])
     cudaMemcpy(&countedBlockNumLv1, countedBlockNumLv1Device, sizeof(unsigned int), cudaMemcpyDeviceToHost);
     cudaMalloc(&minMaxLv2Device, countedBlockNumLv1 * voxelNumLv2 * 2 * sizeof(float));
 
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
+    // SCHE_0 multi-kernel-launch: one kernel call per c0 iteration to avoid
+    // the LICM-hoist `c0 += warp_number` bug. See computeMinMaxLv2_one.
+    for (unsigned int c0_iter = 0; c0_iter < blockZLv2; ++c0_iter) {
+      computeMinMaxLv2_one <<< countedBlockNumLv1, BlockSizeLv2 >>> (
+          c0_iter, blockIndicesLv1Device, minMaxLv2Device);
+    }
+#else
     computeMinMaxLv2 <<< countedBlockNumLv1, BlockSizeLv2 >>> (blockIndicesLv1Device, minMaxLv2Device);
+#endif
 
     cudaMalloc(&blockIndicesLv2Device, countedBlockNumLv1 * voxelNumLv2 * sizeof(unsigned int));
     unsigned int countingBlockNumLv2((countedBlockNumLv1 * voxelNumLv2 + countingThreadNumLv2 - 1) / countingThreadNumLv2);
