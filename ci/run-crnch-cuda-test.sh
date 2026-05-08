@@ -6,7 +6,9 @@
 #SBATCH -N 1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:1
+# GPU not needed: Vortex simx is a pure CPU emulator. Removing --gres=gpu:1
+# lets multiple matrix jobs share a node (allocated by CPU/memory only)
+# instead of serializing on the 1 GPU per node.
 #SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # Combined output and error messages file
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 

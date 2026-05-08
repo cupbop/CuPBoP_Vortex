@@ -4,7 +4,9 @@
 #SBATCH -p rg-nextgen-hpc
 #SBATCH -w dash[1-4]
 #SBATCH -N 1
-#SBATCH --gres=gpu:1
+# GPU not needed: CuPBoP build uses clang (RISC-V target), no CUDA runtime.
+# Removing --gres=gpu:1 frees up GPU slots so more matrix jobs can run in
+# parallel on the same node.
 #SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # Combined output and error messages file
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 
