@@ -152,7 +152,11 @@ void runVLCTest(char *file_name, uint num_block_threads, uint num_blocks) {
   dim3 block_size(num_block_threads, 1, 1);
   unsigned int sm_size;
 
-  unsigned int NT = 10; // number of runs for each execution time
+  // NT was 10 for CPU-side timing benchmark (run kernel 10 times, average).
+  // Each iteration is deterministic and writes via plain store `out[kn]=as[k]`,
+  // so running once vs 10 times produces identical d_destData. Reduce to 1
+  // for Vortex simx CI to fit in wall-time budget.
+  unsigned int NT = 1;
 
   //////////////////* CPU ENCODER *///////////////////////////////////
   unsigned int refbytesize;
