@@ -383,8 +383,11 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
     // then store to a stack alloca so subsequent uses are fast stack reads.
     // Each slot holds entries for up to MAX_BLOCKS blocks * MAX_THREADS_PER_BLOCK
     // (block_index_x * 1024 + thread_idx_in_block) — see AddContextSave.
-    constexpr int MAX_BLOCKS = 8;
-    constexpr int MAX_BLK = 1024 * MAX_BLOCKS;  // 8K i32 per slot
+    // Bumped from 8 to 32 for marchingCubes-cuda's gT kernel (20 blocks): with
+    // MAX_BLOCKS=8, blocks 8-19 wrap and corrupt adjacent variables' slots —
+    // observed via popc(distinctEdges & eds) > popc(eds) (math impossibility).
+    constexpr int MAX_BLOCKS = 32;
+    constexpr int MAX_BLK = 1024 * MAX_BLOCKS;  // 32K i32 per slot
     int elemSize = Layout.getTypeAllocSize(AllocType);
     int elemOffset = g_ctx_pool_offset / elemSize;
 
