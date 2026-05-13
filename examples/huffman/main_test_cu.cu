@@ -179,12 +179,23 @@ void runVLCTest(char *file_name, uint num_block_threads, uint num_blocks) {
 #endif
 
   for (int i = 0; i < NT; i++) {
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 2
+    // SCHE_2 source workaround for shared-mem atomicOr / prefix-sum bug.
+    // See vlc_kernel_sm64huff.cu for details. Sequential per-block.
+    vlc_encode_kernel_seq_per_block<<<grid_size, block_size>>>(
+        d_sourceData, d_codewords, d_codewordlens,
+#ifdef TESTING
+        d_cw32, d_cw32len, d_cw32idx,
+#endif
+        d_destData, d_cindex);
+#else
     vlc_encode_kernel_sm64huff<<<grid_size, block_size>>>(
         d_sourceData, d_codewords, d_codewordlens,
 #ifdef TESTING
         d_cw32, d_cw32len, d_cw32idx,
 #endif
         d_destData, d_cindex); // testedOK2
+#endif
     cudaThreadSynchronize();
   }
   //   //////////////////* END KERNEL *///////////////////////////////////

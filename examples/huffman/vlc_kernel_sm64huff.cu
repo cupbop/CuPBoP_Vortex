@@ -157,4 +157,51 @@ vlc_encode_kernel_sm64huff(unsigned int *data, const unsigned int *gm_codewords,
 //////////////////////////////////////////////////////////////////////////////
 #endif
 
+#if defined(VORTEX_SCHE) && VORTEX_SCHE == 2
+// SCHE_2 source workaround: parallel vlc_encode_kernel_sm64huff produces
+// corruption in late dwords of some blocks (e.g., block 9 positions 70-73).
+// Likely cause: prefix-sum in shared mem or cross-warp atomicOr to shared mem.
+// This sequential single-thread-per-block fallback bypasses both — thread 0
+// of each block does CPU-style bit-packing directly into out[]. Slow but
+// correct. Each block writes to out[blockIdx.x*blockDim.x .. +outidx_words).
+__global__ static void
+vlc_encode_kernel_seq_per_block(unsigned int *data,
+                                const unsigned int *gm_codewords,
+                                const unsigned int *gm_codewordlens,
+#ifdef TESTING
+                                unsigned int *cw32, unsigned int *cw32len,
+                                unsigned int *cw32idx,
+#endif
+                                unsigned int *out, unsigned int *outidx) {
+  if (threadIdx.x != 0) return;
+  unsigned int kn_base = blockIdx.x * blockDim.x;
+  unsigned int *out_block = &out[kn_base];
+  for (unsigned int i = 0; i < blockDim.x; i++) out_block[i] = 0;
+
+  unsigned int startbit = 0;
+  unsigned int as_idx = 0;
+  for (unsigned int i = 0; i < blockDim.x; i++) {
+    unsigned int val32 = data[kn_base + i];
+    for (unsigned int j = 0; j < 4; j++) {
+      unsigned char tmpbyte = (unsigned char)(val32 >> ((3 - j) * 8));
+      unsigned int cw32_v = gm_codewords[tmpbyte];
+      unsigned int cwlen = gm_codewordlens[tmpbyte];
+      while (cwlen > 0) {
+        unsigned int writebits = (32 - startbit < cwlen) ? 32 - startbit : cwlen;
+        unsigned int mask32;
+        if (cwlen == writebits)
+          mask32 = (cw32_v & ((1u << cwlen) - 1)) << (32 - startbit - cwlen);
+        else
+          mask32 = cw32_v >> (cwlen - writebits);
+        out_block[as_idx] |= mask32;
+        cwlen -= writebits;
+        startbit = (startbit + writebits) & 31;
+        if (startbit == 0) as_idx++;
+      }
+    }
+  }
+  outidx[blockIdx.x] = as_idx * 32 + startbit;
+}
+#endif
+
 #endif
