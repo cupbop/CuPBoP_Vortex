@@ -445,7 +445,64 @@ void create_kernel_wrapper_function(llvm::Module *M){
     }
 
     ss << "};\n"
-          "\n"
+          "\n";
+
+    // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): emit per-kernel static
+    // lmem size table. Built from kernel_lmem.log written by mem_share2local.
+    // main() reads this to set __vx_lmem_per_cta_bytes before vx_spawn_threads
+    // so groups_per_core can be clamped to avoid lmem wraparound.
+    {
+      // Apply the same Itanium-ABI demangling-prefix strip that CuPBoP uses for
+      // wrapper_name: strip "_Z" and any subsequent length digits. See
+      // lines 262-266 above for the original logic.
+      auto strip_mangling_prefix = [](std::string s) -> std::string {
+        if (s.size() < 2 || s[0] != '_' || s[1] != 'Z') return s;
+        size_t i = 2;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+        return s.substr(i);
+      };
+      std::map<std::string, uint32_t> kernel_to_lmem;
+      std::ifstream lmem_log("kernel_lmem.log");
+      if (lmem_log.is_open()) {
+        std::string raw_kname;
+        uint32_t bytes;
+        while (lmem_log >> raw_kname >> bytes) {
+          std::string kname = strip_mangling_prefix(raw_kname);
+          // Keep the maximum across multiple entries (passes may log the same
+          // kernel more than once; we want the final layout size).
+          auto it = kernel_to_lmem.find(kname);
+          if (it == kernel_to_lmem.end() || it->second < bytes) {
+            kernel_to_lmem[kname] = bytes;
+          }
+        }
+      }
+      ss << "// Per-kernel __shared__ static byte count (index = kernel_idx).\n";
+      ss << "// Set to 0 if unknown; vx_spawn_threads then skips its lmem clamp.\n";
+      ss << "extern \"C\" uint32_t __vx_lmem_per_cta_bytes;\n";
+      ss << "static const uint32_t kernel_static_lmem_bytes[] = {\n";
+      for (auto f : wrapper_name) {
+        // Strip the "_wrapper" suffix to get the kernel symbol name used by
+        // mem_share2local for its log entries.
+        std::string kname = f;
+        const std::string suffix = "_wrapper";
+        if (kname.size() >= suffix.size() &&
+            kname.compare(kname.size() - suffix.size(), suffix.size(), suffix) == 0) {
+          kname.resize(kname.size() - suffix.size());
+        }
+        uint32_t bytes = 0;
+        // Map keys are pre-normalized to the same demangled form as kname
+        // (see strip_mangling_prefix above).
+        auto it = kernel_to_lmem.find(kname);
+        if (it != kernel_to_lmem.end()) {
+          bytes = it->second;
+        }
+        ss << "    " << bytes << "u, // " << kname << "\n";
+      }
+      ss << "};\n\n";
+    }
+
+    ss <<
+
 
           "int main() {\n"
           "//    vx_printf(\"kernel_wrapper: main\\n\");\n"
@@ -523,6 +580,13 @@ void create_kernel_wrapper_function(llvm::Module *M){
       "//vx_printf(\"execute something\\n\");"
 
           "\n";
+
+    // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): publish per-CTA lmem
+    // size to vx_spawn_threads so it can clamp groups_per_core (avoids lmem
+    // wraparound that aliases group-1 of different cores in DRAM).
+    ss << "    __vx_lmem_per_cta_bytes = "
+          "kernel_static_lmem_bytes[kernel_arg->kernel_idx] + "
+          "ctx->dyn_shared_mem_size;\n";
 
     if (schedule == 0) {
       ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";

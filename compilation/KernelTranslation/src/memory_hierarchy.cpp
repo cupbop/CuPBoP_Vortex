@@ -619,6 +619,20 @@ void mem_share2local(llvm::Module *M) {
       }
       uint32_t staticAligned = alignTo(staticBytes, dynAlign);
 
+      // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
+      // lmem size so generate_wrapper.cpp can emit a kernel_lmem_sizes[] table
+      // and main() can set __vx_lmem_per_cta_bytes before vx_spawn_threads
+      // (which clamps groups_per_core to avoid lmem wraparound).
+      {
+        // Open with default mode (truncate) on first call within this run,
+        // then subsequent writes append via the same stream. Across
+        // re-invocations of the compiler, the static is reinitialized and the
+        // file is truncated fresh.
+        static std::ofstream lmem_log("kernel_lmem.log");
+        lmem_log << F.getName().str() << " " << staticAligned << "\n";
+        lmem_log.flush();
+      }
+
       Value *dynBytes = ConstantInt::get(I32, 0);
       if (!usedDynamic.empty() && DynSizeGV)
         dynBytes = B.CreateLoad(I32, DynSizeGV, "dyn_bytes");
@@ -717,6 +731,14 @@ void mem_share2local(llvm::Module *M) {
       dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
     }
     uint32_t staticAligned = alignTo(staticBytes, dynAlign);
+
+    // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
+    // lmem size. See no-barrier branch above for context.
+    {
+      static std::ofstream lmem_log("kernel_lmem.log", std::ios::app);
+      lmem_log << F.getName().str() << " " << staticAligned << "\n";
+      lmem_log.flush();
+    }
 
     Value *dynBytes = ConstantInt::get(I32, 0);
     if (!usedDynamic.empty() && DynSizeGV)
