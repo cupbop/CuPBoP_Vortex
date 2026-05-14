@@ -478,7 +478,13 @@ void create_kernel_wrapper_function(llvm::Module *M){
       }
       ss << "// Per-kernel __shared__ static byte count (index = kernel_idx).\n";
       ss << "// Set to 0 if unknown; vx_spawn_threads then skips its lmem clamp.\n";
-      ss << "extern \"C\" uint32_t __vx_lmem_per_cta_bytes;\n";
+      // Provide a WEAK fallback definition so that linking succeeds against
+      // older libvortex.a builds that don't yet define this global (no
+      // vx_spawn lmem-clamp fix). In that case main() still writes to this
+      // variable but no one reads it — harmless. When linking against a new
+      // libvortex.a, both weak symbols merge and vx_spawn_threads reads the
+      // value main() stores.
+      ss << "extern \"C\" __attribute__((weak)) uint32_t __vx_lmem_per_cta_bytes = 0;\n";
       ss << "static const uint32_t kernel_static_lmem_bytes[] = {\n";
       for (auto f : wrapper_name) {
         // Strip the "_wrapper" suffix to get the kernel symbol name used by
