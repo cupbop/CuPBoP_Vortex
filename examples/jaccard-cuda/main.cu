@@ -37,18 +37,6 @@ template<typename T>
 __device__
 T parallel_prefix_sum(const int n, const int *ind, const T *w)
 {
-#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
-  // CuPBoP SCHE_0 (FLAT, lane-serialized warp_loop) miscompiles the
-  // shfl-based parallel prefix scan below — same shfl-in-outer-for-loop
-  // ctx_pool aliasing issue as score-cuda. Each thread independently sums
-  // is correct (the function only returns the TOTAL, not per-thread prefix),
-  // and matches the parallel version's return semantics.
-  T total = 0;
-  for (int i = 0; i < n; i++) {
-    total += w[ind[i]];
-  }
-  return total;
-#else
   T sum = 0.0;
   T last;
 
@@ -86,7 +74,6 @@ T parallel_prefix_sum(const int n, const int *ind, const T *w)
   last = __shfl_sync(mask, sum, blockDim.x-1, blockDim.x);
 
   return last;
-#endif
 }
 
 // Volume of neighboors (*weight_s)
