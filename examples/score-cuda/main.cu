@@ -75,23 +75,6 @@ void findTopK(int*__restrict__ indices_,
 
   constexpr int WARP_SIZE = 32; /* must be equal to warpSize */
 
-#if defined(VORTEX_SCHE) && VORTEX_SCHE == 0
-  // CuPBoP SCHE_0 (FLAT, lane-serialized warp_loop) miscompiles the
-  // shfl-based suffix sum below — the cross-iteration `previous_group_first_element`
-  // carry through ctx_pool aliasing produces wrong bins[K] suffix values
-  // (final_count=14 vs expected 10). The sequential thread-0 suffix sum
-  // produces correct output and is the simplest workaround until the
-  // underlying CuPBoP shfl-in-outer-for-loop infrastructure issue is fixed.
-  if (threadIdx.x == 0) {
-    int total = 0;
-    for (int k = BINS - 1; k >= 0; k--) {
-      total += bins[k];
-      bins[k] = total;
-    }
-  }
-  __syncthreads();
-  if (false)
-#endif
   if (threadIdx.x < WARP_SIZE)
   {
     /* We can compute suffix sum of an array in groups of N numbers.

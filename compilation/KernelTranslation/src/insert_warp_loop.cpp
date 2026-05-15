@@ -2305,6 +2305,17 @@ public:
     if (!isKernelFunction(F.getParent(), &F))
       return 0;
 
+    // Remove unreachable BBs before region detection. Dead BBs (preds=0,
+    // typically left over from earlier transforms / unrolled-dead branches)
+    // would otherwise contribute spurious entry barriers to
+    // getParallelRegionBefore, causing it to abort the region and leaving
+    // post-shfl SELECT BBs unwrapped (score-cuda SCHE_0 final_count=14 bug).
+    bool removed = llvm::removeUnreachableBlocks(F);
+    if (removed) {
+      fprintf(stderr, "[ROF] removed unreachable BBs in %s\n",
+              F.getName().str().c_str());
+    }
+
     add_mapping_variable(&F, intra_warp_loop, need_nested_loop, schedule_flag);
 
     auto func_name = (&F)->getName().str();
