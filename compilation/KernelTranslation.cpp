@@ -130,7 +130,6 @@ int main(int argc, char **argv) {
 
   DBG_LOG("replace_wmma_intrinsics\n");
   replace_wmma_intrinsics(program);
-  replace_nvvm_wmma_intrinsics(program);
   dumpFile(program, "5_after_wmma.ll");
 
   VerifyModule(program);

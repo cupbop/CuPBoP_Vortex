@@ -87,14 +87,9 @@ int main(int argc, char **argv) {
 
   srand(42);
   for (int i = 0; i < M * K; i++)
-    // h_A[i] = __float2half((float)(rand() % 5) / 5.0f);
-    h_A[i] = __float2half(1);
-  // for (int i = 0; i < K * N; i++)
-  //   h_B[i] = __float2half((float)(rand() % 5) / 5.0f);
-  for (int i = 0; i < K * N; i++) {
-    int k = i / N; // row index in B since B is K x N row-major
-    h_B[i] = __float2half(k < 16 ? 1.0f : 0.0f);
-  }
+    h_A[i] = __float2half((float)(rand() % 5) / 5.0f);
+  for (int i = 0; i < K * N; i++)
+    h_B[i] = __float2half((float)(rand() % 5) / 5.0f);
   memset(h_C, 0, sizeC);
   memset(h_C_ref, 0, sizeC);
   gemm_cpu(h_A, h_B, h_C_ref, M, N, K);

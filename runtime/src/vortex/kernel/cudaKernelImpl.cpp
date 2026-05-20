@@ -413,38 +413,6 @@ extern "C" void __vx_wmma_load_a_m16n16k16_row_f16(
   }
 }
 
-// TODO: Fix BUG. Compute is not resulting in correct result
-extern "C" void __vx_wmma_load_a_m32n8k16_row_f16(
-    void *frag,    // fragment storage, 8 x i32
-    const void *p, // base pointer to matrix A (fp16 elements)
-    int32_t ldm) { // stride in fp16 elements
-
-  auto *dst = reinterpret_cast<uint32_t *>(frag);
-  auto *src = reinterpret_cast<const uint8_t *>(p);
-
-  uint32_t lane = __vx_get_lane_id();
-  uint32_t lane16 = lane & 0xFu; // 16-lane native subgroup
-  uint32_t row_base =
-      (lane >> 4u) * 16u; // lanes 0..15 => rows 0..15, 16..31 => rows 16..31
-
-  // Native 16x8x16 A mapping:
-  // block_row = lane16 / 4, block_col = (lane16 % 4) * 2
-  // row stride across regs = 4, col stride across regs = 8
-  uint32_t block_row = row_base + (lane16 / 4u);
-  uint32_t block_col = (lane16 % 4u) * 2u;
-
-  for (uint32_t r = 0; r < 8u; ++r) {
-    uint32_t elem_row = block_row + ((r / 2u) * 4u);
-    uint32_t elem_col = block_col + ((r % 2u) * 8u);
-
-    uint32_t off = elem_row * static_cast<uint32_t>(ldm) + elem_col;
-
-    uint32_t packed;
-    __builtin_memcpy(&packed, src + static_cast<uintptr_t>(off) * 2u, 4);
-    dst[r] = packed;
-  }
-}
-
 extern "C" void
 __vx_wmma_load_b_m16n16k16_row_f16(void *frag,    // 8 x i32 fragment storage
                                    const void *p, // base ptr to matrix B
@@ -473,46 +441,6 @@ __vx_wmma_load_b_m16n16k16_row_f16(void *frag,    // 8 x i32 fragment storage
     // Matches <2 x half> {h0, h1} packed into one i32 on little-endian targets.
     dst[r] = static_cast<uint32_t>(h0) | (static_cast<uint32_t>(h1) << 16);
   }
-}
-
-// TODO: Fix BUG. Compute is not resulting in correct result
-extern "C" void __vx_wmma_load_b_m32n8k16_row_f16(
-    void *frag,    // fragment storage, keep 8 x i32 to match wrapper
-    const void *p, // base ptr to matrix B
-    int32_t ldm) { // stride in half elements
-
-  auto *dst = reinterpret_cast<uint32_t *>(frag);
-  auto *src = reinterpret_cast<const uint8_t *>(p);
-
-  uint32_t lane = __vx_get_lane_id();
-  uint32_t lane16 = lane & 0xFu; // both 16-lane subgroups use the same B tile
-
-  // Native 16x8x16 B mapping:
-  // block_col = lane16 / 4, block_row = (lane16 % 4) * 2
-  // NRB = 4 for this native shape, so only dst[0..3] are meaningful.
-  uint32_t block_col = lane16 / 4u;
-  uint32_t block_row = (lane16 % 4u) * 2u;
-
-  for (uint32_t r = 0; r < 4u; ++r) {
-    uint32_t row = block_row + ((r / 2u) * 8u);
-    uint32_t col = block_col + ((r % 2u) * 4u);
-
-    uint32_t off0 = row * static_cast<uint32_t>(ldm) + col;
-    uint32_t off1 = off0 + static_cast<uint32_t>(ldm); // next row
-
-    uint16_t h0;
-    uint16_t h1;
-    __builtin_memcpy(&h0, src + static_cast<uintptr_t>(off0) * 2u, 2);
-    __builtin_memcpy(&h1, src + static_cast<uintptr_t>(off1) * 2u, 2);
-
-    dst[r] = static_cast<uint32_t>(h0) | (static_cast<uint32_t>(h1) << 16);
-  }
-
-  // Unused by the 4-reg B mma path, but keep fragment storage deterministic.
-  dst[4] = 0;
-  dst[5] = 0;
-  dst[6] = 0;
-  dst[7] = 0;
 }
 
 extern "C" void
@@ -553,31 +481,6 @@ extern "C" void __vx_wmma_store_d_m16n16k16_f32(float *p, const float *frag,
     }
   } else if (layout == WMMA_LAYOUT_COL) {
     // TODO: Implement this later
-  }
-}
-
-// TODO: Fix BUG. Compute is not resulting in correct result
-extern "C" void __vx_wmma_store_d_m32n8k16_f32(float *p, const float *frag,
-                                               int32_t ldm, WmmaLayout layout) {
-  uint32_t lane = __vx_get_lane_id();
-
-  uint32_t block_row = lane / 4u;
-  uint32_t block_col = lane % 4u;
-
-  if (layout == WMMA_LAYOUT_ROW) {
-    for (uint32_t r = 0; r < 8u; ++r) {
-      uint32_t row = block_row + ((r / 2u) * 8u);
-      uint32_t col = block_col + ((r % 2u) * 4u);
-      uint32_t off = row * static_cast<uint32_t>(ldm) + col;
-      p[off] = frag[r];
-    }
-  } else if (layout == WMMA_LAYOUT_COL) {
-    for (uint32_t r = 0; r < 8u; ++r) {
-      uint32_t row = block_row + ((r / 2u) * 8u);
-      uint32_t col = block_col + ((r % 2u) * 4u);
-      uint32_t off = col * static_cast<uint32_t>(ldm) + row;
-      p[off] = frag[r];
-    }
   }
 }
 
@@ -622,53 +525,6 @@ extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d,
                : "f"(a0), "f"(a1), "f"(a2), "f"(a3), "f"(a4), "f"(a5), "f"(a6),
                  "f"(a7), "f"(b0), "f"(b1), "f"(b2), "f"(b3), "f"(b4), "f"(b5),
                  "f"(b6), "f"(b7)
-               : "memory");
-
-  d[0] = d0;
-  d[1] = d1;
-  d[2] = d2;
-  d[3] = d3;
-  d[4] = d4;
-  d[5] = d5;
-  d[6] = d6;
-  d[7] = d7;
-}
-
-// TODO: Fix BUG. Compute is not resulting in correct result
-extern "C" void __vx_wmma_mma_m32n8k16_row_row_f16_f16_f32(float *d,
-                                                           const uint32_t *a,
-                                                           const uint32_t *b,
-                                                           const float *c) {
-  register float d0 asm("f0") = c[0];
-  register float d1 asm("f1") = c[1];
-  register float d2 asm("f2") = c[2];
-  register float d3 asm("f3") = c[3];
-  register float d4 asm("f4") = c[4];
-  register float d5 asm("f5") = c[5];
-  register float d6 asm("f6") = c[6];
-  register float d7 asm("f7") = c[7];
-
-  register float a0 asm("f10") = __vx_bitcast_u32_to_f32(a[0]);
-  register float a1 asm("f11") = __vx_bitcast_u32_to_f32(a[1]);
-  register float a2 asm("f12") = __vx_bitcast_u32_to_f32(a[2]);
-  register float a3 asm("f13") = __vx_bitcast_u32_to_f32(a[3]);
-  register float a4 asm("f14") = __vx_bitcast_u32_to_f32(a[4]);
-  register float a5 asm("f15") = __vx_bitcast_u32_to_f32(a[5]);
-  register float a6 asm("f16") = __vx_bitcast_u32_to_f32(a[6]);
-  register float a7 asm("f17") = __vx_bitcast_u32_to_f32(a[7]);
-
-  // Native 16x8x16 B fragment uses 4 regs, matching the supported Vortex path.
-  register float b0 asm("f28") = __vx_bitcast_u32_to_f32(b[0]);
-  register float b1 asm("f29") = __vx_bitcast_u32_to_f32(b[1]);
-  register float b2 asm("f30") = __vx_bitcast_u32_to_f32(b[2]);
-  register float b3 asm("f31") = __vx_bitcast_u32_to_f32(b[3]);
-
-  // x0 = fp32::id, x1 = fp16::id, x0 flags = dense
-  asm volatile(".insn r 0x0b, 0, 2, x0, x1, x0"
-               : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3), "+f"(d4), "+f"(d5),
-                 "+f"(d6), "+f"(d7)
-               : "f"(a0), "f"(a1), "f"(a2), "f"(a3), "f"(a4), "f"(a5), "f"(a6),
-                 "f"(a7), "f"(b0), "f"(b1), "f"(b2), "f"(b3)
                : "memory");
 
   d[0] = d0;

@@ -2733,8 +2733,7 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
   }
 }
 
-// WMMA Section
-
+// WMMA descriptor types
 enum class WmmaOpKind { Unknown, Load, Store, Mma };
 enum class WmmaFragKind { Unknown, MatrixA, MatrixB, Accumulator };
 enum class WmmaElemKind { Unknown, F16, F32, U8, S8, S32 };
@@ -2749,12 +2748,14 @@ struct FragmentSig {
   int K = 0;
 
   bool isValid() const {
-    return Kind != WmmaFragKind::Unknown && M > 0 && N > 0 && K > 0;
+    return Kind != WmmaFragKind::Unknown && Elem != WmmaElemKind::Unknown &&
+           M > 0 && N > 0 && K > 0;
   }
 };
 
 struct WmmaCallDesc {
   WmmaOpKind Op = WmmaOpKind::Unknown;
+
   SmallVector<FragmentSig, 4> OrderedFrags;
 
   FragmentSig D;
@@ -2764,62 +2765,633 @@ struct WmmaCallDesc {
 
   WmmaLayout StoreMemLayout = WmmaLayout::None;
   std::string ReplacementName;
+
+  bool FromNVVMIntrinsic = false;
+
+  unsigned ARegCount = 0;
+  unsigned BRegCount = 0;
+  unsigned CRegCount = 0;
+  unsigned DRegCount = 0;
 };
 
+// Key: old NVVM producer call.
+// Value: pointer to fragment storage to pass to runtime helpers.
+using FragStorageMap = DenseMap<Value *, Value *>;
+
+// WMMA Utility Functions
 std::string maybeDemangle(StringRef Name) {
-  if (Name.starts_with("_Z") || Name.starts_with("?")) {
+  if (Name.starts_with("_Z") || Name.starts_with("?"))
     return demangle(Name.str());
-  }
+
   return Name.str();
 }
 
+static const char *toLoadFragSuffix(WmmaFragKind K) {
+  switch (K) {
+  case WmmaFragKind::MatrixA:
+    return "a";
+  case WmmaFragKind::MatrixB:
+    return "b";
+  case WmmaFragKind::Accumulator:
+    return "c";
+  default:
+    return "unknown";
+  }
+}
+
+static const char *toElemSuffix(WmmaElemKind K) {
+  switch (K) {
+  case WmmaElemKind::F16:
+    return "f16";
+  case WmmaElemKind::F32:
+    return "f32";
+  case WmmaElemKind::U8:
+    return "u8";
+  case WmmaElemKind::S8:
+    return "s8";
+  case WmmaElemKind::S32:
+    return "s32";
+  default:
+    return "unknown";
+  }
+}
+
+static const char *toLayoutSuffix(WmmaLayout L) {
+  switch (L) {
+  case WmmaLayout::RowMajor:
+    return "row";
+  case WmmaLayout::ColMajor:
+    return "col";
+  case WmmaLayout::Dynamic:
+    return "dyn";
+  case WmmaLayout::None:
+    return "none";
+  default:
+    return "unknown";
+  }
+}
+
+static const FragmentSig *getLoadFragment(const WmmaCallDesc &Desc) {
+  if (Desc.A.isValid())
+    return &Desc.A;
+  if (Desc.B.isValid())
+    return &Desc.B;
+  if (Desc.C.isValid())
+    return &Desc.C;
+  return nullptr;
+}
+
+static unsigned getLoadRegCount(const WmmaCallDesc &Desc) {
+  if (Desc.A.isValid())
+    return Desc.ARegCount;
+  if (Desc.B.isValid())
+    return Desc.BRegCount;
+  if (Desc.C.isValid())
+    return Desc.CRegCount;
+  return 0;
+}
+
+static void buildReplacementName(WmmaCallDesc &Desc) {
+  Desc.ReplacementName.clear();
+  raw_string_ostream OS(Desc.ReplacementName);
+
+  if (Desc.Op == WmmaOpKind::Load) {
+    const FragmentSig *Frag = getLoadFragment(Desc);
+    if (!Frag)
+      return;
+
+    OS << "__vx_wmma_load_" << toLoadFragSuffix(Frag->Kind) << "_m" << Frag->M
+       << "n" << Frag->N << "k" << Frag->K << "_"
+       << toLayoutSuffix(Frag->Layout) << "_" << toElemSuffix(Frag->Elem);
+
+  } else if (Desc.Op == WmmaOpKind::Store) {
+    if (!Desc.D.isValid())
+      return;
+
+    OS << "__vx_wmma_store_d"
+       << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
+       << toElemSuffix(Desc.D.Elem);
+
+  } else if (Desc.Op == WmmaOpKind::Mma) {
+    if (!Desc.D.isValid() || !Desc.A.isValid() || !Desc.B.isValid() ||
+        !Desc.C.isValid())
+      return;
+
+    OS << "__vx_wmma_mma"
+       << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
+       << toLayoutSuffix(Desc.A.Layout) << "_" << toLayoutSuffix(Desc.B.Layout)
+       << "_" << toElemSuffix(Desc.A.Elem) << "_" << toElemSuffix(Desc.B.Elem)
+       << "_" << toElemSuffix(Desc.D.Elem);
+  }
+
+  OS.flush();
+}
+
+static bool parseShape(StringRef Tok, int &M, int &N, int &K) {
+  if (!Tok.starts_with("m"))
+    return false;
+
+  size_t NPos = Tok.find('n');
+  size_t KPos = Tok.find('k');
+
+  if (NPos == StringRef::npos || KPos == StringRef::npos || NPos >= KPos)
+    return false;
+
+  StringRef MStr = Tok.slice(1, NPos);
+  StringRef NStr = Tok.slice(NPos + 1, KPos);
+  StringRef KStr = Tok.drop_front(KPos + 1);
+
+  return !MStr.getAsInteger(10, M) && !NStr.getAsInteger(10, N) &&
+         !KStr.getAsInteger(10, K);
+}
+
+static WmmaLayout parseLayoutToken(StringRef Tok) {
+  if (Tok == "row")
+    return WmmaLayout::RowMajor;
+  if (Tok == "col")
+    return WmmaLayout::ColMajor;
+  return WmmaLayout::None;
+}
+
+static WmmaElemKind parseElemToken(StringRef Tok) {
+  if (Tok == "f16")
+    return WmmaElemKind::F16;
+  if (Tok == "f32")
+    return WmmaElemKind::F32;
+  if (Tok == "u8")
+    return WmmaElemKind::U8;
+  if (Tok == "s8")
+    return WmmaElemKind::S8;
+  if (Tok == "s32")
+    return WmmaElemKind::S32;
+  return WmmaElemKind::Unknown;
+}
+
+static WmmaElemKind elemFromLLVMType(Type *Ty) {
+  if (auto *VT = dyn_cast<FixedVectorType>(Ty))
+    Ty = VT->getElementType();
+
+  if (Ty->isHalfTy())
+    return WmmaElemKind::F16;
+
+  if (Ty->isFloatTy())
+    return WmmaElemKind::F32;
+
+  if (Ty->isIntegerTy(32))
+    return WmmaElemKind::S32;
+
+  // LLVM integer types do not preserve signedness.
+  if (Ty->isIntegerTy(8))
+    return WmmaElemKind::Unknown;
+
+  return WmmaElemKind::Unknown;
+}
+
+static unsigned getStructNumElements(Type *Ty) {
+  auto *ST = dyn_cast<StructType>(Ty);
+  if (!ST)
+    return 0;
+  return ST->getNumElements();
+}
+
+static Type *getStructElementType(Type *Ty, unsigned Index) {
+  auto *ST = dyn_cast<StructType>(Ty);
+  if (!ST || Index >= ST->getNumElements())
+    return nullptr;
+  return ST->getElementType(Index);
+}
+
+// Runtime fragment register storage.
+// A/B f16 fragments are packed into i32 registers.
+// C/D f32 fragments are float registers.
+static Type *getRuntimeFragmentRegTy(LLVMContext &Ctx, const FragmentSig &Sig) {
+  switch (Sig.Elem) {
+  case WmmaElemKind::F32:
+    return Type::getFloatTy(Ctx);
+
+  case WmmaElemKind::F16:
+  case WmmaElemKind::U8:
+  case WmmaElemKind::S8:
+  case WmmaElemKind::S32:
+    return Type::getInt32Ty(Ctx);
+
+  default:
+    return nullptr;
+  }
+}
+
+static AllocaInst *createEntryAlloca(Function *F, Type *Ty, StringRef Name) {
+  IRBuilder<> B(&*F->getEntryBlock().getFirstInsertionPt());
+  return B.CreateAlloca(Ty, nullptr, Name);
+}
+
+static AllocaInst *createFragmentAlloca(Function *F, const FragmentSig &Sig,
+                                        unsigned RegCount, StringRef Name) {
+  LLVMContext &Ctx = F->getContext();
+
+  Type *RegTy = getRuntimeFragmentRegTy(Ctx, Sig);
+  if (!RegTy)
+    return nullptr;
+
+  Type *ArrayTy = ArrayType::get(RegTy, RegCount);
+  return createEntryAlloca(F, ArrayTy, Name);
+}
+
+static bool inferABRegCountsForMma(const FragmentSig &A, const FragmentSig &B,
+                                   unsigned ABTotal, unsigned &ARegs,
+                                   unsigned &BRegs) {
+  if (A.Elem == WmmaElemKind::F16 && B.Elem == WmmaElemKind::F16) {
+    if (A.M == 16 && A.N == 16 && A.K == 16 && ABTotal == 16) {
+      ARegs = 8;
+      BRegs = 8;
+      return true;
+    }
+
+    if (A.M == 32 && A.N == 8 && A.K == 16 && ABTotal == 12) {
+      ARegs = 8;
+      BRegs = 4;
+      return true;
+    }
+
+    if (A.M == 8 && A.N == 32 && A.K == 16 && ABTotal == 12) {
+      ARegs = 4;
+      BRegs = 8;
+      return true;
+    }
+  }
+
+  if (ABTotal % 2 == 0) {
+    ARegs = ABTotal / 2;
+    BRegs = ABTotal / 2;
+    return true;
+  }
+
+  return false;
+}
+
+// NVVM descriptor parser
+static bool fillDescFromNVVMIntrinsic(CallInst *CI, WmmaCallDesc &Desc) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return false;
+
+  StringRef Name = Callee->getName();
+
+  if (!Name.starts_with("llvm.nvvm.wmma."))
+    return false;
+
+  SmallVector<StringRef, 16> Parts;
+  Name.split(Parts, '.', -1, false);
+
+  if (Parts.size() < 6)
+    return false;
+
+  if (Parts[0] != "llvm" || Parts[1] != "nvvm" || Parts[2] != "wmma")
+    return false;
+
+  int M = 0, N = 0, K = 0;
+  if (!parseShape(Parts[3], M, N, K))
+    return false;
+
+  Desc = WmmaCallDesc{};
+  Desc.FromNVVMIntrinsic = true;
+
+  if (Parts[4] == "load") {
+    // llvm.nvvm.wmma.m32n8k16.load.a.row.stride.f16.p0
+    if (Parts.size() < 9)
+      return false;
+
+    Desc.Op = WmmaOpKind::Load;
+
+    FragmentSig Frag;
+    Frag.M = M;
+    Frag.N = N;
+    Frag.K = K;
+
+    if (Parts[5] == "a")
+      Frag.Kind = WmmaFragKind::MatrixA;
+    else if (Parts[5] == "b")
+      Frag.Kind = WmmaFragKind::MatrixB;
+    else if (Parts[5] == "c" || Parts[5] == "d")
+      Frag.Kind = WmmaFragKind::Accumulator;
+    else
+      return false;
+
+    Frag.Layout = parseLayoutToken(Parts[6]);
+    Frag.Elem = parseElemToken(Parts[8]);
+
+    if (Frag.Elem == WmmaElemKind::Unknown) {
+      if (Type *EltTy = getStructElementType(CI->getType(), 0))
+        Frag.Elem = elemFromLLVMType(EltTy);
+    }
+
+    if (!Frag.isValid())
+      return false;
+
+    unsigned RegCount = getStructNumElements(CI->getType());
+    if (RegCount == 0)
+      return false;
+
+    if (Frag.Kind == WmmaFragKind::MatrixA) {
+      Desc.A = Frag;
+      Desc.ARegCount = RegCount;
+    } else if (Frag.Kind == WmmaFragKind::MatrixB) {
+      Desc.B = Frag;
+      Desc.BRegCount = RegCount;
+    } else {
+      Desc.C = Frag;
+      Desc.CRegCount = RegCount;
+    }
+
+    Desc.OrderedFrags.push_back(Frag);
+
+  } else if (Parts[4] == "store") {
+    // llvm.nvvm.wmma.m32n8k16.store.d.row.stride.f32.p0
+    if (Parts.size() < 9)
+      return false;
+
+    Desc.Op = WmmaOpKind::Store;
+
+    FragmentSig D;
+    D.Kind = WmmaFragKind::Accumulator;
+    D.M = M;
+    D.N = N;
+    D.K = K;
+    D.Layout = WmmaLayout::None;
+    D.Elem = parseElemToken(Parts[8]);
+
+    if (D.Elem == WmmaElemKind::Unknown && CI->arg_size() >= 2)
+      D.Elem = elemFromLLVMType(CI->getArgOperand(1)->getType());
+
+    if (!D.isValid())
+      return false;
+
+    Desc.D = D;
+    Desc.StoreMemLayout = parseLayoutToken(Parts[6]);
+
+    if (CI->arg_size() < 3)
+      return false;
+
+    // Args: dst, d0..dN, stride
+    Desc.DRegCount = CI->arg_size() - 2;
+    Desc.OrderedFrags.push_back(D);
+
+  } else if (Parts[4] == "mma") {
+    // llvm.nvvm.wmma.m32n8k16.mma.row.row.f32.f32
+    if (Parts.size() < 9)
+      return false;
+
+    Desc.Op = WmmaOpKind::Mma;
+
+    FragmentSig A;
+    FragmentSig B;
+    FragmentSig C;
+    FragmentSig D;
+
+    A.Kind = WmmaFragKind::MatrixA;
+    B.Kind = WmmaFragKind::MatrixB;
+    C.Kind = WmmaFragKind::Accumulator;
+    D.Kind = WmmaFragKind::Accumulator;
+
+    A.M = B.M = C.M = D.M = M;
+    A.N = B.N = C.N = D.N = N;
+    A.K = B.K = C.K = D.K = K;
+
+    A.Layout = parseLayoutToken(Parts[5]);
+    B.Layout = parseLayoutToken(Parts[6]);
+    C.Layout = WmmaLayout::None;
+    D.Layout = WmmaLayout::None;
+
+    Desc.DRegCount = getStructNumElements(CI->getType());
+    Desc.CRegCount = Desc.DRegCount;
+
+    if (Desc.DRegCount == 0)
+      return false;
+
+    unsigned ArgCount = CI->arg_size();
+
+    if (ArgCount <= Desc.CRegCount)
+      return false;
+
+    unsigned ABTotal = ArgCount - Desc.CRegCount;
+
+    if (ArgCount > 0)
+      A.Elem = elemFromLLVMType(CI->getArgOperand(0)->getType());
+
+    if (A.Elem == WmmaElemKind::Unknown)
+      A.Elem = WmmaElemKind::F16;
+
+    B.Elem = A.Elem;
+
+    unsigned ARegs = 0;
+    unsigned BRegs = 0;
+
+    if (!inferABRegCountsForMma(A, B, ABTotal, ARegs, BRegs))
+      return false;
+
+    if (ARegs + BRegs + Desc.CRegCount != ArgCount)
+      return false;
+
+    if (BRegs > 0)
+      B.Elem = elemFromLLVMType(CI->getArgOperand(ARegs)->getType());
+
+    if (B.Elem == WmmaElemKind::Unknown)
+      B.Elem = A.Elem;
+
+    if (Desc.CRegCount > 0) {
+      unsigned CStart = ARegs + BRegs;
+      C.Elem = elemFromLLVMType(CI->getArgOperand(CStart)->getType());
+    }
+
+    if (Type *DEltTy = getStructElementType(CI->getType(), 0))
+      D.Elem = elemFromLLVMType(DEltTy);
+
+    if (C.Elem == WmmaElemKind::Unknown)
+      C.Elem = WmmaElemKind::F32;
+
+    if (D.Elem == WmmaElemKind::Unknown)
+      D.Elem = C.Elem;
+
+    if (!A.isValid() || !B.isValid() || !C.isValid() || !D.isValid())
+      return false;
+
+    Desc.A = A;
+    Desc.B = B;
+    Desc.C = C;
+    Desc.D = D;
+
+    Desc.ARegCount = ARegs;
+    Desc.BRegCount = BRegs;
+
+    Desc.OrderedFrags.push_back(D);
+    Desc.OrderedFrags.push_back(A);
+    Desc.OrderedFrags.push_back(B);
+    Desc.OrderedFrags.push_back(C);
+
+  } else {
+    return false;
+  }
+
+  buildReplacementName(Desc);
+  return !Desc.ReplacementName.empty();
+}
+
+// Demangled nvcuda::wmma helper descriptor parser
+static bool fillDescFromDemangledWmmaHelper(CallInst *CI, WmmaCallDesc &Desc) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return false;
+
+  std::string Name = maybeDemangle(Callee->getName());
+  StringRef Demangled(Name);
+
+  if (!Demangled.contains("nvcuda::wmma::"))
+    return false;
+
+  Desc = WmmaCallDesc{};
+
+  if (Demangled.contains("load_matrix_sync("))
+    Desc.Op = WmmaOpKind::Load;
+  else if (Demangled.contains("store_matrix_sync("))
+    Desc.Op = WmmaOpKind::Store;
+  else if (Demangled.contains("mma_sync("))
+    Desc.Op = WmmaOpKind::Mma;
+  else
+    return false;
+
+  size_t SearchFrom = 0;
+
+  while (true) {
+    size_t Pos = Demangled.find("fragment<", SearchFrom);
+    if (Pos == StringRef::npos)
+      break;
+
+    size_t Start = Pos + strlen("fragment<");
+    int Depth = 1;
+    size_t End = Start;
+
+    for (; End < Demangled.size(); ++End) {
+      if (Demangled[End] == '<') {
+        ++Depth;
+      } else if (Demangled[End] == '>') {
+        --Depth;
+        if (Depth == 0)
+          break;
+      }
+    }
+
+    if (End >= Demangled.size())
+      break;
+
+    StringRef Body = Demangled.slice(Start, End);
+
+    SmallVector<StringRef, 8> Parts;
+    size_t PartStart = 0;
+    int AngleDepth = 0;
+
+    for (size_t J = 0; J < Body.size(); ++J) {
+      if (Body[J] == '<') {
+        ++AngleDepth;
+      } else if (Body[J] == '>') {
+        --AngleDepth;
+      } else if (Body[J] == ',' && AngleDepth == 0) {
+        Parts.push_back(Body.slice(PartStart, J).trim());
+        PartStart = J + 1;
+      }
+    }
+
+    Parts.push_back(Body.drop_front(PartStart).trim());
+
+    if (Parts.size() == 6) {
+      FragmentSig Sig;
+
+      if (Parts[0].contains("matrix_a"))
+        Sig.Kind = WmmaFragKind::MatrixA;
+      else if (Parts[0].contains("matrix_b"))
+        Sig.Kind = WmmaFragKind::MatrixB;
+      else if (Parts[0].contains("accumulator"))
+        Sig.Kind = WmmaFragKind::Accumulator;
+
+      if (Parts[1].getAsInteger(10, Sig.M) ||
+          Parts[2].getAsInteger(10, Sig.N) ||
+          Parts[3].getAsInteger(10, Sig.K)) {
+        SearchFrom = End + 1;
+        continue;
+      }
+
+      if (Parts[4] == "__half" || Parts[4].ends_with("__half"))
+        Sig.Elem = WmmaElemKind::F16;
+      else if (Parts[4] == "float")
+        Sig.Elem = WmmaElemKind::F32;
+      else if (Parts[4] == "unsigned char")
+        Sig.Elem = WmmaElemKind::U8;
+      else if (Parts[4] == "signed char")
+        Sig.Elem = WmmaElemKind::S8;
+      else if (Parts[4] == "int")
+        Sig.Elem = WmmaElemKind::S32;
+
+      if (Parts[5] == "void")
+        Sig.Layout = WmmaLayout::None;
+      else if (Parts[5].contains("row_major"))
+        Sig.Layout = WmmaLayout::RowMajor;
+      else if (Parts[5].contains("col_major"))
+        Sig.Layout = WmmaLayout::ColMajor;
+
+      if (Sig.isValid())
+        Desc.OrderedFrags.push_back(Sig);
+    }
+
+    SearchFrom = End + 1;
+  }
+
+  if (Desc.Op == WmmaOpKind::Load && Desc.OrderedFrags.size() == 1) {
+    FragmentSig Frag = Desc.OrderedFrags[0];
+
+    if (Frag.Kind == WmmaFragKind::MatrixA) {
+      Desc.A = Frag;
+      Desc.ARegCount = 8;
+    } else if (Frag.Kind == WmmaFragKind::MatrixB) {
+      Desc.B = Frag;
+      Desc.BRegCount = 8;
+    } else if (Frag.Kind == WmmaFragKind::Accumulator) {
+      Desc.C = Frag;
+      Desc.CRegCount = 8;
+    }
+
+  } else if (Desc.Op == WmmaOpKind::Store && Desc.OrderedFrags.size() == 1) {
+    Desc.D = Desc.OrderedFrags[0];
+    Desc.DRegCount = 8;
+
+    if (CI->arg_size() >= 4) {
+      if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(3))) {
+        Desc.StoreMemLayout =
+            C->isZero() ? WmmaLayout::RowMajor : WmmaLayout::ColMajor;
+      } else {
+        Desc.StoreMemLayout = WmmaLayout::Dynamic;
+      }
+    }
+
+  } else if (Desc.Op == WmmaOpKind::Mma && Desc.OrderedFrags.size() == 4) {
+    Desc.D = Desc.OrderedFrags[0];
+    Desc.A = Desc.OrderedFrags[1];
+    Desc.B = Desc.OrderedFrags[2];
+    Desc.C = Desc.OrderedFrags[3];
+
+    unsigned ABTotal = 16;
+    inferABRegCountsForMma(Desc.A, Desc.B, ABTotal, Desc.ARegCount,
+                           Desc.BRegCount);
+
+    Desc.CRegCount = 8;
+    Desc.DRegCount = 8;
+  }
+
+  buildReplacementName(Desc);
+  return !Desc.ReplacementName.empty();
+}
+
+// Unified collector
 DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
   DenseMap<CallInst *, WmmaCallDesc> CallToDesc;
-
-  auto toFragSuffix = [](WmmaFragKind K) -> const char * {
-    switch (K) {
-    case WmmaFragKind::MatrixA:
-      return "a";
-    case WmmaFragKind::MatrixB:
-      return "b";
-    case WmmaFragKind::Accumulator:
-      return "acc";
-    default:
-      return "unknown";
-    }
-  };
-
-  auto toElemSuffix = [](WmmaElemKind K) -> const char * {
-    switch (K) {
-    case WmmaElemKind::F16:
-      return "f16";
-    case WmmaElemKind::F32:
-      return "f32";
-    case WmmaElemKind::U8:
-      return "u8";
-    case WmmaElemKind::S8:
-      return "s8";
-    case WmmaElemKind::S32:
-      return "s32";
-    default:
-      return "unknown";
-    }
-  };
-
-  auto toLayoutSuffix = [](WmmaLayout L) -> const char * {
-    switch (L) {
-    case WmmaLayout::RowMajor:
-      return "row";
-    case WmmaLayout::ColMajor:
-      return "col";
-    case WmmaLayout::Dynamic:
-      return "dyn";
-    case WmmaLayout::None:
-      return "none";
-    default:
-      return "unknown";
-    }
-  };
 
   for (Function &F : *M) {
     for (BasicBlock &BB : F) {
@@ -2832,147 +3404,17 @@ DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
         if (!Callee)
           continue;
 
-        std::string Name = maybeDemangle(Callee->getName());
-        StringRef Demangled(Name);
-
-        if (!Demangled.contains("nvcuda::wmma::"))
-          continue;
-
         WmmaCallDesc Desc;
 
-        if (Demangled.contains("load_matrix_sync("))
-          Desc.Op = WmmaOpKind::Load;
-        else if (Demangled.contains("store_matrix_sync("))
-          Desc.Op = WmmaOpKind::Store;
-        else if (Demangled.contains("mma_sync("))
-          Desc.Op = WmmaOpKind::Mma;
-        else
+        if (fillDescFromNVVMIntrinsic(CI, Desc)) {
+          CallToDesc[CI] = std::move(Desc);
           continue;
-
-        size_t SearchFrom = 0;
-        while (true) {
-          size_t Pos = Demangled.find("fragment<", SearchFrom);
-          if (Pos == StringRef::npos)
-            break;
-
-          size_t Start = Pos + strlen("fragment<");
-          int Depth = 1;
-          size_t End = Start;
-          for (; End < Demangled.size(); ++End) {
-            if (Demangled[End] == '<')
-              ++Depth;
-            else if (Demangled[End] == '>') {
-              --Depth;
-              if (Depth == 0)
-                break;
-            }
-          }
-          if (End >= Demangled.size())
-            break;
-
-          StringRef Body = Demangled.slice(Start, End);
-
-          SmallVector<StringRef, 8> Parts;
-          size_t PartStart = 0;
-          int AngleDepth = 0;
-          for (size_t J = 0; J < Body.size(); ++J) {
-            if (Body[J] == '<')
-              ++AngleDepth;
-            else if (Body[J] == '>')
-              --AngleDepth;
-            else if (Body[J] == ',' && AngleDepth == 0) {
-              Parts.push_back(Body.slice(PartStart, J).trim());
-              PartStart = J + 1;
-            }
-          }
-          Parts.push_back(Body.drop_front(PartStart).trim());
-
-          if (Parts.size() == 6) {
-            FragmentSig Sig;
-
-            if (Parts[0].contains("matrix_a"))
-              Sig.Kind = WmmaFragKind::MatrixA;
-            else if (Parts[0].contains("matrix_b"))
-              Sig.Kind = WmmaFragKind::MatrixB;
-            else if (Parts[0].contains("accumulator"))
-              Sig.Kind = WmmaFragKind::Accumulator;
-
-            if (Parts[1].getAsInteger(10, Sig.M) ||
-                Parts[2].getAsInteger(10, Sig.N) ||
-                Parts[3].getAsInteger(10, Sig.K)) {
-              SearchFrom = End + 1;
-              continue;
-            }
-
-            if (Parts[4] == "__half" || Parts[4].ends_with("__half"))
-              Sig.Elem = WmmaElemKind::F16;
-            else if (Parts[4] == "float")
-              Sig.Elem = WmmaElemKind::F32;
-            else if (Parts[4] == "unsigned char")
-              Sig.Elem = WmmaElemKind::U8;
-            else if (Parts[4] == "signed char")
-              Sig.Elem = WmmaElemKind::S8;
-            else if (Parts[4] == "int")
-              Sig.Elem = WmmaElemKind::S32;
-
-            if (Parts[5] == "void")
-              Sig.Layout = WmmaLayout::None;
-            else if (Parts[5].contains("row_major"))
-              Sig.Layout = WmmaLayout::RowMajor;
-            else if (Parts[5].contains("col_major"))
-              Sig.Layout = WmmaLayout::ColMajor;
-
-            if (Sig.isValid())
-              Desc.OrderedFrags.push_back(Sig);
-          }
-
-          SearchFrom = End + 1;
         }
 
-        if (Desc.Op == WmmaOpKind::Load && Desc.OrderedFrags.size() == 1) {
-          if (Desc.OrderedFrags[0].Kind == WmmaFragKind::MatrixA)
-            Desc.A = Desc.OrderedFrags[0];
-          else if (Desc.OrderedFrags[0].Kind == WmmaFragKind::MatrixB)
-            Desc.B = Desc.OrderedFrags[0];
-        } else if (Desc.Op == WmmaOpKind::Store &&
-                   Desc.OrderedFrags.size() == 1) {
-          Desc.D = Desc.OrderedFrags[0];
-          if (CI->arg_size() >= 4) {
-            if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(3)))
-              Desc.StoreMemLayout =
-                  C->isZero() ? WmmaLayout::RowMajor : WmmaLayout::ColMajor;
-            else
-              Desc.StoreMemLayout = WmmaLayout::Dynamic;
-          }
-        } else if (Desc.Op == WmmaOpKind::Mma &&
-                   Desc.OrderedFrags.size() == 4) {
-          Desc.D = Desc.OrderedFrags[0];
-          Desc.A = Desc.OrderedFrags[1];
-          Desc.B = Desc.OrderedFrags[2];
-          Desc.C = Desc.OrderedFrags[3];
+        if (fillDescFromDemangledWmmaHelper(CI, Desc)) {
+          CallToDesc[CI] = std::move(Desc);
+          continue;
         }
-
-        raw_string_ostream OS(Desc.ReplacementName);
-        if (Desc.Op == WmmaOpKind::Load) {
-          const FragmentSig &Frag = Desc.A.isValid() ? Desc.A : Desc.B;
-          OS << "__vx_wmma_load_" << toFragSuffix(Frag.Kind) << "_m" << Frag.M
-             << "n" << Frag.N << "k" << Frag.K << "_"
-             << toLayoutSuffix(Frag.Layout) << "_" << toElemSuffix(Frag.Elem);
-        } else if (Desc.Op == WmmaOpKind::Store) {
-          OS << "__vx_wmma_store_d"
-             << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
-             << toElemSuffix(Desc.D.Elem);
-        } else if (Desc.Op == WmmaOpKind::Mma) {
-          OS << "__vx_wmma_mma"
-             << "_m" << Desc.D.M << "n" << Desc.D.N << "k" << Desc.D.K << "_"
-             << toLayoutSuffix(Desc.A.Layout) << "_"
-             << toLayoutSuffix(Desc.B.Layout) << "_"
-             << toElemSuffix(Desc.A.Elem) << "_" << toElemSuffix(Desc.B.Elem)
-             << "_" << toElemSuffix(Desc.D.Elem);
-        }
-        OS.flush();
-
-        CallToDesc[CI] = std::move(Desc);
       }
     }
   }
@@ -2980,56 +3422,833 @@ DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
   return CallToDesc;
 }
 
-void replace_wmma_intrinsics(llvm::Module *M) {
-  DenseMap<CallInst *, WmmaCallDesc> CallToDesc = collectWMMADesc(M);
-  SmallPtrSet<Function *, 8> ToErase;
+// Glue-pattern helpers
+static bool isNVVMWMMACall(Value *V) {
+  auto *CI = dyn_cast<CallInst>(V);
+  if (!CI)
+    return false;
 
-  DBG(for (auto &It : CallToDesc) {
-    CallInst *CI = It.first;
-    WmmaCallDesc &Desc = It.second;
-    errs() << "[wmma] " << maybeDemangle(CI->getCalledFunction()->getName())
-           << " -> " << Desc.ReplacementName << "\n";
-  });
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return false;
 
-  for (auto &It : CallToDesc) {
-    CallInst *CI = It.first;
-    WmmaCallDesc &Desc = It.second;
+  return Callee->getName().starts_with("llvm.nvvm.wmma.");
+}
 
-    Function *OldHelper = CI->getCalledFunction();
+static bool getConstantGEPIndex(Value *Ptr, Value *&Base, unsigned &Index,
+                                Instruction **GEPInstOut = nullptr) {
+  if (GEPInstOut)
+    *GEPInstOut = nullptr;
 
-    FunctionType *FTy = OldHelper->getFunctionType();
-    FunctionCallee NewHelperCallee =
-        M->getOrInsertFunction(Desc.ReplacementName, FTy);
-    Function *NewHelper = dyn_cast<Function>(NewHelperCallee.getCallee());
-    if (!NewHelper)
-      continue;
-    NewHelper->setCallingConv(CallingConv::C);
-    CI->setCalledFunction(NewHelperCallee);
-    if (OldHelper->use_empty()) {
-      ToErase.insert(OldHelper);
-    }
+  Ptr = Ptr->stripPointerCasts();
+
+  auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+
+  if (!GEP) {
+    Base = Ptr;
+    Index = 0;
+    return true;
   }
 
-  for (Function *F : ToErase) {
-    F->dropAllReferences();
-    F->removeFromParent();
+  if (GEP->getNumIndices() != 1)
+    return false;
+
+  auto IdxIt = GEP->idx_begin();
+  auto *CI = dyn_cast<ConstantInt>(IdxIt->get());
+
+  if (!CI)
+    return false;
+
+  Base = GEP->getPointerOperand()->stripPointerCasts();
+  Index = CI->getZExtValue();
+
+  if (GEPInstOut)
+    *GEPInstOut = GEP;
+
+  return true;
+}
+
+static StoreInst *
+findSingleStoreUserThroughCasts(Value *V,
+                                SmallVectorImpl<Instruction *> &Glue) {
+  if (auto *I = dyn_cast<Instruction>(V))
+    Glue.push_back(I);
+
+  Value *Cur = V;
+
+  while (true) {
+    if (!Cur->hasOneUse())
+      return nullptr;
+
+    User *U = *Cur->user_begin();
+
+    if (auto *BC = dyn_cast<BitCastInst>(U)) {
+      Glue.push_back(BC);
+      Cur = BC;
+      continue;
+    }
+
+    if (auto *ASC = dyn_cast<AddrSpaceCastInst>(U)) {
+      Glue.push_back(ASC);
+      Cur = ASC;
+      continue;
+    }
+
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI)
+      return nullptr;
+
+    if (SI->getValueOperand() != Cur)
+      return nullptr;
+
+    Glue.push_back(SI);
+    return SI;
   }
 }
 
-// Replace raw NVVM WMMA intrinsics (llvm.nvvm.wmma.*) with Vortex runtime
-// calls. These appear when clang inlines the mma.hpp C++ helper functions
-// at compile time, leaving only the low-level NVVM intrinsics which
-// collectWMMADesc (demangled-name matcher) cannot catch.
-void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
+// Handles this pattern:
+//
+//   %frag = call {reg x N} @llvm.nvvm.wmma.*
+//   %x0 = extractvalue %frag, 0
+//   %b0 = bitcast %x0 to i32
+//   store i32 %b0, ptr %base
+//   %p1 = getelementptr i32, ptr %base, i32 1
+//   %x1 = extractvalue %frag, 1
+//   ...
+//
+// It returns %base as the existing fragment pointer.
+static bool
+collectCallResultStoreGlue(CallInst *CI, unsigned RegCount, Value *&FragmentPtr,
+                           SmallVectorImpl<Instruction *> &DeadGlue) {
+  SmallVector<StoreInst *, 16> Stores;
+  Stores.resize(RegCount, nullptr);
+
+  SmallVector<SmallVector<Instruction *, 4>, 16> PerRegGlue;
+  PerRegGlue.resize(RegCount);
+
+  SmallVector<Instruction *, 16> GEPGlue;
+
+  Value *CommonBase = nullptr;
+  unsigned Seen = 0;
+
+  for (User *U : CI->users()) {
+    auto *EVI = dyn_cast<ExtractValueInst>(U);
+    if (!EVI)
+      return false;
+
+    ArrayRef<unsigned> Indices = EVI->getIndices();
+
+    if (Indices.size() != 1)
+      return false;
+
+    unsigned RegIdx = Indices[0];
+
+    if (RegIdx >= RegCount)
+      return false;
+
+    SmallVector<Instruction *, 4> LocalGlue;
+    StoreInst *SI = findSingleStoreUserThroughCasts(EVI, LocalGlue);
+
+    if (!SI)
+      return false;
+
+    Value *Base = nullptr;
+    unsigned StoreIdx = 0;
+    Instruction *GEPInst = nullptr;
+
+    if (!getConstantGEPIndex(SI->getPointerOperand(), Base, StoreIdx, &GEPInst))
+      return false;
+
+    if (StoreIdx != RegIdx)
+      return false;
+
+    if (!CommonBase)
+      CommonBase = Base;
+    else if (CommonBase != Base)
+      return false;
+
+    if (Stores[RegIdx])
+      return false;
+
+    Stores[RegIdx] = SI;
+    PerRegGlue[RegIdx] = std::move(LocalGlue);
+
+    if (GEPInst)
+      GEPGlue.push_back(GEPInst);
+
+    ++Seen;
+  }
+
+  if (Seen != RegCount)
+    return false;
+
+  for (unsigned I = 0; I < RegCount; ++I) {
+    if (!Stores[I])
+      return false;
+  }
+
+  for (Instruction *I : GEPGlue)
+    DeadGlue.push_back(I);
+
+  for (unsigned I = 0; I < RegCount; ++I) {
+    for (Instruction *GI : PerRegGlue[I])
+      DeadGlue.push_back(GI);
+  }
+
+  FragmentPtr = CommonBase;
+  return FragmentPtr != nullptr;
+}
+
+// Handles MMA/store input patterns:
+//
+//   %p0 = getelementptr i32, ptr %frag, i32 0
+//   %l0 = load i32, ptr %p0
+//   %a0 = bitcast i32 %l0 to <2 x half>
+//
+// or:
+//
+//   %p0 = getelementptr float, ptr %frag, i32 0
+//   %c0 = load float, ptr %p0
+//
+// It returns %frag.
+static bool getLoadBaseIndexFromArg(Value *Arg, Value *&Base, unsigned &Index,
+                                    SmallVectorImpl<Instruction *> &Glue) {
+  Value *Cur = Arg;
+
+  while (true) {
+    if (auto *BC = dyn_cast<BitCastInst>(Cur)) {
+      Glue.push_back(BC);
+      Cur = BC->getOperand(0);
+      continue;
+    }
+
+    if (auto *ASC = dyn_cast<AddrSpaceCastInst>(Cur)) {
+      Glue.push_back(ASC);
+      Cur = ASC->getOperand(0);
+      continue;
+    }
+
+    break;
+  }
+
+  auto *LI = dyn_cast<LoadInst>(Cur);
+  if (!LI)
+    return false;
+
+  Glue.push_back(LI);
+
+  Instruction *GEPInst = nullptr;
+  if (!getConstantGEPIndex(LI->getPointerOperand(), Base, Index, &GEPInst))
+    return false;
+
+  if (GEPInst)
+    Glue.push_back(GEPInst);
+
+  return true;
+}
+
+static Value *
+findFragmentStorageFromMemoryArgs(CallInst *CI, unsigned ArgStart,
+                                  unsigned Count,
+                                  SmallVectorImpl<Instruction *> &DeadGlue) {
+  Value *CommonBase = nullptr;
+  SmallVector<Instruction *, 32> LocalGlue;
+
+  for (unsigned I = 0; I < Count; ++I) {
+    if (ArgStart + I >= CI->arg_size())
+      return nullptr;
+
+    SmallVector<Instruction *, 4> PerArgGlue;
+
+    Value *Base = nullptr;
+    unsigned Index = 0;
+
+    if (!getLoadBaseIndexFromArg(CI->getArgOperand(ArgStart + I), Base, Index,
+                                 PerArgGlue))
+      return nullptr;
+
+    if (Index != I)
+      return nullptr;
+
+    if (!CommonBase)
+      CommonBase = Base;
+    else if (CommonBase != Base)
+      return nullptr;
+
+    for (Instruction *GI : PerArgGlue)
+      LocalGlue.push_back(GI);
+  }
+
+  if (!CommonBase)
+    return nullptr;
+
+  for (Instruction *GI : LocalGlue)
+    DeadGlue.push_back(GI);
+
+  return CommonBase;
+}
+
+static Value *
+findFragmentStorageFromExtractArgs(CallInst *CI, unsigned ArgStart,
+                                   unsigned Count,
+                                   FragStorageMap &FragmentStorage) {
+  Value *Found = nullptr;
+
+  for (unsigned I = 0; I < Count; ++I) {
+    if (ArgStart + I >= CI->arg_size())
+      return nullptr;
+
+    Value *Arg = CI->getArgOperand(ArgStart + I);
+
+    auto *EVI = dyn_cast<ExtractValueInst>(Arg);
+    if (!EVI)
+      return nullptr;
+
+    ArrayRef<unsigned> Indices = EVI->getIndices();
+
+    if (Indices.size() != 1)
+      return nullptr;
+
+    if (Indices[0] != I)
+      return nullptr;
+
+    Value *Producer = EVI->getAggregateOperand();
+
+    auto It = FragmentStorage.find(Producer);
+    if (It == FragmentStorage.end())
+      return nullptr;
+
+    if (!Found)
+      Found = It->second;
+    else if (Found != It->second)
+      return nullptr;
+  }
+
+  return Found;
+}
+
+static bool canPackArgsWithoutNVVMDependency(CallInst *CI, unsigned ArgStart,
+                                             unsigned Count,
+                                             FragStorageMap &FragmentStorage) {
+  for (unsigned I = 0; I < Count; ++I) {
+    if (ArgStart + I >= CI->arg_size())
+      return false;
+
+    Value *Arg = CI->getArgOperand(ArgStart + I);
+
+    auto *EVI = dyn_cast<ExtractValueInst>(Arg);
+    if (!EVI)
+      continue;
+
+    Value *Producer = EVI->getAggregateOperand();
+
+    if (!isNVVMWMMACall(Producer))
+      continue;
+
+    // If this is an extract from old NVVM WMMA, we must have recovered the
+    // producer fragment pointer through FragmentStorage. Otherwise, packing
+    // would keep the old NVVM producer alive.
+    if (!FragmentStorage.contains(Producer))
+      return false;
+
+    return false;
+  }
+
+  return true;
+}
+
+static Value *bitcastToRuntimeReg(IRBuilder<> &B, Value *V, Type *DstTy) {
+  Type *SrcTy = V->getType();
+
+  if (SrcTy == DstTy)
+    return V;
+
+  if (SrcTy->isPointerTy() || DstTy->isPointerTy())
+    return B.CreateBitCast(V, DstTy);
+
+  if (SrcTy->getPrimitiveSizeInBits() == DstTy->getPrimitiveSizeInBits())
+    return B.CreateBitCast(V, DstTy);
+
+  if (SrcTy->isIntegerTy() && DstTy->isIntegerTy())
+    return B.CreateIntCast(V, DstTy, false);
+
+  if (SrcTy->isFloatingPointTy() && DstTy->isIntegerTy())
+    return B.CreateBitCast(V, DstTy);
+
+  if (SrcTy->isIntegerTy() && DstTy->isFloatingPointTy())
+    return B.CreateBitCast(V, DstTy);
+
+  return V;
+}
+
+static Value *packArgsToFragmentStorage(Module *M, CallInst *CI,
+                                        unsigned ArgStart, unsigned Count,
+                                        const FragmentSig &Sig, StringRef Name,
+                                        FragStorageMap &FragmentStorage) {
+  if (!canPackArgsWithoutNVVMDependency(CI, ArgStart, Count, FragmentStorage))
+    return nullptr;
+
   LLVMContext &Ctx = M->getContext();
-  Type *F32 = Type::getFloatTy(Ctx);
-  Type *HalfTy = Type::getHalfTy(Ctx);
+  IRBuilder<> B(CI);
+
+  Type *RegTy = getRuntimeFragmentRegTy(Ctx, Sig);
+  if (!RegTy)
+    return nullptr;
+
+  Type *ArrayTy = ArrayType::get(RegTy, Count);
+
+  AllocaInst *Storage = createEntryAlloca(CI->getFunction(), ArrayTy, Name);
+
+  for (unsigned I = 0; I < Count; ++I) {
+    Value *GEP = B.CreateConstInBoundsGEP2_32(ArrayTy, Storage, 0, I);
+
+    Value *Arg = CI->getArgOperand(ArgStart + I);
+    Value *CastArg = bitcastToRuntimeReg(B, Arg, RegTy);
+
+    B.CreateStore(CastArg, GEP);
+  }
+
+  return Storage;
+}
+
+// NVVM no-return lowering
+static bool lowerNVVMLoadNoReturn(Module *M, CallInst *CI,
+                                  const WmmaCallDesc &Desc,
+                                  FragStorageMap &FragmentStorage,
+                                  SmallVectorImpl<Instruction *> &DeadGlue,
+                                  SmallVectorImpl<CallInst *> &OldCalls) {
+  LLVMContext &Ctx = M->getContext();
+
+  Type *VoidTy = Type::getVoidTy(Ctx);
   Type *I32 = Type::getInt32Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
-  Type *VoidTy = Type::getVoidTy(Ctx);
-  Type *V2HalfTy = FixedVectorType::get(HalfTy, 2);
 
-  SmallVector<CallInst *, 16> ToReplace;
+  const FragmentSig *Frag = getLoadFragment(Desc);
+  if (!Frag)
+    return false;
+
+  unsigned RegCount = getLoadRegCount(Desc);
+  if (RegCount == 0)
+    return false;
+
+  IRBuilder<> B(CI);
+
+  Value *FragmentPtr = nullptr;
+  SmallVector<Instruction *, 32> LocalDeadGlue;
+
+  bool HasExistingFragmentStore =
+      collectCallResultStoreGlue(CI, RegCount, FragmentPtr, LocalDeadGlue);
+
+  if (!HasExistingFragmentStore) {
+    AllocaInst *TmpStorage = createFragmentAlloca(CI->getFunction(), *Frag,
+                                                  RegCount, "wmma.load.frag");
+
+    if (!TmpStorage)
+      return false;
+
+    FragmentPtr = TmpStorage;
+  }
+
+  Value *Src = CI->getArgOperand(0);
+  Value *Stride = CI->getArgOperand(1);
+
+  if (Stride->getType() != I32)
+    Stride = B.CreateIntCast(Stride, I32, true);
+
+  FunctionType *FT = FunctionType::get(VoidTy, {PtrTy, PtrTy, I32}, false);
+
+  FunctionCallee FC = M->getOrInsertFunction(Desc.ReplacementName, FT);
+
+  B.CreateCall(FC, {FragmentPtr, Src, Stride});
+
+  FragmentStorage[CI] = FragmentPtr;
+  OldCalls.push_back(CI);
+
+  for (Instruction *I : LocalDeadGlue)
+    DeadGlue.push_back(I);
+
+  return true;
+}
+
+static bool lowerNVVMMmaNoReturn(Module *M, CallInst *CI,
+                                 const WmmaCallDesc &Desc,
+                                 FragStorageMap &FragmentStorage,
+                                 SmallVectorImpl<Instruction *> &DeadGlue,
+                                 SmallVectorImpl<CallInst *> &OldCalls) {
+  LLVMContext &Ctx = M->getContext();
+
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+
+  unsigned ARegs = Desc.ARegCount;
+  unsigned BRegs = Desc.BRegCount;
+  unsigned CRegs = Desc.CRegCount;
+  unsigned DRegs = Desc.DRegCount;
+
+  if (ARegs == 0 || BRegs == 0 || CRegs == 0 || DRegs == 0)
+    return false;
+
+  IRBuilder<> B(CI);
+
+  Value *AStorage = findFragmentStorageFromMemoryArgs(CI, 0, ARegs, DeadGlue);
+
+  if (!AStorage) {
+    AStorage =
+        findFragmentStorageFromExtractArgs(CI, 0, ARegs, FragmentStorage);
+  }
+
+  if (!AStorage) {
+    AStorage = packArgsToFragmentStorage(M, CI, 0, ARegs, Desc.A, "wmma.a.pack",
+                                         FragmentStorage);
+  }
+
+  Value *BStorage =
+      findFragmentStorageFromMemoryArgs(CI, ARegs, BRegs, DeadGlue);
+
+  if (!BStorage) {
+    BStorage =
+        findFragmentStorageFromExtractArgs(CI, ARegs, BRegs, FragmentStorage);
+  }
+
+  if (!BStorage) {
+    BStorage = packArgsToFragmentStorage(M, CI, ARegs, BRegs, Desc.B,
+                                         "wmma.b.pack", FragmentStorage);
+  }
+
+  Value *CStorage =
+      findFragmentStorageFromMemoryArgs(CI, ARegs + BRegs, CRegs, DeadGlue);
+
+  if (!CStorage) {
+    CStorage = findFragmentStorageFromExtractArgs(CI, ARegs + BRegs, CRegs,
+                                                  FragmentStorage);
+  }
+
+  if (!CStorage) {
+    CStorage = packArgsToFragmentStorage(M, CI, ARegs + BRegs, CRegs, Desc.C,
+                                         "wmma.c.pack", FragmentStorage);
+  }
+
+  if (!AStorage || !BStorage || !CStorage)
+    return false;
+
+  Value *DStorage = nullptr;
+  SmallVector<Instruction *, 32> LocalResultGlue;
+
+  bool HasExistingDStore =
+      collectCallResultStoreGlue(CI, DRegs, DStorage, LocalResultGlue);
+
+  if (!HasExistingDStore) {
+    DStorage = createFragmentAlloca(CI->getFunction(), Desc.D, DRegs, "wmma.d");
+  }
+
+  if (!DStorage)
+    return false;
+
+  FunctionType *FT =
+      FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy, PtrTy}, false);
+
+  FunctionCallee FC = M->getOrInsertFunction(Desc.ReplacementName, FT);
+
+  B.CreateCall(FC, {DStorage, AStorage, BStorage, CStorage});
+
+  FragmentStorage[CI] = DStorage;
+  OldCalls.push_back(CI);
+
+  for (Instruction *I : LocalResultGlue)
+    DeadGlue.push_back(I);
+
+  return true;
+}
+
+static bool lowerNVVMStoreNoReturn(Module *M, CallInst *CI,
+                                   const WmmaCallDesc &Desc,
+                                   FragStorageMap &FragmentStorage,
+                                   SmallVectorImpl<Instruction *> &DeadGlue,
+                                   SmallVectorImpl<CallInst *> &OldCalls) {
+  LLVMContext &Ctx = M->getContext();
+
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+
+  unsigned DRegs = Desc.DRegCount;
+
+  if (DRegs == 0) {
+    if (CI->arg_size() < 3)
+      return false;
+
+    DRegs = CI->arg_size() - 2;
+  }
+
+  IRBuilder<> B(CI);
+
+  Value *Dst = CI->getArgOperand(0);
+
+  Value *DStorage = findFragmentStorageFromMemoryArgs(CI, 1, DRegs, DeadGlue);
+
+  if (!DStorage) {
+    DStorage =
+        findFragmentStorageFromExtractArgs(CI, 1, DRegs, FragmentStorage);
+  }
+
+  if (!DStorage) {
+    DStorage = packArgsToFragmentStorage(M, CI, 1, DRegs, Desc.D,
+                                         "wmma.store.pack", FragmentStorage);
+  }
+
+  if (!DStorage)
+    return false;
+
+  Value *Stride = CI->getArgOperand(1 + DRegs);
+
+  if (Stride->getType() != I32)
+    Stride = B.CreateIntCast(Stride, I32, true);
+
+  int Layout = 0;
+
+  if (Desc.StoreMemLayout == WmmaLayout::ColMajor)
+    Layout = 1;
+
+  FunctionType *FT = FunctionType::get(VoidTy, {PtrTy, PtrTy, I32, I32}, false);
+
+  FunctionCallee FC = M->getOrInsertFunction(Desc.ReplacementName, FT);
+
+  B.CreateCall(FC, {Dst, DStorage, Stride, ConstantInt::get(I32, Layout)});
+
+  OldCalls.push_back(CI);
+
+  return true;
+}
+
+static bool lowerNVVMWMMANoReturn(Module *M, CallInst *CI,
+                                  const WmmaCallDesc &Desc,
+                                  FragStorageMap &FragmentStorage,
+                                  SmallVectorImpl<Instruction *> &DeadGlue,
+                                  SmallVectorImpl<CallInst *> &OldCalls) {
+  switch (Desc.Op) {
+  case WmmaOpKind::Load:
+    return lowerNVVMLoadNoReturn(M, CI, Desc, FragmentStorage, DeadGlue,
+                                 OldCalls);
+
+  case WmmaOpKind::Mma:
+    return lowerNVVMMmaNoReturn(M, CI, Desc, FragmentStorage, DeadGlue,
+                                OldCalls);
+
+  case WmmaOpKind::Store:
+    return lowerNVVMStoreNoReturn(M, CI, Desc, FragmentStorage, DeadGlue,
+                                  OldCalls);
+
+  default:
+    return false;
+  }
+}
+
+// Cleanup
+static void
+eraseDeadGlueInstructions(SmallVectorImpl<Instruction *> &DeadGlue) {
+  bool Progress = true;
+
+  while (Progress) {
+    Progress = false;
+
+    SmallVector<unsigned, 32> ToEraseIdx;
+    SmallPtrSet<Instruction *, 32> SeenThisRound;
+
+    for (unsigned Idx = 0, E = DeadGlue.size(); Idx != E; ++Idx) {
+      Instruction *I = DeadGlue[Idx];
+
+      if (!I)
+        continue;
+
+      // This is only safe because we null entries immediately after erasing.
+      if (!I->getParent()) {
+        DeadGlue[Idx] = nullptr;
+        continue;
+      }
+
+      if (!I->use_empty())
+        continue;
+
+      if (SeenThisRound.insert(I).second)
+        ToEraseIdx.push_back(Idx);
+    }
+
+    for (unsigned Idx : ToEraseIdx) {
+      Instruction *I = DeadGlue[Idx];
+
+      if (!I)
+        continue;
+
+      if (!I->getParent()) {
+        DeadGlue[Idx] = nullptr;
+        continue;
+      }
+
+      if (!I->use_empty())
+        continue;
+
+      DeadGlue[Idx] = nullptr;
+      I->eraseFromParent();
+      Progress = true;
+    }
+  }
+}
+
+static bool
+isSafeWMMADeadGlue(Instruction *I,
+                   const SmallPtrSetImpl<Instruction *> &OldCallSet) {
+  if (OldCallSet.contains(I))
+    return true;
+
+  if (isa<ExtractValueInst>(I))
+    return true;
+
+  if (isa<BitCastInst>(I))
+    return true;
+
+  if (isa<AddrSpaceCastInst>(I))
+    return true;
+
+  if (isa<TruncInst>(I) || isa<ZExtInst>(I) || isa<SExtInst>(I))
+    return true;
+
+  if (isa<FPTruncInst>(I) || isa<FPExtInst>(I))
+    return true;
+
+  if (isa<DbgInfoIntrinsic>(I))
+    return true;
+
+  return false;
+}
+
+static bool
+collectDeadWMMAUsers(Instruction *I,
+                     const SmallPtrSetImpl<Instruction *> &OldCallSet,
+                     SmallPtrSetImpl<Instruction *> &DeadSet,
+                     SmallVectorImpl<Instruction *> &BadUsers) {
+  bool OK = true;
+
+  for (User *U : I->users()) {
+    auto *UserI = dyn_cast<Instruction>(U);
+
+    if (!UserI) {
+      OK = false;
+      continue;
+    }
+
+    if (!isSafeWMMADeadGlue(UserI, OldCallSet)) {
+      BadUsers.push_back(UserI);
+      OK = false;
+      continue;
+    }
+
+    if (DeadSet.insert(UserI).second) {
+      if (!collectDeadWMMAUsers(UserI, OldCallSet, DeadSet, BadUsers))
+        OK = false;
+    }
+  }
+
+  return OK;
+}
+
+static void eraseDeadWMMASet(SmallPtrSetImpl<Instruction *> &DeadSet) {
+  bool Progress = true;
+
+  while (Progress) {
+    Progress = false;
+
+    SmallVector<Instruction *, 32> ToEraseNow;
+
+    for (Instruction *I : DeadSet) {
+      if (!I || !I->getParent())
+        continue;
+
+      if (I->use_empty())
+        ToEraseNow.push_back(I);
+    }
+
+    for (Instruction *I : ToEraseNow) {
+      if (!I || !I->getParent())
+        continue;
+
+      DeadSet.erase(I);
+      I->eraseFromParent();
+      Progress = true;
+    }
+  }
+}
+
+static void cleanupOldNVVMCalls(ArrayRef<CallInst *> OldCalls) {
+  SmallPtrSet<Instruction *, 32> OldCallSet;
+
+  for (CallInst *CI : OldCalls) {
+    if (CI && CI->getParent())
+      OldCallSet.insert(CI);
+  }
+
+  SmallPtrSet<Instruction *, 32> DeadSet;
+
+  for (CallInst *CI : OldCalls) {
+    if (CI && CI->getParent())
+      DeadSet.insert(CI);
+  }
+
+  SmallVector<Instruction *, 32> BadUsers;
+
+  for (CallInst *CI : OldCalls) {
+    if (!CI || !CI->getParent())
+      continue;
+
+    collectDeadWMMAUsers(CI, OldCallSet, DeadSet, BadUsers);
+  }
+
+  if (!BadUsers.empty()) {
+    errs() << "[wmma] cannot delete old NVVM WMMA graph because some users "
+              "are not recognized as dead WMMA glue:\n";
+
+    for (Instruction *I : BadUsers) {
+      errs() << "  bad user: ";
+      I->print(errs());
+      errs() << "\n";
+    }
+
+    report_fatal_error("old NVVM WMMA graph has unsupported remaining users");
+  }
+
+  eraseDeadWMMASet(DeadSet);
+
+  for (CallInst *CI : OldCalls) {
+    if (!CI || !CI->getParent())
+      continue;
+
+    errs() << "[wmma] failed to erase old NVVM intrinsic:\n";
+    CI->print(errs());
+    errs() << "\n";
+
+    for (User *U : CI->users()) {
+      errs() << "  remaining user: ";
+      U->print(errs());
+      errs() << "\n";
+
+      if (auto *UserI = dyn_cast<Instruction>(U)) {
+        for (User *UU : UserI->users()) {
+          errs() << "    user's user: ";
+          UU->print(errs());
+          errs() << "\n";
+        }
+      }
+    }
+
+    report_fatal_error(
+        "replace_wmma_intrinsics left an NVVM WMMA intrinsic in the IR");
+  }
+}
+
+// Main entry point for replace_wmma_intrinsics
+void replace_wmma_intrinsics(llvm::Module *M) {
+  DenseMap<CallInst *, WmmaCallDesc> CallToDesc = collectWMMADesc(M);
+
+  SmallVector<CallInst *, 64> OrderedCalls;
 
   for (Function &F : *M) {
     for (BasicBlock &BB : F) {
@@ -3037,145 +4256,109 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
         auto *CI = dyn_cast<CallInst>(&I);
         if (!CI)
           continue;
-        Function *Callee = CI->getCalledFunction();
-        if (!Callee)
-          continue;
-        if (Callee->getName().starts_with("llvm.nvvm.wmma."))
-          ToReplace.push_back(CI);
+
+        if (CallToDesc.contains(CI))
+          OrderedCalls.push_back(CI);
       }
     }
   }
 
-  if (ToReplace.empty())
-    return;
+  FragStorageMap FragmentStorage;
+  SmallVector<CallInst *, 32> OldNVVMCalls;
+  SmallVector<Instruction *, 32> DeadGlue;
+  SmallPtrSet<Function *, 16> ToErase;
 
-  DBG_PRINT("[nvvm-wmma] found %zu NVVM WMMA intrinsics to replace\n",
-            ToReplace.size());
+  DBG(for (CallInst *CI : OrderedCalls) {
+    WmmaCallDesc &Desc = CallToDesc[CI];
 
-  for (CallInst *CI : ToReplace) {
-    Function *Callee = CI->getCalledFunction();
-    StringRef Name = Callee->getName();
-    IRBuilder<> B(CI);
+    errs() << "[wmma] ";
 
-    if (Name.contains(".load.a.") || Name.contains(".load.b.")) {
-      // llvm.nvvm.wmma.m16n16k16.load.{a,b}.{row,col}.stride.f16.p0
-      // Args: (ptr src, i32 stride) -> {<2 x half> x8}
-      bool isA = Name.contains(".load.a.");
-      bool isRow = Name.contains(".row.");
-      const char *rtName = isA
-          ? (isRow ? "__vx_wmma_load_a_m16n16k16_row_f16"
-                   : "__vx_wmma_load_a_m16n16k16_col_f16")
-          : (isRow ? "__vx_wmma_load_b_m16n16k16_row_f16"
-                   : "__vx_wmma_load_b_m16n16k16_col_f16");
+    if (Desc.FromNVVMIntrinsic)
+      errs() << CI->getCalledFunction()->getName();
+    else
+      errs() << maybeDemangle(CI->getCalledFunction()->getName());
 
-      DBG_PRINT("[nvvm-wmma] %s -> %s\n", Name.str().c_str(), rtName);
+    errs() << " -> " << Desc.ReplacementName << "\n";
+  });
 
-      Value *Src = CI->getArgOperand(0);
-      Value *Stride = CI->getArgOperand(1);
+  for (CallInst *CI : OrderedCalls) {
+    if (!CI || !CI->getParent())
+      continue;
 
-      // Alloca [8 x <2 x half>] at function entry
-      Type *FragTy = ArrayType::get(V2HalfTy, 8);
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *Frag = AB.CreateAlloca(FragTy, nullptr, "wmma.frag");
+    auto It = CallToDesc.find(CI);
+    if (It == CallToDesc.end())
+      continue;
 
-      // void runtime(ptr frag, ptr src, i32 ldm)
-      FunctionType *FT = FunctionType::get(VoidTy, {PtrTy, PtrTy, I32}, false);
-      FunctionCallee FC = M->getOrInsertFunction(rtName, FT);
-      B.CreateCall(FC, {Frag, Src, Stride});
+    WmmaCallDesc &Desc = It->second;
 
-      // Load 8 x <2 x half> and build return struct
-      Value *Result = UndefValue::get(CI->getType());
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(FragTy, Frag, 0, i);
-        Value *Val = B.CreateLoad(V2HalfTy, GEP);
-        Result = B.CreateInsertValue(Result, Val, i);
-      }
-      CI->replaceAllUsesWith(Result);
-      CI->eraseFromParent();
+    Function *OldHelper = CI->getCalledFunction();
 
-    } else if (Name.contains(".mma.")) {
-      // llvm.nvvm.wmma.m16n16k16.mma.{row}.{row}.f32.f32
-      // Args: (<2 x half> a0..a7, <2 x half> b0..b7, float c0..c7) -> {float x8}
-      DBG_PRINT("[nvvm-wmma] %s -> __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32\n",
-                Name.str().c_str());
+    if (Desc.FromNVVMIntrinsic) {
+      bool OK = lowerNVVMWMMANoReturn(M, CI, Desc, FragmentStorage, DeadGlue,
+                                      OldNVVMCalls);
 
-      Type *AFragTy = ArrayType::get(V2HalfTy, 8);
-      Type *CFragTy = ArrayType::get(F32, 8);
-
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *AAlloca = AB.CreateAlloca(AFragTy, nullptr, "wmma.a");
-      Value *BAlloca = AB.CreateAlloca(AFragTy, nullptr, "wmma.b");
-      Value *CAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.c");
-      Value *DAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.d");
-
-      // Store a0..a7 (<2 x half> args 0-7)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(AFragTy, AAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(i), GEP);
-      }
-      // Store b0..b7 (<2 x half> args 8-15)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(AFragTy, BAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(8 + i), GEP);
-      }
-      // Store c0..c7 (float args 16-23)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, CAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(16 + i), GEP);
+      if (!OK) {
+        errs() << "[wmma] failed to lower NVVM WMMA intrinsic:\n";
+        CI->print(errs());
+        errs() << "\n";
+        report_fatal_error("failed to lower NVVM WMMA intrinsic");
       }
 
-      // void __vx_wmma_mma_...(ptr d, ptr a, ptr b, ptr c)
-      FunctionType *FT = FunctionType::get(VoidTy,
-          {PtrTy, PtrTy, PtrTy, PtrTy}, false);
-      FunctionCallee FC = M->getOrInsertFunction(
-          "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32", FT);
-      B.CreateCall(FC, {DAlloca, AAlloca, BAlloca, CAlloca});
-
-      // Load d0..d7 and build return struct
-      Value *Result = UndefValue::get(CI->getType());
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, DAlloca, 0, i);
-        Value *Val = B.CreateLoad(F32, GEP);
-        Result = B.CreateInsertValue(Result, Val, i);
-      }
-      CI->replaceAllUsesWith(Result);
-      CI->eraseFromParent();
-
-    } else if (Name.contains(".store.d.")) {
-      // llvm.nvvm.wmma.m16n16k16.store.d.{row,col}.stride.f32.p0
-      // Args: (ptr dst, float f0..f7, i32 stride) -> void
-      int layout = Name.contains(".store.d.row.") ? 0 : 1;
-      DBG_PRINT("[nvvm-wmma] %s -> __vx_wmma_store_d_m16n16k16_f32 (layout=%d)\n",
-                Name.str().c_str(), layout);
-
-      Type *CFragTy = ArrayType::get(F32, 8);
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *FragAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.store");
-
-      Value *Dst = CI->getArgOperand(0);
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, FragAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(1 + i), GEP);
-      }
-      Value *Stride = CI->getArgOperand(9);
-
-      // void __vx_wmma_store_d_m16n16k16_f32(ptr p, ptr frag, i32 ldm, i32 layout)
-      FunctionType *FT = FunctionType::get(VoidTy,
-          {PtrTy, PtrTy, I32, I32}, false);
-      FunctionCallee FC = M->getOrInsertFunction(
-          "__vx_wmma_store_d_m16n16k16_f32", FT);
-      B.CreateCall(FC, {Dst, FragAlloca, Stride,
-                        ConstantInt::get(I32, layout)});
-      CI->eraseFromParent();
+      continue;
     }
+
+    // Non-inlined nvcuda::wmma helper calls are already pointer-style.
+    // For those, just replace the callee.
+    if (!OldHelper)
+      continue;
+
+    FunctionType *FTy = OldHelper->getFunctionType();
+
+    FunctionCallee NewHelperCallee =
+        M->getOrInsertFunction(Desc.ReplacementName, FTy);
+
+    Function *NewHelper =
+        dyn_cast<Function>(NewHelperCallee.getCallee()->stripPointerCasts());
+
+    if (!NewHelper)
+      continue;
+
+    NewHelper->setCallingConv(CallingConv::C);
+
+    CI->setCalledFunction(NewHelperCallee);
+    CI->setCallingConv(CallingConv::C);
+
+    if (OldHelper->use_empty())
+      ToErase.insert(OldHelper);
   }
 
-  // Remove unused NVVM intrinsic declarations
-  SmallVector<Function *, 8> DeadDecls;
+  // First erase recognized store/load glue such as:
+  //   extractvalue -> bitcast -> store
+  //   gep -> load -> bitcast -> old mma
+  // eraseDeadGlueInstructions(DeadGlue);
+
+  // Then erase old NVVM calls and their remaining extractvalue chains.
+  // cleanupOldNVVMCalls(OldNVVMCalls);
+
+  // After old calls are gone, some input load/bitcast glue may become dead.
+  // eraseDeadGlueInstructions(DeadGlue);
+
+  for (Function *F : ToErase) {
+    if (!F || !F->use_empty())
+      continue;
+
+    F->dropAllReferences();
+    F->eraseFromParent();
+  }
+
+  SmallVector<Function *, 8> DeadNVVMDecls;
+
   for (Function &F : *M) {
     if (F.getName().starts_with("llvm.nvvm.wmma.") && F.use_empty())
-      DeadDecls.push_back(&F);
+      DeadNVVMDecls.push_back(&F);
   }
-  for (Function *F : DeadDecls)
-    F->removeFromParent();
+
+  for (Function *F : DeadNVVMDecls)
+    F->eraseFromParent();
+  errs() << "End\n";
 }
