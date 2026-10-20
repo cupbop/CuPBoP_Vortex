@@ -241,6 +241,8 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
 	@echo "--- Kernel compilation completed!"
+lookup_global_symbols.txt: kernel.elf
+	nm -C --defined-only -g $< > $@
 else
 kernel.o: kernel.bc
 	@echo "--- Compiling kernel.bc"
