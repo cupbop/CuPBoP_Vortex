@@ -35,11 +35,15 @@ else()
 endif()
 
 # Check the environment variable
-if("$ENV{VORTEX_ARCHITECTURE}" STREQUAL "64")
-  add_definitions(-DVORTEX_ARCHITECTURE_64=1)
-  message(STATUS "VORTEX_ARCHITECTURE_64 is set")
+# Vortex 3.0 is 64-bit only: default to the 64-bit argument-block layout unless
+# VORTEX_ARCHITECTURE=32 is requested explicitly. (The host runtime's context_t must
+# match the device wrapper's; a 32-bit host layout against a 64-bit kernel silently
+# shifts kernel_idx/num_args/args and the kernel reads garbage.)
+if("$ENV{VORTEX_ARCHITECTURE}" STREQUAL "32")
+  message(STATUS "VORTEX_ARCHITECTURE=32: 32-bit argument layout")
 else()
-  message(STATUS "VORTEX_ARCHITECTURE_64 is not set (32bit)")
+  add_definitions(-DVORTEX_ARCHITECTURE_64=1)
+  message(STATUS "VORTEX_ARCHITECTURE_64 is set (default)")
 endif()
 
 set(CMAKE_CXX_FLAGS "${LLVM_CXX_FLAG} ${CMAKE_CXX_FLAGS}")
