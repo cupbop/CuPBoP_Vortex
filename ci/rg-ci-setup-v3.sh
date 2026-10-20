@@ -19,7 +19,10 @@ export VORTEX_VER=3
 export VORTEX_DRIVER=${VORTEX_DRIVER:-simx}
 # Vortex 3.0 disables the A (atomics) extension by default and SimX aborts silently on an AMO
 # when it is off; the CuPBoP examples use atomics, so enable it in the SimX build and kernels.
-export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE"}
+# Zacas (amocas.w/d) as well: without it atomicCAS lowers to an lr/sc loop, and lanes of one warp
+# retrying on the same cache line in lockstep livelock in SimX 3.0 (line-granular reservations:
+# lane 0's sc always wins and kills lane 1's reservation) — bh-cuda SCHE_2 TreeBuildingKernel hung.
+export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"}
 # sgemm_tcu / sgemm_dxa / sgemm_tcu_dxa need the TCU and DXA extensions, which 3.0 also leaves off by
 # default; they run against a second SimX build (VORTEX_PATH_TCU) configured with these flags.
 export VORTEX_CONFIGS_TCU=${VORTEX_CONFIGS_TCU:-"$VORTEX_CONFIGS -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE"}
