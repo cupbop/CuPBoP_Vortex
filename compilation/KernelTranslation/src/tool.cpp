@@ -93,6 +93,39 @@ void DumpModule(llvm::Module *M, char *file_name) {
   Out.keep();
 }
 
+// LLVM 20 clang marks CUDA kernels with the ptx_kernel calling convention instead of
+// the nvvm.annotations {F, "kernel", 1} entry that this translator (and LLVM <= 18
+// clang) use. Normalize: record the annotation so isKernelFunction() keeps working,
+// and drop the NVPTX-only calling convention, which the RISC-V backend rejects
+// ("Unsupported calling convention").
+void normalize_ptx_kernel_cc(llvm::Module *M) {
+  llvm::LLVMContext &C = M->getContext();
+  NamedMDNode *NamedMD = M->getOrInsertNamedMetadata("nvvm.annotations");
+  for (Function &F : *M) {
+    if (F.getCallingConv() != llvm::CallingConv::PTX_Kernel)
+      continue;
+    bool annotated = false;
+    for (unsigned I = 0, E = NamedMD->getNumOperands(); I != E && !annotated; ++I) {
+      MDNode *MD = NamedMD->getOperand(I);
+      if (!MD || MD->getNumOperands() != 3) continue;
+      auto *VMD = dyn_cast<llvm::ValueAsMetadata>(MD->getOperand(0));
+      auto *Str = dyn_cast<MDString>(MD->getOperand(1));
+      if (VMD && Str && VMD->getValue() == &F && Str->getString() == "kernel")
+        annotated = true;
+    }
+    if (!annotated) {
+      llvm::Metadata *Ops[] = {
+          llvm::ValueAsMetadata::get(&F), MDString::get(C, "kernel"),
+          llvm::ValueAsMetadata::get(ConstantInt::get(Type::getInt32Ty(C), 1))};
+      NamedMD->addOperand(MDNode::get(C, Ops));
+    }
+    F.setCallingConv(llvm::CallingConv::C);
+    for (User *U : F.users())
+      if (auto *CB = dyn_cast<CallBase>(U))
+        CB->setCallingConv(llvm::CallingConv::C);
+  }
+}
+
 bool isKernelFunction(llvm::Module *M, llvm::Function *F) {
   NamedMDNode *NamedMD = M->getNamedMetadata("nvvm.annotations");
   if (!NamedMD) {

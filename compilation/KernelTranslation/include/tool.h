@@ -13,6 +13,7 @@ inline bool cupbop_debug() {
 llvm::Module *LoadModuleFromFilr(char *file_name);
 void DumpModule(llvm::Module *M, char *file_name);
 bool isKernelFunction(llvm::Module *M, llvm::Function *F);
+void normalize_ptx_kernel_cc(llvm::Module *M);
 void replace_block(llvm::Function *F, llvm::BasicBlock *before,
                    llvm::BasicBlock *after);
 llvm::CallInst *CreateInterWarpBarrier(llvm::Instruction *InsertBefore);

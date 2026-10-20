@@ -51,6 +51,10 @@ int main(int argc, char **argv) {
   std::ofstream fout;
   fout.open(PATH);
 
+  // LLVM 20 clang: kernels carry the ptx_kernel calling convention (no "kernel" annotation)
+  DBG_LOG("normalize_ptx_kernel_cc\n");
+  normalize_ptx_kernel_cc(program);
+
   // Replace cp.async before init_block (PTX inline asm must be alive)
   DBG_LOG("replace_cp_async_dxa\n");
   replace_cp_async_with_dxa(program);
