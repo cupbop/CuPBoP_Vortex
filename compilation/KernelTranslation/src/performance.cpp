@@ -82,12 +82,12 @@ void eliminate_redudant_threadIdx_computation(llvm::Module *M) {
         for (BasicBlock::iterator i = B->begin(); i != B->end(); ++i) {
           Instruction *inst = &(*i);
           if (auto loadInst = dyn_cast<LoadInst>(inst)) {
-            if (loadInst->getOperand(0)->getName().equals(
+            if (loadInst->getOperand(0)->getName() == (
                     "local_intra_warp_idx") &&
                 !load_intra_warp_index)
               load_intra_warp_index = loadInst;
           } else if (auto storeInst = dyn_cast<StoreInst>(inst)) {
-            if (storeInst->getOperand(1)->getName().equals(
+            if (storeInst->getOperand(1)->getName() == (
                     "local_intra_warp_idx")) {
               safe_to_replace = false;
               break;

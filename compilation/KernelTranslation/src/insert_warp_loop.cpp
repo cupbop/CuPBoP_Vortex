@@ -1,4 +1,5 @@
 
+#include <optional>
 #include "insert_warp_loop.h"
 #include "handle_sync.h"
 #include "tool.h"
@@ -2423,7 +2424,7 @@ public:
       for (auto *I : to_demote) {
         fprintf(stderr, "[fixdom] demoting to stack: ");
         I->print(llvm::errs()); fprintf(stderr, "\n");
-        DemoteRegToStack(*I, false, nullptr);
+        DemoteRegToStack(*I, false, std::nullopt);
       }
     }
 

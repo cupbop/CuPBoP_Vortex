@@ -133,7 +133,9 @@ void decode_input(llvm::Module *M) {
 
       //LLVM 18 changes
       //auto element_type = PT->getElementType();
-      auto element_type = PT->getNonOpaquePointerElementType();
+      // LLVM 17+: pointers are opaque; the pointee is the global's value type.
+      [[maybe_unused]] auto element_type = share_memory->getValueType();
+      (void)PT;
 
       // std::cout << element_type->getTypeID()  << " Got global memor $$$$$$"
       // << share_memory->getName().str() << std::endl;

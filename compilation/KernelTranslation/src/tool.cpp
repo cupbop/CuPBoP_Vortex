@@ -1100,7 +1100,10 @@ void replace_built_in_function(llvm::Module *M) {
               // Handled in NVVM intrinsic replacement pass below
             } else if (func_name == "llvm.nvvm.mul24.i") {
               Call->getCalledFunction()->setName("__nvvm_mul24_i");
-            } else if (func_name == "llvm.nvvm.membar.gl") {
+            } else if (func_name == "llvm.nvvm.membar.gl" ||
+                       func_name == "llvm.nvvm.membar.cta" ||
+                       func_name == "llvm.nvvm.membar.sys") {
+              // Vortex has a single fence scope; lifted SASS (CuLifter) emits membar.cta.
               Call->getCalledFunction()->setName("__nvvm_membar_gl");
             } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") !=
                        std::string::npos) {

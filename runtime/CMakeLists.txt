@@ -11,18 +11,24 @@ add_subdirectory(threadPool)
 
 # compile vortex runtime library
 # 공통 include (변수로 정리)
+# CUDA toolkit headers (dim3, cudaError_t, ...) or the bundled minimal stub when CUDA_PATH is unset
+if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/include/cuda_runtime.h")
+  set(CUPBOP_CUDA_INCLUDE "$ENV{CUDA_PATH}/include")
+else()
+  set(CUPBOP_CUDA_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_stub")
+endif()
+message(STATUS "CUDA include: ${CUPBOP_CUDA_INCLUDE}")
 set(VORTEX_RUNTIME_INCLUDES
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/threadPool/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/../compilation/KernelTranslation/include"
-  "$ENV{CUDA_PATH}/include"
+  "${CUPBOP_CUDA_INCLUDE}"
   "$ENV{VORTEX_HOME}/runtime/include"
   "$ENV{VORTEX_HOME}/kernel/include"
   "$ENV{VORTEX_HOME}/build/hw"
 )
 
 message(STATUS "VORTEX_PATH: $ENV{VORTEX_PATH}")
-message(STATUS "CUDA_PATH: $ENV{CUDA_PATH}")
 message(STATUS "VORTEX_HOME: $ENV{VORTEX_HOME}")
 
 file(GLOB proj_SOURCES "./src/vortex/host/*.cpp")
