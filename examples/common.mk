@@ -178,6 +178,21 @@ clean-perf:
 	rm -f Perf_counter_*.txt
 
 # ─── Step 1: CUDA source -> bitcode ──────────────────────────────────────────
+ifeq ($(VORTEX_VER),3)
+# Two clang invocations: device bitcode and host bitcode. Unlike the combined -save-temps
+# compile below, this never runs NVPTX code generation, so a Vortex LLVM built without the
+# NVPTX backend (tools-v3.0.1, clang 20) can serve as the CUDA frontend.
+$(DEVICE_BC): $(KERNEL_CU)
+	@echo "--- Generate device bitcode (clang --cuda-device-only)"
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=sm_90 --cuda-device-only \
+		-emit-llvm -c ./$(KERNEL_CU) -o $@
+$(HOST_BC): $(KERNEL_CU)
+	@echo "--- Generate host bitcode (clang --cuda-host-only)"
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+		-x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only --sysroot=/ --target=x86_64-linux-gnu \
+		-emit-llvm -c ./$(KERNEL_CU) -o $@
+else
 $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate bitcode files for host and device"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
@@ -189,6 +204,8 @@ $(HOST_BC): $(DEVICE_BC)
 	@true
 
 # ─── Step 2: kernelTranslator -> kernel.bc + kernel_wrapper.cpp ──────────────
+endif
+
 kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC)
 	@echo "--- Translate kernel bitcode"
 	$(CuPBoP_PATH)/build/compilation/kernelTranslator $< kernel.bc

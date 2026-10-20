@@ -33,7 +33,8 @@ cd $CuPBoP_PATH; echo "cupbop built $(date +%H:%M:%S)"
 # --- matrix ---
 RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,exec_ok,result,seconds" > $RES
 run_one() { # test sched lmem
-  local t=$1 s=$2 l=$3 log=$LOGS/${t}_s${s}_l${l}.log t0=$SECONDS
+  local t=$1 s=$2 l=$3
+  local log=$LOGS/${t}_s${s}_l${l}.log t0=$SECONDS   # separate line: a single `local` expands ${s} before assigning it
   ( cd examples && make -C $t clean > /dev/null 2>&1; rm -f $t/ci_status_*.txt $t/ci_output.txt
     timeout 1800 make -C $t ci SCHEDULE=$s LOCALMEM=$l > $log 2>&1 ); local rc=$?
   local k=0 h=0 e=0; grep -q "Kernel compilation completed!" $log && k=1; grep -q "Host compilation completed!" $log && h=1; grep -q "Execution completed!" $log && e=1
