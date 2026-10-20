@@ -115,9 +115,12 @@ all: build run
 
 ci: build ci-run
 
+# Unbuffered stdout so that the runtime's own error message survives an abort (core dump) in the log.
+STDBUF := $(shell command -v stdbuf 2>/dev/null)
+STDBUF_RUN := $(if $(STDBUF),$(STDBUF) -o0 -e0,)
 ci-run: build
 	@echo "--- Running (CI)"
-	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 ./host.out $(CI_RUN_ARGS) | tee ci_output.txt
+	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 $(STDBUF_RUN) ./host.out $(CI_RUN_ARGS) 2>&1 | tee ci_output.txt
 	@echo "--- Execution completed!"
 
 CI_RUN_ARGS ?= $(RUN_ARGS)
