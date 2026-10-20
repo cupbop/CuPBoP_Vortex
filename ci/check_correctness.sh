@@ -9,8 +9,10 @@ STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}_LMEM_${LMEM}.txt"
 RESULT="FAIL"
 cmp_golden() { python3 ./ci/compare_golden.py "$1" "$2" --tolerance=1e-4 > /dev/null 2>&1; }
 case $TEST_NAME in
-  saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
+  saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
     if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT" && ! grep -q "^FAIL" "$CI_OUTPUT"; then RESULT="PASS"; fi ;;
+  huffman)  # its checker (comparison_helpers.h) prints "PASS! vectors are matching!" / "FAIL! vectors are NOT matching!", never "PASSED"
+    if [ -f "$CI_OUTPUT" ] && grep -q "PASS! vectors are matching" "$CI_OUTPUT" && ! grep -q "^FAIL" "$CI_OUTPUT"; then RESULT="PASS"; fi ;;
   backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda)
     G="${EXAMPLE_DIR}/golden_output.txt"
     [ -f "$G" ] && [ -f "$CI_OUTPUT" ] && cmp_golden "$G" "$CI_OUTPUT" && RESULT="PASS" ;;

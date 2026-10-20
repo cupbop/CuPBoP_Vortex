@@ -186,10 +186,15 @@ ifeq ($(VORTEX_VER),3)
 # Two clang invocations: device bitcode and host bitcode. Unlike the combined -save-temps
 # compile below, this never runs NVPTX code generation, so a Vortex LLVM built without the
 # NVPTX backend (tools-v3.0.1, clang 20) can serve as the CUDA frontend.
+# -nocudalib: do not link/inline libdevice. The 2.x flow left __nv_* math as external calls that
+# kernelTranslator maps to libm (and cudaKernelImpl.cpp defines the rest); inlined libdevice bodies
+# go through NVVM intrinsics the translator does not model (blackscholes produced NaN).
+# With -nocudalib this clang no longer reports the SDK version, which would select the pre-CUDA-9
+# cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
 $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
-		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=sm_90 --cuda-device-only \
+		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=sm_90 --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
 $(HOST_BC): $(KERNEL_CU)
 	@echo "--- Generate host bitcode (clang --cuda-host-only)"

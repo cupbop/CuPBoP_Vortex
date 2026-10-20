@@ -200,6 +200,12 @@ __vx_dxa_issue_2d(unsigned int desc_slot, unsigned int barrier_id,
   // Only first warp in CTA issues DXA
   if (__warps_per_group != 0 && (vx_warp_id() & (__warps_per_group - 1)) != 0)
     return;
+#if defined(VX_CFG_NUM_THREADS)
+  // Vortex 3.0: a barrier with pending transactions releases only after the DXA engine
+  // retires them (BarrierUnit events). Register this transfer before issuing it, like
+  // vortex::barrier::expect_tx() in tests/regression/sgemm2_dxa. 2.0 counted it implicitly.
+  vx_barrier_expect_tx((int)barrier_id, 1);
+#endif
   unsigned int meta = (barrier_id << 4) | desc_slot;
   unsigned int a0 =
       (unsigned int)vx_wgather((size_t)(uintptr_t)smem_addr, (size_t)meta,
@@ -368,6 +374,56 @@ __attribute__((always_inline)) float __vx_bitcast_u32_to_f32(uint32_t x) {
   return f;
 }
 
+// ── TCU wrappers ───────────────────────────────────────────────────────────
+// Vortex 3.0 (tools-v3.0.1 trees define VX_CFG_* macros): the TCU is driven through
+// <vx_tensor.h>'s wmma_context, which owns the per-lane fragment layout and the
+// bank-conflict-free register permutation that the 3.0 WMMA macro-op expects. The
+// hand-written 2.0 register protocol below (f0-7 / f10-17 / f24-31 in logical order,
+// `.insn r 0x0b, 0, 2`) is kept for 2.0 trees only. The translator allocates 8 x 32-bit
+// per lane for every fragment; the 3.0 fragments for NT=32 / fp16->fp32 fit in that.
+// NOTE: for NT=32 the hardware tile is m16n16k32 (two fp16 per 32-bit lane register),
+// exactly as the 2.0 wrappers loaded it; CUDA's m16n16k16 fragments are mapped the same way.
+#if defined(VX_CFG_NUM_THREADS)
+#if defined(VX_CFG_EXT_TCU_ENABLE)
+#include <vx_tensor.h>
+namespace {
+namespace vt = vortex::tensor;
+using tcu_ctx = vt::wmma_context<VX_CFG_NUM_THREADS, vt::fp16, vt::fp32>;
+static_assert(tcu_ctx::tileM == 16 && tcu_ctx::tileN == 16, "CuPBoP TCU wrappers assume a 16x16 (M,N) tile: use NUM_THREADS=32");
+static_assert(sizeof(tcu_ctx::fragment_a) <= 32 && sizeof(tcu_ctx::fragment_b) <= 32 && sizeof(tcu_ctx::fragment_acc) == 32,
+              "translator fragment storage is 8 x 32-bit per lane");
+} // namespace
+
+extern "C" void __vx_wmma_load_a_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_a_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_b_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_b_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_c_m16n16k16_row_f32(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_acc *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_store_d_m16n16k16_f32(float *p, const float *frag, int32_t ldm, WmmaLayout layout) {
+  const auto &acc = *reinterpret_cast<const tcu_ctx::fragment_acc *>(frag);
+  if (layout == WMMA_LAYOUT_ROW)
+    tcu_ctx::store_matrix_sync(p, acc, (size_t)ldm);
+  else
+    tcu_ctx::store_matrix_sync<vt::col_major>(p, acc, (size_t)ldm);
+}
+extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d, const uint32_t *a, const uint32_t *b, const float *c) {
+  tcu_ctx::fragment_acc fd;
+  tcu_ctx::mma_sync(fd, *reinterpret_cast<const tcu_ctx::fragment_a *>(a), *reinterpret_cast<const tcu_ctx::fragment_b *>(b),
+                    *reinterpret_cast<const tcu_ctx::fragment_acc *>(c));
+  __builtin_memcpy(d, fd.data.data(), sizeof(fd.data));
+}
+#endif // VX_CFG_EXT_TCU_ENABLE (3.0: TCU disabled -> no wrappers, TCU kernels fail to link with a clear symbol name)
+#else  // Vortex 2.0 register-protocol wrappers
 extern "C" void __vx_wmma_m16n16k16_load_a_row_f16(uint32_t *out_regs,
                                                    const uint16_t *ptr,
                                                    int stride) {
@@ -680,6 +736,7 @@ extern "C" void __vx_wmma_mma_m32n8k16_row_row_f16_f16_f32(float *d,
   d[6] = d6;
   d[7] = d7;
 }
+#endif // Vortex 2.0 TCU wrappers
 
 // Float atomic add helper.
 // RISC-V "A" extension has no native float atomic add. The default LLVM
@@ -711,6 +768,59 @@ float __cuda_atomic_fadd_f32(float *addr, float val) {
   return old;
 }
 
+// ── Warp-sum over the ACTIVE lanes only ─────────────────────────────────────
+// Vortex 3.0's SHFL yields the reader's OWN value when the source lane is
+// inactive (simx alu_unit.cpp: "a masked source lane yields the reader's own
+// value"); 2.0 returned the inactive lane's stale register, which the two
+// warp-reduced atomic fast paths below relied on being 0. A butterfly over a
+// partially active warp therefore double-counts on 3.0: a single active lane
+// ends up with 32x its value (jacobi SCHE_2 reported error x sqrt(32)).
+// Full warps keep the log2(NT)-step butterfly; partial warps gather the
+// active lanes' values with idx shuffles. `active` is uniform across the
+// warp, so the gather loop does not diverge.
+static inline __attribute__((always_inline))
+unsigned __vx_full_warp_mask(void) {
+  unsigned nt = (unsigned)vx_num_threads();
+  return (nt >= 32u) ? 0xFFFFFFFFu : ((1u << nt) - 1u);
+}
+
+static inline __attribute__((always_inline))
+float __vx_warp_sum_active_f32(float val, unsigned active) {
+  if (active == __vx_full_warp_mask()) {
+    for (int i = (int)vx_num_threads() >> 1; i > 0; i >>= 1)
+      val += __shfl_xor_sync(0xFFFFFFFF, val, i, 31);
+    return val;
+  }
+  float sum = 0.0f;
+  for (unsigned m = active; m != 0u; m &= m - 1u)
+    sum += __shfl_sync(0xFFFFFFFF, val, (int)__builtin_ctz(m), 31);
+  return sum;
+}
+
+static inline __attribute__((always_inline))
+unsigned long long __vx_warp_sum_active_u64(unsigned long long val, unsigned active) {
+  if (active == __vx_full_warp_mask()) {
+    for (int i = (int)vx_num_threads() >> 1; i > 0; i >>= 1) {
+      int lo = (int)(unsigned int)val;
+      int hi = (int)(unsigned int)(val >> 32);
+      unsigned int rlo = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, lo, i, 31);
+      unsigned int rhi = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, hi, i, 31);
+      val += ((unsigned long long)rhi << 32) | rlo;
+    }
+    return val;
+  }
+  unsigned long long sum = 0ull;
+  for (unsigned m = active; m != 0u; m &= m - 1u) {
+    int l = (int)__builtin_ctz(m);
+    int lo = (int)(unsigned int)val;
+    int hi = (int)(unsigned int)(val >> 32);
+    unsigned int rlo = (unsigned int)__shfl_sync(0xFFFFFFFF, lo, l, 31);
+    unsigned int rhi = (unsigned int)__shfl_sync(0xFFFFFFFF, hi, l, 31);
+    sum += ((unsigned long long)rhi << 32) | rlo;
+  }
+  return sum;
+}
+
 // Warp-reduced fast path for the common case: uniform address + unused return.
 // All 32 lanes add to the SAME `addr`, reduce within the warp first via
 // shfl_xor butterfly, then only lane 0 takes the global lock and does the
@@ -720,13 +830,11 @@ float __cuda_atomic_fadd_f32(float *addr, float val) {
 // Called by lower_atomicrmw_fadd when RMW->use_empty() AND pointer is
 // a function argument (uniform across warp). Unsafe to use when the
 // pointer varies per lane.
-extern "C" __attribute__((noinline))
+extern "C" __attribute__((noinline, convergent))
 void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
-  // Butterfly warp reduction. NVPTX-encoded c=31 for warp-wide.
-  #pragma unroll
-  for (int i = 16; i > 0; i >>= 1) {
-    val += __shfl_xor_sync(0xFFFFFFFF, val, i, 31);
-  }
+  // Warp reduction over the active lanes (see __vx_warp_sum_active_f32).
+  unsigned active = (unsigned)vx_active_threads();
+  val = __vx_warp_sum_active_f32(val, active);
   // Lowest active lane issues lock-free CAS-based atomic add.
   // Spinlock approach (originally here) deadlocks under multi-warp
   // contention in simx — Vortex's vx_split_n + global spinlock interaction
@@ -735,7 +843,6 @@ void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
   // The cmpxchg-bnez divergence issue (per atomic_float_cas_hang.md) only
   // applies when MANY lanes do cmpxchg concurrently; here only ONE lane
   // executes the CAS, so no divergence.
-  unsigned active = (unsigned)vx_active_threads();
   unsigned issuer = (unsigned)__builtin_ctz(active);
   if ((unsigned)vx_thread_id() == issuer) {
     int *iaddr = (int *)addr;
@@ -765,19 +872,12 @@ void __cuda_atomic_fadd_f32_uniform_void(float *addr, float val) {
 extern "C" __attribute__((noinline, convergent))
 void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
                                         unsigned long long val) {
-  #pragma unroll
-  for (int i = 16; i > 0; i >>= 1) {
-    int lo = (int)(unsigned int)val;
-    int hi = (int)(unsigned int)(val >> 32);
-    unsigned int rlo = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, lo, i, 31);
-    unsigned int rhi = (unsigned int)__shfl_xor_sync(0xFFFFFFFF, hi, i, 31);
-    val += ((unsigned long long)rhi << 32) | rlo;
-  }
   // marchingCubes generatingTriangles calls this from inside a divergent
   // `for c0 < numTriangles` loop. Lane 0 may be inactive (numTriangles=0)
-  // while lanes 1-31 are still iterating. Keying the atomic off lane 0
-  // would lose the warp-reduced sum entirely. Use the lowest active lane.
+  // while lanes 1-31 are still iterating, so reduce over the ACTIVE lanes
+  // (see __vx_warp_sum_active_u64) and key the atomic off the lowest one.
   unsigned active = (unsigned)vx_active_threads();
+  val = __vx_warp_sum_active_u64(val, active);
   unsigned issuer = (unsigned)__builtin_ctz(active);
   if ((unsigned)vx_thread_id() == issuer) {
     __atomic_fetch_add(addr, val, __ATOMIC_RELAXED);

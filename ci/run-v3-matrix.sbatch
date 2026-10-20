@@ -29,16 +29,20 @@ rm -rf build && mkdir build && cd build
 cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG" > cmake.log 2>&1 || { echo "CMAKE FAILED"; tail -15 cmake.log; exit 1; }
 make -j16 kernelTranslator hostTranslator vortexRuntime ThreadPool > make.log 2>&1 || { echo "BUILD FAILED"; grep -n "error" make.log | head -10 | cut -c1-200; exit 1; }
 cd $CuPBoP_PATH; echo "cupbop built $(date +%H:%M:%S)"
-# --- SimX driver for exactly $VORTEX_CONFIGS (rebuilt when the recorded config differs) ---
-MARK=$VORTEX_PATH/.cupbop_simx_configs
-if [ ! -f $VORTEX_PATH/config.mk ]; then mkdir -p $VORTEX_PATH && ( cd $VORTEX_PATH && $VORTEX_HOME/configure --xlen=64 --tooldir=$TOOLDIR > /dev/null ) || { echo "configure failed"; exit 1; }; fi
-if [ ! -f $VORTEX_PATH/sw/runtime/libvortex-simx.so ] || [ "$(cat $MARK 2>/dev/null)" != "$VORTEX_CONFIGS" ]; then
-  echo "building SimX for: $VORTEX_CONFIGS"
-  ( cd $VORTEX_PATH && make -C hw && make -C sw/kernel && make -C sw/runtime/stub && make -C sim/simx clean && make -C sw/runtime/simx clean && \
-    CONFIGS="$VORTEX_CONFIGS" make -C sim/simx PERF=1 -j16 && CONFIGS="$VORTEX_CONFIGS" make -C sw/runtime/simx PERF=1 ) > $LOGS/simx_build.log 2>&1 \
-    || { echo "SimX build failed"; grep -n error $LOGS/simx_build.log | head; exit 1; }
-  echo "$VORTEX_CONFIGS" > $MARK; echo "simx built $(date +%H:%M:%S)"
-fi
+# --- SimX drivers: main config, plus a TCU+DXA config for the tensor examples (rebuilt when the recorded config differs)
+ensure_simx() { # build_dir configs
+  local bdir=$1 cfg=$2 mark=$1/.cupbop_simx_configs
+  if [ ! -f $bdir/config.mk ]; then mkdir -p $bdir && ( cd $bdir && $VORTEX_HOME/configure --xlen=64 --tooldir=$TOOLDIR > /dev/null ) || { echo "configure failed: $bdir"; exit 1; }; fi
+  if [ ! -f $bdir/sw/runtime/libvortex-simx.so ] || [ "$(cat $mark 2>/dev/null)" != "$cfg" ]; then
+    echo "building SimX in $(basename $bdir) for: $cfg"
+    ( cd $bdir && make -C hw && make -C sw/kernel && make -C sw/runtime/stub && make -C sim/simx clean && make -C sw/runtime/simx clean && \
+      CONFIGS="$cfg" make -C sim/simx PERF=1 -j16 && CONFIGS="$cfg" make -C sw/runtime/simx PERF=1 ) > $LOGS/simx_build_$(basename $bdir).log 2>&1 \
+      || { echo "SimX build failed: $bdir"; grep -n error $LOGS/simx_build_$(basename $bdir).log | head; exit 1; }
+    echo "$cfg" > $mark; echo "simx built $(date +%H:%M:%S)"
+  fi
+}
+ensure_simx $VORTEX_PATH "$VORTEX_CONFIGS"
+ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU"
 # --- matrix ---
 RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,exec_ok,result,seconds" > $RES
 run_one() { # test sched lmem
@@ -54,8 +58,11 @@ run_one() { # test sched lmem
 export -f run_one; export LOGS RES
 run_test() { # all configurations of one test, sequentially (shared example dir)
   local t=$1
-  case $t in sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa) run_one $t 2 1 ;; *) run_one $t 2 1; run_one $t 0 1 ;; esac
-  case $t in bh-cuda|cc-cuda|hotspot) run_one $t 2 0 ;; esac
+  case $t in
+    sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa) export VORTEX_PATH=$VORTEX_PATH_TCU VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU"; run_one $t 2 1 ;;   # SCHE_2 only (ci.yml exclude)
+    *) run_one $t 2 1; run_one $t 0 1 ;;
+  esac
+  case $t in bh-cuda|cc-cuda|hotspot|jaccard-cuda|jacobi-cuda|marchingCubes-cuda|score-cuda|wedford-cuda|sgemm_dxa|sgemm_tcu_dxa) run_one $t 2 0 ;; esac   # ci.yml include: list
 }
 export -f run_test
 echo "$TESTS" | tr ' ' '\n' | grep -v '^$' | xargs -P $PAR -I{} bash -c 'run_test {}'

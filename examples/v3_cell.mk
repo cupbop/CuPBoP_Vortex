@@ -10,7 +10,8 @@ include $(ROOT_DIR)/config.mk
 
 PROJECT := cupbop_kernel
 SRCS := $(CUPBOP_WORK)/dummy_host.cpp
-VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp
+VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp \
+           $(CuPBoP_PATH)/runtime/src/vortex/kernel/nv_libdevice_compat.cpp
 KERNEL_LIB := vortex
 
 include ../common.mk

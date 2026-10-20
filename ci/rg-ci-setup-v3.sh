@@ -20,6 +20,10 @@ export VORTEX_DRIVER=${VORTEX_DRIVER:-simx}
 # Vortex 3.0 disables the A (atomics) extension by default and SimX aborts silently on an AMO
 # when it is off; the CuPBoP examples use atomics, so enable it in the SimX build and kernels.
 export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE"}
+# sgemm_tcu / sgemm_dxa / sgemm_tcu_dxa need the TCU and DXA extensions, which 3.0 also leaves off by
+# default; they run against a second SimX build (VORTEX_PATH_TCU) configured with these flags.
+export VORTEX_CONFIGS_TCU=${VORTEX_CONFIGS_TCU:-"$VORTEX_CONFIGS -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE"}
+export VORTEX_PATH_TCU=${VORTEX_PATH_TCU:-$VORTEX_HOME/build64_cupbop_tcu}
 export VORTEX_NUM_CORES=${VORTEX_NUM_CORES:-4}
 export VORTEX_NUM_WARPS=${VORTEX_NUM_WARPS:-16}
 export VORTEX_NUM_THREADS=${VORTEX_NUM_THREADS:-32}
