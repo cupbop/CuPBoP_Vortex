@@ -92,7 +92,8 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
 VORTEX_VER ?= 2
 ifeq ($(VORTEX_VER),3)
   VORTEX_CONFIGS ?= -DVX_CFG_NUM_CORES=$(VORTEX_NUM_CORES) -DVX_CFG_NUM_WARPS=$(VORTEX_NUM_WARPS) -DVX_CFG_NUM_THREADS=$(VORTEX_NUM_THREADS)
-  VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(KERNEL)_s$(SCHEDULE)_l$(LOCALMEM)
+  # keyed by the example directory, not the kernel file: several examples share main.cu
+  VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(notdir $(CURDIR))_s$(SCHEDULE)_l$(LOCALMEM)
   VX3_RT_DIR = $(VORTEX_PATH)/sw/runtime
   export VORTEX_DRIVER ?= simx
 endif
