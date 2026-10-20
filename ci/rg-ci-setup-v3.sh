@@ -17,7 +17,9 @@ export CuPBoP_PATH=${CuPBoP_PATH:-$PWD}
 export VORTEX_ARCHITECTURE=64
 export VORTEX_VER=3
 export VORTEX_DRIVER=${VORTEX_DRIVER:-simx}
-export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32"}
+# Vortex 3.0 disables the A (atomics) extension by default and SimX aborts silently on an AMO
+# when it is off; the CuPBoP examples use atomics, so enable it in the SimX build and kernels.
+export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE"}
 export VORTEX_NUM_CORES=${VORTEX_NUM_CORES:-4}
 export VORTEX_NUM_WARPS=${VORTEX_NUM_WARPS:-16}
 export VORTEX_NUM_THREADS=${VORTEX_NUM_THREADS:-32}

@@ -29,7 +29,16 @@ rm -rf build && mkdir build && cd build
 cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG" > cmake.log 2>&1 || { echo "CMAKE FAILED"; tail -15 cmake.log; exit 1; }
 make -j16 kernelTranslator hostTranslator vortexRuntime ThreadPool > make.log 2>&1 || { echo "BUILD FAILED"; grep -n "error" make.log | head -10 | cut -c1-200; exit 1; }
 cd $CuPBoP_PATH; echo "cupbop built $(date +%H:%M:%S)"
-[ -f $VORTEX_PATH/sw/runtime/libvortex-simx.so ] || { echo "SimX driver missing in $VORTEX_PATH (build it first)"; exit 1; }
+# --- SimX driver for exactly $VORTEX_CONFIGS (rebuilt when the recorded config differs) ---
+MARK=$VORTEX_PATH/.cupbop_simx_configs
+if [ ! -f $VORTEX_PATH/config.mk ]; then mkdir -p $VORTEX_PATH && ( cd $VORTEX_PATH && $VORTEX_HOME/configure --xlen=64 --tooldir=$TOOLDIR > /dev/null ) || { echo "configure failed"; exit 1; }; fi
+if [ ! -f $VORTEX_PATH/sw/runtime/libvortex-simx.so ] || [ "$(cat $MARK 2>/dev/null)" != "$VORTEX_CONFIGS" ]; then
+  echo "building SimX for: $VORTEX_CONFIGS"
+  ( cd $VORTEX_PATH && make -C hw && make -C sw/kernel && make -C sw/runtime/stub && make -C sim/simx clean && make -C sw/runtime/simx clean && \
+    CONFIGS="$VORTEX_CONFIGS" make -C sim/simx PERF=1 -j16 && CONFIGS="$VORTEX_CONFIGS" make -C sw/runtime/simx PERF=1 ) > $LOGS/simx_build.log 2>&1 \
+    || { echo "SimX build failed"; grep -n error $LOGS/simx_build.log | head; exit 1; }
+  echo "$VORTEX_CONFIGS" > $MARK; echo "simx built $(date +%H:%M:%S)"
+fi
 # --- matrix ---
 RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,exec_ok,result,seconds" > $RES
 run_one() { # test sched lmem
