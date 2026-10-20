@@ -433,58 +433,28 @@ void init_llvm_pass() {
   initializeTarget(Registry);
 
   llvm::StringMap<llvm::cl::Option *> &opts = llvm::cl::getRegisteredOptions();
-
-  llvm::cl::Option *O = nullptr;
-
-  O = opts["scalarize-load-store"];
-  assert(O && "could not find LLVM option 'scalarize-load-store'");
-  O->addOccurrence(1, StringRef("scalarize-load-store"), StringRef("1"), false);
-
-  // LLVM inner loop vectorizer does not check whether the loop inside
-  // another loop, in which case even a small trip count loops might be
-  // worthwhile to vectorize.
-  O = opts["vectorizer-min-trip-count"];
-  assert(O && "could not find LLVM option 'vectorizer-min-trip-count'");
-  O->addOccurrence(1, StringRef("vectorizer-min-trip-count"), StringRef("2"),
-                   false);
-
-  // Disable jump threading optimization with following two options from
-  // duplicating blocks. Using jump threading will mess up parallel region
-  // construction especially when kernel contains barriers.
-  // TODO: If enabled then parallel region construction code needs
-  // improvements and make sure it doesn't disallow other optimizations like
-  // vectorization.
-  O = opts["jump-threading-threshold"];
-  assert(O && "could not find LLVM option 'jump-threading-threshold'");
-  O->addOccurrence(1, StringRef("jump-threading-threshold"), StringRef("0"),
-                   false);
-  O = opts["jump-threading-implication-search-threshold"];
-  assert(O && "could not find LLVM option "
-              "'jump-threading-implication-search-threshold'");
-  O->addOccurrence(1, StringRef("jump-threading-implication-search-threshold"),
-                   StringRef("0"), false);
-
+  // Set an LLVM cl::opt if this LLVM still registers it. Options come and go
+  // between releases (e.g. 'scalarize-load-store' exists in LLVM 18 but is a
+  // ScalarizerPass parameter in LLVM 20), so a missing one is reported, not fatal.
+  auto set_opt = [&](const char *name, const char *value) {
+    auto it = opts.find(name);
+    if (it == opts.end() || !it->second) {
+      if (cupbop_debug()) fprintf(stderr, "[init] LLVM option '%s' not registered in this LLVM; skipped\n", name);
+      return;
+    }
+    it->second->addOccurrence(1, StringRef(name), StringRef(value), false);
+  };
+  set_opt("scalarize-load-store", "1");
+  set_opt("vectorizer-min-trip-count", "2");
+  set_opt("jump-threading-threshold", "0");
+  set_opt("jump-threading-implication-search-threshold", "0");
   // Enable diagnostics from the loop vectorizer.
-  O = opts["pass-remarks-missed"];
-  assert(O && "could not find LLVM option 'pass-remarks-missed'");
-  O->addOccurrence(1, StringRef("pass-remarks-missed"),
-                   StringRef("loop-vectorize"), false);
-  O->addOccurrence(1, StringRef("pass-remarks-missed"),
-                   StringRef("slp-vectorize"), false);
-
-  O = opts["pass-remarks-analysis"];
-  assert(O && "could not find LLVM option 'pass-remarks-analysis'");
-  O->addOccurrence(1, StringRef("pass-remarks-analysis"),
-                   StringRef("loop-vectorize"), false);
-  O->addOccurrence(1, StringRef("pass-remarks-analysis"),
-                   StringRef("slp-vectorize"), false);
-
-  O = opts["pass-remarks"];
-  assert(O && "could not find LLVM option 'pass-remarks'");
-  O->addOccurrence(1, StringRef("pass-remarks"), StringRef("loop-vectorize"),
-                   false);
-  O->addOccurrence(1, StringRef("pass-remarks"), StringRef("slp-vectorize"),
-                   false);
+  set_opt("pass-remarks-missed", "loop-vectorize");
+  set_opt("pass-remarks-missed", "slp-vectorize");
+  set_opt("pass-remarks-analysis", "loop-vectorize");
+  set_opt("pass-remarks-analysis", "slp-vectorize");
+  set_opt("pass-remarks", "loop-vectorize");
+  set_opt("pass-remarks", "slp-vectorize");
 }
 
 void llvm_preprocess(llvm::Module *M) {

@@ -84,12 +84,31 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
              -Xclang -target-feature -Xclang +zicond \
              -mllvm -disable-loop-idiom-all
 
+# ─── Vortex 3.0 mode ─────────────────────────────────────────────────────
+# VORTEX_VER=3: VORTEX_HOME is the Vortex 3.0 source root (sw/ layout) and VORTEX_PATH its configured
+# build dir. The kernel ELF is built by Vortex's tests/regression/common.mk in a scratch cell
+# (examples/v3_cell.mk), the host links against <build>/sw/runtime/libvortex.so and runs with
+# VORTEX_DRIVER (default simx). VORTEX_CONFIGS must equal the CONFIGS the SimX driver was built with.
+VORTEX_VER ?= 2
+ifeq ($(VORTEX_VER),3)
+  VORTEX_CONFIGS ?= -DVX_CFG_NUM_CORES=$(VORTEX_NUM_CORES) -DVX_CFG_NUM_WARPS=$(VORTEX_NUM_WARPS) -DVX_CFG_NUM_THREADS=$(VORTEX_NUM_THREADS)
+  VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(KERNEL)_s$(SCHEDULE)_l$(LOCALMEM)
+  VX3_RT_DIR = $(VORTEX_PATH)/sw/runtime
+  export VORTEX_DRIVER ?= simx
+endif
+
 # ─── Derived ──────────────────────────────────────────────────────────────────
 DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_90.bc
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
 
+ifeq ($(VORTEX_VER),3)
+LD_LIB_PATH = ../../build/runtime/threadPool:$(VX3_RT_DIR):../../build/runtime
+HOST_VX_LIBDIRS = -L$(VX3_RT_DIR)
+else
 LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PATH)/runtime/lib:../../build/runtime
+HOST_VX_LIBDIRS = -L$(VORTEX_PATH)/runtime/ -L$(VORTEX_PATH)/runtime/lib/
+endif
 
 # ─── Top-level targets ────────────────────────────────────────────────────────
 all: build run
@@ -193,6 +212,19 @@ host.o: host.bc
 	g++ -g -O0 $< -c -o $@
 
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
+ifeq ($(VORTEX_VER),3)
+# Vortex 3.0: delegate the kernel ELF to Vortex's own regression makefile (see examples/v3_cell.mk).
+kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
+	@echo "--- Building kernel ELF with Vortex 3.0 tests/regression/common.mk in $(VX3_CELL)"
+	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
+	printf 'int main(){return 0;}\n' > dummy_host.cpp
+	cp $(CuPBoP_PATH)/examples/v3_cell.mk $(VX3_CELL)/Makefile
+	$(MAKE) -C $(VX3_CELL) kernel.vxbin kernel.dump CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
+		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) \
+		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
+	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
+	@echo "--- Kernel compilation completed!"
+else
 kernel.o: kernel.bc
 	@echo "--- Compiling kernel.bc"
 	$(LLVM_BIN)/clang++ $(VX_CFLAGS) $(VX_VXFLAGS) $< -c -o $@ > kernel.log 2>&1
@@ -219,13 +251,14 @@ kernel.vxbin: kernel.elf
 
 kernel.dump: kernel.elf
 	$(LLVM_BIN)/llvm-objdump -D $< > $@
+endif
 
 # ─── Step 9: host.out ────────────────────────────────────────────────────────
 host.out: host.o $(EXTRA_OBJS) kernel.vxbin lookup_global_symbols.txt
 	@echo "--- Linking host.out"
 	g++ -g -O0 -Wall \
 		-L../../build/runtime -L../../build/runtime/threadPool \
-		-L$(VORTEX_PATH)/runtime/ -L$(VORTEX_PATH)/runtime/lib/ -I$(VORTEX_PATH)/kernel/include \
+		$(HOST_VX_LIBDIRS) -I$(VORTEX_PATH)/kernel/include \
 		-o $@ -fPIC -no-pie \
 		host.o $(EXTRA_OBJS) \
 		-lc -lvortexRuntime -lvortex -lThreadPool -lpthread

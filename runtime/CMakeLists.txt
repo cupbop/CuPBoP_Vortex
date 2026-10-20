@@ -26,6 +26,13 @@ set(VORTEX_RUNTIME_INCLUDES
   "$ENV{VORTEX_HOME}/runtime/include"
   "$ENV{VORTEX_HOME}/kernel/include"
   "$ENV{VORTEX_HOME}/build/hw"
+  # Vortex 3.0 layout: sources under sw/, generated VX_types.h under <build>/sw
+  "$ENV{VORTEX_HOME}/sw/runtime/include"
+  "$ENV{VORTEX_HOME}/sw/kernel/include"
+  "$ENV{VORTEX_HOME}/sw/common"
+  "$ENV{VORTEX_HOME}/hw"
+  "$ENV{VORTEX_PATH}/sw"
+  "$ENV{VORTEX_PATH}/hw"
 )
 
 message(STATUS "VORTEX_PATH: $ENV{VORTEX_PATH}")
