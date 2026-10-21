@@ -37,7 +37,11 @@ jobs:
           clean: false
 
       - name: Run Sbatch file
-        run: chmod +x ./ci/run-crnch-cuda.sh && sbatch --wait --export=ALL ./ci/run-crnch-cuda.sh
+        run: |
+          chmod +x ./ci/run-crnch-cuda.sh
+          # Slurm log dir: the shared report dir when this account can write it, else inside the workspace
+          CI_LOG_DIR=/tools/ci-reports/CuPBoP_logs; [ -w "$CI_LOG_DIR" ] || { CI_LOG_DIR=$GITHUB_WORKSPACE/ci/logs_runner; mkdir -p "$CI_LOG_DIR"; }
+          sbatch --wait --export=ALL,CI_LOG_DIR=$CI_LOG_DIR -o $CI_LOG_DIR/CuPBoP-cuda-test-%j.out ./ci/run-crnch-cuda.sh
 
   tests:
     runs-on: self-hosted
@@ -102,7 +106,9 @@ jobs:
           export TEST_NAME="${{ matrix.name }}"
           export VORTEX_SCHEDULE_FLAG="${{ matrix.scheduler }}"
           export VORTEX_LOCALMEM_FLAG="${{ matrix.localmem }}"
-          chmod +x ./ci/run-crnch-cuda-test.sh && sbatch --wait --export=ALL ./ci/run-crnch-cuda-test.sh
+          chmod +x ./ci/run-crnch-cuda-test.sh
+          CI_LOG_DIR=/tools/ci-reports/CuPBoP_logs; [ -w "$CI_LOG_DIR" ] || { CI_LOG_DIR=$GITHUB_WORKSPACE/ci/logs_runner; mkdir -p "$CI_LOG_DIR"; }
+          sbatch --wait --export=ALL,CI_LOG_DIR=$CI_LOG_DIR -o $CI_LOG_DIR/CuPBoP-cuda-test-%j.out ./ci/run-crnch-cuda-test.sh
           echo "Showing last 100 lines of log:"
           LOG_FILE=/tools/ci-reports/CuPBoP_logs/${TEST_NAME}.out
           tail -n 100 $LOG_FILE

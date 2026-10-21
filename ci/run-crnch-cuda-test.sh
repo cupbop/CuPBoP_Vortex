@@ -9,7 +9,7 @@
 # GPU not needed: Vortex simx is a pure CPU emulator. Removing --gres=gpu:1
 # lets multiple matrix jobs share a node (allocated by CPU/memory only)
 # instead of serializing on the 1 GPU per node.
-#SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # Combined output and error messages file
+#SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # default only: ci.yml passes -o $CI_LOG_DIR/... (dir writable by the runner account)
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 
 # ci.yml "tests" job on Vortex 3.0: one matrix entry (TEST_NAME, VORTEX_SCHEDULE_FLAG, VORTEX_LOCALMEM_FLAG).

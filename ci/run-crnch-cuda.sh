@@ -9,7 +9,7 @@
 # GPU not needed: CuPBoP build uses clang (RISC-V target), no CUDA runtime.
 # Removing --gres=gpu:1 frees up GPU slots so more matrix jobs can run in
 # parallel on the same node.
-#SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # Combined output and error messages file
+#SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # default only: ci.yml passes -o $CI_LOG_DIR/... (dir writable by the runner account)
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 
 # ci.yml "build" job on Vortex 3.0: builds the CuPBoP translators + host runtime against the Vortex LLVM 20 of
