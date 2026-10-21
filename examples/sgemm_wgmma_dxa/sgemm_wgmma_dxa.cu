@@ -7,7 +7,8 @@
 // K-major and each is fetched as two 2-D boxes of 8 k x 64 rows per k-step. A box lands in local
 // memory as 64 rows of 16 bytes, i.e. exactly the canonical no-swizzle K-major core-matrix layout
 // with LBO = 1024 B (next K half) and SBO = 128 B (next 8-row group) -- the wgmma descriptor says so
-// and nothing else changes. Vortex-only example (the DXA host/device API has no GPU counterpart).
+// and nothing else changes. Double-buffered by default (DXA_STAGES=2). Vortex-only example (the DXA
+// host/device API has no GPU counterpart).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -39,6 +40,12 @@ __device__ unsigned int __vx_warps_per_group(void) { return 1; }
 #define WG_ACC (WG_N / 2)
 #define DXA_BOX_K 8   // inner box dimension: 8 fp16 = 16 bytes = one core-matrix row
 #define DXA_BOX_ROWS 64
+// Pipeline depth (lowering-recipe knob, -DDXA_STAGES=1|2 via EXTRA_CLANG_FLAGS):
+//   1: issue, wait, compute, sync per k-step (DXA latency exposed)
+//   2: the next k-step's boxes are issued into the other buffer while this one is computed
+#ifndef DXA_STAGES
+#define DXA_STAGES 2
+#endif
 
 #define CUDA_CHECK(_expr)                                                      \
   do {                                                                         \
@@ -84,33 +91,55 @@ __device__ __forceinline__ void wgmma_m64n64k16(float *d, uint64_t desc_a, uint6
 
 __global__ void __launch_bounds__(WG_THREADS)
 sgemm_wgmma_dxa_kernel(const half *A, const half *Bt, float *C, int M, int N, int K) {
-  __shared__ __align__(1024) half sA[WG_M * WG_K]; // 2 KB: two 1 KB K-halves of 64 x 16 B rows
-  __shared__ __align__(1024) half sB[WG_N * WG_K];
+  __shared__ __align__(1024) half sA[DXA_STAGES][WG_M * WG_K]; // 2 KB each: two 1 KB K-halves of 64 x 16 B rows
+  __shared__ __align__(1024) half sB[DXA_STAGES][WG_N * WG_K];
   const int tile_m = blockIdx.y * WG_M, tile_n = blockIdx.x * WG_N;
   const int tid = threadIdx.x;
-  const unsigned int bar = __vx_dxa_barrier_id(0);
+  const unsigned int bar[2] = {__vx_dxa_barrier_id(0), __vx_dxa_barrier_id(1)};
   const int is_dxa = __vx_is_dxa_warp();
   const unsigned int nwarps = __vx_warps_per_group();
   float d[WG_ACC];
 #pragma unroll
   for (int i = 0; i < WG_ACC; i++) d[i] = 0.f;
 
-  for (int k0 = 0; k0 < K; k0 += WG_K) {
-    if (is_dxa) { // one warp issues the four boxes; each adds one transaction to the barrier
-      __vx_dxa_issue_2d(DXA_DESC_A, bar, sA, k0, tile_m);
-      __vx_dxa_issue_2d(DXA_DESC_A, bar, sA + 8 * DXA_BOX_ROWS, k0 + DXA_BOX_K, tile_m);
-      __vx_dxa_issue_2d(DXA_DESC_B, bar, sB, k0, tile_n);
-      __vx_dxa_issue_2d(DXA_DESC_B, bar, sB + 8 * DXA_BOX_ROWS, k0 + DXA_BOX_K, tile_n);
-    }
-    __vx_barrier_arrive_and_wait(bar, nwarps); // all warps: tiles landed
+  // one warp issues the four boxes of a k-step into buffer `buf`; each adds one transaction to bar[buf]
+#define ISSUE_KSTEP(buf, kk)                                                              \
+  do {                                                                                    \
+    __vx_dxa_issue_2d(DXA_DESC_A, bar[buf], sA[buf], (kk), tile_m);                       \
+    __vx_dxa_issue_2d(DXA_DESC_A, bar[buf], sA[buf] + 8 * DXA_BOX_ROWS, (kk) + DXA_BOX_K, tile_m); \
+    __vx_dxa_issue_2d(DXA_DESC_B, bar[buf], sB[buf], (kk), tile_n);                       \
+    __vx_dxa_issue_2d(DXA_DESC_B, bar[buf], sB[buf] + 8 * DXA_BOX_ROWS, (kk) + DXA_BOX_K, tile_n); \
+  } while (0)
+
+#if DXA_STAGES == 2
+  if (is_dxa) ISSUE_KSTEP(0, 0);
+  int s = 0;
+  for (int k0 = 0; k0 < K; k0 += WG_K, s ^= 1) {
+    // prefetch the next k-step into the other buffer: its readers finished at the previous __syncthreads
+    if (is_dxa && k0 + WG_K < K) ISSUE_KSTEP(s ^ 1, k0 + WG_K);
+    __vx_barrier_arrive_and_wait(bar[s], nwarps); // this k-step's tiles landed
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    const uint64_t da = make_desc(sA), db = make_desc(sB);
+    const uint64_t da = make_desc(sA[s]), db = make_desc(sB[s]);
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+    wgmma_m64n64k16(d, da, db);
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    __syncthreads(); // all warps done reading buffer s before it is refilled two steps later
+  }
+#else
+  for (int k0 = 0; k0 < K; k0 += WG_K) {
+    if (is_dxa) ISSUE_KSTEP(0, k0);
+    __vx_barrier_arrive_and_wait(bar[0], nwarps); // all warps: tiles landed
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    const uint64_t da = make_desc(sA[0]), db = make_desc(sB[0]);
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
     wgmma_m64n64k16(d, da, db);
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     __syncthreads(); // before the next boxes overwrite the tiles
   }
+#endif
+#undef ISSUE_KSTEP
 
   const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int row = tile_m + 16 * warp + g;
