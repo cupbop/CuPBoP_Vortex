@@ -45,5 +45,6 @@ void printIR(llvm::Module *module_);
 bool triton_cupbop_enabled();
 void replace_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_wmma_intrinsics(llvm::Module *M);
+void replace_nvvm_mma_intrinsics(llvm::Module *M);
 void replace_cp_async_with_dxa(llvm::Module *M);
 #endif

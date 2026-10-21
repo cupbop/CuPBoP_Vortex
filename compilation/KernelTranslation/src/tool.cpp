@@ -986,6 +986,31 @@ void replace_built_in_function(llvm::Module *M) {
               }
               Call->replaceAllUsesWith(C32);
               need_remove.push_back(Call);
+            } else if (func_name == "llvm.nvvm.read.ptx.sreg.laneid") {
+              // CuLifter-lifted kernels read the lane id through this intrinsic
+              // (clang CUDA emits the `mov.u32 $0, %laneid;` asm, handled in
+              // replace_asm_call). Left alone it reaches the RISC-V backend and
+              // crashes ISel. 1:1 schedule: the hardware lane (vx_thread_id via
+              // __cupbop_laneid), consistent with the shuffle/vote wrappers and
+              // the mma.sync helpers. Flat schedule: the warp-loop index, as for
+              // the asm form.
+              IRBuilder<> builder(context);
+              builder.SetInsertPoint(Call);
+              Value *lane;
+              if (schedule == 2) {
+                FunctionCallee fc = M->getOrInsertFunction(
+                    "__cupbop_laneid", FunctionType::get(I32, {}, false));
+                CallInst *c = builder.CreateCall(fc, {}, "laneid");
+                MDNode *N =
+                    MDNode::get(context, MDString::get(context, "divergence"));
+                c->setMetadata("divergence", N);
+                lane = c;
+              } else {
+                lane = createLoad(builder,
+                                  M->getGlobalVariable("intra_warp_index"));
+              }
+              Call->replaceAllUsesWith(lane);
+              need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.barrier0") {
               if (schedule == 2) {
                 IRBuilder<> builder(context);
@@ -1837,6 +1862,23 @@ void replace_asm_call(llvm::Module *M) {
               Value *half_val = builder.CreateBitCast(src, HalfTy);
               Value *result = builder.CreateFPExt(half_val, F32, "cvt.f16.f32");
               Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("movmatrix.sync.aligned.m8n8.trans.b16") !=
+                       std::string::npos) {
+              // CuLifter form of SASS MOVM (8x8 b16 transpose across the warp):
+              //   %d = call i32 asm sideeffect "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;", "=r,r"(i32 %a)
+              // -> runtime helper on hardware shuffles (cudaKernelImpl.cpp). 1:1 schedule only.
+              IRBuilder<> builder(Call);
+              FunctionType *FT = FunctionType::get(I32, {I32}, false);
+              FunctionCallee FC = M->getOrInsertFunction(
+                  "__cupbop_movmatrix_m8n8_trans_b16", FT);
+              Value *src = Call->getArgOperand(0);
+              if (!src->getType()->isIntegerTy(32))
+                src = builder.CreateBitCast(src, I32);
+              Value *res = builder.CreateCall(FC, {src}, "movmatrix.trans");
+              if (!Call->getType()->isIntegerTy(32))
+                res = builder.CreateBitCast(res, Call->getType());
+              Call->replaceAllUsesWith(res);
               need_remove.push_back(Call);
             } else {
               if (cupbop_debug())
@@ -3056,6 +3098,94 @@ void replace_wmma_intrinsics(llvm::Module *M) {
 // calls. These appear when clang inlines the mma.hpp C++ helper functions
 // at compile time, leaving only the low-level NVVM intrinsics which
 // collectWMMADesc (demangled-name matcher) cannot catch.
+// =============================================================================
+// llvm.nvvm.mma.* (mma.sync) → runtime helpers
+//
+// CuLifter lifts SASS HMMA to the NVPTX mma.sync intrinsics (never to wmma):
+//   {f32,f32,f32,f32} @llvm.nvvm.mma.m16n8k16.row.col.f32.f32(<2 x half> a0..a3, <2 x half> b0,b1, f32 c0..c3)
+//   {f32,f32,f32,f32} @llvm.nvvm.mma.m16n8k8.row.col.f32.f32 (<2 x half> a0,a1,  <2 x half> b0,    f32 c0..c3)
+// Left alone they reach the Vortex RISC-V backend, which crashes in ISel. Lower them to
+//   void __cupbop_mma_m16n8k16_f16f32(i32 a0..a3, i32 b0,b1, f32 c0..c3, ptr d4)
+//   void __cupbop_mma_m16n8k8_f16f32 (i32 a0,a1,  i32 b0,    f32 c0..c3, ptr d4)
+// (cudaKernelImpl.cpp; PTX fragment layouts, fp32 FMAs over hardware shuffles; a TCU-backed
+// variant can replace them behind the same symbols). Only the f16 x f16 -> f32 row.col forms
+// are implemented; anything else is reported and aborts the translation.
+// =============================================================================
+void replace_nvvm_mma_intrinsics(llvm::Module *M) {
+  LLVMContext &Ctx = M->getContext();
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
+
+  SmallVector<CallInst *, 16> ToReplace;
+  for (Function &F : *M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Callee = CI->getCalledFunction())
+            if (Callee->getName().starts_with("llvm.nvvm.mma."))
+              ToReplace.push_back(CI);
+  if (ToReplace.empty())
+    return;
+
+  DBG_PRINT("[nvvm-mma] found %zu NVVM mma.sync intrinsics to replace\n",
+            ToReplace.size());
+
+  for (CallInst *CI : ToReplace) {
+    StringRef Name = CI->getCalledFunction()->getName();
+    bool k16 = Name.contains(".m16n8k16.");
+    bool k8 = Name.contains(".m16n8k8.");
+    bool ok = (k16 || k8) && Name.contains(".row.col.") && Name.ends_with(".f32.f32");
+    unsigned nA = k16 ? 4 : 2, nB = k16 ? 2 : 1;
+    if (!ok || CI->arg_size() != nA + nB + 4) {
+      fprintf(stderr,
+              "error: unsupported mma.sync intrinsic %s (%u operands); only "
+              "m16n8k16/m16n8k8 .row.col f16*f16->f32 are lowered\n",
+              Name.str().c_str(), (unsigned)CI->arg_size());
+      exit(1);
+    }
+    const char *rtName = k16 ? "__cupbop_mma_m16n8k16_f16f32"
+                             : "__cupbop_mma_m16n8k8_f16f32";
+    DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.str().c_str(), rtName);
+
+    IRBuilder<> B(CI);
+    SmallVector<Value *, 12> Args;
+    SmallVector<Type *, 12> ArgTys;
+    for (unsigned i = 0; i < nA + nB; i++) { // <2 x half> fragments as packed i32
+      Value *V = CI->getArgOperand(i);
+      if (!V->getType()->isIntegerTy(32))
+        V = B.CreateBitCast(V, I32);
+      Args.push_back(V);
+      ArgTys.push_back(I32);
+    }
+    for (unsigned i = 0; i < 4; i++) { // fp32 accumulators
+      Value *V = CI->getArgOperand(nA + nB + i);
+      if (!V->getType()->isFloatTy())
+        V = B.CreateBitCast(V, F32);
+      Args.push_back(V);
+      ArgTys.push_back(F32);
+    }
+    Type *DTy = ArrayType::get(F32, 4);
+    IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
+    Value *D = AB.CreateAlloca(DTy, nullptr, "mma.d");
+    Args.push_back(D);
+    ArgTys.push_back(PtrTy);
+
+    FunctionCallee FC =
+        M->getOrInsertFunction(rtName, FunctionType::get(VoidTy, ArgTys, false));
+    B.CreateCall(FC, Args);
+
+    Value *Result = UndefValue::get(CI->getType()); // {f32, f32, f32, f32}
+    for (unsigned i = 0; i < 4; i++) {
+      Value *GEP = B.CreateConstInBoundsGEP2_32(DTy, D, 0, i);
+      Result = B.CreateInsertValue(Result, B.CreateLoad(F32, GEP), i);
+    }
+    CI->replaceAllUsesWith(Result);
+    CI->eraseFromParent();
+  }
+}
+
 void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
   LLVMContext &Ctx = M->getContext();
   Type *F32 = Type::getFloatTy(Ctx);

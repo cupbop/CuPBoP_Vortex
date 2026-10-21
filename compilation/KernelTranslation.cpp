@@ -135,6 +135,7 @@ int main(int argc, char **argv) {
   DBG_LOG("replace_wmma_intrinsics\n");
   replace_wmma_intrinsics(program);
   replace_nvvm_wmma_intrinsics(program);
+  replace_nvvm_mma_intrinsics(program); // CuLifter-lifted HMMA (mma.sync intrinsics)
   dumpFile(program, "5_after_wmma.ll");
 
   VerifyModule(program);

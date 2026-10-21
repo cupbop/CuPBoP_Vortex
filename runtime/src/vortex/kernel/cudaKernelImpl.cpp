@@ -883,3 +883,98 @@ void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
     __atomic_fetch_add(addr, val, __ATOMIC_RELAXED);
   }
 }
+
+// =============================================================================
+// mma.sync lowering for lifted (CuLifter) kernels
+// =============================================================================
+// CuLifter emits SASS HMMA as the NVPTX intrinsics
+//   llvm.nvvm.mma.m16n8k16.row.col.f32.f32  (sm_80: A 4x<2 x half>, B 2x<2 x half>, C/D 4xf32)
+//   llvm.nvvm.mma.m16n8k8.row.col.f32.f32   (sm_75: A 2x<2 x half>, B 1x<2 x half>, C/D 4xf32)
+// and SASS MOVM as the inline asm `movmatrix.sync.aligned.m8n8.trans.b16`.
+// kernelTranslator (replace_nvvm_mma_intrinsics / replace_asm_call) lowers them to the helpers
+// below. Fragment layouts are the PTX ISA ones: groupID = lane >> 2, tig = lane & 3,
+//   A(16xK,row): a0 = A[g][2t..2t+1], a1 = A[g+8][2t..], a2 = A[g][2t+8..], a3 = A[g+8][2t+8..]
+//   B(Kx8,col):  b0 = B[2t..2t+1][g], b1 = B[2t+8..][g]
+//   C/D(16x8):   c0 = C[g][2t], c1 = C[g][2t+1], c2 = C[g+8][2t], c3 = C[g+8][2t+1]
+// (low 16 bits of a register = the lower column/row index). This is the software reference:
+// fp32 FMAs over hardware index shuffles, SCHE_2 / 1:1 only (lane = hardware thread, all 32
+// lanes active, as mma.sync requires). A TCU-backed variant can replace it behind the same
+// symbols; keep the two numerically comparable (products exact in fp32, k-ordered sums).
+// %laneid for the 1:1 schedule: the hardware lane, like the shuffle/vote wrappers above.
+extern "C" int __cupbop_laneid() { return vx_thread_id(); }
+
+static inline float __cupbop_f16_to_f32(uint32_t h) {
+  h &= 0xffffu;
+  uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
+  if (e == 0) {
+    if (m == 0) {
+      bits = sign;
+    } else { // subnormal: value = m * 2^-24
+      int sh = 0;
+      while (!(m & 0x400u)) { m <<= 1; ++sh; }
+      bits = sign | ((uint32_t)(113 - sh) << 23) | ((m & 0x3ffu) << 13);
+    }
+  } else if (e == 31) {
+    bits = sign | 0x7f800000u | (m << 13);
+  } else {
+    bits = sign | ((e + 112u) << 23) | (m << 13);
+  }
+  float f;
+  __builtin_memcpy(&f, &bits, 4);
+  return f;
+}
+static inline uint32_t __cupbop_shfl32(uint32_t v, int src_lane) {
+  return (uint32_t)vx_shfl_idx((size_t)v, src_lane, 31, 0); // full-warp index gather
+}
+
+// movmatrix.sync.aligned.m8n8.trans.b16: 8x8 b16 matrix, lane holds M[g][2t..2t+1]; result is the
+// transpose in the same layout, i.e. {M[2t][g], M[2t+1][g]}.
+extern "C" uint32_t __cupbop_movmatrix_m8n8_trans_b16(uint32_t a) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const uint32_t x = __cupbop_shfl32(a, ((2 * t) << 2) | (g >> 1));     // owner of M[2t][g]
+  const uint32_t y = __cupbop_shfl32(a, ((2 * t + 1) << 2) | (g >> 1)); // owner of M[2t+1][g]
+  const int sh = 16 * (g & 1);
+  return ((x >> sh) & 0xffffu) | (((y >> sh) & 0xffffu) << 16);
+}
+
+// D = A(16x16,f16,row) * B(16x8,f16,col) + C(16x8,f32)
+extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1,
+                                             float c0, float c1, float c2, float c3, float *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
+  float d0 = c0, d1 = c1, d2 = c2, d3 = c3;
+  for (int kk = 0; kk < 8; ++kk) { // k = 2kk, 2kk+1 ; owner tig = kk & 3 ; k >= 8 -> a2/a3, b1
+    const int q = kk & 3;
+    const uint32_t xa = __cupbop_shfl32(kk < 4 ? a0 : a2, la | q);  // A[g][k..k+1]
+    const uint32_t ya = __cupbop_shfl32(kk < 4 ? a1 : a3, la | q);  // A[g+8][k..k+1]
+    const uint32_t ub = __cupbop_shfl32(kk < 4 ? b0 : b1, lb0 | q); // B[k..k+1][2t]
+    const uint32_t vb = __cupbop_shfl32(kk < 4 ? b0 : b1, lb1 | q); // B[k..k+1][2t+1]
+    for (int h = 0; h < 32; h += 16) {
+      const float ag = __cupbop_f16_to_f32(xa >> h), ag8 = __cupbop_f16_to_f32(ya >> h);
+      const float bn0 = __cupbop_f16_to_f32(ub >> h), bn1 = __cupbop_f16_to_f32(vb >> h);
+      d0 += ag * bn0; d1 += ag * bn1; d2 += ag8 * bn0; d3 += ag8 * bn1;
+    }
+  }
+  d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
+}
+
+// D = A(16x8,f16,row) * B(8x8,f16,col) + C(16x8,f32)
+extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
+                                            float c0, float c1, float c2, float c3, float *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
+  float d0 = c0, d1 = c1, d2 = c2, d3 = c3;
+  for (int kk = 0; kk < 4; ++kk) { // k = 2kk, 2kk+1 ; owner tig = kk
+    const uint32_t xa = __cupbop_shfl32(a0, la | kk);
+    const uint32_t ya = __cupbop_shfl32(a1, la | kk);
+    const uint32_t ub = __cupbop_shfl32(b0, lb0 | kk);
+    const uint32_t vb = __cupbop_shfl32(b0, lb1 | kk);
+    for (int h = 0; h < 32; h += 16) {
+      const float ag = __cupbop_f16_to_f32(xa >> h), ag8 = __cupbop_f16_to_f32(ya >> h);
+      const float bn0 = __cupbop_f16_to_f32(ub >> h), bn1 = __cupbop_f16_to_f32(vb >> h);
+      d0 += ag * bn0; d1 += ag * bn1; d2 += ag8 * bn0; d3 += ag8 * bn1;
+    }
+  }
+  d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
+}
