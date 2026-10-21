@@ -22,7 +22,10 @@ export VORTEX_DRIVER=${VORTEX_DRIVER:-simx}
 # Zacas (amocas.w/d) as well: without it atomicCAS lowers to an lr/sc loop, and lanes of one warp
 # retrying on the same cache line in lockstep livelock in SimX 3.0 (line-granular reservations:
 # lane 0's sc always wins and kills lane 1's reservation) — bh-cuda SCHE_2 TreeBuildingKernel hung.
-export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE"}
+# L2: SimX 3.0 commits AMOs at the last-level cache (sim/simx/mem/cache.cpp commitAmo); with L2/L3 off
+# every core's private L1 is the LLC (socket.cpp:93), so atomics from different cores update stale private
+# copies and lose updates (marchingCubes SCHE_2 counts always low; PASS with 1 core or with L2, job 174316).
+export VORTEX_CONFIGS=${VORTEX_CONFIGS:-"-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_L2_ENABLE"}
 # sgemm_tcu / sgemm_dxa / sgemm_tcu_dxa need the TCU and DXA extensions, which 3.0 also leaves off by
 # default; they run against a second SimX build (VORTEX_PATH_TCU) configured with these flags.
 export VORTEX_CONFIGS_TCU=${VORTEX_CONFIGS_TCU:-"$VORTEX_CONFIGS -DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE"}
