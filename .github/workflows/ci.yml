@@ -28,6 +28,8 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: self-hosted
+    # Self-hosted runner on a public repo: never run code from a fork's pull request here.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
       - name: Checkout Repositoty
@@ -46,6 +48,7 @@ jobs:
   tests:
     runs-on: self-hosted
     needs: build
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -151,7 +154,7 @@ jobs:
   complete:
     runs-on: self-hosted
     needs: tests
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
       - name: Check Completion
