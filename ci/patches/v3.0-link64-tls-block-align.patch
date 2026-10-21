@@ -1,0 +1,26 @@
+diff --git a/sw/kernel/scripts/link64.ld b/sw/kernel/scripts/link64.ld
+index aa6b87ff..21480054 100644
+--- a/sw/kernel/scripts/link64.ld
++++ b/sw/kernel/scripts/link64.ld
+@@ -97,7 +97,11 @@ SECTIONS
+   .gcc_except_table   : ONLY_IF_RW { *(.gcc_except_table .gcc_except_table.*) }
+   .exception_ranges   : ONLY_IF_RW { *(.exception_ranges*) }
+   /* Thread Local Storage sections  */
+-  .tdata	  :
++  /* Align the start of the TLS image: __tls_block_size (below) is the per-hart stride measured from
++     __tdata_start, so if .tdata starts at a 4-aligned address (it has no ALIGN and may be empty)
++     the stride picks up the .tbss ALIGN(8) padding and becomes e.g. 44 bytes -> every odd hart's tp
++     is 4-aligned and 8-byte TLS loads/stores trap with "misaligned memory access". */
++  .tdata	ALIGN(16) :
+    {
+      PROVIDE_HIDDEN (__tdata_start = .);
+      *(.tdata .tdata.* .gnu.linkonce.td.*)
+@@ -117,7 +121,7 @@ SECTIONS
+      __tbss_size alone made adjacent harts' images overlap by
+      __tbss_offset bytes. __tbss_offset and __tbss_size are both
+      section-aligned, so their sum keeps the image alignment. */
+-  PROVIDE(__tls_block_size = __tbss_offset + __tbss_size);
++  PROVIDE(__tls_block_size = ALIGN(__tbss_offset + __tbss_size, 16));
+   .preinit_array    :
+   {
+     PROVIDE_HIDDEN (__preinit_array_start = .);
