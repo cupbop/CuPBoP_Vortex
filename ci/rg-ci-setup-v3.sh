@@ -46,6 +46,9 @@ export PATH=$LLVM_VORTEX/bin:$PATH
 export LD_LIBRARY_PATH=$CuPBoP_PATH/build/runtime:$CuPBoP_PATH/build/runtime/threadPool:$VORTEX_PATH/sw/runtime:$LLVM_VORTEX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export CC=gcc
 export CXX=g++
+# The Vortex build dirs under VORTEX_HOME are shared between the runner account and the maintainers who install or
+# refresh them (both build SimX and the regression cells there), so make everything created from here group-writable.
+umask 002
 
 # cupbop_v3_ensure_simx <build_dir> <VX_CFG flags>
 # Configure <build_dir> (once) and build its SimX driver with the given flags: hw (config headers), sw/kernel
