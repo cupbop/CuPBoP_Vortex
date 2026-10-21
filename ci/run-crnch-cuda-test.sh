@@ -12,13 +12,20 @@
 #SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # Combined output and error messages file
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 
+# ci.yml "tests" job on Vortex 3.0: one matrix entry (TEST_NAME, VORTEX_SCHEDULE_FLAG, VORTEX_LOCALMEM_FLAG).
+# `make ci` translates the example with the CuPBoP build of the build job, builds the kernel ELF in a Vortex
+# regression cell and runs it on the SimX of ci/rg-ci-setup-v3.sh (the TCU+DXA SimX for the tensor examples).
+
 cd $GITHUB_WORKSPACE
 hostname
 
-export FINAL_OUTPUT_PATH="/tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-${SLURM_JOB_ID}.out"
-apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBoP-Vortex/ /projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif /bin/bash << 'EOF'
+CI_LOG_DIR=${CI_LOG_DIR:-/tools/ci-reports/CuPBoP_logs}
+export FINAL_OUTPUT_PATH="$CI_LOG_DIR/CuPBoP-cuda-test-${SLURM_JOB_ID}.out"
+apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBoP-Vortex/ ${CI_EXTRA_BINDS:+-B $CI_EXTRA_BINDS} /projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif /bin/bash << 'EOF_IN'
     set -e
-    source "./ci/rg-ci-setup.sh"
+    source "./ci/rg-ci-setup-v3.sh"
+    cupbop_v3_select_simx "$TEST_NAME"
+    echo "test=$TEST_NAME schedule=$VORTEX_SCHEDULE_FLAG localmem=${VORTEX_LOCALMEM_FLAG:-1} simx=$VORTEX_PATH"
 
     cd ./examples
     make -C ${TEST_NAME} clean
@@ -26,8 +33,8 @@ apptainer exec --nv -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/
     rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}*LOCAL_MEM_${LMEM_FLAG}*.txt
     rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}.txt
     rm -f ${TEST_NAME}/ci_status_SCHE_${VORTEX_SCHEDULE_FLAG}_LMEM_${LMEM_FLAG}.txt
-    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG} LOCALMEM=${VORTEX_LOCALMEM_FLAG:-1}
+    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG} LOCALMEM=${LMEM_FLAG}
     exit 0
-EOF
+EOF_IN
 
-ln -sf /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-${SLURM_JOB_ID}.out /tools/ci-reports/CuPBoP_logs/${TEST_NAME}.out
+ln -sf "$FINAL_OUTPUT_PATH" "$CI_LOG_DIR/${TEST_NAME}.out"

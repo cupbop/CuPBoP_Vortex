@@ -12,6 +12,14 @@
 # limitations under the License.
 #
 # Modified from Vortex CI by Aaron Kantsevoy (akantsevoy3@gatech.edu)
+#
+# Target: Vortex 3.0 (release tag v3.0) with toolchain v3.0.1 (Vortex LLVM 20), both installed under
+# /projects/ci-runners/CuPBoP-Vortex/tools (vortex_v3.0, tools-v3.0.1); environment: ci/rg-ci-setup-v3.sh.
+#   build : ci/run-crnch-cuda.sh      — CuPBoP translators + host runtime, and the two SimX drivers
+#                                        (main config, TCU+DXA config for the tensor examples)
+#   tests : ci/run-crnch-cuda-test.sh — `make ci` of one matrix entry inside the CI container
+#   verify: ci/check_correctness.sh   — per-example rule (program verdict / golden compare / exact diff)
+# The same 77-entry matrix can be run as one Slurm job with ci/run-v3-matrix.sbatch.
 
 name: CI
 
@@ -111,108 +119,11 @@ jobs:
       - name: Verify Correctness
         if: always()
         run: |
-          export TEST_NAME="${{ matrix.name }}"
-          export SCHEDULE="${{ matrix.scheduler }}"
-          export LMEM="${{ matrix.localmem }}"
+          # Rules live in ci/check_correctness.sh (shared with ci/run-v3-matrix.sbatch). It prints the verdict,
+          # writes examples/<test>/ci_status_SCHE_<s>_LMEM_<l>.txt and exits 1 on FAIL.
           echo "PWD: $(pwd)"
-          ls -la ./examples/${TEST_NAME}/ci_output.txt || echo "ci_output.txt NOT FOUND"
-          ls -la ./examples/${TEST_NAME}/golden_output.txt || echo "golden_output.txt NOT FOUND"
-          EXAMPLE_DIR="./examples/${TEST_NAME}"
-          CI_OUTPUT="${EXAMPLE_DIR}/ci_output.txt"
-          STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}_LMEM_${LMEM}.txt"
-
-          RESULT="FAIL"
-          case $TEST_NAME in
-            saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|huffman|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
-              if [ -f "$CI_OUTPUT" ] && grep -q "PASSED" "$CI_OUTPUT" && ! grep -q "^FAIL" "$CI_OUTPUT"; then
-                echo "Correctness: PASS"
-                RESULT="PASS"
-              else
-                echo "Correctness: FAIL (PASSED not found or FAIL detected)"
-                [ -f "$CI_OUTPUT" ] && tail -20 "$CI_OUTPUT"
-              fi
-              ;;
-            backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda)
-              GOLDEN="${EXAMPLE_DIR}/golden_output.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$CI_OUTPUT" ]; then
-                if python3 ./ci/compare_golden.py "$GOLDEN" "$CI_OUTPUT" --tolerance=1e-4; then
-                  RESULT="PASS"
-                fi
-              else
-                echo "Correctness: FAIL (golden or CI output missing)"
-              fi
-              ;;
-            nw)
-              GOLDEN="${EXAMPLE_DIR}/golden_result_nw.txt"
-              RESULT_FILE="${EXAMPLE_DIR}/result_vortex.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
-                diff -q "$GOLDEN" "$RESULT_FILE" && echo "Correctness: PASS" && RESULT="PASS" || { echo "Correctness: FAIL"; diff "$GOLDEN" "$RESULT_FILE" || true; }
-              else
-                echo "Correctness: FAIL (golden or result file missing)"
-              fi
-              ;;
-            hotspot)
-              GOLDEN="${EXAMPLE_DIR}/golden_output_hotspot.txt"
-              RESULT_FILE="${EXAMPLE_DIR}/output.out"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
-                if python3 ./ci/compare_golden.py "$GOLDEN" "$RESULT_FILE" --tolerance=1e-4; then
-                  RESULT="PASS"
-                fi
-              else
-                echo "Correctness: FAIL (golden or output file missing)"
-              fi
-              ;;
-            bfs)
-              GOLDEN="${EXAMPLE_DIR}/golden_result_bfs.txt"
-              RESULT_FILE="${EXAMPLE_DIR}/result_vortex.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
-                if diff -q "$GOLDEN" "$RESULT_FILE" > /dev/null 2>&1; then
-                  echo "Correctness: PASS"
-                  RESULT="PASS"
-                else
-                  echo "Correctness: FAIL"
-                  diff "$GOLDEN" "$RESULT_FILE" || true
-                fi
-              else
-                echo "Correctness: FAIL (golden or result file missing)"
-              fi
-              ;;
-            streamcluster)
-              GOLDEN="${EXAMPLE_DIR}/golden_result_streamcluster.txt"
-              RESULT_FILE="${EXAMPLE_DIR}/output.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
-                if python3 ./ci/compare_golden.py "$GOLDEN" "$RESULT_FILE" --tolerance=1e-4; then
-                  RESULT="PASS"
-                fi
-              else
-                echo "Correctness: FAIL (golden or result file missing)"
-              fi
-              ;;
-            btree)
-              GOLDEN="${EXAMPLE_DIR}/golden_result_btree.txt"
-              RESULT_FILE="${EXAMPLE_DIR}/output.txt"
-              if [ -f "$GOLDEN" ] && [ -f "$RESULT_FILE" ]; then
-                if diff -q "$GOLDEN" "$RESULT_FILE" > /dev/null 2>&1; then
-                  echo "Correctness: PASS"
-                  RESULT="PASS"
-                else
-                  echo "Correctness: FAIL"
-                  diff "$GOLDEN" "$RESULT_FILE" || true
-                fi
-              else
-                echo "Correctness: FAIL (golden or result file missing)"
-              fi
-              ;;
-            *)
-              echo "No correctness check defined for $TEST_NAME"
-              RESULT="SKIP"
-              ;;
-          esac
-
-          echo "$RESULT" > "$STATUS_FILE"
-          if [ "$RESULT" = "FAIL" ]; then
-            exit 1
-          fi
+          chmod +x ./ci/check_correctness.sh
+          ./ci/check_correctness.sh "${{ matrix.name }}" "${{ matrix.scheduler }}" "${{ matrix.localmem }}"
 
       - name: Report Performance
         if: always()

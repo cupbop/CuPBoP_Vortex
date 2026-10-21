@@ -85,3 +85,7 @@ run_build.sh
 # Other CUDA header files
 cuda-header.tar.gz
 cuda_12.1.1_530.30.02_linux.run
+
+# CuPBoP CI on Vortex 3.0: per-run logs of ci/run-v3-matrix.sbatch
+ci/logs_v3/*
+!ci/logs_v3/.gitkeep

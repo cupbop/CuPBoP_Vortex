@@ -1,4 +1,6 @@
 #!/bin/bash
+# LEGACY: Vortex 2.0 (tools/vortex_bugfix_branch) + LLVM 18 environment of the pre-3.0 CI. Not sourced by
+# .github/workflows/ci.yml any more; kept only to reproduce old results. Current environment: ci/rg-ci-setup-v3.sh.
 
 # Loading NVCC
 # module use /projects/tools/x86_64/ubuntu-22.04/nvhpc-24.9/modulefiles/
