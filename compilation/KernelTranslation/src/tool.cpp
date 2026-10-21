@@ -3145,9 +3145,20 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
               Name.str().c_str(), (unsigned)CI->arg_size());
       exit(1);
     }
-    const char *rtName = k16 ? "__cupbop_mma_m16n8k16_f16f32"
+    // CUPBOP_MMA_LOWERING: auto (default; the runtime dispatches to its TCU-backed
+    // helper when the kernel is built for a TCU-enabled Vortex, else software),
+    // sw (force the software reference), tcu (force the TCU-backed helper; links
+    // only against a TCU build). A lowering-recipe knob for lifted tensor kernels.
+    std::string rtName = k16 ? "__cupbop_mma_m16n8k16_f16f32"
                              : "__cupbop_mma_m16n8k8_f16f32";
-    DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.str().c_str(), rtName);
+    if (const char *env = std::getenv("CUPBOP_MMA_LOWERING")) {
+      std::string mode(env);
+      if (mode == "sw" || mode == "tcu")
+        rtName += "_" + mode;
+      else if (mode != "auto" && !mode.empty())
+        fprintf(stderr, "warning: CUPBOP_MMA_LOWERING=%s unknown (auto|sw|tcu); using auto\n", env);
+    }
+    DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.str().c_str(), rtName.c_str());
 
     IRBuilder<> B(CI);
     SmallVector<Value *, 12> Args;
@@ -3173,7 +3184,7 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     ArgTys.push_back(PtrTy);
 
     FunctionCallee FC =
-        M->getOrInsertFunction(rtName, FunctionType::get(VoidTy, ArgTys, false));
+        M->getOrInsertFunction(rtName.c_str(), FunctionType::get(VoidTy, ArgTys, false));
     B.CreateCall(FC, Args);
 
     Value *Result = UndefValue::get(CI->getType()); // {f32, f32, f32, f32}

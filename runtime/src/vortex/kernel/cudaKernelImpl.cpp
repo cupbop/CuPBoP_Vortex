@@ -900,6 +900,9 @@ void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
 // fp32 FMAs over hardware index shuffles, SCHE_2 / 1:1 only (lane = hardware thread, all 32
 // lanes active, as mma.sync requires). A TCU-backed variant can replace it behind the same
 // symbols; keep the two numerically comparable (products exact in fp32, k-ordered sums).
+// Three symbols per shape: <name>_sw (this reference), <name>_tcu (TCU-backed, TCU builds only) and
+// <name> (dispatch: _tcu when available unless CUPBOP_MMA_SW is defined). kernelTranslator picks the
+// suffix from CUPBOP_MMA_LOWERING=auto|sw|tcu.
 // %laneid for the 1:1 schedule: the hardware lane, like the shuffle/vote wrappers above.
 extern "C" int __cupbop_laneid() { return vx_thread_id(); }
 
@@ -938,7 +941,7 @@ extern "C" uint32_t __cupbop_movmatrix_m8n8_trans_b16(uint32_t a) {
 }
 
 // D = A(16x16,f16,row) * B(16x8,f16,col) + C(16x8,f32)
-extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+extern "C" void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                              uint32_t b0, uint32_t b1,
                                              float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
@@ -960,7 +963,7 @@ extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t 
 }
 
 // D = A(16x8,f16,row) * B(8x8,f16,col) + C(16x8,f32)
-extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
+extern "C" void __cupbop_mma_m16n8k8_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
                                             float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
@@ -977,4 +980,90 @@ extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b
     }
   }
   d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
+}
+
+// ---- TCU-backed variant ----------------------------------------------------------------------
+#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE)
+// vx_tensor.h layouts for NT=32, NR=8, fp16->fp32 (tcM=8, tcN=4, tcK=4, tile m16n16k32), lane l,
+// g = l>>2, t = l&3:
+//   A  reg r : row g + 8*(r>>2),  k = 8*(r&3) + 2t + {0,1}   (low half = lower k)
+//   B  reg r : k = 8*(r>>1) + 2t + {0,1},  n = g + 8*(r&1)    (pack_row: low half = lower k)
+//   C/D reg r: row g + 8*(r>>2),  col t + 4*(r&3)
+// The PTX m16n8k16 fragments of the *same lane* are A: a0=(g,2t..) a1=(g+8,2t..) a2=(g,2t+8..)
+// a3=(g+8,2t+8..) and B: b0=(2t..,g) b1=(2t+8..,g), so A and B map register-for-register:
+//   fa = {a0, a2, 0, 0, a1, a3, 0, 0}   (k >= 16 zero)      fb = {b0, 0, b1, 0, 0, 0, 0, 0}   (n >= 8, k >= 16 zero)
+// Only the accumulator columns differ (PTX: 2t, 2t+1 ; Vortex: t, t+4), hence 8 shuffles in and 8 out.
+// The padded three quarters of the tile cost nothing extra: one macro-op either way. Fusing the two
+// N-halves (and two K-steps) that CuLifter emits as separate mma calls would fill the tile; that
+// needs the translator to pair calls and is a later recipe option.
+static_assert(tcu_ctx::tileM == 16 && tcu_ctx::tileN == 16 && tcu_ctx::tileK == 32, "TCU-backed mma.sync helpers assume the NT=32 m16n16k32 tile");
+static_assert(tcu_ctx::fragment_a::NR == 8 && tcu_ctx::fragment_b::NR == 8 && tcu_ctx::fragment_acc::NR == 8, "8 registers per fragment");
+static inline float __cupbop_u32_as_f32(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+static inline float __cupbop_shflf(float v, int src_lane) {
+  uint32_t u; __builtin_memcpy(&u, &v, 4);
+  u = __cupbop_shfl32(u, src_lane);
+  float f; __builtin_memcpy(&f, &u, 4); return f;
+}
+// PTX accumulator (c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)) -> Vortex acc regs 0,1,4,5 (cols t, t+4)
+static inline void __cupbop_acc_nv_to_vx(float c0, float c1, float c2, float c3, tcu_ctx::fragment_acc &fc) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int s0 = (g << 2) | (t >> 1), s1 = (g << 2) | ((t >> 1) + 2); // owners of col t and col t+4
+  const bool odd = t & 1;                                              // their slot
+  const float x0 = __cupbop_shflf(c0, s0), x1 = __cupbop_shflf(c1, s0);
+  const float y0 = __cupbop_shflf(c0, s1), y1 = __cupbop_shflf(c1, s1);
+  const float z0 = __cupbop_shflf(c2, s0), z1 = __cupbop_shflf(c3, s0);
+  const float w0 = __cupbop_shflf(c2, s1), w1 = __cupbop_shflf(c3, s1);
+  fc.data[0] = odd ? x1 : x0; fc.data[1] = odd ? y1 : y0; fc.data[2] = 0.f; fc.data[3] = 0.f;
+  fc.data[4] = odd ? z1 : z0; fc.data[5] = odd ? w1 : w0; fc.data[6] = 0.f; fc.data[7] = 0.f;
+}
+// Vortex acc regs -> PTX d0..d3
+static inline void __cupbop_acc_vx_to_nv(const tcu_ctx::fragment_acc &fd, float *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int u0 = (g << 2) | ((2 * t) & 3), u1 = u0 + 1; // holders of col 2t and 2t+1
+  const bool hi = t >> 1;                               // in reg 1/5 (col >= 4) or reg 0/4
+  const float p0 = __cupbop_shflf(fd.data[0], u0), p1 = __cupbop_shflf(fd.data[1], u0);
+  const float q0 = __cupbop_shflf(fd.data[0], u1), q1 = __cupbop_shflf(fd.data[1], u1);
+  const float r0 = __cupbop_shflf(fd.data[4], u0), r1 = __cupbop_shflf(fd.data[5], u0);
+  const float v0 = __cupbop_shflf(fd.data[4], u1), v1 = __cupbop_shflf(fd.data[5], u1);
+  d[0] = hi ? p1 : p0; d[1] = hi ? q1 : q0; d[2] = hi ? r1 : r0; d[3] = hi ? v1 : v0;
+}
+extern "C" void __cupbop_mma_m16n8k16_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                 uint32_t b0, uint32_t b1,
+                                                 float c0, float c1, float c2, float c3, float *d) {
+  tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
+  fa.data = {{__cupbop_u32_as_f32(a0), __cupbop_u32_as_f32(a2), 0.f, 0.f, __cupbop_u32_as_f32(a1), __cupbop_u32_as_f32(a3), 0.f, 0.f}};
+  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, __cupbop_u32_as_f32(b1), 0.f, 0.f, 0.f, 0.f, 0.f}};
+  __cupbop_acc_nv_to_vx(c0, c1, c2, c3, fc);
+  tcu_ctx::mma_sync(fd, fa, fb, fc);
+  __cupbop_acc_vx_to_nv(fd, d);
+}
+extern "C" void __cupbop_mma_m16n8k8_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
+                                                float c0, float c1, float c2, float c3, float *d) {
+  tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
+  fa.data = {{__cupbop_u32_as_f32(a0), 0.f, 0.f, 0.f, __cupbop_u32_as_f32(a1), 0.f, 0.f, 0.f}};
+  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
+  __cupbop_acc_nv_to_vx(c0, c1, c2, c3, fc);
+  tcu_ctx::mma_sync(fd, fa, fb, fc);
+  __cupbop_acc_vx_to_nv(fd, d);
+}
+#define CUPBOP_MMA_TCU_AVAILABLE 1
+#endif // TCU-backed variant
+
+// ---- dispatch symbols (what kernelTranslator emits for CUPBOP_MMA_LOWERING=auto) ----------------
+extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1,
+                                             float c0, float c1, float c2, float c3, float *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k16_f16f32_tcu(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+#else
+  __cupbop_mma_m16n8k16_f16f32_sw(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+#endif
+}
+extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
+                                            float c0, float c1, float c2, float c3, float *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k8_f16f32_tcu(a0, a1, b0, c0, c1, c2, c3, d);
+#else
+  __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, c0, c1, c2, c3, d);
+#endif
 }
