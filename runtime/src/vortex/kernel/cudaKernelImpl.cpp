@@ -394,17 +394,33 @@ static_assert(sizeof(tcu_ctx::fragment_a) <= 32 && sizeof(tcu_ctx::fragment_b) <
               "translator fragment storage is 8 x 32-bit per lane");
 } // namespace
 
+// CUDA m16n16k16 fragments on the NT=32 m16n16k32 tile: load_matrix_sync reads 32 k-columns
+// (A regs r with (r&3) >= 2, B regs r with (r>>1) >= 2 hold k = 16..31). A CUDA k16 step must
+// not see them (they are the next step's data, or memory past the matrix), so zero them: each
+// wmma call is then an exact k16 product and K loops of any length are correct. Found with
+// sgemm_tcu -n 64 (n=32 in CI happened to pass; sgemm_tcu_dxa zero-pads its smem tiles to 32).
+// Fusing two k16 steps into one k32 op is a translator-side optimization (mma_fuse).
+static inline void __vx_wmma_zero_upper_k_a(tcu_ctx::fragment_a &f) { f.data[2] = f.data[3] = f.data[6] = f.data[7] = 0.f; }
+static inline void __vx_wmma_zero_upper_k_b(tcu_ctx::fragment_b &f) { f.data[4] = f.data[5] = f.data[6] = f.data[7] = 0.f; }
 extern "C" void __vx_wmma_load_a_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) {
-  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+  auto &f = *reinterpret_cast<tcu_ctx::fragment_a *>(frag);
+  tcu_ctx::load_matrix_sync(f, p, (size_t)ldm);
+  __vx_wmma_zero_upper_k_a(f);
 }
 extern "C" void __vx_wmma_load_a_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) {
-  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+  auto &f = *reinterpret_cast<tcu_ctx::fragment_a *>(frag);
+  tcu_ctx::load_matrix_sync<vt::col_major>(f, p, (size_t)ldm);
+  __vx_wmma_zero_upper_k_a(f);
 }
 extern "C" void __vx_wmma_load_b_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) {
-  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+  auto &f = *reinterpret_cast<tcu_ctx::fragment_b *>(frag);
+  tcu_ctx::load_matrix_sync(f, p, (size_t)ldm);
+  __vx_wmma_zero_upper_k_b(f);
 }
 extern "C" void __vx_wmma_load_b_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) {
-  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+  auto &f = *reinterpret_cast<tcu_ctx::fragment_b *>(frag);
+  tcu_ctx::load_matrix_sync<vt::col_major>(f, p, (size_t)ldm);
+  __vx_wmma_zero_upper_k_b(f);
 }
 extern "C" void __vx_wmma_load_c_m16n16k16_row_f32(void *frag, const void *p, int32_t ldm) {
   tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_acc *>(frag), p, (size_t)ldm);
