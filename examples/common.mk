@@ -99,6 +99,8 @@ ifeq ($(VORTEX_VER),3)
 endif
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
+# sm_90a for examples that use wgmma / TMA (sgemm_wgmma); example Makefiles may override
+CUDA_GPU_ARCH ?= sm_90
 DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_90.bc
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
@@ -194,7 +196,7 @@ ifeq ($(VORTEX_VER),3)
 $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
-		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=sm_90 --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
+		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=$(CUDA_GPU_ARCH) --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
 $(HOST_BC): $(KERNEL_CU)
 	@echo "--- Generate host bitcode (clang --cuda-host-only)"
@@ -206,7 +208,7 @@ $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate bitcode files for host and device"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
 		./$(KERNEL_CU) --sysroot=/ --target=x86_64-linux-gnu \
-		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=sm_90 \
+		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=$(CUDA_GPU_ARCH) \
 		-lcudart_static -ldl -lrt -pthread -save-temps -v 2>&1 || true
 
 $(HOST_BC): $(DEVICE_BC)

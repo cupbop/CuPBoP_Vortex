@@ -1067,3 +1067,78 @@ extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b
   __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, c0, c1, c2, c3, d);
 #endif
 }
+
+// =============================================================================
+// Hopper warpgroup forms: cvta.to.shared, wgmma.mma_async (sgemm_wgmma and lifted sm_90a kernels)
+// =============================================================================
+// Shared-memory window address: Vortex local memory is the shared window, so the 32-bit
+// "shared" address of a pointer is its byte offset from the local memory base (<= 256 KB fits
+// the 18-bit descriptor address field). kernelTranslator lowers the cvta.to.shared asm to this.
+extern "C" uint32_t __cupbop_cvta_to_shared(const void *p) {
+  return (uint32_t)((uintptr_t)p - (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE));
+}
+
+#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE)
+// PTX matrix descriptor (wgmma smem operand): [13:0] addr>>4, [29:16] LBO>>4, [45:32] SBO>>4,
+// [63:62] swizzle. Canonical no-swizzle K-major layout: 8-row x 16-byte core matrices, LBO = next
+// core matrix along K, SBO = next 8-row group; element (r,k) at (r>>3)*SBO + (k>>3)*LBO + (r&7)*16 + (k&7)*2.
+struct __cupbop_smem_desc { const char *base; uint32_t lbo, sbo, swz; };
+static inline __cupbop_smem_desc __cupbop_decode_desc(uint64_t d) {
+  __cupbop_smem_desc m;
+  m.base = (const char *)csr_read(VX_CSR_LOCAL_MEM_BASE) + ((d & 0x3FFFu) << 4);
+  m.lbo = (uint32_t)((d >> 16) & 0x3FFFu) << 4;
+  m.sbo = (uint32_t)((d >> 32) & 0x3FFFu) << 4;
+  m.swz = (uint32_t)(d >> 62);
+  return m;
+}
+static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k) { // fp16 pair (k, k+1), k even
+  uint32_t v = *(const uint32_t *)(m.base + (r >> 3) * m.sbo + (k >> 3) * m.lbo + (r & 7) * 16 + (k & 7) * 2);
+  float f; __builtin_memcpy(&f, &v, 4); return f;
+}
+// wgmma.mma_async.sync.aligned.m64nNk16.f32.f16.f16 with K-major A (64x16) and B (Nx16, i.e. KxN
+// column-major) in shared memory, no swizzle. Warp `warp_in_wg` of the warpgroup owns rows
+// 16w..16w+15 and computes them as N/16 TCU m16n16k16 ops (the k32 tile's upper half zero).
+// acc: N/2 fp32 per thread, in/out, PTX accumulator layout
+//   acc[4j+0] = (g, 8j+2t)  acc[4j+1] = (g, 8j+2t+1)  acc[4j+2] = (g+8, 8j+2t)  acc[4j+3] = (g+8, 8j+2t+1)
+// Vortex acc reg r = (g + 8*(r>>2), t + 4*(r&3)) within a 16-column block, hence the shuffles.
+// scale_d = 0 ignores the incoming accumulator (D = A*B). Synchronous: the translator drops
+// wgmma.fence / commit_group / wait_group and fence.proxy.async.
+extern "C" void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
+                                               int warp_in_wg, float *acc) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
+  const int row0 = 16 * warp_in_wg;
+  tcu_ctx::fragment_a fa; // reg r: row g + 8*(r>>2), k = 8*(r&3) + 2t ; k >= 16 zero
+  fa.data = {{__cupbop_core_ld(A, row0 + g, 2 * t), __cupbop_core_ld(A, row0 + g, 8 + 2 * t), 0.f, 0.f,
+              __cupbop_core_ld(A, row0 + g + 8, 2 * t), __cupbop_core_ld(A, row0 + g + 8, 8 + 2 * t), 0.f, 0.f}};
+  const bool odd = t & 1, hi = t >> 1;
+  for (int nb = 0; nb < n_cols / 16; ++nb) {
+    const int n0 = 16 * nb;
+    tcu_ctx::fragment_b fb; // reg r: k = 8*(r>>1) + 2t, n = g + 8*(r&1) ; k >= 16 zero
+    fb.data = {{__cupbop_core_ld(B, n0 + g, 2 * t), __cupbop_core_ld(B, n0 + g + 8, 2 * t),
+                __cupbop_core_ld(B, n0 + g, 8 + 2 * t), __cupbop_core_ld(B, n0 + g + 8, 8 + 2 * t), 0.f, 0.f, 0.f, 0.f}};
+    tcu_ctx::fragment_acc fc, fd;
+    if (scale_d) {
+      for (int r = 0; r < 8; ++r) { // Vortex reg r <- PTX owner lane (g, cc>>1), slot cc&1, cc = t + 4*((r&3)&1), j = 2nb + ((r&3)>>1)
+        const int jl = (r & 3) >> 1, q = (r & 3) & 1;
+        const int src = (g << 2) | ((t >> 1) + 2 * q);
+        const int base = 4 * (2 * nb + jl) + 2 * (r >> 2);
+        const float v0 = __cupbop_shflf(acc[base], src), v1 = __cupbop_shflf(acc[base + 1], src);
+        fc.data[r] = odd ? v1 : v0;
+      }
+    } else {
+      for (int r = 0; r < 8; ++r) fc.data[r] = 0.f;
+    }
+    tcu_ctx::mma_sync(fd, fa, fb, fc);
+    for (int jl = 0; jl < 2; ++jl) { // PTX acc[4j+s] <- Vortex holder lane (g, c&3), reg 4*(s>>1) + (c>>2), c = 8jl + 2t + (s&1)
+      const int j = 2 * nb + jl;
+      for (int s = 0; s < 4; ++s) {
+        const int c = 8 * jl + 2 * t + (s & 1);
+        const int src = (g << 2) | (c & 3), rb = 4 * (s >> 1) + 2 * jl;
+        const float p0 = __cupbop_shflf(fd.data[rb], src), p1 = __cupbop_shflf(fd.data[rb + 1], src);
+        acc[4 * j + s] = hi ? p1 : p0;
+      }
+    }
+  }
+}
+#endif // wgmma (TCU builds)

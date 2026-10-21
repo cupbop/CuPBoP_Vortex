@@ -16,7 +16,7 @@
 set -u
 export PATH=$HOME/.local/bin:/usr/bin:/bin:/usr/local/bin
 export CuPBoP_PATH=$SLURM_SUBMIT_DIR
-export TESTS=${TESTS:-"backprop dotproduct pathfinder psum bfs btree conv3 nn saxpy sgemm stencil transpose vecadd bh-cuda blackscholes cc-cuda cfd gauss hotspot huffman jaccard-cuda jacobi-cuda lud marchingCubes-cuda nw psort score-cuda sfilter spmv srad_v2 streamcluster wedford-cuda sgemm_tcu sgemm_dxa sgemm_tcu_dxa"}
+export TESTS=${TESTS:-"backprop dotproduct pathfinder psum bfs btree conv3 nn saxpy sgemm stencil transpose vecadd bh-cuda blackscholes cc-cuda cfd gauss hotspot huffman jaccard-cuda jacobi-cuda lud marchingCubes-cuda nw psort score-cuda sfilter spmv srad_v2 streamcluster wedford-cuda sgemm_tcu sgemm_dxa sgemm_tcu_dxa sgemm_wgmma"}
 export PAR=${PAR:-4}
 export RUN_TAG=${SLURM_JOB_ID:-manual}
 SIF=/projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif
@@ -54,7 +54,7 @@ export -f run_one; export LOGS RES
 run_test() { # all configurations of one test, sequentially (shared example dir)
   local t=$1
   case $t in
-    sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa) export VORTEX_PATH=$VORTEX_PATH_TCU VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU"; run_one $t 2 1 ;;   # SCHE_2 only (ci.yml exclude)
+    sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma) export VORTEX_PATH=$VORTEX_PATH_TCU VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU"; run_one $t 2 1 ;;   # SCHE_2 only (ci.yml exclude)
     *) run_one $t 2 1; run_one $t 0 1 ;;
   esac
   case $t in bh-cuda|cc-cuda|hotspot|jaccard-cuda|jacobi-cuda|marchingCubes-cuda|score-cuda|wedford-cuda|sgemm_dxa|sgemm_tcu_dxa) run_one $t 2 0 ;; esac   # ci.yml include: list

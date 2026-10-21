@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda, sgemm_tcu, sgemm_dxa, sgemm_tcu_dxa]
+        name: [backprop, dotproduct, pathfinder, psum, bfs, btree, conv3, nn, saxpy, sgemm, stencil, transpose, vecadd, bh-cuda, blackscholes, cc-cuda, cfd, gauss, hotspot, huffman, jaccard-cuda, jacobi-cuda, lud, marchingCubes-cuda, nw, psort, score-cuda, sfilter, spmv, srad_v2, streamcluster, wedford-cuda, sgemm_tcu, sgemm_dxa, sgemm_tcu_dxa, sgemm_wgmma]
         scheduler: [2, 0]
         localmem: [1]
         exclude:
@@ -62,6 +62,8 @@ jobs:
           - name: sgemm_dxa
             scheduler: 0
           - name: sgemm_tcu_dxa
+            scheduler: 0
+          - name: sgemm_wgmma
             scheduler: 0
         include:
           # SCHE_2 + LOCALMEM=0 for shared memory benchmarks

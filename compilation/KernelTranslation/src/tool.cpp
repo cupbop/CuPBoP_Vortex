@@ -9,6 +9,9 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include <cctype>
+#include <cstdlib>
+#include <vector>
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -1862,6 +1865,112 @@ void replace_asm_call(llvm::Module *M) {
               Value *half_val = builder.CreateBitCast(src, HalfTy);
               Value *result = builder.CreateFPExt(half_val, F32, "cvt.f16.f32");
               Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("cvta.to.shared") != std::string::npos) {
+              // shared-window address of a generic pointer (i32 or i64 result) -> offset from
+              // the Vortex local memory base (runtime __cupbop_cvta_to_shared)
+              IRBuilder<> builder(Call);
+              FunctionCallee FC = M->getOrInsertFunction(
+                  "__cupbop_cvta_to_shared", FunctionType::get(I32, {PtrTy}, false));
+              Value *p = Call->getArgOperand(0);
+              if (!p->getType()->isPointerTy())
+                p = builder.CreateIntToPtr(p, PtrTy);
+              Value *res = builder.CreateCall(FC, {p}, "smem.off");
+              if (Call->getType()->isIntegerTy(64))
+                res = builder.CreateZExt(res, I64);
+              else if (!Call->getType()->isIntegerTy(32))
+                res = builder.CreateBitCast(res, Call->getType());
+              Call->replaceAllUsesWith(res);
+              need_remove.push_back(Call);
+            } else if (asm_str.find("wgmma.fence") != std::string::npos ||
+                       asm_str.find("wgmma.commit_group") != std::string::npos ||
+                       asm_str.find("wgmma.wait_group") != std::string::npos ||
+                       asm_str.find("fence.proxy.async") != std::string::npos) {
+              // the wgmma lowering below is synchronous and reads shared memory through the
+              // ordinary load path, so the async-proxy fences and group bookkeeping are no-ops
+              need_remove.push_back(Call);
+            } else if (asm_str.find("wgmma.mma_async") != std::string::npos) {
+              // wgmma.mma_async.sync.aligned.m64n<N>k16.f32.f16.f16 {d0..d(N/2-1)}, desc-a, desc-b, p, sA, sB, tA, tB
+              // LLVM operands: [0] desc_a (i64), [1] desc_b (i64), [2] scale-d (i32), [3..] N/2 tied f32 accumulators
+              // (plus "n" immediates between [2] and the accumulators when passed as operands).
+              // -> __cupbop_wgmma_m64nNk16_f16f32(N, desc_a, desc_b, scale_d, warp_in_warpgroup, acc[N/2])
+              size_t sp = asm_str.find("m64n");
+              int N = (sp == std::string::npos) ? 0 : atoi(asm_str.c_str() + sp + 4);
+              bool ok = N >= 8 && (N % 16) == 0 && asm_str.find("k16.f32.f16.f16") != std::string::npos;
+              unsigned nacc = ok ? (unsigned)N / 2 : 0;
+              unsigned firstAcc = 0;
+              while (firstAcc < Call->arg_size() &&
+                     !Call->getArgOperand(firstAcc)->getType()->isFloatTy())
+                firstAcc++;
+              ok = ok && firstAcc >= 3 && Call->arg_size() == firstAcc + nacc &&
+                   Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
+                   Call->getArgOperand(1)->getType()->isIntegerTy(64) &&
+                   Call->getArgOperand(2)->getType()->isIntegerTy(32);
+              // scale-a, scale-b, trans-a, trans-b: literal "1, 1, 0, 0" in the string, or "n" operands
+              if (ok) {
+                size_t semi = asm_str.find(';', asm_str.find("k16.f32.f16.f16"));
+                std::string tail = asm_str.substr(asm_str.find("k16.f32.f16.f16"), semi - asm_str.find("k16.f32.f16.f16"));
+                std::vector<std::string> toks; size_t st = 0;
+                for (size_t c = tail.find(','); ; c = tail.find(',', st)) {
+                  toks.push_back(tail.substr(st, (c == std::string::npos ? tail.size() : c) - st));
+                  if (c == std::string::npos) break; st = c + 1;
+                }
+                int want[4] = {1, 1, 0, 0}; // scale-a, scale-b, trans-a, trans-b
+                if (toks.size() >= 4) {
+                  for (int i = 0; i < 4; i++) {
+                    std::string tk = toks[toks.size() - 4 + i];
+                    tk.erase(0, tk.find_first_not_of(" \t\n")); tk.erase(tk.find_last_not_of(" \t\n;") + 1);
+                    long v = -999;
+                    if (!tk.empty() && tk[0] == '$') { // operand placeholder: outputs come first
+                      unsigned ph = (unsigned)atoi(tk.c_str() + 1);
+                      if (ph >= nacc && ph - nacc < Call->arg_size())
+                        if (auto *CI = dyn_cast<ConstantInt>(Call->getArgOperand(ph - nacc)))
+                          v = CI->getSExtValue();
+                    } else if (!tk.empty() && (isdigit(tk[0]) || tk[0] == '-')) {
+                      v = atol(tk.c_str());
+                    }
+                    if (v != want[i]) ok = false;
+                  }
+                } else {
+                  ok = false;
+                }
+              }
+              if (!ok) {
+                fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
+                        "  only m64nNk16 .f32.f16.f16, K-major A and B (trans 0,0), scale 1,1 are lowered\n",
+                        (unsigned)Call->arg_size(), asm_str.c_str());
+                exit(1);
+              }
+              IRBuilder<> builder(Call);
+              auto sreg = [&](const char *name) -> Value * {
+                return builder.CreateCall(
+                    M->getOrInsertFunction(name, FunctionType::get(I32, false)), {});
+              };
+              // warp index inside the warpgroup = (linear thread id / 32) % 4; the sreg calls are
+              // lowered later by replace_built_in_function for either schedule
+              Value *ntx = sreg("llvm.nvvm.read.ptx.sreg.ntid.x");
+              Value *nty = sreg("llvm.nvvm.read.ptx.sreg.ntid.y");
+              Value *lin = sreg("llvm.nvvm.read.ptx.sreg.tid.x");
+              lin = builder.CreateAdd(lin, builder.CreateMul(sreg("llvm.nvvm.read.ptx.sreg.tid.y"), ntx));
+              lin = builder.CreateAdd(lin, builder.CreateMul(sreg("llvm.nvvm.read.ptx.sreg.tid.z"),
+                                                             builder.CreateMul(ntx, nty)));
+              Value *wig = builder.CreateAnd(builder.CreateLShr(lin, 5), 3, "warp.in.wg");
+              Type *AccTy = ArrayType::get(F32, nacc);
+              IRBuilder<> AB(&Call->getFunction()->getEntryBlock().front());
+              Value *Acc = AB.CreateAlloca(AccTy, nullptr, "wgmma.acc");
+              for (unsigned i = 0; i < nacc; i++)
+                builder.CreateStore(Call->getArgOperand(firstAcc + i),
+                                    builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
+              FunctionCallee FC = M->getOrInsertFunction(
+                  "__cupbop_wgmma_m64nNk16_f16f32",
+                  FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
+              builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
+                                      Call->getArgOperand(1), Call->getArgOperand(2), wig, Acc});
+              Value *Res = UndefValue::get(Call->getType());
+              for (unsigned i = 0; i < nacc; i++)
+                Res = builder.CreateInsertValue(
+                    Res, builder.CreateLoad(F32, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i)), i);
+              Call->replaceAllUsesWith(Res);
               need_remove.push_back(Call);
             } else if (asm_str.find("movmatrix.sync.aligned.m8n8.trans.b16") !=
                        std::string::npos) {
