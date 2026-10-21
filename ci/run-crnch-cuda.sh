@@ -41,7 +41,9 @@ apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBo
     XCFG=$(python3 $VORTEX_HOME/ci/gen_config.py --config=$VORTEX_HOME/VX_config.toml --cflags="$VORTEX_CONFIGS -DVX_CFG_XLEN=64")
     mkdir -p $CuPBoP_PATH/build && cd $CuPBoP_PATH/build
     cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG"
-    make -j${SLURM_CPUS_PER_TASK:-4}
+    # Only the targets the examples need: `make all` also builds vortexRuntimeKernel, a 2.0-era target that compiles
+    # cudaKernelImpl.cpp with the host clang (-mcmodel=medany); in 3.0 mode the regression cell compiles that file.
+    make -j${SLURM_CPUS_PER_TASK:-4} kernelTranslator hostTranslator vortexRuntime ThreadPool
     cd $CuPBoP_PATH
 
     # SimX drivers for the matrix: the main configuration and the TCU+DXA one used by the tensor examples.

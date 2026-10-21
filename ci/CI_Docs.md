@@ -64,7 +64,7 @@ source ./ci/rg-ci-setup-v3.sh
 XCFG=$(python3 $VORTEX_HOME/ci/gen_config.py --config=$VORTEX_HOME/VX_config.toml --cflags="$VORTEX_CONFIGS -DVX_CFG_XLEN=64")
 rm -rf build; mkdir build; cd build
 cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG"
-make -j8
+make -j8 kernelTranslator hostTranslator vortexRuntime ThreadPool   # not `make all`: vortexRuntimeKernel is a 2.0-era target
 cd ..
 cupbop_v3_ensure_simx $VORTEX_PATH "$VORTEX_CONFIGS"            # idempotent
 cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU"

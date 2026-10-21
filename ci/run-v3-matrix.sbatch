@@ -32,7 +32,7 @@ echo "vortex: $VORTEX_HOME ($(git -C $VORTEX_HOME describe --tags --always 2>/de
 XCFG=$(python3 $VORTEX_HOME/ci/gen_config.py --config=$VORTEX_HOME/VX_config.toml --cflags="$VORTEX_CONFIGS -DVX_CFG_XLEN=64")
 rm -rf build && mkdir build && cd build
 cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG" > cmake.log 2>&1 || { echo "CMAKE FAILED"; tail -15 cmake.log; exit 1; }
-make -j${SLURM_CPUS_PER_TASK:-8} > make.log 2>&1 || { echo "BUILD FAILED"; grep -n "error" make.log | head -10 | cut -c1-200; exit 1; }
+make -j${SLURM_CPUS_PER_TASK:-8} kernelTranslator hostTranslator vortexRuntime ThreadPool > make.log 2>&1 || { echo "BUILD FAILED"; grep -n "error" make.log | head -10 | cut -c1-200; exit 1; }
 cd $CuPBoP_PATH; echo "cupbop built $(date +%H:%M:%S)"
 # --- SimX drivers: main config, plus the TCU+DXA config for the tensor examples (rebuilt when the recorded config differs)
 cupbop_v3_ensure_simx $VORTEX_PATH "$VORTEX_CONFIGS" || exit 1
