@@ -556,8 +556,22 @@ public:
       auto header_block = L->getHeader();
       assert(header_block->getTerminator()->getNumSuccessors() == 2 &&
              "has more than 2 successors of the for-head\n");
+      // The header's branch is the loop test (clang's for.cond) only when one
+      // successor leaves the loop; then the in-loop successor is the body entry
+      // that every continuing thread passes. Lifted (SASS-derived) loops are
+      // rotated: the header may end in an ordinary, possibly divergent, if whose
+      // both targets stay in the loop (hotspot: `if (computed) ...` right after
+      // the header). A barrier at one of those targets would be executed by a
+      // subset of the threads only (path-dependent barrier count: hang or
+      // desync); the barrier at the header start already synchronizes every
+      // iteration.
       BasicBlock *for_body = NULL;
-      for (int i = 0; i < header_block->getTerminator()->getNumSuccessors();
+      bool header_exits = false;
+      for (int i = 0; i < header_block->getTerminator()->getNumSuccessors(); i++)
+        if (!L->contains(header_block->getTerminator()->getSuccessor(i)))
+          header_exits = true;
+      for (int i = 0; header_exits &&
+                      i < header_block->getTerminator()->getNumSuccessors();
            i++) {
         auto bb = header_block->getTerminator()->getSuccessor(i);
         if (L->contains(bb)) {

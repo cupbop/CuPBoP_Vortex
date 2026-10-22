@@ -69,6 +69,12 @@ class CustomDivergenceAnalysis {
 public:
   std::unordered_set<const Value *> DivergentValues;
   std::queue<const Instruction *> Worklist;
+  // Instructions already queued through the divergent-branch rule below. That
+  // rule re-queues every instruction of a dominated successor without marking
+  // it, so a block that dominates itself (single-block loop with a divergent
+  // exit test, e.g. lifted lud after the warp syncs are erased) re-queued its
+  // own branch forever and the translator never returned.
+  std::unordered_set<const Instruction *> BranchQueued;
 
   void setAnalyzers(DominatorTree &DomTree, PostDominatorTree &PostDomTree,
                     LoopInfo &LoopInf) {
@@ -147,6 +153,7 @@ public:
                 for (const Instruction &I : *SuccBB) {
                   // llvm::errs() << "new divergence check 4\n";
                   // if (DivergentValues.insert(&I).second) {
+                  if (BranchQueued.insert(&I).second)
                     Worklist.push(&I);
                   //}
                 }
