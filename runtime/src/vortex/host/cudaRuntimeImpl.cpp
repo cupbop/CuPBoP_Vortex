@@ -113,6 +113,7 @@ static bool cupbop_debug_enabled() {
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
     uint32_t dyn_shared_mem_size;
+    uint32_t virt_lanes;   // core mapping: lanes per physical warp (0 = hardware NT)
   };
 
 #else
@@ -125,6 +126,7 @@ static bool cupbop_debug_enabled() {
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
     uint32_t dyn_shared_mem_size;
+    uint32_t virt_lanes;   // core mapping: lanes per physical warp (0 = hardware NT)
   };
 #endif
 
@@ -1244,7 +1246,14 @@ cudaError_t cudaLaunchKernel_vortex(
       // the logical warps; __shared__ in CTA local memory as in 1:1.
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
       const uint32_t nt = (uint32_t)NUM_THREADS_VX;
-      const uint32_t block_warps = (uint32_t)((block_threads + nt - 1) / nt);
+      // Lane gating: use only L of the NT lanes of each physical warp
+      // (CUPBOP_VIRT_LANES, default NT). Emulates a narrower issue width on a wider
+      // bitstream; TCU tile geometry, LSU lanes and the memory side stay the bitstream's.
+      uint32_t L = nt;
+      if (char *env = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < nt) L = (uint32_t)v; }
+      // Every physical warp must own at least one logical thread (its lanes leave
+      // early otherwise and the CTA barrier would wait for it): P <= ceil(block/L).
+      const uint32_t block_warps = (uint32_t)((block_threads + L - 1) / L);
       uint32_t P = block_warps;
       if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
       if ((uint64_t)P * nt > NUM_WARPS_VX * NUM_THREADS_VX) {
@@ -1252,6 +1261,7 @@ cudaError_t cudaLaunchKernel_vortex(
                (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);
         std::abort();
       }
+      ctx.virt_lanes = (L == nt) ? 0u : L;
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
       // Never more hardware threads than logical ones: hardware thread h owns the
       // logical threads h, h+P*nt, ... and the kernel's uniform control flow
@@ -1261,10 +1271,11 @@ cudaError_t cudaLaunchKernel_vortex(
       // thread; their uninitialized copies split the warp on a uniform branch and
       // the CTA barriers deadlocked. min() keeps every hardware thread busy and
       // is what the 1:1 schedule does for partial warps anyway.
-      block[0] = (uint32_t)std::min<uint64_t>((uint64_t)P * nt, block_threads); block[1] = 1; block[2] = 1;
+      // Lane gating needs the full warps dispatched (the kernel entry retires lanes >= L).
+      block[0] = (L == nt) ? (uint32_t)std::min<uint64_t>((uint64_t)P * nt, block_threads) : P * nt; block[1] = 1; block[2] = 1;
       ndim = 3;
       lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
-      DBG_PRINT("virt: block_warps=%u physical_warps=%u cta_threads=%u\n", block_warps, P, block[0]);
+      DBG_PRINT("virt: block_warps=%u physical_warps=%u lanes=%u cta_threads=%u\n", block_warps, P, L, block[0]);
     } else {
       // flat schedule: one CUDA block per hardware thread; the device entry recovers
       // the block index from (CTA, thread). __shared__ lives in global memory.

@@ -255,6 +255,13 @@ void create_global_variable(llvm::Module *M) {
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            zero, "inter_warp_index", NULL,
                            llvm::GlobalValue::NotThreadLocal, 0, false);
+  // Core mapping (virt): number of the pass of the single warp loop this hardware
+  // thread is in (0, 1, ...). Context arrays are indexed by it, so the mapping
+  // needs no division and no warp-size constant (NT and the lane count L are
+  // runtime values). Localized per function like intra_warp_index.
+  new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
+                           zero, "intra_warp_slot", NULL,
+                           llvm::GlobalValue::NotThreadLocal, 0, false);
 
   new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::ExternalLinkage,
                            NULL, "__warps_per_group", NULL,

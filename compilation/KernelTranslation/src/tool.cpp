@@ -683,6 +683,16 @@ void replace_built_in_function(llvm::Module *M) {
       return Instr->getParent()->getParent()->getName().str() == func_name;
     });
 
+    // virt: the pass counter is per hardware thread too
+    if (auto *global_slot = F->getParent()->getGlobalVariable("intra_warp_slot")) {
+      auto local_slot = builder.CreateAlloca(global_slot->getValueType(), 0, "local_intra_warp_slot");
+      builder.CreateStore(ConstantInt::get(I32, 0), local_slot);
+      global_slot->replaceUsesWithIf(local_slot, [&](Use &U) {
+        auto *Instr = dyn_cast<Instruction>(U.getUser());
+        return Instr->getParent()->getParent()->getName().str() == func_name;
+      });
+    }
+
     auto global_inter_warp_idx =
         F->getParent()->getGlobalVariable("inter_warp_index");
 
@@ -1006,7 +1016,7 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               Value *lane;
-              if (schedule != 0) { // 1:1 and virt (core mapping): lanes are hardware
+              if (schedule == 2) { // 1:1: lanes are hardware
                 FunctionCallee fc = M->getOrInsertFunction(
                     "__cupbop_laneid", FunctionType::get(I32, {}, false));
                 CallInst *c = builder.CreateCall(fc, {}, "laneid");
@@ -1014,6 +1024,8 @@ void replace_built_in_function(llvm::Module *M) {
                     MDNode::get(context, MDString::get(context, "divergence"));
                 c->setMetadata("divergence", N);
                 lane = c;
+              } else if (schedule == 1) { // virt: the CUDA lane of the logical thread (NT may differ from 32)
+                lane = builder.CreateAnd(createLoad(builder, local_intra_warp_idx), ConstantInt::get(I32, 31), "laneid");
               } else {
                 lane = createLoad(builder,
                                   M->getGlobalVariable("intra_warp_index"));
@@ -1076,12 +1088,14 @@ void replace_built_in_function(llvm::Module *M) {
             IRBuilder<> builder(context);
             builder.SetInsertPoint(Call);
             Value *intra_warp_index;
-            if (schedule != 0) { // 1:1 and virt: hardware lane
+            if (schedule == 2) { // 1:1: hardware lane
               FunctionCallee fc = M->getOrInsertFunction(
                   "__cupbop_laneid", FunctionType::get(I32, {}, false));
               CallInst *c = builder.CreateCall(fc, {}, "laneid");
               c->setMetadata("divergence", MDNode::get(context, MDString::get(context, "divergence")));
               intra_warp_index = c;
+            } else if (schedule == 1) { // virt: CUDA lane of the logical thread
+              intra_warp_index = builder.CreateAnd(createLoad(builder, local_intra_warp_idx), ConstantInt::get(I32, 31), "laneid");
             } else {
               intra_warp_index = createLoad(builder, local_intra_warp_idx);
             }
