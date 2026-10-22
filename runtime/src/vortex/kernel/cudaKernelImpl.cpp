@@ -923,23 +923,23 @@ void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
 extern "C" __attribute__((always_inline)) int __cupbop_laneid() { return vx_thread_id(); }
 
 static inline float __cupbop_f16_to_f32(uint32_t h) {
+  // Branch- and loop-free on purpose: the earlier version normalised subnormals with a
+  // data-dependent while loop, which is miscompiled once this helper is inlined into the kernel
+  // (CUPBOP_LTO=1; noinline or an fpext-based conversion were both correct). Subnormals are
+  // m * 2^-24 computed in fp32 (exact), everything else is bit assembly, selected without branches.
   h &= 0xffffu;
-  uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
-  if (e == 0) {
-    if (m == 0) {
-      bits = sign;
-    } else { // subnormal: value = m * 2^-24
-      int sh = 0;
-      while (!(m & 0x400u)) { m <<= 1; ++sh; }
-      bits = sign | ((uint32_t)(113 - sh) << 23) | ((m & 0x3ffu) << 13);
-    }
-  } else if (e == 31) {
-    bits = sign | 0x7f800000u | (m << 13);
-  } else {
-    bits = sign | ((e + 112u) << 23) | (m << 13);
-  }
+  const uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+  const uint32_t normal = ((e + 112u) << 23) | (m << 13);
+  const uint32_t infnan = 0x7f800000u | (m << 13);
+  uint32_t bits = (e == 31u) ? infnan : normal;
+  float sub = (float)m * 0x1p-24f; // e == 0: zero or subnormal
   float f;
   __builtin_memcpy(&f, &bits, 4);
+  f = (e == 0u) ? sub : f;
+  uint32_t fb;
+  __builtin_memcpy(&fb, &f, 4);
+  fb |= sign;
+  __builtin_memcpy(&f, &fb, 4);
   return f;
 }
 static inline uint32_t __cupbop_shfl32(uint32_t v, int src_lane) {
