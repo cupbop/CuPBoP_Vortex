@@ -3383,6 +3383,14 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
     StringRef Name = Callee->getName();
     IRBuilder<> B(CI);
 
+    if (Name.contains(".bf16") || Name.contains(".tf32") || Name.contains(".s8") || Name.contains(".u8")) {
+      // the wrappers below assume the f16 m16n16k16 fragment shape (8 x <2 x half>); other
+      // element types have other fragment shapes. Lifted kernels do not hit this (HMMA lifts
+      // to mma.sync intrinsics, handled in replace_nvvm_mma_intrinsics).
+      fprintf(stderr, "error: CUDA wmma intrinsic %s: only f16 inputs are lowered on the wmma path "
+                      "(bf16/tf32/int8 wmma not implemented)\n", Name.str().c_str());
+      exit(1);
+    }
     if (Name.contains(".load.a.") || Name.contains(".load.b.")) {
       // llvm.nvvm.wmma.m16n16k16.load.{a,b}.{row,col}.stride.f16.p0
       // Args: (ptr src, i32 stride) -> {<2 x half> x8}
