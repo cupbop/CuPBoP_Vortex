@@ -610,11 +610,39 @@ static RegisterPass<InsertBuiltInBarrier>
                             "Insert built in barriers");
 } // namespace
 
+// Core mapping (virt, schedule 1): a physical warp runs one logical warp at a time
+// with all NT lanes in lockstep, so __syncwarp / llvm.nvvm.bar.warp.sync are no-ops.
+// They are erased here, before any sync pass, because the lifted (SASS-derived)
+// kernels carry one before almost every __syncthreads and branch
+// (CuLifter's reconvergence idiom): left in place they (a) make insert_sync treat
+// conditional barriers as intra-warp ones, (b) get their own blocks from
+// split_block_by_sync, and (c) stop the parallel-region walk in insert_warp_loop
+// right in front of every CTA barrier, so lifted hotspot/pathfinder/backprop
+// ended up with 0 regions and wrote nothing.
+static void erase_warp_syncs_for_virt(llvm::Module *M) {
+  std::vector<llvm::CallInst *> dead;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+          if (CI->isInlineAsm() || !CI->getCalledFunction())
+            continue;
+          if (isWarpSync(CI->getCalledFunction()->getName().str()))
+            dead.push_back(CI);
+        }
+  for (auto *CI : dead)
+    CI->eraseFromParent();
+  if (!dead.empty())
+    fprintf(stderr, "[insert_sync] schedule 1 (virt): erased %zu warp-level syncs (lanes run in lockstep)\n", dead.size());
+}
+
 void insert_sync(llvm::Module *M) {
   int schedule = 0;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     schedule = std::stoi(std::string(env));
   }
+  if (schedule == 1)
+    erase_warp_syncs_for_virt(M);
 
   auto Registry = PassRegistry::getPassRegistry();
 

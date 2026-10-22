@@ -2112,8 +2112,8 @@ public:
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync")
             has_barrier = 1;
-          if (isWarpSync(func_name) && intra_warp_loop)
-            has_barrier = 1;
+          if (isWarpSync(func_name) && intra_warp_loop && g_schedule_flag != 1)
+            has_barrier = 1; // (schedule 1 / virt: warp syncs are erased in insert_sync; never a boundary)
           if (func_name == "cupbop.shfl.barrier")
             has_barrier = 1;
         }
