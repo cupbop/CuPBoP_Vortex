@@ -101,6 +101,8 @@ endif
 # ─── Derived ──────────────────────────────────────────────────────────────────
 # sm_90a for examples that use wgmma / TMA (sgemm_wgmma); example Makefiles may override
 CUDA_GPU_ARCH ?= sm_90
+# CUPBOP_LTO=1: llvm-link the device runtime into the kernel before the final -O3 (see v3_cell.mk)
+CUPBOP_LTO ?= 0
 DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_90.bc
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
@@ -248,7 +250,7 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 	printf 'int main(){return 0;}\n' > dummy_host.cpp
 	cp $(CuPBoP_PATH)/examples/v3_cell.mk $(VX3_CELL)/Makefile
 	$(MAKE) -C $(VX3_CELL) kernel.vxbin kernel.dump CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
-		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) \
+		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
 	@echo "--- Kernel compilation completed!"

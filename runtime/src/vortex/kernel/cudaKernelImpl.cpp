@@ -920,7 +920,7 @@ void __cuda_atomic_add_u64_uniform_void(unsigned long long *addr,
 // <name> (dispatch: _tcu when available unless CUPBOP_MMA_SW is defined). kernelTranslator picks the
 // suffix from CUPBOP_MMA_LOWERING=auto|sw|tcu.
 // %laneid for the 1:1 schedule: the hardware lane, like the shuffle/vote wrappers above.
-extern "C" int __cupbop_laneid() { return vx_thread_id(); }
+extern "C" __attribute__((always_inline)) int __cupbop_laneid() { return vx_thread_id(); }
 
 static inline float __cupbop_f16_to_f32(uint32_t h) {
   h &= 0xffffu;
@@ -948,7 +948,7 @@ static inline uint32_t __cupbop_shfl32(uint32_t v, int src_lane) {
 
 // movmatrix.sync.aligned.m8n8.trans.b16: 8x8 b16 matrix, lane holds M[g][2t..2t+1]; result is the
 // transpose in the same layout, i.e. {M[2t][g], M[2t+1][g]}.
-extern "C" uint32_t __cupbop_movmatrix_m8n8_trans_b16(uint32_t a) {
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_movmatrix_m8n8_trans_b16(uint32_t a) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const uint32_t x = __cupbop_shfl32(a, ((2 * t) << 2) | (g >> 1));     // owner of M[2t][g]
   const uint32_t y = __cupbop_shfl32(a, ((2 * t + 1) << 2) | (g >> 1)); // owner of M[2t+1][g]
@@ -957,7 +957,7 @@ extern "C" uint32_t __cupbop_movmatrix_m8n8_trans_b16(uint32_t a) {
 }
 
 // D = A(16x16,f16,row) * B(16x8,f16,col) + C(16x8,f32)
-extern "C" void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                              uint32_t b0, uint32_t b1,
                                              float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
@@ -979,7 +979,7 @@ extern "C" void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32
 }
 
 // D = A(16x8,f16,row) * B(8x8,f16,col) + C(16x8,f32)
-extern "C" void __cupbop_mma_m16n8k8_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
                                             float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
@@ -1043,7 +1043,7 @@ static inline void __cupbop_acc_vx_to_nv(const tcu_ctx::fragment_acc &fd, float 
   const float v0 = __cupbop_shflf(fd.data[4], u1), v1 = __cupbop_shflf(fd.data[5], u1);
   d[0] = hi ? p1 : p0; d[1] = hi ? q1 : q0; d[2] = hi ? r1 : r0; d[3] = hi ? v1 : v0;
 }
-extern "C" void __cupbop_mma_m16n8k16_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                  uint32_t b0, uint32_t b1,
                                                  float c0, float c1, float c2, float c3, float *d) {
   tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
@@ -1053,7 +1053,7 @@ extern "C" void __cupbop_mma_m16n8k16_f16f32_tcu(uint32_t a0, uint32_t a1, uint3
   tcu_ctx::mma_sync(fd, fa, fb, fc);
   __cupbop_acc_vx_to_nv(fd, d);
 }
-extern "C" void __cupbop_mma_m16n8k8_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
                                                 float c0, float c1, float c2, float c3, float *d) {
   tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
   fa.data = {{__cupbop_u32_as_f32(a0), 0.f, 0.f, 0.f, __cupbop_u32_as_f32(a1), 0.f, 0.f, 0.f}};
@@ -1066,7 +1066,7 @@ extern "C" void __cupbop_mma_m16n8k8_f16f32_tcu(uint32_t a0, uint32_t a1, uint32
 #endif // TCU-backed variant
 
 // ---- dispatch symbols (what kernelTranslator emits for CUPBOP_MMA_LOWERING=auto) ----------------
-extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                              uint32_t b0, uint32_t b1,
                                              float c0, float c1, float c2, float c3, float *d) {
 #if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
@@ -1075,7 +1075,7 @@ extern "C" void __cupbop_mma_m16n8k16_f16f32(uint32_t a0, uint32_t a1, uint32_t 
   __cupbop_mma_m16n8k16_f16f32_sw(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
 #endif
 }
-extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
                                             float c0, float c1, float c2, float c3, float *d) {
 #if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
   __cupbop_mma_m16n8k8_f16f32_tcu(a0, a1, b0, c0, c1, c2, c3, d);
@@ -1090,7 +1090,7 @@ extern "C" void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b
 // Shared-memory window address: Vortex local memory is the shared window, so the 32-bit
 // "shared" address of a pointer is its byte offset from the local memory base (<= 256 KB fits
 // the 18-bit descriptor address field). kernelTranslator lowers the cvta.to.shared asm to this.
-extern "C" uint32_t __cupbop_cvta_to_shared(const void *p) {
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const void *p) {
   return (uint32_t)((uintptr_t)p - (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE));
 }
 
@@ -1119,7 +1119,7 @@ static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k) 
 // Vortex acc reg r = (g + 8*(r>>2), t + 4*(r&3)) within a 16-column block, hence the shuffles.
 // scale_d = 0 ignores the incoming accumulator (D = A*B). Synchronous: the translator drops
 // wgmma.fence / commit_group / wait_group and fence.proxy.async.
-extern "C" void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
+extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
                                                int warp_in_wg, float *acc) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
