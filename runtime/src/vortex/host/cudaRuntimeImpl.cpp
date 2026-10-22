@@ -7,6 +7,7 @@
 #include "structures.h"
 #include <bits/stdint-uintn.h>
 #include <cstddef>
+#include <algorithm>
 #include <iostream>
 #include <stdint.h>
 #include <stdio.h>
@@ -1252,10 +1253,18 @@ cudaError_t cudaLaunchKernel_vortex(
         std::abort();
       }
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
-      block[0] = P * nt; block[1] = 1; block[2] = 1;
+      // Never more hardware threads than logical ones: hardware thread h owns the
+      // logical threads h, h+P*nt, ... and the kernel's uniform control flow
+      // (loop exits between the region loops) reads per-hardware-thread scalars
+      // that only an owned logical thread writes. With a CTA of P*nt threads a
+      // 16-thread block (lud_diagonal) left lanes 16..31 without any logical
+      // thread; their uninitialized copies split the warp on a uniform branch and
+      // the CTA barriers deadlocked. min() keeps every hardware thread busy and
+      // is what the 1:1 schedule does for partial warps anyway.
+      block[0] = (uint32_t)std::min<uint64_t>((uint64_t)P * nt, block_threads); block[1] = 1; block[2] = 1;
       ndim = 3;
       lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
-      DBG_PRINT("virt: block_warps=%u physical_warps=%u\n", block_warps, P);
+      DBG_PRINT("virt: block_warps=%u physical_warps=%u cta_threads=%u\n", block_warps, P, block[0]);
     } else {
       // flat schedule: one CUDA block per hardware thread; the device entry recovers
       // the block index from (CTA, thread). __shared__ lives in global memory.
