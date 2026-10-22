@@ -1006,7 +1006,7 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               Value *lane;
-              if (schedule == 2) {
+              if (schedule != 0) { // 1:1 and virt (core mapping): lanes are hardware
                 FunctionCallee fc = M->getOrInsertFunction(
                     "__cupbop_laneid", FunctionType::get(I32, {}, false));
                 CallInst *c = builder.CreateCall(fc, {}, "laneid");
@@ -1075,7 +1075,16 @@ void replace_built_in_function(llvm::Module *M) {
             // return the rank within the warp
             IRBuilder<> builder(context);
             builder.SetInsertPoint(Call);
-            auto intra_warp_index = createLoad(builder, local_intra_warp_idx);
+            Value *intra_warp_index;
+            if (schedule != 0) { // 1:1 and virt: hardware lane
+              FunctionCallee fc = M->getOrInsertFunction(
+                  "__cupbop_laneid", FunctionType::get(I32, {}, false));
+              CallInst *c = builder.CreateCall(fc, {}, "laneid");
+              c->setMetadata("divergence", MDNode::get(context, MDString::get(context, "divergence")));
+              intra_warp_index = c;
+            } else {
+              intra_warp_index = createLoad(builder, local_intra_warp_idx);
+            }
             Call->replaceAllUsesWith(intra_warp_index);
             need_remove.push_back(Call);
           }
@@ -1530,10 +1539,19 @@ void replace_asm_call(llvm::Module *M) {
               // return the rank within the warp
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
-              auto intra_warp_index_addr =
-                  M->getGlobalVariable("intra_warp_index");
-              auto intra_warp_index =
-                  createLoad(builder, intra_warp_index_addr);
+              int lane_sched = 0;
+              if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) lane_sched = std::atoi(e);
+              Value *intra_warp_index;
+              if (lane_sched != 0) { // 1:1 and virt: hardware lane
+                FunctionCallee fc = M->getOrInsertFunction(
+                    "__cupbop_laneid", FunctionType::get(I32, {}, false));
+                CallInst *c = builder.CreateCall(fc, {}, "laneid");
+                c->setMetadata("divergence", MDNode::get(context, MDString::get(context, "divergence")));
+                intra_warp_index = c;
+              } else {
+                auto intra_warp_index_addr = M->getGlobalVariable("intra_warp_index");
+                intra_warp_index = createLoad(builder, intra_warp_index_addr);
+              }
               Call->replaceAllUsesWith(intra_warp_index);
               need_remove.push_back(Call);
             } else if (asm_str.find("mad.lo.cc.u32") != std::string::npos &&
@@ -1895,7 +1913,7 @@ void replace_asm_call(llvm::Module *M) {
               int sched = 0;
               if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) sched = std::atoi(e);
               Value *res;
-              if (sched == 2) {
+              if (sched != 0) { // 1:1 and virt: hardware active mask
                 FunctionCallee FC = M->getOrInsertFunction("__cupbop_activemask", FunctionType::get(I32, false));
                 res = builder.CreateCall(FC, {}, "activemask");
               } else {
