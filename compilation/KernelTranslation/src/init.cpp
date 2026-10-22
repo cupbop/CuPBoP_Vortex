@@ -991,8 +991,9 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     mem_share2global(M);
   }
 
-  else if (schedule == 2)
+  else if (schedule == 2 || schedule == 1)
   {
+    // 1:1 and core mapping (virt): one CTA per CUDA block, __shared__ in the CTA's local memory
     if (local_mem_use == 1)
     {
       mem_share2local(M);
@@ -1004,7 +1005,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   }
     else 
     {
-    std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0 or 2)\n";
+    std::cerr << "Error: invalid VORTEX_SCHEDULE_FLAG (use 0, 1 or 2)\n";
     std::exit(1);
     }
   // replace constant memory (addrspace 4 → 0)

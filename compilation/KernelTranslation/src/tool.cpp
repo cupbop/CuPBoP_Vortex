@@ -3513,3 +3513,28 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
   for (Function *F : DeadDecls)
     F->removeFromParent();
 }
+
+
+// Core mapping (virt, schedule 1): lanes are hardware, so every value derived from
+// the intra-warp index is lane-divergent. Mark the loads of the lane index (global
+// intra_warp_index / per-function local_intra_warp_idx alloca) with the "divergence"
+// metadata the 1:1 schedule puts on threadIdx loads; the root call (vx_thread_id) is
+// marked in insert_warp_loop.cpp.
+void mark_virt_lane_divergence(llvm::Module *M) {
+  auto *gv = M->getGlobalVariable("intra_warp_index");
+  for (auto &F : *M) {
+    if (F.isDeclaration()) continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI) continue;
+        auto *ptr = LI->getPointerOperand();
+        bool lane = (gv && ptr == gv);
+        if (auto *AI = dyn_cast<AllocaInst>(ptr))
+          lane = lane || AI->getName() == "local_intra_warp_idx";
+        if (!lane) continue;
+        LI->setMetadata("divergence", MDNode::get(M->getContext(), MDString::get(M->getContext(), "divergence")));
+      }
+    }
+  }
+}

@@ -1184,6 +1184,10 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
       FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
       FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
+      // virt: the lane id is the root of every lane-divergent value (the intra index
+      // round-trips through an alloca that mem2reg removes), so mark it for the
+      // Vortex backend's divergence handling like the 1:1 schedule marks threadIdx.
+      tid->setMetadata("divergence", MDNode::get(M->getContext(), MDString::get(M->getContext(), "divergence")));
       auto nHT = builder.CreateCall(nHTC, {}, "nHT");
       sche_data.inner_loop_init = tid;
       sche_data.inner_loop_inc = nHT;
@@ -1199,11 +1203,15 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   if (schedule_flag == 1) {
       // Get hardware information
       FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
-      FunctionCallee nHWC = M->getOrInsertFunction("vx_num_warps", nTTy);
+      FunctionCallee nHWC = M->getOrInsertFunction("__cupbop_cta_size", nTTy); // virt: physical warps of this CTA (VX_CSR_CTA_SIZE)
       FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
-      FunctionCallee widC = M->getOrInsertFunction("vx_warp_id", nTTy);
+      FunctionCallee widC = M->getOrInsertFunction("__cupbop_cta_rank", nTTy);  // virt: this warp's rank in the CTA (VX_CSR_CTA_RANK)
 
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
+      // virt: the lane id is the root of every lane-divergent value (the intra index
+      // round-trips through an alloca that mem2reg removes), so mark it for the
+      // Vortex backend's divergence handling like the 1:1 schedule marks threadIdx.
+      tid->setMetadata("divergence", MDNode::get(M->getContext(), MDString::get(M->getContext(), "divergence")));
       auto wid = builder.CreateCall(widC, {}, "hw_wid");
       auto nHT = builder.CreateCall(nHTC, {}, "nHT");
       auto nHW = builder.CreateCall(nHWC, {}, "nHW"); 
@@ -1961,31 +1969,31 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
     }
   }
 
-  if (schedule_flag == 1 && barriers.size() > 1) {
+  if (schedule_flag == 1 && !intra_warp_loop) {
+    // Core mapping (virt): the region loops only serialize the logical warps of ONE
+    // physical warp; the other physical warps of the CTA run their own logical warps
+    // concurrently, so every __syncthreads must stay a real CTA barrier between the
+    // region loops: vx_barrier(cta_id, physical_warps). Inserted before the original
+    // call, which is then deleted below like in the flat schedule.
     auto M = F->getParent();
     LLVMContext &context = M->getContext();
-
-    // Generate function def for getting VX Warp Size
-    FunctionType *nTTy =
-        FunctionType::get(IntegerType::getInt32Ty(context), true);
-    FunctionCallee nWC = M->getOrInsertFunction("vx_num_warps", nTTy);
-
-    // Generate function def for VX Barrier
-    ArrayRef<Type *> VXBParams = {IntegerType::getInt32Ty(context),
-                                  IntegerType::getInt32Ty(context)};
-    FunctionType *VXBarTy =
-        FunctionType::get(Type::getVoidTy(context), VXBParams, false);
-    FunctionCallee VXBarC = M->getOrInsertFunction("vx_barrier", VXBarTy);
-    
-    int curBNum_ = 1;
-    for (auto B = barriers.begin() + 1; B != barriers.end(); ++B) {
-      IRBuilder<> builder(*B);
-      CallInst *nW = builder.CreateCall(nWC);
-      auto cnt = builder.getInt32(curBNum_++);
-      // builder.CreateCall(VXBarC, {cnt, nW});
-    } 
+    auto I32 = IntegerType::getInt32Ty(context);
+    FunctionCallee VXBarC = M->getOrInsertFunction(
+        "vx_barrier", FunctionType::get(Type::getVoidTy(context), {I32, I32}, false));
+    auto *gidGV = M->getNamedGlobal("__local_group_id");
+    auto *wpgGV = M->getNamedGlobal("__warps_per_group");
+    assert(gidGV && wpgGV && "virt: __local_group_id/__warps_per_group globals missing");
+    for (auto *inst : barriers) {
+      auto *CI = dyn_cast<CallInst>(inst);
+      if (!CI || !CI->getCalledFunction()) continue;
+      auto name = CI->getCalledFunction()->getName();
+      if (name != "llvm.nvvm.barrier0" && name != "llvm.nvvm.barrier.sync") continue;
+      IRBuilder<> builder(CI);
+      auto gid = builder.CreateLoad(I32, gidGV, "cta_id");
+      auto wpg = builder.CreateLoad(I32, wpgGV, "cta_warps");
+      builder.CreateCall(VXBarC, {gid, wpg});
+    }
   }
-
   for (auto inst : barriers) {
     if (auto *CI = dyn_cast<CallInst>(inst)) {
       if (CI->getCalledFunction() &&

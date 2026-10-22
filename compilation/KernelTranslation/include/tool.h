@@ -47,4 +47,5 @@ void replace_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_mma_intrinsics(llvm::Module *M);
 void replace_cp_async_with_dxa(llvm::Module *M);
+void mark_virt_lane_divergence(llvm::Module *M); // schedule 1 (virt): lane-index loads are divergent
 #endif

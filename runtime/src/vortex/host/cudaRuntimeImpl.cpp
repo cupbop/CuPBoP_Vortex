@@ -1237,6 +1237,25 @@ cudaError_t cudaLaunchKernel_vortex(
         printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
         std::abort();
       }
+    } else if (schedule == 1) {
+      // core mapping (virt): CTA == CUDA block, but only P physical warps
+      // (CUPBOP_VIRT_WARPS, default = all block warps). The kernel loops over
+      // the logical warps; __shared__ in CTA local memory as in 1:1.
+      const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
+      const uint32_t nt = (uint32_t)NUM_THREADS_VX;
+      const uint32_t block_warps = (uint32_t)((block_threads + nt - 1) / nt);
+      uint32_t P = block_warps;
+      if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
+      if ((uint64_t)P * nt > NUM_WARPS_VX * NUM_THREADS_VX) {
+        printf("Error: block_size %lu exceeds threads_per_core %lu even with CUPBOP_VIRT_WARPS=%u\n",
+               (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);
+        std::abort();
+      }
+      grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
+      block[0] = P * nt; block[1] = 1; block[2] = 1;
+      ndim = 3;
+      lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
+      DBG_PRINT("virt: block_warps=%u physical_warps=%u\n", block_warps, P);
     } else {
       // flat schedule: one CUDA block per hardware thread; the device entry recovers
       // the block index from (CTA, thread). __shared__ lives in global memory.

@@ -250,6 +250,13 @@ __attribute__((always_inline)) int __vx_is_dxa_warp(void) {
 #ifndef VX_CSR_LOCAL_MEM_BASE
 #define VX_CSR_LOCAL_MEM_BASE 0xFC3
 #endif
+// Core mapping (virt): physical warp rank / warp count of this CTA (KMU CSRs).
+extern "C" __attribute__((always_inline)) int __cupbop_cta_rank(void) {
+  return (int)csr_read_nv(VX_CSR_CTA_RANK);
+}
+extern "C" __attribute__((always_inline)) int __cupbop_cta_size(void) {
+  return (int)csr_read_nv(VX_CSR_CTA_SIZE);
+}
 // Get number of warps per CTA (runtime value from vx_spawn_threads)
 __attribute__((always_inline)) unsigned int __vx_warps_per_group(void) {
   return __warps_per_group;

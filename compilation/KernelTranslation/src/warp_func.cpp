@@ -69,7 +69,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
   }
   // handle different mappings
   switch (mapping_) {
-  case MAPPING_CORE:
+  case MAPPING_CORE: // virt: hardware lanes -> same lowering as 1:1
+    replaceWarpVote1to1(m, replace);
     break;
   case MAPPING_FLAT:
     replaceWarpVoteFlat(m, replace);
@@ -293,7 +294,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
   }
   // handle different mappings
   switch (mapping_) {
-  case MAPPING_CORE:
+  case MAPPING_CORE: // virt: hardware lanes -> same lowering as 1:1
+    replaceWarpShfl1to1(m, replace);
     break;
   case MAPPING_FLAT:
     replaceWarpShflFlat(m, replace);

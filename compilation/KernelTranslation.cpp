@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     int schedule = std::stoi(std::string(env));
     if (schedule == 0) warp_mapping = MAPPING_FLAT;
+    if (schedule == 1) warp_mapping = MAPPING_CORE;   // virt: lanes are hardware, warp ops stay native
   }
   MPM.addPass(ReplaceWarpLevelPrimitive(warp_mapping));
   MPM.run(*program, MAM);
@@ -130,6 +131,9 @@ int main(int argc, char **argv) {
 
   DBG_LOG("replace_built_in_function\n");
   replace_built_in_function(program);
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    if (std::stoi(std::string(env)) == 1) mark_virt_lane_divergence(program); // virt: hardware lanes
+  }
   dumpFile(program, "4_after_replace_builtin.ll");
 
   DBG_LOG("replace_wmma_intrinsics\n");
