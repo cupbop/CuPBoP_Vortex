@@ -120,7 +120,12 @@ public:
       CreateIntraWarpBarrier(inst);
     }
     for (auto inst : insert_inter_warp_sync_before) {
-      CreateInterWarpBarrier(inst);
+      // Entry/exit markers: warp-loop region boundaries for schedule 0/1 only.
+      // Tagged so the virt schedule (1) does not turn them into hardware CTA
+      // barriers (a CTA needs no barrier at kernel entry or before return).
+      auto *c = CreateInterWarpBarrier(inst);
+      auto &mctx = c->getContext();
+      c->setMetadata("cupbop.builtin_barrier", llvm::MDNode::get(mctx, llvm::MDString::get(mctx, "entry_exit")));
     }
     return 1;
   }

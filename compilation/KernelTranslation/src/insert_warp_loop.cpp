@@ -1988,6 +1988,7 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
       if (!CI || !CI->getCalledFunction()) continue;
       auto name = CI->getCalledFunction()->getName();
       if (name != "llvm.nvvm.barrier0" && name != "llvm.nvvm.barrier.sync") continue;
+      if (CI->getMetadata("cupbop.builtin_barrier")) continue; // entry/exit marker: region boundary only
       IRBuilder<> builder(CI);
       auto gid = builder.CreateLoad(I32, gidGV, "cta_id");
       auto wpg = builder.CreateLoad(I32, wpgGV, "cta_warps");
