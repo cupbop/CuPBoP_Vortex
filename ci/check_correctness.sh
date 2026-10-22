@@ -5,7 +5,7 @@
 # Prints "Correctness: PASS|FAIL|SKIP" (with the reason and the tail of the output on FAIL) and a final
 # "RESULT=..." line, writes examples/<test>/ci_status_SCHE_<s>_LMEM_<l>.txt and exits 1 on FAIL.
 TEST_NAME=$1; SCHEDULE=$2; LMEM=$3
-EXAMPLE_DIR="./examples/${TEST_NAME}"
+EXAMPLE_DIR="${CI_EXAMPLE_DIR:-./examples/${TEST_NAME}}"   # CI_EXAMPLE_DIR: check a copy of the example elsewhere (coadapt trials)
 CI_OUTPUT="${EXAMPLE_DIR}/ci_output.txt"
 STATUS_FILE="${EXAMPLE_DIR}/ci_status_SCHE_${SCHEDULE}_LMEM_${LMEM}.txt"
 RESULT="FAIL"; WHY=""; G=""; R=""
