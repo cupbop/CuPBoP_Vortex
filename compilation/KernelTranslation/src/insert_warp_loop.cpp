@@ -413,10 +413,23 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
         varName + "_base"));
     g_ctx_pool_offset += MAX_BLK * elemSize;
   } else {
-    // SCHE_2: stack alloca
+    // stack alloca (schedule 1 and 2)
     auto block_size_addr = M->getGlobalVariable("block_size");
     auto block_size = createLoad(builder, block_size_addr);
-    Result = builder.CreateAlloca(AllocType, block_size, varName);
+    llvm::Value *count = block_size;
+    if (g_schedule_flag == 1) {
+      // virt: lanes are hardware, so a physical warp needs one slot per logical
+      // warp it executes: ceil(ceil(block_size/32) / P) instead of block_size.
+      auto I32c = Type::getInt32Ty(C);
+      auto warps = builder.CreateLShr(builder.CreateAdd(block_size, ConstantInt::get(I32c, 31)), ConstantInt::get(I32c, 5), "block_warps");
+      auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32c, false)), {}, "cta_warps");
+      count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(warps, P), ConstantInt::get(I32c, 1)), P, "ctx_slots");
+    }
+    auto *AI = builder.CreateAlloca(AllocType, count, varName);
+    // Byte-array slots (e.g. a lifter's 400-byte parameter block) are accessed as
+    // i32/i64 inside; an align-1 base would put slots at odd addresses.
+    if (AI->getAlign().value() < 16) AI->setAlignment(llvm::Align(16));
+    Result = AI;
   }
 
   contextArrays[varName] = Result;
@@ -453,6 +466,10 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
+  if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
+    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
+  }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size (per-block), so adding block_index_x
   // would write OOB. ctx_pool allocas are sized MAX_BLK (multi-block).
@@ -505,6 +522,10 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
+  if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
+    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
+  }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size, so block_index_x offset would OOB.
   // Direct global load (not threadlocal.address intrinsic) — see
@@ -1373,6 +1394,10 @@ static llvm::Value *computeThreadIdxForCtx(llvm::IRBuilder<> &builder,
       builder.CreateMul(inter_warp_index,
                         ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
+  if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
+    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
+  }
   if (g_schedule_flag == 0 && need_nested_loop) {
     auto block_index_x =
         createLoad(builder, M->getGlobalVariable("block_index_x"));
