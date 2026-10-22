@@ -392,8 +392,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
     // runtime (cudaRuntimeImpl.cpp) using the cudaMemcpyToSymbol mechanism.
     // No device-side scratch needed.
 
-    ss << "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
-            "void* p = __local_mem(size);\n"
+    ss << "// Vortex 3.0 KMU launch (CUPBOP_LAUNCH2): the CTA dispatcher hands each CTA its own\n"
+          "// local-memory window (VX_CSR_CTA_LMEM_ADDR, stride = lmem_size of the launch), so the\n"
+          "// legacy __local_mem(size) = base + group_id*size carve is no longer needed.\n"
+          "extern \"C\" void* vx_local_alloc(uint32_t size) {\n"
+            "(void)size;\n"
+            "void* p = (void*)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);\n"
             //"vx_printf(\"local memory allocation with %d bytes, add 0x%p\\n\", size, p);\n"
             // "void* csr_read = (void*)csr_read(VX_CSR_LOCAL_MEM_BASE);\n"
             // "vx_printf(\"csr_parameter: %d\\n\", VX_CSR_LOCAL_MEM_BASE);\n"
@@ -419,13 +423,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
       // Schedule 0/1: generate cuda_*_wrapper that copies vx_spawn TLS → CuPBoP TLS
       for (auto f : wrapper_name) {
         ss << "void cuda_" << f << "(void* args) {\n"
-                  "    block_index_x = blockIdx.x;\n"
-                  "    block_index_y = blockIdx.y;\n"
-                  "    block_index_z = blockIdx.z;\n"
-                  "\n"
-                  "    thread_id_x = threadIdx.x;\n"
-                  "    thread_id_y = threadIdx.y;\n"
-                  "    thread_id_z = threadIdx.z;\n"
+                  "    // block_index_{x,y,z} were set by the KMU entry (one CUDA block per hardware thread)\n"
+                  "    thread_id_x = 0;\n"
+                  "    thread_id_y = 0;\n"
+                  "    thread_id_z = 0;\n"
                   "\n"
                   "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"
                   "\n"
@@ -510,128 +511,89 @@ void create_kernel_wrapper_function(llvm::Module *M){
     }
 
     ss <<
-
-
-          "int main() {\n"
-          "//    vx_printf(\"kernel_wrapper: main\\n\");\n"
-          "    kernel_arg_t* kernel_arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH); \n"
+          "// ─── Vortex 3.0 KMU entry (CUPBOP_LAUNCH2) ─────────────────────────────────\n"
+          "// The host launches this entry with the real CUDA grid/block geometry\n"
+          "// (vx_enqueue_launch); the hardware CTA dispatcher places one CTA per core slot and\n"
+          "// every thread of every CTA starts here with the kernel-arg pointer in MSCRATCH.\n"
+          "// We fill the legacy vx_spawn globals (threadIdx/blockIdx TLS, blockDim/gridDim,\n"
+          "// __local_group_id, __warps_per_group) from the CTA CSRs so the translated kernel IR\n"
+          "// and the device runtime keep working unchanged.\n"
+          "static inline __attribute__((always_inline)) void __cupbop_fill_spawn_globals() {\n"
+          "    threadIdx.x = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_X);\n"
+          "    threadIdx.y = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_Y);\n"
+          "    threadIdx.z = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_Z);\n"
+          "    blockIdx.x  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_X);\n"
+          "    blockIdx.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y);\n"
+          "    blockIdx.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z);\n"
+          "    blockDim.x  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_X);\n"
+          "    blockDim.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Y);\n"
+          "    blockDim.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Z);\n"
+          "    gridDim.x   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_X);\n"
+          "    gridDim.y   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Y);\n"
+          "    gridDim.z   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Z);\n"
+          "    __local_group_id = (uint32_t)csr_read_nv(VX_CSR_CTA_ID);\n"
+          "    __warps_per_group = (uint32_t)csr_read_nv(VX_CSR_CTA_SIZE);\n"
+          "}\n"
+          "\n"
+          "// Service launches (grid 1, block 1): kernel_idx == -1 applies the cudaMemcpyToSymbol\n"
+          "// list [count | dst, size, inline data...]*; kernel_idx == -2 performs device->device\n"
+          "// copies [count | dst, src, size]* (device-variable read-back into a staging buffer).\n"
+          "static void __cupbop_service(int kernel_idx, uint64_t* list) {\n"
+          "    if (kernel_idx == -1) {\n"
+          "        uint64_t* slot = &list[1];\n"
+          "        for (int i = 0; i < (int)list[0]; i++) {\n"
+          "            auto dst_addr = (void*)slot[0];\n"
+          "            auto size = (size_t)slot[1];\n"
+          "            auto src_data = (void*)&slot[2];\n"
+          "            memcpy(dst_addr, src_data, size);\n"
+          "            size_t data_slots = (size + sizeof(uint64_t) - 1) / sizeof(uint64_t);\n"
+          "            slot += 2 + data_slots;\n"
+          "        }\n"
+          "    } else if (kernel_idx == -2) {\n"
+          "        uint64_t* slot = &list[1];\n"
+          "        for (int i = 0; i < (int)list[0]; i++) {\n"
+          "            memcpy((void*)slot[0], (const void*)slot[1], (size_t)slot[2]);\n"
+          "            slot += 3;\n"
+          "        }\n"
+          "    }\n"
+          "}\n"
+          "\n"
+          "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
+          "void kernel_main(kernel_arg_t* kernel_arg) {\n"
           "    auto ctx = &kernel_arg->ctx; \n"
           "    auto num_args = kernel_arg->num_args;\n"
           "    auto args = (uint64_t*)kernel_arg->args;\n"
-          "    auto memcpy_symbol_array = (uint64_t*)kernel_arg->args + num_args;"
-          "\n";
-
-    if (schedule != 2) {
-      // Schedule 0/1: populate CuPBoP globals from context
-      ss << "    grid_size_x = ctx->num_groups[0];\n"
-            "    grid_size_y = ctx->num_groups[1];\n"
-            "    grid_size_z = ctx->num_groups[2];\n"
-            "\n"
-
-            "    block_size_x = ctx->local_size[0];\n"
-            "    block_size_y = ctx->local_size[1];\n"
-            "    block_size_z = ctx->local_size[2];\n"
-            "\n"
-            "    block_size = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n";
-    }
-
-    ss << "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
-          "\n"
-
-          "//NOTE: old format — (dst_addr, staging_dev_addr, size) per symbol\n"
-          "//if (memcpy_symbol_array[0] != 0) {\n"
-          "//    int memcpy_symbol_idx = 0;\n"
-          "//    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
-          "//        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
-          "//        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
-          "//        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
-          "//        memcpy(dst_addr, src_addr, size);\n"
-          "//        memcpy_symbol_idx++;}}\n"
-          "// New format: [count | dst_addr, size, inline_data... | ...]\n"
-          "if (memcpy_symbol_array[0] != 0) {\n"
-          "    vx_printf(\"CHECK: cudamemcpytosymbol, number=%d\\n\", memcpy_symbol_array[0]);\n"
-          "    uint64_t* slot = &memcpy_symbol_array[1];\n"
-          "    for (int i = 0; i < (int)memcpy_symbol_array[0]; i++) {\n"
-          "        auto dst_addr = (void*)slot[0];\n"
-          "        auto size = (size_t)slot[1];\n"
-          "        auto src_data = (void*)&slot[2];\n"
-          "        memcpy(dst_addr, src_data, size);\n"
-          "        size_t data_slots = (size + sizeof(uint64_t) - 1) / sizeof(uint64_t);\n"
-          "        slot += 2 + data_slots;\n"
-          "    }}\n"
-
-
-          //      "    auto additional_info = (uint64_t*)KERNEL_ARG_ADDITIONAL_INFO_BASE_ADDR; \n"
-          // //"    vx_printf(\"additional_info[0]: %lu\\n\", additional_info[0]);\n"
-          // "    if (additional_info[0] != 0) {\n"
-          // "       vx_printf(\"CHECK: cudamemcpytosymbol\");\n"
-          // "       int additional_info_idx = 0;\n"
-          // "       while (additional_info_idx < additional_info[0]) {\n"
-          // "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
-          // "           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];\n"
-          // "           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];\n"
-          // "           memcpy(dst_addr, src_addr, size);\n"
-          // "           additional_info_idx++;}}\n"
-
-
-          "    //vx_printf(\"sizeof everything %d %d %d\\n\", sizeof(*kernel_arg), sizeof(*ctx), sizeof(ctx->printf_buffer)); \n"
-          "    //vx_printf(\"base: 0x%lx\\n\", KERNEL_ARG_BASE_ADDR); \n"
-          "    //vx_printf(\"kernel#%d (callback:0x%lx): gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), args=(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\\n\", \n"
-          "    //    kernel_arg->kernel_idx, callbacks[kernel_arg->kernel_idx], ctx->num_groups[0], ctx->num_groups[1], ctx->num_groups[2], \n"
-          "    //    ctx->local_size[0], ctx->local_size[1], ctx->local_size[2],\n"
-          "    //    args[0], args[1], args[2], args[3], args[4], args[5]);\n"
-          "    //vx_printf(\"workdim=%d\\n\", ctx->work_dim);\n"
-          "    //vx_printf(\"threadIdx.x=%d threadIdx.y=%d threadIdx.z=%d\\n\", threadIdx.x, threadIdx.y, threadIdx.z);\n"
-          
-      
-
-      "//vx_printf(\"execute something\\n\");"
-
-          "\n";
-
-    // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): publish per-CTA lmem
-    // size to vx_spawn_threads so it can clamp groups_per_core (avoids lmem
-    // wraparound that aliases group-1 of different cores in DRAM).
-    ss << "    __vx_lmem_per_cta_bytes = "
-          "kernel_static_lmem_bytes[kernel_arg->kernel_idx] + "
-          "ctx->dyn_shared_mem_size;\n";
-
+          "    if (kernel_arg->kernel_idx < 0) { __cupbop_service(kernel_arg->kernel_idx, args + num_args); return; }\n"
+          "    __cupbop_fill_spawn_globals();\n"
+          "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
+;
     if (schedule == 0) {
-      ss << "    return vx_spawn_threads(3, ctx->num_groups, nullptr, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
+      ss <<           "    // Flat schedule: one CUDA block per hardware thread. The host launched\n"
+          "    // ceil(num_blocks / NT) CTAs of NT threads; recover the CUDA block index.\n"
+          "    grid_size_x = ctx->num_groups[0];\n"
+          "    grid_size_y = ctx->num_groups[1];\n"
+          "    grid_size_z = ctx->num_groups[2];\n"
+          "    block_size_x = ctx->local_size[0];\n"
+          "    block_size_y = ctx->local_size[1];\n"
+          "    block_size_z = ctx->local_size[2];\n"
+          "    block_size = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
+          "    uint32_t linear = blockIdx.x * blockDim.x + threadIdx.x;\n"
+          "    uint32_t total = ctx->num_groups[0] * ctx->num_groups[1] * ctx->num_groups[2];\n"
+          "    if (linear >= total) return;\n"
+          "    block_index_x = linear % ctx->num_groups[0];\n"
+          "    block_index_y = (linear / ctx->num_groups[0]) % ctx->num_groups[1];\n"
+          "    block_index_z = linear / (ctx->num_groups[0] * ctx->num_groups[1]);\n"
+          "    callbacks[kernel_arg->kernel_idx](args);\n"
+          "}\n"
+;
     } else if (schedule == 1) {
       std::cerr << "Block mapping is not implemented yet\n";
     } else {
-      ss << "    return vx_spawn_threads(3, ctx->num_groups, ctx->local_size, (vx_kernel_func_cb)callbacks[kernel_arg->kernel_idx], args); \n";
-    }
-    ss << "\n" 
-
-          // --------------- CUDAMemcpytosymbol -----------4temp disabled
-          // "    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
-          // "if (memcpy_symbol_array[0] != 0) {\n"
-          // "    vx_printf(\"CHECK: cudamemcpytosymbol, number of cudamemcpytosymbol=%d \\n\", memcpy_symbol_array[0]);\n"
-          // "    int memcpy_symbol_idx = 0;\n"
-          // "    while (memcpy_symbol_idx < memcpy_symbol_array[0]) {\n"
-          // "        auto src_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 1];\n"
-          // "        auto dst_addr = (uint64_t*)memcpy_symbol_array[memcpy_symbol_idx * 3 + 2];\n"
-          // "        auto size = (size_t)memcpy_symbol_array[memcpy_symbol_idx * 3 + 3];\n"
-          // "        memcpy(dst_addr, src_addr, size);\n"
-          // "        vx_printf(\"memcpy_symbol[%d]: dst_addr=0x%p, src_addr=0x%p, size=%lu\\n\", memcpy_symbol_idx, dst_addr, src_addr, size);\n"
-          // "        memcpy_symbol_idx++;}}\n"
-
-      /*"    // Copy back the additional info (changed by the kernel, Cudamemcpytosymbol)\n"
-          "    if (additional_info[0] != 0) {\n"
-          "       int additional_info_idx = 0;\n"
-          "       while (additional_info_idx < additional_info[0]) {\n"
-          "           auto src_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 1];\n"
-          "           auto dst_addr = (uint64_t*)additional_info[additional_info_idx * 3 + 2];\n"
-          "           auto size = (size_t)additional_info[additional_info_idx * 3 + 3];\n"
-          "           memcpy(dst_addr, src_addr, size);\n"
-          "           additional_info_idx++;}}\n"
-      
-          "    return 0;\n"
-      */
+      ss <<           "    callbacks[kernel_arg->kernel_idx](args);\n"
           "}\n"
-          "\n";
+;
+    }
+    ss << "\n";
 
     auto content = ss.str();
 

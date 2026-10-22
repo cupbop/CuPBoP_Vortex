@@ -197,8 +197,9 @@ extern uint32_t __warps_per_group __attribute__((weak));
 __attribute__((always_inline)) void
 __vx_dxa_issue_2d(unsigned int desc_slot, unsigned int barrier_id,
                   void *smem_addr, unsigned int coord0, unsigned int coord1) {
-  // Only first warp in CTA issues DXA
-  if (__warps_per_group != 0 && (vx_warp_id() & (__warps_per_group - 1)) != 0)
+  // Only the first warp in the CTA issues DXA. Vortex 3.0 KMU launch: the CTA's
+  // warp rank comes from VX_CSR_CTA_RANK (CTA warps need not be aligned hardware warps).
+  if ((uint32_t)csr_read_nv(VX_CSR_CTA_RANK) != 0)
     return;
 #if defined(VX_CFG_NUM_THREADS)
   // Vortex 3.0: a barrier with pending transactions releases only after the DXA engine
@@ -242,9 +243,7 @@ __vx_dxa_barrier_id(unsigned int id) {
 
 // Check if current warp is the DXA warp (first warp in CTA)
 __attribute__((always_inline)) int __vx_is_dxa_warp(void) {
-  if (__warps_per_group == 0)
-    return 0;
-  return (vx_warp_id() & (__warps_per_group - 1)) == 0 ? 1 : 0;
+  return (uint32_t)csr_read_nv(VX_CSR_CTA_RANK) == 0 ? 1 : 0;
 }
 
 // Get shared memory base pointer (local memory)
@@ -336,17 +335,16 @@ __vx_wgmma_mma_ss(float *fragC, float *fragA_meta, float *fragB_meta) {
   fragC[7] = fd7;
 }
 
+// Per-CTA shared-memory window. Vortex 3.0 KMU launch: the CTA dispatcher assigns
+// each CTA its own local-memory region (stride = lmem_size of the launch) and
+// publishes the base in VX_CSR_CTA_LMEM_ADDR, so no group_id*size carve is needed.
 __attribute__((always_inline)) void *__vx_local_mem(void) {
-  // Must offset by __local_group_id so each CTA gets its own shared memory
-  // region Same as vx_spawn.h's __local_mem(size) but without size param
-  // (caller manages layout)
-  return (void *)csr_read(VX_CSR_LOCAL_MEM_BASE);
+  return (void *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
 }
 
-// Local mem with per-CTA offset (matches vx_spawn.h __local_mem(size))
 __attribute__((always_inline)) void *__vx_local_mem_offset(unsigned int size) {
-  return (void *)((char *)csr_read(VX_CSR_LOCAL_MEM_BASE) +
-                  __local_group_id * size);
+  (void)size;
+  return (void *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
 }
 
 struct __vx_dim3 {

@@ -151,8 +151,14 @@ private:
     , staging_size_(0)
     , krnl_buffer_(nullptr)
     , args_buffer_(nullptr)
+    , module_(nullptr)
+    , kernel_(nullptr)
+    , queue_(nullptr)
   {
     RT_CHECK(vx_dev_open(&device_));
+    // CUPBOP_LAUNCH2: one in-order queue for kernel launches (vx_enqueue_launch).
+    vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
+    RT_CHECK((int)vx_queue_create(device_, &qi, &queue_));
   }
 
   ~DeviceContext() {
@@ -162,7 +168,9 @@ private:
 	vx_mem_free(krnl_buffer_);
       if (args_buffer_ != nullptr)
 	vx_mem_free(args_buffer_);
-      
+      if (kernel_) vx_kernel_release(kernel_);
+      if (module_) vx_module_release(module_);
+      if (queue_)  vx_queue_release(queue_);
       vx_dev_close(device_);
     }
   }
@@ -180,8 +188,20 @@ public:
       vx_mem_free(krnl_buffer_);
       krnl_buffer_ = nullptr;
     }
+    if (kernel_) { vx_kernel_release(kernel_); kernel_ = nullptr; }
+    if (module_) { vx_module_release(module_); module_ = nullptr; }
     last_krnl_path_.clear();
   }
+
+  // CUPBOP_LAUNCH2: load kernel.vxbin as a module and resolve the single CuPBoP
+  // entry (generated kernel_main, exposed by the vxbin symbol footer as "main").
+  void load_module(const std::string& path) {
+    RT_CHECK((int)vx_module_load_file(device_, path.c_str(), &module_));
+    RT_CHECK((int)vx_module_get_kernel(module_, "main", &kernel_));
+  }
+  vx_module_h module() const { return module_; }
+  vx_kernel_h kernel() const { return kernel_; }
+  vx_queue_h  queue()  const { return queue_; }
 
   const std::string& last_krnl_path() const { return last_krnl_path_; }
   void set_last_krnl_path(const std::string& p) { last_krnl_path_ = p; }
@@ -195,6 +215,9 @@ private:
   vx_buffer_h krnl_buffer_;
   vx_buffer_h args_buffer_;
   std::string last_krnl_path_;
+  vx_module_h module_;
+  vx_kernel_h kernel_;
+  vx_queue_h  queue_;
 
   // Pointer manager
   struct MemoryInfo {
@@ -322,6 +345,86 @@ uint64_t NUM_THREADS_VX, NUM_WARPS_VX, NUM_CORES_VX;
 int caps_return1 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_THREADS, &NUM_THREADS_VX);
 int caps_return2 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_WARPS, &NUM_WARPS_VX);
 int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES_VX);
+
+// ─── CUPBOP_LAUNCH2 helpers (Vortex 3.0 KMU launch path) ──────────────────────
+// The device wrapper exposes one entry (kernel_main). A launch with
+// kernel_arg_t.kernel_idx >= 0 runs CUDA kernel #idx with the hardware CTA
+// dispatcher placing the grid; kernel_idx == -1 / -2 are single-thread service
+// launches (apply cudaMemcpyToSymbol list / device->device copies) used instead
+// of host-side writes into the module image.
+static int cupbop_schedule_flag() {
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) return std::stoi(std::string(env));
+  return 2;
+}
+static std::string cupbop_strip_prefix(const std::string &s) {
+  size_t i = 0;
+  if (s.size() > 2 && s[0] == '_' && s[1] == 'Z') i = 2;
+  while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
+  return s.substr(i);
+}
+// Per-kernel static __shared__ bytes, written by mem_share2local into kernel_lmem.log.
+static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
+  static std::map<std::string, uint32_t> table;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    std::ifstream f("kernel_lmem.log");
+    std::string name; uint32_t bytes;
+    while (f >> name >> bytes) {
+      std::string k = cupbop_strip_prefix(name);
+      if (table[k] < bytes) table[k] = bytes;
+    }
+  }
+  auto it = table.find(func_stripped);
+  return it == table.end() ? 0u : it->second;
+}
+static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
+                               const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes) {
+  vx_launch_info_t li = {};
+  li.struct_size = sizeof(li);
+  li.kernel      = DC->kernel();
+  li.args_host   = blob;
+  li.args_size   = size;
+  li.ndim        = ndim;
+  for (int i = 0; i < 3; ++i) { li.grid_dim[i] = grid[i]; li.block_dim[i] = block[i]; li.cluster_dim[i] = 1; }
+  li.lmem_size   = lmem_bytes;
+  vx_event_h ev = nullptr;
+  RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
+  RT_CHECK((int)vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE));
+  vx_event_release(ev);
+}
+// Service launch (grid 1, block 1): kernel_idx -1 or -2 with the op list after the header.
+static void cupbop_service_launch(DeviceContext *DC, int kind, const std::vector<uint64_t> &list) {
+  std::vector<uint8_t> blob(sizeof(kernel_arg_t) + list.size() * sizeof(uint64_t), 0);
+  auto *ka = (kernel_arg_t *)blob.data();
+  ka->kernel_idx = kind;
+  ka->num_args = 0;
+  memcpy(ka->args, list.data(), list.size() * sizeof(uint64_t));
+  uint32_t one[3] = {1, 1, 1};
+  cupbop_launch_blob(DC, blob.data(), blob.size(), 1, one, one, 0);
+}
+// Read device memory that lives inside the module image (BSS / __device__ vars):
+// the service kernel copies each range into a host-visible staging buffer.
+static void cupbop_read_device_ranges(DeviceContext *DC, const std::vector<std::pair<uint64_t, size_t>> &ranges,
+                                      const std::vector<void *> &dsts) {
+  if (ranges.empty()) return;
+  size_t total = 0;
+  for (auto &r : ranges) total += (r.second + 7) & ~size_t(7);
+  static uint64_t staging_addr = 0; static size_t staging_cap = 0;
+  if (total > staging_cap) {
+    if (staging_addr) DC->dev_mem_free((void *)staging_addr);
+    DC->dev_mem_alloc((int)total, VX_MEM_READ_WRITE, &staging_addr);
+    staging_cap = total;
+  }
+  std::vector<uint64_t> list; list.push_back(ranges.size());
+  uint64_t off = 0;
+  for (auto &r : ranges) { list.push_back(staging_addr + off); list.push_back(r.first); list.push_back(r.second); off += (r.second + 7) & ~size_t(7); }
+  cupbop_service_launch(DC, -2, list);
+  std::vector<uint8_t> host(total);
+  DC->copy_from_dev(staging_addr, host.data(), (int)total);
+  off = 0;
+  for (size_t i = 0; i < ranges.size(); ++i) { memcpy(dsts[i], host.data() + off, ranges[i].second); off += (ranges[i].second + 7) & ~size_t(7); }
+}
 
 
 extern "C" {
@@ -516,7 +619,7 @@ cudaError_t cudaMemcpyFromSymbol(void *dst,
     DBG_PRINT("cudaMemcpyFromSymbol: Copying %zu bytes from device address 0x%llx to host address %p\n",
            count, source_address, dst);
     
-    DC->copy_from_dev(source_address, dst, count);
+    cupbop_read_device_ranges(DC, {{source_address, (size_t)count}}, {dst});
 
     return cudaSuccess;
 }
@@ -874,9 +977,9 @@ cudaError_t cudaLaunchKernel_vortex(
   {
     // Use func as path if it looks like a file path (absolute or relative with /), else fallback
     std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
-    if (DC->get_krnl_buf() == nullptr || krnl_path != DC->last_krnl_path()) {
+    if (DC->module() == nullptr || krnl_path != DC->last_krnl_path()) {
       DC->cleanup_krnl();
-      RT_CHECK(vx_upload_kernel_file(DC->device(), krnl_path.c_str(), DC->krnl_buffer()));
+      DC->load_module(krnl_path);
       DC->set_last_krnl_path(krnl_path);
     }
   }
@@ -1019,7 +1122,7 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // upload kernel arguments
   // RT_CHECK(vx_copy_to_dev(DC->device(), KERNEL_ARG_BASE_ADDR, abuf_ptr, abuf_size));
-  RT_CHECK(vx_upload_bytes(DC->device(), abuf_ptr, abuf_size+abuf_size_additional, DC->args_buffer()));
+  const size_t abuf_total = abuf_size + abuf_size_additional; // host blob handed to vx_enqueue_launch
   DBG_PRINT("args_buffer: %p\n", DC->args_buffer());
   
 
@@ -1103,12 +1206,50 @@ cudaError_t cudaLaunchKernel_vortex(
   }
 
 
-  // start execution
-  RT_CHECK(vx_start(DC->device(), DC->get_krnl_buf(), DC->get_args_buf()));
-
-  DBG_PRINT("wait device\n");
-  // wait for the execution to complete
-  RT_CHECK(vx_ready_wait(DC->device(), VX_MAX_TIMEOUT));
+  // ── CUPBOP_LAUNCH2: hardware CTA dispatch via vx_enqueue_launch ─────────────
+  {
+    const int schedule = cupbop_schedule_flag();
+    const int kernel_idx = abuf_ptr->kernel_idx;
+    // 1) restore cudaMemcpyToSymbol / __device__ variables (single-thread service launch)
+    if (!memcpy_symbol.empty()) {
+      abuf_ptr->kernel_idx = -1;
+      uint32_t one[3] = {1, 1, 1};
+      cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0);
+      abuf_ptr->kernel_idx = kernel_idx;
+    }
+    // 2) the kernel itself
+    uint32_t grid[3], block[3], ndim, lmem = 0;
+    if (schedule == 2) {
+      // 1:1 mapping: CUDA block == Vortex CTA (must fit one core), __shared__ in CTA local memory
+      const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
+      const uint64_t core_threads = NUM_WARPS_VX * NUM_THREADS_VX;
+      if (block_threads > core_threads) {
+        printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
+               (unsigned long)block_threads, (unsigned long)core_threads);
+        std::abort();
+      }
+      grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
+      block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
+      ndim = 3;
+      lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
+      uint64_t lmem_cap = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
+        printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
+        std::abort();
+      }
+    } else {
+      // flat schedule: one CUDA block per hardware thread; the device entry recovers
+      // the block index from (CTA, thread). __shared__ lives in global memory.
+      const uint64_t total_blocks = (uint64_t)gridDim.x * gridDim.y * gridDim.z;
+      const uint32_t nt = (uint32_t)NUM_THREADS_VX;
+      grid[0] = (uint32_t)((total_blocks + nt - 1) / nt); grid[1] = 1; grid[2] = 1;
+      block[0] = nt; block[1] = 1; block[2] = 1;
+      ndim = 1;
+    }
+    DBG_PRINT("launch2: sched=%d grid=(%u,%u,%u) block=(%u,%u,%u) lmem=%u args=%zu\n",
+              schedule, grid[0], grid[1], grid[2], block[0], block[1], block[2], lmem, abuf_total);
+    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
+  }
 
   // Read back __device__ variables from device memory after kernel execution.
   // These are registered as memcpy_symbol entries so they get restored
@@ -1185,18 +1326,15 @@ cudaError_t cudaLaunchKernel_vortex(
     if (device_vars_registered) {
       // Read back device vars using the kernel buffer handle.
       // BSS globals reside within the kernel binary's memory region.
-      static uint64_t krnl_base_addr = 0;
-      if (krnl_base_addr == 0 && DC->get_krnl_buf()) {
-        vx_mem_address(DC->get_krnl_buf(), &krnl_base_addr);
-        DBG_PRINT("[device_var] kernel base addr=0x%lx\n", krnl_base_addr);
-      }
+      // CUPBOP_LAUNCH2: the module image is not a host-visible buffer; a service
+      // launch copies the variables into a staging buffer we can read.
+      std::vector<std::pair<uint64_t, size_t>> ranges; std::vector<void *> dsts;
       for (size_t i = device_var_start_idx; i < memcpy_symbol.size(); i++) {
         auto &entry = memcpy_symbol[i];
-        uint64_t offset = entry.dst_addr - krnl_base_addr;
-        vx_copy_from_dev(entry.data.data(), DC->get_krnl_buf(), offset, entry.size);
-        DBG_PRINT("[device_var] read-back[%ld]: addr=0x%lx offset=0x%lx\n",
-               i, entry.dst_addr, offset);
+        ranges.push_back({entry.dst_addr, (size_t)entry.size}); dsts.push_back(entry.data.data());
+        DBG_PRINT("[device_var] read-back[%ld]: addr=0x%lx size=%ld\n", i, entry.dst_addr, entry.size);
       }
+      cupbop_read_device_ranges(DC, ranges, dsts);
     }
   }
 
