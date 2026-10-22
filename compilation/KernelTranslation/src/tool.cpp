@@ -989,6 +989,12 @@ void replace_built_in_function(llvm::Module *M) {
               }
               Call->replaceAllUsesWith(C32);
               need_remove.push_back(Call);
+            } else if (func_name == "llvm.nvvm.read.ptx.sreg.cluster.ctarank" ||
+                       func_name == "llvm.nvvm.read.ptx.sreg.cluster.nctarank") {
+              // no thread-block clusters on Vortex: rank 0 of a cluster of 1
+              bool isN = func_name.find("nctarank") != std::string::npos;
+              Call->replaceAllUsesWith(ConstantInt::get(I32, isN ? 1 : 0));
+              need_remove.push_back(Call);
             } else if (func_name == "llvm.nvvm.read.ptx.sreg.laneid") {
               // CuLifter-lifted kernels read the lane id through this intrinsic
               // (clang CUDA emits the `mov.u32 $0, %laneid;` asm, handled in
@@ -1882,6 +1888,22 @@ void replace_asm_call(llvm::Module *M) {
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
               need_remove.push_back(Call);
+            } else if (asm_str.find("activemask.b32") != std::string::npos) {
+              // CuLifter's warp-reconvergence idiom: activemask feeds bar.warp.sync. 1:1: the
+              // hardware active mask; flat schedule: all lanes.
+              IRBuilder<> builder(Call);
+              int sched = 0;
+              if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) sched = std::atoi(e);
+              Value *res;
+              if (sched == 2) {
+                FunctionCallee FC = M->getOrInsertFunction("__cupbop_activemask", FunctionType::get(I32, false));
+                res = builder.CreateCall(FC, {}, "activemask");
+              } else {
+                res = ConstantInt::get(I32, 0xffffffffu);
+              }
+              if (!Call->getType()->isIntegerTy(32)) res = builder.CreateBitCast(res, Call->getType());
+              Call->replaceAllUsesWith(res);
+              need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.fence") != std::string::npos ||
                        asm_str.find("wgmma.commit_group") != std::string::npos ||
                        asm_str.find("wgmma.wait_group") != std::string::npos ||
@@ -1902,35 +1924,49 @@ void replace_asm_call(llvm::Module *M) {
               while (firstAcc < Call->arg_size() &&
                      !Call->getArgOperand(firstAcc)->getType()->isFloatTy())
                 firstAcc++;
-              ok = ok && firstAcc >= 3 && Call->arg_size() == firstAcc + nacc &&
+              // operands before the accumulators: desc_a, desc_b and, when scale-d is a
+              // register ("r" operand, clang/CUTLASS form) rather than a literal in the string
+              // (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"), the i32 scale-d
+              ok = ok && firstAcc >= 2 && Call->arg_size() == firstAcc + nacc &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
-                   Call->getArgOperand(1)->getType()->isIntegerTy(64) &&
-                   Call->getArgOperand(2)->getType()->isIntegerTy(32);
-              // scale-a, scale-b, trans-a, trans-b: literal "1, 1, 0, 0" in the string, or "n" operands
+                   Call->getArgOperand(1)->getType()->isIntegerTy(64);
+              Value *scaleD = nullptr; // nullptr -> literal, resolved below
+              // trailing operands of the instruction: [p|scale-d], scale-a, scale-b, trans-a, trans-b
               if (ok) {
-                size_t semi = asm_str.find(';', asm_str.find("k16.f32.f16.f16"));
-                std::string tail = asm_str.substr(asm_str.find("k16.f32.f16.f16"), semi - asm_str.find("k16.f32.f16.f16"));
+                size_t k16 = asm_str.find("k16.f32.f16.f16");
+                size_t semi = asm_str.find(';', k16);
+                std::string tail = asm_str.substr(k16, semi - k16);
                 std::vector<std::string> toks; size_t st = 0;
                 for (size_t c = tail.find(','); ; c = tail.find(',', st)) {
                   toks.push_back(tail.substr(st, (c == std::string::npos ? tail.size() : c) - st));
                   if (c == std::string::npos) break; st = c + 1;
                 }
-                int want[4] = {1, 1, 0, 0}; // scale-a, scale-b, trans-a, trans-b
-                if (toks.size() >= 4) {
-                  for (int i = 0; i < 4; i++) {
-                    std::string tk = toks[toks.size() - 4 + i];
-                    tk.erase(0, tk.find_first_not_of(" \t\n")); tk.erase(tk.find_last_not_of(" \t\n;") + 1);
-                    long v = -999;
-                    if (!tk.empty() && tk[0] == '$') { // operand placeholder: outputs come first
-                      unsigned ph = (unsigned)atoi(tk.c_str() + 1);
-                      if (ph >= nacc && ph - nacc < Call->arg_size())
-                        if (auto *CI = dyn_cast<ConstantInt>(Call->getArgOperand(ph - nacc)))
-                          v = CI->getSExtValue();
-                    } else if (!tk.empty() && (isdigit(tk[0]) || tk[0] == '-')) {
-                      v = atol(tk.c_str());
+                auto resolve = [&](std::string tk, long &v, Value *&reg) {
+                  tk.erase(0, tk.find_first_not_of(" \t\n")); tk.erase(tk.find_last_not_of(" \t\n;") + 1);
+                  v = -999; reg = nullptr;
+                  if (!tk.empty() && tk[0] == '$') { // operand placeholder: outputs come first
+                    unsigned ph = (unsigned)atoi(tk.c_str() + 1);
+                    if (ph >= nacc && ph - nacc < Call->arg_size()) {
+                      Value *op = Call->getArgOperand(ph - nacc);
+                      if (auto *CI = dyn_cast<ConstantInt>(op)) v = CI->getSExtValue(); else reg = op;
                     }
+                  } else if (tk == "p") {
+                    reg = (firstAcc >= 3) ? Call->getArgOperand(2) : nullptr; // predicate set from the "r" operand
+                  } else if (!tk.empty() && (isdigit(tk[0]) || tk[0] == '-')) {
+                    v = atol(tk.c_str());
+                  }
+                };
+                int want[4] = {1, 1, 0, 0}; // scale-a, scale-b, trans-a, trans-b
+                if (toks.size() >= 5) {
+                  long v; Value *reg;
+                  for (int i = 0; i < 4; i++) {
+                    resolve(toks[toks.size() - 4 + i], v, reg);
                     if (v != want[i]) ok = false;
                   }
+                  resolve(toks[toks.size() - 5], v, reg); // scale-d
+                  if (reg) scaleD = reg;
+                  else if (v == 0 || v == 1) scaleD = ConstantInt::get(I32, (uint64_t)v);
+                  else ok = false;
                 } else {
                   ok = false;
                 }
@@ -1965,7 +2001,7 @@ void replace_asm_call(llvm::Module *M) {
                   "__cupbop_wgmma_m64nNk16_f16f32",
                   FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
               builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
-                                      Call->getArgOperand(1), Call->getArgOperand(2), wig, Acc});
+                                      Call->getArgOperand(1), scaleD, wig, Acc});
               Value *Res = UndefValue::get(Call->getType());
               for (unsigned i = 0; i < nacc; i++)
                 Res = builder.CreateInsertValue(

@@ -1090,9 +1090,15 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32(uint3
 // Shared-memory window address: Vortex local memory is the shared window, so the 32-bit
 // "shared" address of a pointer is its byte offset from the local memory base (<= 256 KB fits
 // the 18-bit descriptor address field). kernelTranslator lowers the cvta.to.shared asm to this.
+// Convention: the "shared window" address of a local-memory pointer is its address modulo
+// 2^18 (the descriptor address field is 18 bits). CuLifter-lifted kernels build their wgmma
+// descriptors as (SASS descriptor) + ((&shared_mem >> 4) & 0x3FFF), i.e. the same thing, so
+// both the cvta path and lifted descriptors decode with one formula regardless of how the
+// local-memory base is aligned, as long as the local-memory region is below 256 KB.
 extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const void *p) {
-  return (uint32_t)((uintptr_t)p - (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE));
+  return (uint32_t)((uintptr_t)p & 0x3FFFFu);
 }
+extern "C" __attribute__((always_inline)) int __cupbop_activemask() { return (int)vx_active_threads(); }
 
 #if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE)
 // PTX matrix descriptor (wgmma smem operand): [13:0] addr>>4, [29:16] LBO>>4, [45:32] SBO>>4,
@@ -1101,7 +1107,8 @@ extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const
 struct __cupbop_smem_desc { const char *base; uint32_t lbo, sbo, swz; };
 static inline __cupbop_smem_desc __cupbop_decode_desc(uint64_t d) {
   __cupbop_smem_desc m;
-  m.base = (const char *)csr_read(VX_CSR_LOCAL_MEM_BASE) + ((d & 0x3FFFu) << 4);
+  const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
+  m.base = (const char *)(lmem + ((((d & 0x3FFFu) << 4) - (lmem & 0x3FFFFu)) & 0x3FFFFu)); // window addr -> pointer
   m.lbo = (uint32_t)((d >> 16) & 0x3FFFu) << 4;
   m.sbo = (uint32_t)((d >> 32) & 0x3FFFu) << 4;
   m.swz = (uint32_t)(d >> 62);
