@@ -597,7 +597,14 @@ void mem_share2local(llvm::Module *M) {
 
     // If there is no first barrier: handle immediately in entry (do NOT add group_off)
     if (!FirstBarrier) {
-      IRBuilder<> B(&*EntryBB->getFirstInsertionPt());
+      // Insert the local-memory prologue AFTER the leading allocas. insert_sync's
+      // built-in entry barrier goes before the first non-alloca/load/cast
+      // instruction; a vx_local_alloc call at the very top would pull every
+      // alloca behind that barrier and into the first warp-loop region
+      // (schedule 0/1), breaking dominance ("alloca does not dominate all uses").
+      auto EntryIP = EntryBB->getFirstInsertionPt();
+      while (EntryIP != EntryBB->end() && isa<AllocaInst>(&*EntryIP)) ++EntryIP;
+      IRBuilder<> B(&*EntryIP);
 
       // static layout
       struct Item { GlobalVariable* GV; uint32_t off; };
