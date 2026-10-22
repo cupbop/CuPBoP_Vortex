@@ -27,7 +27,8 @@ $(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS)
 else
 VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CUPBOP_RT_SRCS)
 endif
-KERNEL_LIB := vortex2   # Vortex 3.0 KMU launch path (CUPBOP_LAUNCH2): __vx_cta_entry + kernel_main entry
+# Vortex 3.0 KMU launch path (CUPBOP_LAUNCH2): vx_start.S built with KMU_ENABLE (__vx_cta_entry), kernel_main entry
+KERNEL_LIB := vortex2
 
 include ../common.mk
 

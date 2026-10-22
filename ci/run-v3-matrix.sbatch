@@ -47,6 +47,7 @@ run_one() { # test sched lmem
     timeout 1800 make -C $t ci SCHEDULE=$s LOCALMEM=$l > $log 2>&1 ); local rc=$?
   local k=0 h=0 e=0; grep -q "Kernel compilation completed!" $log && k=1; grep -q "Host compilation completed!" $log && h=1; grep -q "Execution completed!" $log && e=1
   local r; r=$(./ci/check_correctness.sh $t $s $l 2>&1 | tee -a $log | sed -n 's/^RESULT=//p')
+  [ $rc -ne 0 ] && r=FAIL   # a failed build can never be a PASS (stale result files from an earlier run must not count)
   echo "$t,$s,$l,$rc,$k,$h,$e,$r,$((SECONDS-t0))" >> $RES
   printf "%-20s sched=%s lmem=%s make=%-3s k/h/e=%s%s%s  %s  %ss\n" $t $s $l $rc $k $h $e $r $((SECONDS-t0))
 }
