@@ -263,6 +263,22 @@ static int g_schedule_flag = 2;
 static int g_ctx_pool_offset = 0;
 int need_nested_loop;
 
+// Core mapping (virt) hardware helpers (__cupbop_cta_size / __cupbop_cta_rank /
+// __cupbop_num_threads): CSR reads that are constant for the kernel's lifetime.
+// Declared memory(none) so LLVM can CSE and hoist the many per-access calls
+// (ctx_slot = (logical warp)/P is recomputed at every context array access;
+// without this a small kernel like nn paid ~20 csrr+udiv per logical thread).
+static llvm::FunctionCallee getVirtHelper(llvm::Module *M, const char *name,
+                                          llvm::FunctionType *FT) {
+  auto C = M->getOrInsertFunction(name, FT);
+  if (auto *Fn = llvm::dyn_cast<llvm::Function>(C.getCallee())) {
+    Fn->setDoesNotAccessMemory();
+    Fn->setDoesNotThrow();
+    Fn->setWillReturn();
+  }
+  return C;
+}
+
 // adding multiple kenerl in file support
 
 bool ShouldNotBeContextSaved(llvm::Instruction *instr,
@@ -422,7 +438,7 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
       // warp it executes: ceil(ceil(block_size/32) / P) instead of block_size.
       auto I32c = Type::getInt32Ty(C);
       auto warps = builder.CreateLShr(builder.CreateAdd(block_size, ConstantInt::get(I32c, 31)), ConstantInt::get(I32c, 5), "block_warps");
-      auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32c, false)), {}, "cta_warps");
+      auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32c, false)), {}, "cta_warps");
       count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(warps, P), ConstantInt::get(I32c, 1)), P, "ctx_slots");
     }
     auto *AI = builder.CreateAlloca(AllocType, count, varName);
@@ -467,7 +483,7 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
   if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
-    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
     thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
   }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
@@ -523,7 +539,7 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
   if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
-    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
     thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
   }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
@@ -1202,7 +1218,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   if (need_nested_loop && intra_warp_loop) {
     // Only set inner loop variables for intra_warp pass
     if (schedule_flag == 1) {
-      FunctionCallee nHTC = M->getOrInsertFunction("__cupbop_num_threads", nTTy);
+      FunctionCallee nHTC = getVirtHelper(M, "__cupbop_num_threads", nTTy);
       FunctionCallee tidC = M->getOrInsertFunction("__cupbop_laneid", nTTy);
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
       // virt: the lane id is the root of every lane-divergent value (the intra index
@@ -1223,10 +1239,10 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
 
   if (schedule_flag == 1) {
       // Get hardware information
-      FunctionCallee nHTC = M->getOrInsertFunction("__cupbop_num_threads", nTTy);
-      FunctionCallee nHWC = M->getOrInsertFunction("__cupbop_cta_size", nTTy); // virt: physical warps of this CTA (VX_CSR_CTA_SIZE)
+      FunctionCallee nHTC = getVirtHelper(M, "__cupbop_num_threads", nTTy);
+      FunctionCallee nHWC = getVirtHelper(M, "__cupbop_cta_size", nTTy); // virt: physical warps of this CTA (VX_CSR_CTA_SIZE)
       FunctionCallee tidC = M->getOrInsertFunction("__cupbop_laneid", nTTy);
-      FunctionCallee widC = M->getOrInsertFunction("__cupbop_cta_rank", nTTy);  // virt: this warp's rank in the CTA (VX_CSR_CTA_RANK)
+      FunctionCallee widC = getVirtHelper(M, "__cupbop_cta_rank", nTTy);  // virt: this warp's rank in the CTA (VX_CSR_CTA_RANK)
 
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
       // virt: the lane id is the root of every lane-divergent value (the intra index
@@ -1395,7 +1411,7 @@ static llvm::Value *computeThreadIdxForCtx(llvm::IRBuilder<> &builder,
                         ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
   if (g_schedule_flag == 1) { // virt: slot = (logical warp index) / P
-    auto P = builder.CreateCall(M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
+    auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
     thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
   }
   if (g_schedule_flag == 0 && need_nested_loop) {
@@ -2311,13 +2327,14 @@ public:
         }
         // when handling intra warp loop, we need also split the blocks
         // between warp barrier and shfl barrier
-        if (intra_warp_loop && (isWarpSync(func_name) ||
+        // (schedule 1 / virt: lanes are hardware, warp syncs are not boundaries)
+        if (intra_warp_loop && g_schedule_flag != 1 && (isWarpSync(func_name) ||
             func_name == "cupbop.shfl.barrier")) {
           exit_blocks.push_back(&(*s));
         }
 
         // split the blocks between thread group barrier
-        if (intra_warp_loop && isCGThreadGroupSync(func_name)) {
+        if (intra_warp_loop && g_schedule_flag != 1 && isCGThreadGroupSync(func_name)) {
           exit_blocks.push_back(&(*s));
         }
       }
@@ -2512,6 +2529,18 @@ void insert_warp_loop(llvm::Module *M) {
   }
 
   int need_loop_serialize = (schedule != 2);
+
+  // Core mapping (virt, schedule 1): a physical warp runs one logical warp at a
+  // time with all NT lanes in lockstep, so warp-level syncs/shuffles/votes are
+  // hardware ops exactly as in the 1:1 schedule; only __syncthreads splits the
+  // (single, block-sized) warp loop. The nested inter/intra form exists for the
+  // flat schedule, where one hardware thread emulates a whole warp, and its
+  // region detection does not survive the lifted (SASS-derived, ballot-driven)
+  // control flow: lifted hotspot/pathfinder/backprop/lud wrote nothing or trapped.
+  if (schedule == 1 && need_nested_loop) {
+    fprintf(stderr, "[IWL] schedule 1 (virt): warp-level syncs are hardware, using the single block-sized loop (no nested loop)\n");
+    need_nested_loop = 0;
+  }
 
   fprintf(stderr, "[IWL] schedule=%d, need_loop_serialize=%d, need_nested_loop=%d\n",
           schedule, need_loop_serialize, need_nested_loop);
