@@ -1181,8 +1181,8 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
   if (need_nested_loop && intra_warp_loop) {
     // Only set inner loop variables for intra_warp pass
     if (schedule_flag == 1) {
-      FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
-      FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
+      FunctionCallee nHTC = M->getOrInsertFunction("__cupbop_num_threads", nTTy);
+      FunctionCallee tidC = M->getOrInsertFunction("__cupbop_laneid", nTTy);
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
       // virt: the lane id is the root of every lane-divergent value (the intra index
       // round-trips through an alloca that mem2reg removes), so mark it for the
@@ -1202,9 +1202,9 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
 
   if (schedule_flag == 1) {
       // Get hardware information
-      FunctionCallee nHTC = M->getOrInsertFunction("vx_num_threads", nTTy);
+      FunctionCallee nHTC = M->getOrInsertFunction("__cupbop_num_threads", nTTy);
       FunctionCallee nHWC = M->getOrInsertFunction("__cupbop_cta_size", nTTy); // virt: physical warps of this CTA (VX_CSR_CTA_SIZE)
-      FunctionCallee tidC = M->getOrInsertFunction("vx_thread_id", nTTy);
+      FunctionCallee tidC = M->getOrInsertFunction("__cupbop_laneid", nTTy);
       FunctionCallee widC = M->getOrInsertFunction("__cupbop_cta_rank", nTTy);  // virt: this warp's rank in the CTA (VX_CSR_CTA_RANK)
 
       auto tid = builder.CreateCall(tidC, {}, "hw_tid");
