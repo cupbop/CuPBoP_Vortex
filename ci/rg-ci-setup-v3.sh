@@ -77,7 +77,7 @@ cupbop_v3_ensure_simx() {
 # The tensor examples run on the TCU+DXA SimX build: switch VORTEX_PATH / VORTEX_CONFIGS for them.
 cupbop_v3_select_simx() {
   case $1 in
-    sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa)
+    sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa|sgemm_wgmma_bf16|sgemm_tcu_bf16)
       export VORTEX_PATH=$VORTEX_PATH_TCU VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU"
       export LD_LIBRARY_PATH=$VORTEX_PATH/sw/runtime:$LD_LIBRARY_PATH ;;
   esac

@@ -1918,7 +1918,9 @@ void replace_asm_call(llvm::Module *M) {
               // -> __cupbop_wgmma_m64nNk16_f16f32(N, desc_a, desc_b, scale_d, warp_in_warpgroup, acc[N/2])
               size_t sp = asm_str.find("m64n");
               int N = (sp == std::string::npos) ? 0 : atoi(asm_str.c_str() + sp + 4);
-              bool ok = N >= 8 && (N % 16) == 0 && asm_str.find("k16.f32.f16.f16") != std::string::npos;
+              bool wgF16 = asm_str.find("k16.f32.f16.f16") != std::string::npos;
+              bool wgBf16 = asm_str.find("k16.f32.bf16.bf16") != std::string::npos;
+              bool ok = N >= 8 && (N % 16) == 0 && (wgF16 || wgBf16);
               unsigned nacc = ok ? (unsigned)N / 2 : 0;
               unsigned firstAcc = 0;
               while (firstAcc < Call->arg_size() &&
@@ -1933,7 +1935,7 @@ void replace_asm_call(llvm::Module *M) {
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
               // trailing operands of the instruction: [p|scale-d], scale-a, scale-b, trans-a, trans-b
               if (ok) {
-                size_t k16 = asm_str.find("k16.f32.f16.f16");
+                size_t k16 = asm_str.find(wgBf16 ? "k16.f32.bf16.bf16" : "k16.f32.f16.f16");
                 size_t semi = asm_str.find(';', k16);
                 std::string tail = asm_str.substr(k16, semi - k16);
                 std::vector<std::string> toks; size_t st = 0;
@@ -1973,7 +1975,7 @@ void replace_asm_call(llvm::Module *M) {
               }
               if (!ok) {
                 fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
-                        "  only m64nNk16 .f32.f16.f16, K-major A and B (trans 0,0), scale 1,1 are lowered\n",
+                        "  only m64nNk16 .f32.f16.f16 / .f32.bf16.bf16, K-major A and B (trans 0,0), scale 1,1 are lowered\n",
                         (unsigned)Call->arg_size(), asm_str.c_str());
                 exit(1);
               }
@@ -1998,7 +2000,7 @@ void replace_asm_call(llvm::Module *M) {
                 builder.CreateStore(Call->getArgOperand(firstAcc + i),
                                     builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
               FunctionCallee FC = M->getOrInsertFunction(
-                  "__cupbop_wgmma_m64nNk16_f16f32",
+                  wgBf16 ? "__cupbop_wgmma_m64nNk16_bf16f32" : "__cupbop_wgmma_m64nNk16_f16f32",
                   FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
               builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
                                       Call->getArgOperand(1), scaleD, wig, Acc});
@@ -3281,12 +3283,14 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     StringRef Name = CI->getCalledFunction()->getName();
     bool k16 = Name.contains(".m16n8k16.");
     bool k8 = Name.contains(".m16n8k8.");
-    bool ok = (k16 || k8) && Name.contains(".row.col.") && Name.ends_with(".f32.f32");
+    // f16 inputs: ...row.col.f32.f32 (<2 x half> operands); bf16 inputs: ...row.col.bf16 (i32 operands)
+    bool isBf16 = Name.ends_with(".bf16");
+    bool ok = (k16 || k8) && Name.contains(".row.col.") && (Name.ends_with(".f32.f32") || isBf16);
     unsigned nA = k16 ? 4 : 2, nB = k16 ? 2 : 1;
     if (!ok || CI->arg_size() != nA + nB + 4) {
       fprintf(stderr,
               "error: unsupported mma.sync intrinsic %s (%u operands); only "
-              "m16n8k16/m16n8k8 .row.col f16*f16->f32 are lowered\n",
+              "m16n8k16/m16n8k8 .row.col f16*f16->f32 and bf16*bf16->f32 are lowered\n",
               Name.str().c_str(), (unsigned)CI->arg_size());
       exit(1);
     }
@@ -3294,8 +3298,8 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     // helper when the kernel is built for a TCU-enabled Vortex, else software),
     // sw (force the software reference), tcu (force the TCU-backed helper; links
     // only against a TCU build). A lowering-recipe knob for lifted tensor kernels.
-    std::string rtName = k16 ? "__cupbop_mma_m16n8k16_f16f32"
-                             : "__cupbop_mma_m16n8k8_f16f32";
+    std::string rtName = std::string(k16 ? "__cupbop_mma_m16n8k16_" : "__cupbop_mma_m16n8k8_") +
+                         (isBf16 ? "bf16f32" : "f16f32");
     if (const char *env = std::getenv("CUPBOP_MMA_LOWERING")) {
       std::string mode(env);
       if (mode == "sw" || mode == "tcu")

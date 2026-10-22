@@ -389,6 +389,7 @@ __attribute__((always_inline)) float __vx_bitcast_u32_to_f32(uint32_t x) {
 namespace {
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<VX_CFG_NUM_THREADS, vt::fp16, vt::fp32>;
+using tcu_ctx_bf16 = vt::wmma_context<VX_CFG_NUM_THREADS, vt::bf16, vt::fp32>; // same tile/lane layout, input id 3
 static_assert(tcu_ctx::tileM == 16 && tcu_ctx::tileN == 16, "CuPBoP TCU wrappers assume a 16x16 (M,N) tile: use NUM_THREADS=32");
 static_assert(sizeof(tcu_ctx::fragment_a) <= 32 && sizeof(tcu_ctx::fragment_b) <= 32 && sizeof(tcu_ctx::fragment_acc) == 32,
               "translator fragment storage is 8 x 32-bit per lane");
@@ -942,6 +943,9 @@ static inline float __cupbop_f16_to_f32(uint32_t h) {
   __builtin_memcpy(&f, &fb, 4);
   return f;
 }
+static inline float __cupbop_bf16_to_f32(uint32_t h) { // bf16 = upper half of fp32
+  uint32_t bits = (h & 0xffffu) << 16; float f; __builtin_memcpy(&f, &bits, 4); return f;
+}
 static inline uint32_t __cupbop_shfl32(uint32_t v, int src_lane) {
   return (uint32_t)vx_shfl_idx((size_t)v, src_lane, 31, 0); // full-warp index gather
 }
@@ -957,7 +961,8 @@ extern "C" __attribute__((always_inline)) uint32_t __cupbop_movmatrix_m8n8_trans
 }
 
 // D = A(16x16,f16,row) * B(16x8,f16,col) + C(16x8,f32)
-extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+template <float (*CVT)(uint32_t)>
+static inline void __cupbop_mma_m16n8k16_sw_impl(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                              uint32_t b0, uint32_t b1,
                                              float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
@@ -970,16 +975,27 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_sw(u
     const uint32_t ub = __cupbop_shfl32(kk < 4 ? b0 : b1, lb0 | q); // B[k..k+1][2t]
     const uint32_t vb = __cupbop_shfl32(kk < 4 ? b0 : b1, lb1 | q); // B[k..k+1][2t+1]
     for (int h = 0; h < 32; h += 16) {
-      const float ag = __cupbop_f16_to_f32(xa >> h), ag8 = __cupbop_f16_to_f32(ya >> h);
-      const float bn0 = __cupbop_f16_to_f32(ub >> h), bn1 = __cupbop_f16_to_f32(vb >> h);
+      const float ag = CVT(xa >> h), ag8 = CVT(ya >> h);
+      const float bn0 = CVT(ub >> h), bn1 = CVT(vb >> h);
       d0 += ag * bn0; d1 += ag * bn1; d2 += ag8 * bn0; d3 += ag8 * bn1;
     }
   }
   d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
 }
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1,
+                                             float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k16_sw_impl<__cupbop_f16_to_f32>(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_bf16f32_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1,
+                                             float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k16_sw_impl<__cupbop_bf16_to_f32>(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+}
 
 // D = A(16x8,f16,row) * B(8x8,f16,col) + C(16x8,f32)
-extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
+template <float (*CVT)(uint32_t)>
+static inline void __cupbop_mma_m16n8k8_sw_impl(uint32_t a0, uint32_t a1, uint32_t b0,
                                             float c0, float c1, float c2, float c3, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
@@ -990,12 +1006,20 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_sw(ui
     const uint32_t ub = __cupbop_shfl32(b0, lb0 | kk);
     const uint32_t vb = __cupbop_shfl32(b0, lb1 | kk);
     for (int h = 0; h < 32; h += 16) {
-      const float ag = __cupbop_f16_to_f32(xa >> h), ag8 = __cupbop_f16_to_f32(ya >> h);
-      const float bn0 = __cupbop_f16_to_f32(ub >> h), bn1 = __cupbop_f16_to_f32(vb >> h);
+      const float ag = CVT(xa >> h), ag8 = CVT(ya >> h);
+      const float bn0 = CVT(ub >> h), bn1 = CVT(vb >> h);
       d0 += ag * bn0; d1 += ag * bn1; d2 += ag8 * bn0; d3 += ag8 * bn1;
     }
   }
   d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
+                                            float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k8_sw_impl<__cupbop_f16_to_f32>(a0, a1, b0, c0, c1, c2, c3, d);
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32_sw(uint32_t a0, uint32_t a1, uint32_t b0,
+                                            float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k8_sw_impl<__cupbop_bf16_to_f32>(a0, a1, b0, c0, c1, c2, c3, d);
 }
 
 // ---- TCU-backed variant ----------------------------------------------------------------------
@@ -1021,7 +1045,8 @@ static inline float __cupbop_shflf(float v, int src_lane) {
   float f; __builtin_memcpy(&f, &u, 4); return f;
 }
 // PTX accumulator (c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)) -> Vortex acc regs 0,1,4,5 (cols t, t+4)
-static inline void __cupbop_acc_nv_to_vx(float c0, float c1, float c2, float c3, tcu_ctx::fragment_acc &fc) {
+template <class CTX>
+static inline void __cupbop_acc_nv_to_vx(float c0, float c1, float c2, float c3, typename CTX::fragment_acc &fc) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int s0 = (g << 2) | (t >> 1), s1 = (g << 2) | ((t >> 1) + 2); // owners of col t and col t+4
   const bool odd = t & 1;                                              // their slot
@@ -1033,7 +1058,8 @@ static inline void __cupbop_acc_nv_to_vx(float c0, float c1, float c2, float c3,
   fc.data[4] = odd ? z1 : z0; fc.data[5] = odd ? w1 : w0; fc.data[6] = 0.f; fc.data[7] = 0.f;
 }
 // Vortex acc regs -> PTX d0..d3
-static inline void __cupbop_acc_vx_to_nv(const tcu_ctx::fragment_acc &fd, float *d) {
+template <class CTX>
+static inline void __cupbop_acc_vx_to_nv(const typename CTX::fragment_acc &fd, float *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int u0 = (g << 2) | ((2 * t) & 3), u1 = u0 + 1; // holders of col 2t and 2t+1
   const bool hi = t >> 1;                               // in reg 1/5 (col >= 4) or reg 0/4
@@ -1043,24 +1069,44 @@ static inline void __cupbop_acc_vx_to_nv(const tcu_ctx::fragment_acc &fd, float 
   const float v0 = __cupbop_shflf(fd.data[4], u1), v1 = __cupbop_shflf(fd.data[5], u1);
   d[0] = hi ? p1 : p0; d[1] = hi ? q1 : q0; d[2] = hi ? r1 : r0; d[3] = hi ? v1 : v0;
 }
+template <class CTX>
+static inline void __cupbop_mma_m16n8k16_tcu_impl(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                 uint32_t b0, uint32_t b1,
+                                                 float c0, float c1, float c2, float c3, float *d) {
+  typename CTX::fragment_a fa; typename CTX::fragment_b fb; typename CTX::fragment_acc fc, fd;
+  fa.data = {{__cupbop_u32_as_f32(a0), __cupbop_u32_as_f32(a2), 0.f, 0.f, __cupbop_u32_as_f32(a1), __cupbop_u32_as_f32(a3), 0.f, 0.f}};
+  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, __cupbop_u32_as_f32(b1), 0.f, 0.f, 0.f, 0.f, 0.f}};
+  __cupbop_acc_nv_to_vx<CTX>(c0, c1, c2, c3, fc);
+  CTX::mma_sync(fd, fa, fb, fc);
+  __cupbop_acc_vx_to_nv<CTX>(fd, d);
+}
 extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                  uint32_t b0, uint32_t b1,
                                                  float c0, float c1, float c2, float c3, float *d) {
-  tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
-  fa.data = {{__cupbop_u32_as_f32(a0), __cupbop_u32_as_f32(a2), 0.f, 0.f, __cupbop_u32_as_f32(a1), __cupbop_u32_as_f32(a3), 0.f, 0.f}};
-  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, __cupbop_u32_as_f32(b1), 0.f, 0.f, 0.f, 0.f, 0.f}};
-  __cupbop_acc_nv_to_vx(c0, c1, c2, c3, fc);
-  tcu_ctx::mma_sync(fd, fa, fb, fc);
-  __cupbop_acc_vx_to_nv(fd, d);
+  __cupbop_mma_m16n8k16_tcu_impl<tcu_ctx>(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_bf16f32_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                 uint32_t b0, uint32_t b1,
+                                                 float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k16_tcu_impl<tcu_ctx_bf16>(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+}
+template <class CTX>
+static inline void __cupbop_mma_m16n8k8_tcu_impl(uint32_t a0, uint32_t a1, uint32_t b0,
+                                                float c0, float c1, float c2, float c3, float *d) {
+  typename CTX::fragment_a fa; typename CTX::fragment_b fb; typename CTX::fragment_acc fc, fd;
+  fa.data = {{__cupbop_u32_as_f32(a0), 0.f, 0.f, 0.f, __cupbop_u32_as_f32(a1), 0.f, 0.f, 0.f}};
+  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
+  __cupbop_acc_nv_to_vx<CTX>(c0, c1, c2, c3, fc);
+  CTX::mma_sync(fd, fa, fb, fc);
+  __cupbop_acc_vx_to_nv<CTX>(fd, d);
 }
 extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
                                                 float c0, float c1, float c2, float c3, float *d) {
-  tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
-  fa.data = {{__cupbop_u32_as_f32(a0), 0.f, 0.f, 0.f, __cupbop_u32_as_f32(a1), 0.f, 0.f, 0.f}};
-  fb.data = {{__cupbop_u32_as_f32(b0), 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
-  __cupbop_acc_nv_to_vx(c0, c1, c2, c3, fc);
-  tcu_ctx::mma_sync(fd, fa, fb, fc);
-  __cupbop_acc_vx_to_nv(fd, d);
+  __cupbop_mma_m16n8k8_tcu_impl<tcu_ctx>(a0, a1, b0, c0, c1, c2, c3, d);
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
+                                                float c0, float c1, float c2, float c3, float *d) {
+  __cupbop_mma_m16n8k8_tcu_impl<tcu_ctx_bf16>(a0, a1, b0, c0, c1, c2, c3, d);
 }
 #define CUPBOP_MMA_TCU_AVAILABLE 1
 #endif // TCU-backed variant
@@ -1075,12 +1121,29 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_f16f32(uint
   __cupbop_mma_m16n8k16_f16f32_sw(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
 #endif
 }
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k16_bf16f32(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1,
+                                             float c0, float c1, float c2, float c3, float *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k16_bf16f32_tcu(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+#else
+  __cupbop_mma_m16n8k16_bf16f32_sw(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, d);
+#endif
+}
 extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_f16f32(uint32_t a0, uint32_t a1, uint32_t b0,
                                             float c0, float c1, float c2, float c3, float *d) {
 #if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
   __cupbop_mma_m16n8k8_f16f32_tcu(a0, a1, b0, c0, c1, c2, c3, d);
 #else
   __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, c0, c1, c2, c3, d);
+#endif
+}
+extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32(uint32_t a0, uint32_t a1, uint32_t b0,
+                                            float c0, float c1, float c2, float c3, float *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k8_bf16f32_tcu(a0, a1, b0, c0, c1, c2, c3, d);
+#else
+  __cupbop_mma_m16n8k8_bf16f32_sw(a0, a1, b0, c0, c1, c2, c3, d);
 #endif
 }
 
@@ -1126,21 +1189,21 @@ static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k) 
 // Vortex acc reg r = (g + 8*(r>>2), t + 4*(r&3)) within a 16-column block, hence the shuffles.
 // scale_d = 0 ignores the incoming accumulator (D = A*B). Synchronous: the translator drops
 // wgmma.fence / commit_group / wait_group and fence.proxy.async.
-extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
-                                               int warp_in_wg, float *acc) {
+template <class CTX>
+static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
   const int row0 = 16 * warp_in_wg;
-  tcu_ctx::fragment_a fa; // reg r: row g + 8*(r>>2), k = 8*(r&3) + 2t ; k >= 16 zero
+  typename CTX::fragment_a fa; // reg r: row g + 8*(r>>2), k = 8*(r&3) + 2t ; k >= 16 zero
   fa.data = {{__cupbop_core_ld(A, row0 + g, 2 * t), __cupbop_core_ld(A, row0 + g, 8 + 2 * t), 0.f, 0.f,
               __cupbop_core_ld(A, row0 + g + 8, 2 * t), __cupbop_core_ld(A, row0 + g + 8, 8 + 2 * t), 0.f, 0.f}};
   const bool odd = t & 1, hi = t >> 1;
   for (int nb = 0; nb < n_cols / 16; ++nb) {
     const int n0 = 16 * nb;
-    tcu_ctx::fragment_b fb; // reg r: k = 8*(r>>1) + 2t, n = g + 8*(r&1) ; k >= 16 zero
+    typename CTX::fragment_b fb; // reg r: k = 8*(r>>1) + 2t, n = g + 8*(r&1) ; k >= 16 zero
     fb.data = {{__cupbop_core_ld(B, n0 + g, 2 * t), __cupbop_core_ld(B, n0 + g + 8, 2 * t),
                 __cupbop_core_ld(B, n0 + g, 8 + 2 * t), __cupbop_core_ld(B, n0 + g + 8, 8 + 2 * t), 0.f, 0.f, 0.f, 0.f}};
-    tcu_ctx::fragment_acc fc, fd;
+    typename CTX::fragment_acc fc, fd;
     if (scale_d) {
       for (int r = 0; r < 8; ++r) { // Vortex reg r <- PTX owner lane (g, cc>>1), slot cc&1, cc = t + 4*((r&3)&1), j = 2nb + ((r&3)>>1)
         const int jl = (r & 3) >> 1, q = (r & 3) & 1;
@@ -1152,7 +1215,7 @@ extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(in
     } else {
       for (int r = 0; r < 8; ++r) fc.data[r] = 0.f;
     }
-    tcu_ctx::mma_sync(fd, fa, fb, fc);
+    CTX::mma_sync(fd, fa, fb, fc);
     for (int jl = 0; jl < 2; ++jl) { // PTX acc[4j+s] <- Vortex holder lane (g, c&3), reg 4*(s>>1) + (c>>2), c = 8jl + 2t + (s&1)
       const int j = 2 * nb + jl;
       for (int s = 0; s < 4; ++s) {
@@ -1163,5 +1226,11 @@ extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(in
       }
     }
   }
+}
+extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc) {
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
+}
+extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_bf16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc) {
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
 }
 #endif // wgmma (TCU builds)
