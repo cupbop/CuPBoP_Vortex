@@ -1821,14 +1821,13 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
   // branch is handled by hardware predication, so injecting gates would
   // be pure overhead with no correctness benefit. Bailing out for non-
   // SCHE_0 keeps SCHE_2 behavior unchanged.
-  // virt sub-pass form (SCHE_1, S > 1): the same gating is needed, INTRA pass
-  // only. A staged warp op (or a native bar.warp.sync) inside a divergent `if`
-  // splits the body; without the gate every later piece runs for all lanes of
-  // the logical warp (lifted kernels: ballots at every SASS branch). The INTER
-  // loop iterates logical warps, where a per-lane predicate has no meaning.
+  // NOT for the virt sub-pass form (SCHE_1, S > 1): tried 2026-10-22 (INTRA pass
+  // only). It found no guard in the lifted kernels (insert_sync already re-tests
+  // the condition in every piece of a split `if`), and in jacobi/wedford/score it
+  // gated the body of a user loop (`if (wid == 0) for (...) shfl`) so the lanes
+  // outside the `if` never advanced the loop counter -> SimX hang.
   bool predicated_exec_enabled =
-      (g_schedule_flag == 0 && need_nested_loop) ||
-      (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop);
+      (g_schedule_flag == 0 && need_nested_loop);
   if (predicated_exec_enabled && !parallel_regions.empty()) {
     llvm::Function *F = parallel_regions[0].start_block->getParent();
 
