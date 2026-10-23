@@ -2428,6 +2428,12 @@ public:
     } while (iter != exit);
 
     divergent_found:
+    // virt sub-pass form: a region that is not looped runs once per hardware thread, but
+    // allocas written there may be per-lane copies (e.g. kernel-argument stores into the
+    // lifter's param buffer in a tid-free entry region) -- the other sub-pass's copy then
+    // stays uninitialized. Under S>1 every non-empty region is a lane loop.
+    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop && !is_useless)
+      any_divergent_var = true;
     if (is_useless || !any_divergent_var) {
       return;
     }
