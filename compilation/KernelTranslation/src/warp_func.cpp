@@ -7,6 +7,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -29,7 +30,90 @@ using namespace std;
 ReplaceWarpLevelPrimitive::ReplaceWarpLevelPrimitive(MapOpt mapping)
     : mapping_(mapping) {}
 
+
+// virt: the lifter emits a ballot at every SASS branch (legacy_entry/taken/path
+// masks) whose only consumers are bar.warp.sync masks and the mask operand of
+// further warp ops -- reconvergence bookkeeping. In the warp loop a sync's mask
+// is irrelevant (passes run in sequence) and such a mask equals the active set,
+// so ballot(mask, p) == ballot(-1, p): fold these ballots to the full mask and
+// drop the syncs they fed. Anything with a data use is left alone.
+static void foldReconvergenceMasks(Module &m) {
+  auto isVote = [](CallInst *ci) {
+    Function *f = ci->getCalledFunction();
+    if (!f) return false;
+    auto n = f->getName();
+    return n.starts_with("llvm.nvvm.vote.") || n == "__cupbop_activemask" || n == "llvm.nvvm.activemask";
+  };
+  auto isWarpOp = [](Function *f) {
+    auto n = f->getName();
+    return n.starts_with("llvm.nvvm.vote.") || n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.match.");
+  };
+  std::vector<CallInst *> cands;
+  for (auto &f : m)
+    for (auto &bb : f)
+      for (auto &i : bb)
+        if (auto *ci = dyn_cast<CallInst>(&i))
+          if (!ci->isInlineAsm() && isVote(ci)) cands.push_back(ci);
+  if (cands.empty()) return;
+  std::set<CallInst *> syncs_fed;
+  int folded = 0;
+  for (auto *ci : cands) {
+    std::set<CallInst *> local_syncs;
+    std::set<Value *> seen;
+    std::vector<Value *> work{ci};
+    bool ok = true;
+    while (ok && !work.empty()) {
+      Value *v = work.back(); work.pop_back();
+      if (!seen.insert(v).second) continue;
+      for (Use &u : v->uses()) {
+        auto *I = dyn_cast<Instruction>(u.getUser());
+        if (!I) { ok = false; break; }
+        if (auto *call = dyn_cast<CallInst>(I)) {
+          Function *cf = call->getCalledFunction();
+          if (!cf || call->isInlineAsm()) { ok = false; break; }
+          if (cf->getName() == "llvm.nvvm.bar.warp.sync") { local_syncs.insert(call); continue; }
+          if (isWarpOp(cf) && u.getOperandNo() == 0) continue; // mask operand of another warp op
+          if (cf->getName().starts_with("llvm.dbg")) continue;
+          ok = false; break;
+        }
+        if (auto *bo = dyn_cast<BinaryOperator>(I)) {
+          auto op = bo->getOpcode();
+          if (op == Instruction::And || op == Instruction::Or || op == Instruction::Xor) { work.push_back(I); continue; }
+          ok = false; break;
+        }
+        if (isa<SelectInst>(I)) { if (u.getOperandNo() == 0) { ok = false; break; } work.push_back(I); continue; }
+        if (isa<PHINode>(I) || isa<ZExtInst>(I) || isa<SExtInst>(I) || isa<TruncInst>(I) || isa<BitCastInst>(I) || isa<FreezeInst>(I)) { work.push_back(I); continue; }
+        if (auto *st = dyn_cast<StoreInst>(I)) { // PHI-demoted lifter temporaries: follow the alloca's loads
+          if (u.getOperandNo() != 0) { ok = false; break; }
+          auto *ai = dyn_cast<AllocaInst>(st->getPointerOperand()->stripPointerCasts());
+          if (!ai) { ok = false; break; }
+          bool simple = true;
+          for (User *au : ai->users()) {
+            if (isa<LoadInst>(au) || isa<StoreInst>(au)) continue;
+            if (auto *ii = dyn_cast<IntrinsicInst>(au)) if (ii->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(ii)) continue;
+            if (auto *cc = dyn_cast<CallInst>(au)) if (cc->getCalledFunction() && cc->getCalledFunction()->getName().starts_with("llvm.dbg")) continue;
+            simple = false; break;
+          }
+          if (!simple) { ok = false; break; }
+          for (User *au : ai->users()) if (auto *ld = dyn_cast<LoadInst>(au)) work.push_back(ld);
+          continue;
+        }
+        ok = false; break;
+      }
+    }
+    if (!ok) continue;
+    ci->replaceAllUsesWith(Constant::getAllOnesValue(ci->getType()));
+    ci->eraseFromParent();
+    folded++;
+    syncs_fed.insert(local_syncs.begin(), local_syncs.end());
+  }
+  for (auto *s : syncs_fed) s->eraseFromParent();
+  if (folded)
+    fprintf(stderr, "[virt] folded %d reconvergence ballot/activemask sites (mask-only results); erased %zu bar.warp.sync fed by them\n", folded, syncs_fed.size());
+}
+
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
+  if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
   // In FLAT mode, skip shfl replacement here — it's handled by
   // replace_warp_shfl_early() after init_block (barrier insertion order matters).
   if (mapping_ != MAPPING_FLAT)
