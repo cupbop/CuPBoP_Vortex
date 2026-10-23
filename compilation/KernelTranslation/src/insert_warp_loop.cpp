@@ -211,7 +211,12 @@ private:
       if (const Function *F = CI->getCalledFunction()) {
         if (F->getName() == "llvm.nvvm.read.ptx.sreg.tid.x" ||
             F->getName() == "llvm.nvvm.read.ptx.sreg.tid.y" ||
-            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" //||
+            F->getName() == "llvm.nvvm.read.ptx.sreg.tid.z" ||
+            // the lane id is thread-dependent too: a kernel that only reads it
+            // (lifted TCU GEMMs address mma fragments by lane) still needs the
+            // warp loop; without this it had 0 regions and ran once per hardware
+            // thread, which only worked while the lane was the hardware lane
+            F->getName() == "llvm.nvvm.read.ptx.sreg.laneid"
             // LLVM 18 added for thread mapping (flat collapsing)
             // F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.x" ||
             // F->getName() == "llvm.nvvm.read.ptx.sreg.ctaid.y" ||
@@ -219,6 +224,11 @@ private:
             ) {
           return true;
         }
+      }
+      if (CI->isInlineAsm()) { // clang's `mov.u32 $0, %laneid;`
+        if (auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand()))
+          if (IA->getAsmString().find("%laneid") != std::string::npos)
+            return true;
       }
     }
     // For SCHE_0 nested loop: tool.cpp replaces threadIdx intrinsics with
