@@ -602,6 +602,13 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
 // hardware ballots/shuffles into per-sub-pass results read after a second
 // marker (…glue_end, a warp sync by name so every pass treats it as one).
 // ---------------------------------------------------------------------------
+
+// The sub-pass stores and the glue loads sit in different loops that the warp-loop
+// pass tags with llvm.mem.parallel_loop_access; without volatile LLVM may reorder
+// them (the flat warp_shfl emulation is volatile for the same reason).
+static StoreInst *vstore(IRBuilder<> &b, Value *v, Value *p) { auto *st = b.CreateStore(v, p); st->setVolatile(true); return st; }
+static LoadInst *vload(IRBuilder<> &b, Type *t, Value *p, const Twine &n = "") { auto *ld = b.CreateLoad(t, p, n); ld->setVolatile(true); return ld; }
+
 static Value *virtLogicalLane(IRBuilder<> &b, Module &m) {
   return createLoad(b, m.getGlobalVariable("intra_warp_index"));
 }
@@ -651,28 +658,28 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
     IRBuilder<> eb(virtEntryInsertPt(F));
     auto *stage = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_vote_stage");
     auto *res = eb.CreateAlloca(I32, nullptr, "shfl_virt_vote_res");
-    for (int j = 0; j < S; j++) eb.CreateStore(ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
+    for (int j = 0; j < S; j++) evstore(b, ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
     IRBuilder<> b(ci);
     // store phase (this sub-pass): in-mask predicate of the logical lane
     Value *l = virtLogicalLane(b, m);
     Value *j = b.CreateLShr(l, ConstantInt::get(I32, LG), "vsub");
     Value *inm = b.CreateAnd(b.CreateLShr(mask, l), ConstantInt::get(I32, 1));
     Value *v = b.CreateAnd(inm, b.CreateZExt(pred, I32), "vote_v");
-    b.CreateStore(v, b.CreateInBoundsGEP(ArrTy, stage, {ConstantInt::get(I32, 0), j}));
+    vstore(b, v, b.CreateInBoundsGEP(ArrTy, stage, {ConstantInt::get(I32, 0), j}));
     CreateIntraWarpBarrier(ci); // marker: all sub-passes of this logical warp are done
     // glue (uniform, all lanes): OR of the hardware ballots of the S slots, then clean
     Value *bits = ConstantInt::get(I32, 0);
     for (int jj = 0; jj < S; jj++) {
       auto *gep = b.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, jj);
-      auto *hb = b.CreateCall(hwBallot, {b.CreateLoad(I32, gep)});
+      auto *hb = b.CreateCall(hwBallot, {vload(b, I32, gep)});
       hb->addFnAttr(Attribute::Convergent);
       bits = b.CreateOr(bits, b.CreateShl(hb, ConstantInt::get(I32, L * jj)));
-      b.CreateStore(ConstantInt::get(I32, 0), gep);
+      vstore(b, ConstantInt::get(I32, 0), gep);
     }
-    b.CreateStore(bits, res);
+    vstore(b, bits, res);
     b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
     // load phase (next region, per sub-pass)
-    Value *bm = b.CreateAnd(b.CreateLoad(I32, res, "vote_bits"), mask);
+    Value *bm = b.CreateAnd(vload(b, I32, res, "vote_bits"), mask);
     Value *result;
     if (isActive || name.find(".ballot.") != string::npos) result = bm;
     else if (name.find(".any.") != string::npos) result = b.CreateICmpNE(bm, ConstantInt::get(I32, 0));
@@ -738,32 +745,32 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
     Value *l = virtLogicalLane(b, m);
     Value *j = b.CreateLShr(l, ConstantInt::get(I32, LG), "ssub");
     Value *zero = ConstantInt::get(I32, 0);
-    b.CreateStore(varBits, b.CreateInBoundsGEP(ArrTy, stV, {zero, j}));
-    b.CreateStore(bArg, b.CreateInBoundsGEP(ArrTy, stB, {zero, j}));
-    b.CreateStore(cArg, b.CreateInBoundsGEP(ArrTy, stC, {zero, j}));
+    vstore(b, varBits, b.CreateInBoundsGEP(ArrTy, stV, {zero, j}));
+    vstore(b, bArg, b.CreateInBoundsGEP(ArrTy, stB, {zero, j}));
+    vstore(b, cArg, b.CreateInBoundsGEP(ArrTy, stC, {zero, j}));
     CreateIntraWarpBarrier(ci);
     // glue: for every reader sub-pass jr, source logical lane s -> hardware shuffle of slot s>>LG from lane s&(L-1)
     Value *hl = b.CreateAnd(b.CreateCall(laneId, {}, "hwlane"), ConstantInt::get(I32, L - 1));
     for (int jr = 0; jr < S; jr++) {
       Value *lr = b.CreateAdd(hl, ConstantInt::get(I32, L * jr));
-      Value *bj = b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stB, 0, jr));
-      Value *cj = b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stC, 0, jr));
+      Value *bj = vload(b, I32, b.CreateConstInBoundsGEP2_32(ArrTy, stB, 0, jr));
+      Value *cj = vload(b, I32, b.CreateConstInBoundsGEP2_32(ArrTy, stC, 0, jr));
       Value *s = b.CreateCall(srcLane, {ConstantInt::get(I32, mode), lr, bj, cj}, "srclane");
       Value *js = b.CreateLShr(s, ConstantInt::get(I32, LG));
       Value *hs = b.CreateAnd(s, ConstantInt::get(I32, L - 1));
       Value *val = zero;
       for (int jj = 0; jj < S; jj++) {
-        auto *x = b.CreateCall(hwShfl, {b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stV, 0, jj)), hs, ConstantInt::get(I32, L - 1)});
+        auto *x = b.CreateCall(hwShfl, {vload(b, I32, b.CreateConstInBoundsGEP2_32(ArrTy, stV, 0, jj)), hs, ConstantInt::get(I32, L - 1)});
         x->addFnAttr(Attribute::Convergent);
         val = b.CreateSelect(b.CreateICmpEQ(js, ConstantInt::get(I32, jj)), x, val);
       }
-      b.CreateStore(val, b.CreateConstInBoundsGEP2_32(ArrTy, stR, 0, jr));
+      vstore(b, val, b.CreateConstInBoundsGEP2_32(ArrTy, stR, 0, jr));
     }
     b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
     // load phase (next region): this sub-pass's result
     Value *l2 = virtLogicalLane(b, m);
     Value *j2 = b.CreateLShr(l2, ConstantInt::get(I32, LG));
-    Value *r = b.CreateLoad(I32, b.CreateInBoundsGEP(ArrTy, stR, {zero, j2}), "shfl_r");
+    Value *r = vload(b, I32, b.CreateInBoundsGEP(ArrTy, stR, {zero, j2}), "shfl_r");
     Value *result = isFloat ? b.CreateBitCast(r, F32) : b.CreateIntCast(r, VT, true);
     ci->replaceAllUsesWith(result);
     ci->eraseFromParent();
