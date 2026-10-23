@@ -59,6 +59,7 @@ using namespace llvm;
 
 // Forward declaration — set in insert_warp_loop() before pass runs
 extern int need_nested_loop;
+static int g_schedule_flag = 2; // (defined here: the divergence analysis above the old spot reads it)
 
 // LLVM-19 does not provide divergence analysis for NVPTX backend.
 // Thus, we need to implement our own divergence analysis.
@@ -306,7 +307,6 @@ std::map<std::string, llvm::Instruction *> contextArrays;
 // same address).
 std::map<llvm::Function *, llvm::Instruction *> ctxPoolLoadCache;
 int tempInstructionIndex = 0;
-static int g_schedule_flag = 2;
 static int g_ctx_pool_offset = 0;
 int need_nested_loop;
 
