@@ -658,7 +658,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
     IRBuilder<> eb(virtEntryInsertPt(F));
     auto *stage = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_vote_stage");
     auto *res = eb.CreateAlloca(I32, nullptr, "shfl_virt_vote_res");
-    for (int j = 0; j < S; j++) evstore(b, ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
+    for (int j = 0; j < S; j++) vstore(eb, ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
     IRBuilder<> b(ci);
     // store phase (this sub-pass): in-mask predicate of the logical lane
     Value *l = virtLogicalLane(b, m);
