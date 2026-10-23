@@ -22,6 +22,19 @@
 #include <map>
 #include <sstream>
 
+// DepthFlexGPU rt_num_warps knob: VX_RT_NUM_WARPS=<k> caps the warps the Vortex CTA dispatcher uses
+// per core (a runtime DCR, see vortex sw/runtime/common/queue.cpp). The launch checks below must use
+// the effective count, or a block/CTA that needs more warps than the cap would never be admitted.
+static uint32_t cupbop_eff_num_warps() {
+  static const uint32_t v = []() -> uint32_t {
+    uint32_t nw = (uint32_t)NUM_WARPS_VX;
+    if (const char *e = getenv("VX_RT_NUM_WARPS")) { int k = atoi(e); if (k > 0 && (uint32_t)k < nw) nw = (uint32_t)k; }
+    return nw;
+  }();
+  return v;
+}
+
+
 // Global variable to support CudaMemcpytoSymbol
 //NOTE: old approach used staging device buffer — replaced with inline args
 //std::vector<std::vector<uint64_t> >  memcpy_symbol;
@@ -1223,7 +1236,7 @@ cudaError_t cudaLaunchKernel_vortex(
     if (schedule == 2) {
       // 1:1 mapping: CUDA block == Vortex CTA (must fit one core), __shared__ in CTA local memory
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
-      const uint64_t core_threads = NUM_WARPS_VX * NUM_THREADS_VX;
+      const uint64_t core_threads = (uint64_t)cupbop_eff_num_warps() * NUM_THREADS_VX;   // VX_RT_NUM_WARPS-aware
       if (block_threads > core_threads) {
         printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
                (unsigned long)block_threads, (unsigned long)core_threads);
@@ -1258,7 +1271,8 @@ cudaError_t cudaLaunchKernel_vortex(
       const uint32_t block_warps = (uint32_t)((block_threads + (L < 32 ? 32 : L) - 1) / (L < 32 ? 32 : L));
       uint32_t P = block_warps;
       if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
-      if ((uint64_t)P * nt > NUM_WARPS_VX * NUM_THREADS_VX) {
+      if (P > cupbop_eff_num_warps()) P = cupbop_eff_num_warps();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
+      if ((uint64_t)P * nt > (uint64_t)cupbop_eff_num_warps() * NUM_THREADS_VX) {
         printf("Error: block_size %lu exceeds threads_per_core %lu even with CUPBOP_VIRT_WARPS=%u\n",
                (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);
         std::abort();
