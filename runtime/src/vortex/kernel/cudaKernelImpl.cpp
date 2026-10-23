@@ -475,6 +475,15 @@ extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d, const uint
                     *reinterpret_cast<const tcu_ctx::fragment_acc *>(c));
   __builtin_memcpy(d, fd.data.data(), sizeof(fd.data));
 }
+#else // NT != 32: CUDA wmma (m16n16k16) is not lowered for this tile yet (step 3). Keep the symbols so a
+      // merged lifted module whose source twin uses wmma still links; reaching one is a bug -> trap.
+extern "C" void __vx_wmma_load_a_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) { __builtin_trap(); }
+extern "C" void __vx_wmma_load_a_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) { __builtin_trap(); }
+extern "C" void __vx_wmma_load_b_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) { __builtin_trap(); }
+extern "C" void __vx_wmma_load_b_m16n16k16_col_f16(void *frag, const void *p, int32_t ldm) { __builtin_trap(); }
+extern "C" void __vx_wmma_load_c_m16n16k16_row_f32(void *frag, const void *p, int32_t ldm) { __builtin_trap(); }
+extern "C" void __vx_wmma_store_d_m16n16k16_f32(float *p, const float *frag, int32_t ldm, WmmaLayout layout) { __builtin_trap(); }
+extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d, const uint32_t *a, const uint32_t *b, const float *c) { __builtin_trap(); }
 #endif // NT=32 wmma wrappers
 #endif // VX_CFG_EXT_TCU_ENABLE (3.0: TCU disabled -> no wrappers, TCU kernels fail to link with a clear symbol name)
 #else  // Vortex 2.0 register-protocol wrappers
