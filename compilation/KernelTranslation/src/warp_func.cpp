@@ -873,6 +873,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
 // into the thread's slots [pass][reg]; marker; glue (uniform); glue_end; load phase: d0..d3.
 static void replaceMmaStaged(Module &m) {
   const VirtGeom vg = getVirtGeom();
+  if (std::getenv("CUPBOP_VIRT_NO_MMA_STAGE")) { fprintf(stderr, "[virt-stage] mma/movmatrix staging disabled (bisection)\n"); return; }
   std::vector<CallInst *> sites;
   for (auto &f : m) {
     if (!isKernelFunction(&m, &f)) continue;
@@ -940,15 +941,20 @@ static void replaceMmaStaged(Module &m) {
 // virt sub-pass form: CuLifter's `movmatrix.sync.aligned.m8n8.trans.b16` (inline asm, i32 -> i32)
 // staged the same way; the transpose itself is done once per CUDA warp by the NT=16 glue.
 static void replaceMovmatrixStaged(Module &m) {
+  if (std::getenv("CUPBOP_VIRT_NO_MMA_STAGE")) return;
   std::vector<CallInst *> sites;
   for (auto &f : m) {
     if (!isKernelFunction(&m, &f)) continue;
     for (auto &bb : f)
       for (auto &i : bb)
-        if (auto *ci = dyn_cast<CallInst>(&i))
-          if (ci->isInlineAsm())
+        if (auto *ci = dyn_cast<CallInst>(&i)) {
+          if (ci->isInlineAsm()) {
             if (auto *IA = dyn_cast<InlineAsm>(ci->getCalledOperand()))
               if (IA->getAsmString().find("movmatrix.sync.aligned.m8n8.trans.b16") != std::string::npos) sites.push_back(ci);
+          } else if (Function *cf = ci->getCalledFunction()) {
+            if (cf->getName() == "__cupbop_movmatrix_m8n8_trans_b16") sites.push_back(ci); // already converted by init_block
+          }
+        }
   }
   if (sites.empty()) return;
   if (getVirtGeom().lanes != 16) { fprintf(stderr, "error: virt sub-pass form stages movmatrix for 16 lanes only\n"); exit(1); }
