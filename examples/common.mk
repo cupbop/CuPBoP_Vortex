@@ -31,6 +31,7 @@ LOCALMEM       ?= 1
 STARTUP_ADDR   ?= 0x080000000
 EXTRA_C_SRCS   ?=
 EXTRA_CLANG_FLAGS ?=
+HOST_PREFIX ?=   # CI diagnosis only: command prefixed to ./host.out (e.g. ci/run_with_bt.sh for a gdb backtrace on a host crash)
 RUN_ARGS       ?=
 
 # Vortex HW config — must match simx build (blackbox.sh --cores/--warps/--threads).
@@ -131,7 +132,7 @@ STDBUF := $(shell command -v stdbuf 2>/dev/null)
 STDBUF_RUN := $(if $(STDBUF),$(STDBUF) -o0 -e0,)
 ci-run: build
 	@echo "--- Running (CI)"
-	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 $(STDBUF_RUN) ./host.out $(CI_RUN_ARGS) 2>&1 | tee ci_output.txt
+	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 $(STDBUF_RUN) $(HOST_PREFIX) ./host.out $(CI_RUN_ARGS) 2>&1 | tee ci_output.txt
 	@echo "--- Execution completed!"
 
 CI_RUN_ARGS ?= $(RUN_ARGS)
