@@ -300,9 +300,14 @@ static llvm::FunctionCallee getVirtHelper(llvm::Module *M, const char *name,
 // before the kernel runs, so this one is declared read-only, not memory(none).
 static llvm::FunctionCallee getVirtLanes(llvm::Module *M) {
   auto I32 = llvm::Type::getInt32Ty(M->getContext());
+  if (std::getenv("CUPBOP_VIRT_LANES_NT")) // bisection aid: the hardware NT (memory(none) helper) as before
+    return getVirtHelper(M, "__cupbop_num_threads", llvm::FunctionType::get(I32, false));
   auto C = M->getOrInsertFunction("__cupbop_virt_lanes", llvm::FunctionType::get(I32, false));
   if (auto *Fn = llvm::dyn_cast<llvm::Function>(C.getCallee())) {
-    Fn->setOnlyReadsMemory();
+    if (std::getenv("CUPBOP_VIRT_LANES_READNONE")) // bisection aid: attribute only
+      Fn->setDoesNotAccessMemory();
+    else
+      Fn->setOnlyReadsMemory();
     Fn->setDoesNotThrow();
     Fn->setWillReturn();
   }
