@@ -605,6 +605,15 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
 static Value *virtLogicalLane(IRBuilder<> &b, Module &m) {
   return createLoad(b, m.getGlobalVariable("intra_warp_index"));
 }
+// Stage slots live in the entry block after every existing alloca: insert_sync puts
+// the kernel-entry barrier before the first non-alloca instruction, so anything
+// placed in front of the original allocas would push them behind that barrier
+// (verifier: "Instruction does not dominate all uses").
+static Instruction *virtEntryInsertPt(Function *F) {
+  for (auto &I : F->getEntryBlock())
+    if (!isa<AllocaInst>(&I)) return &I;
+  return F->getEntryBlock().getTerminator();
+}
 
 void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallInst *> &replace_in) {
   const VirtGeom vg = getVirtGeom();
@@ -639,7 +648,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
     Value *mask = isActive ? ConstantInt::get(I32, -1) : ci->getArgOperand(0);
     Value *pred = isActive ? ConstantInt::getTrue(ctx) : ci->getArgOperand(1);
     if (mask->getType() != I32) { IRBuilder<> tb(ci); mask = tb.CreateIntCast(mask, I32, false); }
-    IRBuilder<> eb(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+    IRBuilder<> eb(virtEntryInsertPt(F));
     auto *stage = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_vote_stage");
     auto *res = eb.CreateAlloca(I32, nullptr, "shfl_virt_vote_res");
     for (int j = 0; j < S; j++) eb.CreateStore(ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
@@ -720,7 +729,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
     }
     bArg = b.CreateIntCast(bArg, I32, true);
     Value *varBits = isFloat ? b.CreateBitCast(var, I32) : b.CreateIntCast(var, I32, true);
-    IRBuilder<> eb(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+    IRBuilder<> eb(virtEntryInsertPt(F));
     auto *stV = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_val");
     auto *stB = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_b");
     auto *stC = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_c");
