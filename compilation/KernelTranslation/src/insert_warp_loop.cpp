@@ -1212,7 +1212,11 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
         // Skip context arrays from prior passes
         if (isa<AllocaInst>(instruction) &&
             (instruction->getName().contains("_intra_warp_") ||
-             instruction->getName().contains("_inter_warp_")))
+             instruction->getName().contains("_inter_warp_") ||
+             // virt staging slots are per hardware thread by design (both sub-passes
+             // of a thread share them through the slot index; the uniform glue
+             // writes them once). A per-lane copy would leave sub-pass 1 unwritten.
+             instruction->getName().starts_with("shfl_")))
           continue;
         if (ShouldNotBeContextSaved(instruction, DI))
           continue;
