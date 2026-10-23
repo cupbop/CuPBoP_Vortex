@@ -112,8 +112,10 @@ static void foldReconvergenceMasks(Module &m) {
     fprintf(stderr, "[virt] folded %d reconvergence ballot/activemask sites (mask-only results); erased %zu bar.warp.sync fed by them\n", folded, syncs_fed.size());
 }
 
+static void replaceMmaStaged(Module &m);
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m); // virt sub-pass form: mma.sync -> NT=16 TCU glue
   // In FLAT mode, skip shfl replacement here — it's handled by
   // replace_warp_shfl_early() after init_block (barrier insertion order matters).
   if (mapping_ != MAPPING_FLAT)
@@ -861,6 +863,76 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
     n++;
   }
   fprintf(stderr, "[virt-stage] %d shfl sites staged over %d sub-passes of %d lanes\n", n, S, L);
+}
+
+// virt sub-pass form: CuLifter's mma.sync m16n8k16 staged over the S=2 passes and executed
+// once per CUDA warp by the NT=16 glue in the device runtime (__cupbop_mma_m16n8k16_*_glue16,
+// which owns the PTX<->Vortex fragment mapping). Store phase: this pass's a0..a3, b0,b1, c0..c3
+// into the thread's slots [pass][reg]; marker; glue (uniform); glue_end; load phase: d0..d3.
+static void replaceMmaStaged(Module &m) {
+  const VirtGeom vg = getVirtGeom();
+  std::vector<CallInst *> sites;
+  for (auto &f : m) {
+    if (!isKernelFunction(&m, &f)) continue;
+    for (auto &bb : f)
+      for (auto &i : bb)
+        if (auto *ci = dyn_cast<CallInst>(&i))
+          if (Function *cf = ci->getCalledFunction())
+            if (cf->getName().starts_with("llvm.nvvm.mma.")) sites.push_back(ci);
+  }
+  if (sites.empty()) return;
+  if (vg.lanes != 16) {
+    fprintf(stderr, "error: virt sub-pass form stages mma.sync for 16 lanes only (lanes=%d)\n", vg.lanes);
+    exit(1);
+  }
+  if (const char *e = std::getenv("CUPBOP_MMA_LOWERING"))
+    if (std::string(e) == "sw") {
+      fprintf(stderr, "error: CUPBOP_MMA_LOWERING=sw has no 16-lane sub-pass form (use tcu or auto)\n");
+      exit(1);
+    }
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *F32 = Type::getFloatTy(ctx), *VoidT = Type::getVoidTy(ctx);
+  Type *PtrTy = PointerType::getUnqual(ctx);
+  FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
+  if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  auto *ATy = ArrayType::get(I32, 8); auto *BTy = ArrayType::get(I32, 4); auto *CTy = ArrayType::get(F32, 8);
+  int n = 0;
+  for (auto *ci : sites) {
+    StringRef Name = ci->getCalledFunction()->getName();
+    const bool bf16 = Name.ends_with(".bf16");
+    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != 10) {
+      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col only)\n", Name.str().c_str());
+      exit(1);
+    }
+    Function *F = ci->getFunction();
+    IRBuilder<> eb(virtEntryInsertPt(F));
+    auto *stA = eb.CreateAlloca(ATy, nullptr, "shfl_virt_mma_a");
+    auto *stB = eb.CreateAlloca(BTy, nullptr, "shfl_virt_mma_b");
+    auto *stC = eb.CreateAlloca(CTy, nullptr, "shfl_virt_mma_c");
+    auto *stD = eb.CreateAlloca(CTy, nullptr, "shfl_virt_mma_d");
+    IRBuilder<> b(ci);
+    Value *l = virtLogicalLane(b, m);
+    Value *j = b.CreateLShr(l, ConstantInt::get(I32, 4), "msub");
+    auto slot = [&](Value *base, Type *ArrT, int stride, int i) {
+      Value *idx = b.CreateAdd(b.CreateMul(j, ConstantInt::get(I32, stride)), ConstantInt::get(I32, i));
+      return b.CreateInBoundsGEP(ArrT, base, {ConstantInt::get(I32, 0), idx});
+    };
+    for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(i);     if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stA, ATy, 4, i)); }
+    for (int i = 0; i < 2; i++) { Value *v = ci->getArgOperand(4 + i); if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stB, BTy, 2, i)); }
+    for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(6 + i); if (!v->getType()->isFloatTy())     v = b.CreateBitCast(v, F32); vstore(b, v, slot(stC, CTy, 4, i)); }
+    CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
+    std::string gname = std::string("__cupbop_mma_m16n8k16_") + (bf16 ? "bf16f32" : "f16f32") + "_glue16";
+    FunctionCallee glue = m.getOrInsertFunction(gname, FunctionType::get(VoidT, {PtrTy, PtrTy, PtrTy, PtrTy}, false));
+    if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+    b.CreateCall(glue, {stA, stB, stC, stD})->addFnAttr(Attribute::Convergent);
+    b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
+    Value *res = UndefValue::get(ci->getType());
+    for (int i = 0; i < 4; i++) res = b.CreateInsertValue(res, vload(b, F32, slot(stD, CTy, 4, i)), i);
+    ci->replaceAllUsesWith(res);
+    ci->eraseFromParent();
+    n++;
+  }
+  fprintf(stderr, "[virt-stage] %d mma.sync m16n8k16 sites staged over 2 sub-passes of 16 lanes (TCU glue)\n", n);
 }
 
 } // namespace cupbop

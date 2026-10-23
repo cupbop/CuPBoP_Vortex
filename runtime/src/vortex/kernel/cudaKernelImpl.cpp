@@ -423,9 +423,11 @@ namespace {
 namespace vt = vortex::tensor;
 using tcu_ctx = vt::wmma_context<VX_CFG_NUM_THREADS, vt::fp16, vt::fp32>;
 using tcu_ctx_bf16 = vt::wmma_context<VX_CFG_NUM_THREADS, vt::bf16, vt::fp32>; // same tile/lane layout, input id 3
+#if VX_CFG_NUM_THREADS == 32
 static_assert(tcu_ctx::tileM == 16 && tcu_ctx::tileN == 16, "CuPBoP TCU wrappers assume a 16x16 (M,N) tile: use NUM_THREADS=32");
 static_assert(sizeof(tcu_ctx::fragment_a) <= 32 && sizeof(tcu_ctx::fragment_b) <= 32 && sizeof(tcu_ctx::fragment_acc) == 32,
               "translator fragment storage is 8 x 32-bit per lane");
+#endif
 } // namespace
 
 // CUDA m16n16k16 fragments on the NT=32 m16n16k32 tile: load_matrix_sync reads 32 k-columns
@@ -434,6 +436,7 @@ static_assert(sizeof(tcu_ctx::fragment_a) <= 32 && sizeof(tcu_ctx::fragment_b) <
 // wmma call is then an exact k16 product and K loops of any length are correct. Found with
 // sgemm_tcu -n 64 (n=32 in CI happened to pass; sgemm_tcu_dxa zero-pads its smem tiles to 32).
 // Fusing two k16 steps into one k32 op is a translator-side optimization (mma_fuse).
+#if VX_CFG_NUM_THREADS == 32 // CUDA wmma wrappers: NT=32 tile only (NT=16 runs mma.sync through the sub-pass glue below)
 static inline void __vx_wmma_zero_upper_k_a(tcu_ctx::fragment_a &f) { f.data[2] = f.data[3] = f.data[6] = f.data[7] = 0.f; }
 static inline void __vx_wmma_zero_upper_k_b(tcu_ctx::fragment_b &f) { f.data[4] = f.data[5] = f.data[6] = f.data[7] = 0.f; }
 extern "C" void __vx_wmma_load_a_m16n16k16_row_f16(void *frag, const void *p, int32_t ldm) {
@@ -472,6 +475,7 @@ extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d, const uint
                     *reinterpret_cast<const tcu_ctx::fragment_acc *>(c));
   __builtin_memcpy(d, fd.data.data(), sizeof(fd.data));
 }
+#endif // NT=32 wmma wrappers
 #endif // VX_CFG_EXT_TCU_ENABLE (3.0: TCU disabled -> no wrappers, TCU kernels fail to link with a clear symbol name)
 #else  // Vortex 2.0 register-protocol wrappers
 extern "C" void __vx_wmma_m16n16k16_load_a_row_f16(uint32_t *out_regs,
@@ -1057,6 +1061,13 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32_sw(u
 
 // ---- TCU-backed variant ----------------------------------------------------------------------
 #if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE)
+static inline float __cupbop_u32_as_f32(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+static inline float __cupbop_shflf(float v, int src_lane) {
+  uint32_t u; __builtin_memcpy(&u, &v, 4);
+  u = (uint32_t)vx_shfl_idx((size_t)u, src_lane, VX_CFG_NUM_THREADS - 1, 0);
+  float f; __builtin_memcpy(&f, &u, 4); return f;
+}
+#if VX_CFG_NUM_THREADS == 32
 // vx_tensor.h layouts for NT=32, NR=8, fp16->fp32 (tcM=8, tcN=4, tcK=4, tile m16n16k32), lane l,
 // g = l>>2, t = l&3:
 //   A  reg r : row g + 8*(r>>2),  k = 8*(r&3) + 2t + {0,1}   (low half = lower k)
@@ -1071,12 +1082,6 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32_sw(u
 // needs the translator to pair calls and is a later recipe option.
 static_assert(tcu_ctx::tileM == 16 && tcu_ctx::tileN == 16 && tcu_ctx::tileK == 32, "TCU-backed mma.sync helpers assume the NT=32 m16n16k32 tile");
 static_assert(tcu_ctx::fragment_a::NR == 8 && tcu_ctx::fragment_b::NR == 8 && tcu_ctx::fragment_acc::NR == 8, "8 registers per fragment");
-static inline float __cupbop_u32_as_f32(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
-static inline float __cupbop_shflf(float v, int src_lane) {
-  uint32_t u; __builtin_memcpy(&u, &v, 4);
-  u = __cupbop_shfl32(u, src_lane);
-  float f; __builtin_memcpy(&f, &u, 4); return f;
-}
 // PTX accumulator (c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)) -> Vortex acc regs 0,1,4,5 (cols t, t+4)
 template <class CTX>
 static inline void __cupbop_acc_nv_to_vx(float c0, float c1, float c2, float c3, typename CTX::fragment_acc &fc) {
@@ -1142,6 +1147,43 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32_tcu(
   __cupbop_mma_m16n8k8_tcu_impl<tcu_ctx_bf16>(a0, a1, b0, c0, c1, c2, c3, d);
 }
 #define CUPBOP_MMA_TCU_AVAILABLE 1
+#elif VX_CFG_NUM_THREADS == 16
+// NT=16 sub-pass form (CuPBoP virt, S=2): the CUDA warp's 32 lanes are two passes of this
+// 16-lane hardware warp. The translator stages each pass's PTX m16n8k16 fragments in
+// per-thread slots (A[2][4], B[2][2] packed u32; C[2][4] f32), then every hardware lane runs
+// this glue once per CUDA warp. Vortex NT=16 tile = m16n8k16 (tcM=tcN=tcK=4; NRA=8, NRB=4,
+// NRC=8), lane h: A reg r = (row (h>>2)+4(r>>1), k 2(h&3)+8(r&1)); B reg r = (k 2(h&3)+8(r>>1),
+// n (h>>2)+4(r&1)); C/D reg r = (row (h>>2)+4(r>>1), col (h&3)+4(r&1)). PTX lane L=h+16j
+// (g=L>>2, t=L&3): a0=(g,2t) a1=(g+8,2t) a2=(g,2t+8) a3=(g+8,2t+8); b0=(2t,g) b1=(2t+8,g);
+// c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1). A and B therefore come from this lane's own
+// slots (pass (r>>1)&1 resp. r&1, no shuffles); C in and D out take 16 index shuffles each.
+// Index formulas checked against a software model of both layouts (2026-10-22).
+template <class CTX>
+static inline void __cupbop_mma_m16n8k16_glue16_impl(const uint32_t *stA, const uint32_t *stB, const float *stC, float *stD) {
+  const int h = vx_thread_id();
+  typename CTX::fragment_a fa; typename CTX::fragment_b fb; typename CTX::fragment_acc fc, fd;
+  for (int r = 0; r < 8; r++) fa.data[r] = __cupbop_u32_as_f32(stA[((r >> 1) & 1) * 4 + (r >= 4 ? 1 : 0) + 2 * (r & 1)]);
+  for (int r = 0; r < 4; r++) fb.data[r] = __cupbop_u32_as_f32(stB[(r & 1) * 2 + (r >> 1)]);
+  for (int r = 0; r < 8; r++) {
+    const int j = (r >> 1) & 1, hp = 4 * (h >> 2) + ((h & 3) >> 1) + 2 * (r & 1), ce = (r >= 4) ? 2 : 0;
+    const float x = __cupbop_shflf(stC[j * 4 + ce], hp), y = __cupbop_shflf(stC[j * 4 + ce + 1], hp);
+    fc.data[r] = (h & 1) ? y : x;
+  }
+  CTX::mma_sync(fd, fa, fb, fc);
+  for (int j = 0; j < 2; j++)
+    for (int q = 0; q < 4; q++) {
+      const int re = 2 * j + ((q >= 2) ? 4 : 0), h0 = 4 * (h >> 2) + 2 * (h & 1) + (q & 1);
+      const float v0 = __cupbop_shflf(fd.data[re], h0), v1 = __cupbop_shflf(fd.data[re + 1], h0);
+      stD[j * 4 + q] = ((h >> 1) & 1) ? v1 : v0;
+    }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f32_glue16(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx>(a, b, c, d);
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_bf16f32_glue16(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx_bf16>(a, b, c, d);
+}
+#endif // NT=32 helpers / NT=16 glue
 #endif // TCU-backed variant
 
 // ---- dispatch symbols (what kernelTranslator emits for CUPBOP_MMA_LOWERING=auto) ----------------
