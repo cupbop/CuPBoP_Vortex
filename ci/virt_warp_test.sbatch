@@ -11,6 +11,7 @@ SIF=/projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif
 apptainer exec -B /projects/ci-runners,/net/netscratch,/nethome $SIF /bin/bash <<'INNER'
 set -u
 cd $CuPBoP_PATH && source ./ci/rg-ci-setup-v3.sh
+make -C build kernelTranslator hostTranslator vortexRuntime ThreadPool -j8 > ci/logs_v3/virt_warp_test_build_$SLURM_JOB_ID.log 2>&1 || { echo BUILD FAILED; grep -n error ci/logs_v3/virt_warp_test_build_$SLURM_JOB_ID.log | head; exit 1; }
 OUT=$CuPBoP_PATH/ci/logs_v3/virt_warp_test_$SLURM_JOB_ID; mkdir -p $OUT
 VXH=$VORTEX_HOME
 CFG32="$VORTEX_CONFIGS"

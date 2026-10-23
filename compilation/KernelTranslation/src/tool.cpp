@@ -1496,6 +1496,36 @@ void replace_built_in_function(llvm::Module *M) {
 }
 
 void replace_asm_call(llvm::Module *M) {
+  // clang (CUDA 12, sm_90) emits __activemask() as the llvm.nvvm.activemask intrinsic,
+  // not the `activemask.b32` asm the lifter uses; lower it the same way here so the
+  // schedule-1 staging sees a __cupbop_activemask call and the backend never sees the
+  // NVVM intrinsic ("Do not know how to promote this operator").
+  {
+    int sched = 0;
+    if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) sched = std::atoi(e);
+    auto I32 = llvm::Type::getInt32Ty(M->getContext());
+    std::vector<llvm::CallInst *> acts;
+    for (auto &F : *M)
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (CI->getCalledFunction() && CI->getCalledFunction()->getName() == "llvm.nvvm.activemask")
+              acts.push_back(CI);
+    for (auto *CI : acts) {
+      llvm::IRBuilder<> builder(CI);
+      llvm::Value *res;
+      if (sched != 0) {
+        llvm::FunctionCallee FC = M->getOrInsertFunction("__cupbop_activemask", llvm::FunctionType::get(I32, false));
+        res = builder.CreateCall(FC, {}, "activemask");
+      } else {
+        res = llvm::ConstantInt::get(I32, 0xffffffffu);
+      }
+      if (CI->getType() != I32) res = builder.CreateBitCast(res, CI->getType());
+      CI->replaceAllUsesWith(res);
+      CI->eraseFromParent();
+    }
+    if (!acts.empty()) fprintf(stderr, "[CuPBoP] lowered %zu llvm.nvvm.activemask\n", acts.size());
+  }
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
   auto I64 = llvm::Type::getInt64Ty(context);
