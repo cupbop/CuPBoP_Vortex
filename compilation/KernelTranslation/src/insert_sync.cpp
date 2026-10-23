@@ -229,7 +229,7 @@ public:
 
 
       // we should create warp/block barrier based on the conditional barrier
-      if (has_warp_barrier(b)) {
+      if ((has_warp_barrier(b) && !has_block_barrier(b))) {
         CreateIntraWarpBarrier(pred->getTerminator());
       } else {
         CreateInterWarpBarrier(pred->getTerminator());
@@ -258,7 +258,7 @@ public:
         if (PDT->getPostDomTree().dominates(curr, pred)) {
           // find the truly merge point
           merge_point = curr;
-          if (has_warp_barrier(b)) {
+          if ((has_warp_barrier(b) && !has_block_barrier(b))) {
             CreateIntraWarpBarrier(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               CreateIntraWarpBarrier(&(*Pred->getTerminator()));
@@ -324,7 +324,7 @@ public:
           // we should insert barrier at the beginning and
           // end of its predecessor
           //printf("insert [255]: %s\n", curr->getName().str().c_str());
-          if (has_warp_barrier(b)) {
+          if ((has_warp_barrier(b) && !has_block_barrier(b))) {
             CreateIntraWarpBarrier(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               //printf("insert [262]: %s\n", Pred->getName().str().c_str());
@@ -431,7 +431,7 @@ public:
       Builder.SetInsertPoint(Block);
       auto br_inst = Builder.CreateBr(merge_point);
       if (!has_barrier(head)) continue;  // skip if O1 removed barrier
-      if (has_warp_barrier(head)) {
+      if ((has_warp_barrier(head) && !has_block_barrier(head))) {
         CreateIntraWarpBarrier(br_inst);
       } else {
         CreateInterWarpBarrier(br_inst);
@@ -470,6 +470,11 @@ public:
     // check whether this loop has barrier
     bool is_conditional_loop = 0;
     bool is_warp = 0;
+    // A loop with any CTA barrier (barrier0) needs CTA barriers at its edges; warp
+    // syncs alone make it a warp-level loop. The old scan stopped at the first sync
+    // it met, so a staged warp op (virt sub-passes) ahead of a __syncthreads turned a
+    // CTA-barrier loop into a warp-level one and the inter-warp regions vanished.
+    bool has_block_sync = false, has_warp_sync = false;
     for (Loop::block_iterator i = L->block_begin(), e = L->block_end(); i != e;
          ++i) {
       for (BasicBlock::iterator j = (*i)->begin(), e = (*i)->end(); j != e;
@@ -478,25 +483,15 @@ public:
           if (Call->isInlineAsm() || !Call->getCalledFunction())
             continue;
           auto func_name = Call->getCalledFunction()->getName().str();
-          if (func_name == "llvm.nvvm.barrier0" ||
-              isWarpSync(func_name) ||
-              func_name == "llvm.nvvm.barrier.sync" ||
-              func_name == "cupbop.shfl.barrier") {
-                //printf("found barrier inst new!\n");
-                // print the whole block
-                // (*i)->print(errs());
-                // print the whole function
-                //printf("-----------------\n");
-                // L->getHeader()->getParent()->print(errs());
-            is_conditional_loop = true;
-            if (isWarpSync(func_name)) {
-              is_warp = 1;
-            }
-            break;
-          }
+          if (func_name == "llvm.nvvm.barrier0" || func_name == "llvm.nvvm.barrier.sync")
+            has_block_sync = true;
+          else if (isWarpSync(func_name) || func_name == "cupbop.shfl.barrier")
+            has_warp_sync = true;
         }
       }
     }
+    is_conditional_loop = has_block_sync || has_warp_sync;
+    is_warp = has_warp_sync && !has_block_sync;
     if (!is_conditional_loop)
       return 0;
     // insert barrier at the beginning of header (for_cond)
