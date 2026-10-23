@@ -8,6 +8,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -76,13 +77,16 @@ public:
         // virt sub-pass staging: the zero-init stores of the per-thread stage slots
         // (shfl_virt_* allocas, and the GEPs into them) belong before the entry
         // barrier; inside the first region loop every sub-pass would re-zero them.
-        if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
-            if (auto *A = dyn_cast<AllocaInst>(GEP->getPointerOperand()->stripPointerCasts()))
-                if (A->getName().starts_with("shfl_virt_")) { ++iter; continue; }
-        }
-        if (auto *ST = dyn_cast<StoreInst>(I)) {
-            if (auto *A = dyn_cast<AllocaInst>(ST->getPointerOperand()->stripPointerCasts()))
-                if (A->getName().starts_with("shfl_virt_")) { ++iter; continue; }
+        // getUnderlyingObject (not stripPointerCasts): the slot-j store goes through a
+        // [0, j] GEP, which stripPointerCasts only sees through for j == 0 -- with
+        // stripPointerCasts the barrier landed before the very first slot-1 store.
+        {
+            Value *P = nullptr;
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) P = GEP->getPointerOperand();
+            else if (auto *ST = dyn_cast<StoreInst>(I)) P = ST->getPointerOperand();
+            if (P)
+                if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(P)))
+                    if (A->getName().starts_with("shfl_virt_")) { ++iter; continue; }
         }
 
         // vx_local_alloc + gep + addrspacecast + store 시퀀스 예외
