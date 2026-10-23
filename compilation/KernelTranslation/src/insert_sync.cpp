@@ -146,6 +146,22 @@ public:
   }
 };
 
+// A sync call (block barrier, FLAT shfl barrier, warp sync / staged marker)?
+static bool isSyncCallInst(llvm::Instruction *I) {
+  auto *CI = llvm::dyn_cast_or_null<llvm::CallInst>(I);
+  if (!CI || CI->isInlineAsm() || !CI->getCalledFunction()) return false;
+  auto n = CI->getCalledFunction()->getName().str();
+  return n == "llvm.nvvm.barrier0" || n == "llvm.nvvm.barrier.sync" || n == "cupbop.shfl.barrier" || isWarpSync(n);
+}
+// Does a sync call immediately precede I (debug intrinsics skipped)?
+static bool syncRightBefore(llvm::Instruction *I) {
+  for (auto *P = I->getPrevNode(); P; P = P->getPrevNode()) {
+    if (llvm::isa<llvm::DbgInfoIntrinsic>(P)) continue;
+    return isSyncCallInst(P);
+  }
+  return false;
+}
+
 class InsertConditionalBarrier : public llvm::FunctionPass {
 
 public:
@@ -194,6 +210,21 @@ public:
 
     auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>();
 
+    const bool virt_subpass = (getVirtGeom().schedule == 1 && getVirtGeom().subpasses > 1);
+    // virt sub-pass form: run to a fixpoint (a merge that received a barrier is a
+    // conditional barrier of the enclosing if), with idempotent insertion so that
+    // the fixpoint terminates. Other schedules: one round, as before.
+    int inserted = 0;
+    auto alreadySynced = [&](llvm::Instruction *at) {
+      if (!virt_subpass) return false;
+      if (at == &*at->getParent()->begin()) return isSyncCallInst(at);
+      return syncRightBefore(at);
+    };
+    auto insIntra = [&](llvm::Instruction *at) { if (alreadySynced(at)) return; CreateIntraWarpBarrier(at); inserted++; };
+    auto insInter = [&](llvm::Instruction *at) { if (alreadySynced(at)) return; CreateInterWarpBarrier(at); inserted++; };
+    bool changed = false;
+    for (int round = 0; round < (virt_subpass ? 8 : 1); round++) {
+    inserted = 0;
     // first find all conditional barriers
     std::vector<BasicBlock *> conditionalBarriers;
     for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
@@ -205,7 +236,6 @@ public:
       // FLAT shfl barrier only; without this the merge had two entry barriers, no
       // region was formed there, and the code after the `if` ran once per hardware
       // thread (if-body results visible to all lanes, post-loop stores to sub-pass 0).
-      const bool virt_subpass = (getVirtGeom().schedule == 1 && getVirtGeom().subpasses > 1);
       if (!has_barrier(b) && !(virt_subpass && has_warp_barrier(b)))
         continue;
 
@@ -219,9 +249,7 @@ public:
     }
 
     if (conditionalBarriers.size() == 0)
-      return 0;
-
-    bool changed = false;
+      break;
 
     while (!conditionalBarriers.empty()) {
       BasicBlock *b = conditionalBarriers.back();
@@ -253,9 +281,9 @@ public:
 
       // we should create warp/block barrier based on the conditional barrier
       if ((has_warp_barrier(b) && !has_block_barrier(b))) {
-        CreateIntraWarpBarrier(pred->getTerminator());
+        insIntra(pred->getTerminator());
       } else {
-        CreateInterWarpBarrier(pred->getTerminator());
+        insInter(pred->getTerminator());
       }
       changed = true;
 
@@ -282,14 +310,14 @@ public:
           // find the truly merge point
           merge_point = curr;
           if ((has_warp_barrier(b) && !has_block_barrier(b))) {
-            CreateIntraWarpBarrier(&(*curr->begin()));
+            insIntra(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
-              CreateIntraWarpBarrier(&(*Pred->getTerminator()));
+              insIntra(&(*Pred->getTerminator()));
             }
           } else {
-            CreateInterWarpBarrier(&(*curr->begin()));
+            insInter(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
-              CreateInterWarpBarrier(&(*Pred->getTerminator()));
+              insInter(&(*Pred->getTerminator()));
             }
           }
           break;
@@ -348,16 +376,16 @@ public:
           // end of its predecessor
           //printf("insert [255]: %s\n", curr->getName().str().c_str());
           if ((has_warp_barrier(b) && !has_block_barrier(b))) {
-            CreateIntraWarpBarrier(&(*curr->begin()));
+            insIntra(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               //printf("insert [262]: %s\n", Pred->getName().str().c_str());
-              CreateIntraWarpBarrier(&(*Pred->getTerminator()));
+              insIntra(&(*Pred->getTerminator()));
             }
           } else {
-            CreateInterWarpBarrier(&(*curr->begin()));
+            insInter(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               //printf("insert [268]: %s\n", Pred->getName().str().c_str());
-              CreateInterWarpBarrier(&(*Pred->getTerminator()));
+              insInter(&(*Pred->getTerminator()));
             }
           }
         }
@@ -370,6 +398,9 @@ public:
         }
       }
     }
+    if (inserted == 0) break;
+    changed = true;
+    } // rounds
     return changed;
   }
 };
