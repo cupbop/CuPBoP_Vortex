@@ -31,7 +31,7 @@ __global__ void warp_test(int *out) {
   out[o + 12] = __shfl_up_sync(full, t, 1, 8);
   int v = t; if (lane >= 16) v += 100;
   out[o + 13] = __shfl_down_sync(full, v, 8);
-  out[o + 14] = __popc(__ballot_sync(full, lane >= 16));
+  out[o + 14] = __ballot_sync(full, lane >= 16); // (no __popc: libdevice __nv_popc does not legalize in the Vortex backend)
   out[o + 15] = t;
 }
 int main() {
