@@ -37,3 +37,11 @@ VX_CFLAGS += -I$(CuPBoP_PATH)/runtime/include -I$(CuPBoP_PATH)/runtime/threadPoo
 VX_CFLAGS += -DXLEN_64 -DNUM_CORES=$(VORTEX_NUM_CORES) -DNUM_WARPS=$(VORTEX_NUM_WARPS) -DNUM_THREADS=$(VORTEX_NUM_THREADS)
 # CuPBoP's generated wrapper and device runtime are not warning-clean under Vortex's -Wall -Werror.
 VX_CFLAGS += -Wno-error -w -mllvm -disable-loop-idiom-all
+# The installed Vortex LLVM skips its whole divergence pipeline (StructurizeCFG + split/join + loop
+# predication) for functions with more basic blocks than -vortex-divergence-max-bbs, silently: the
+# kernel is then compiled with plain branches and divergent lanes follow the leader. Translated
+# CuPBoP kernels (warp loops, context arrays, staged warp ops) easily exceed the default; the lifted
+# sm_80 GEMM under core mapping sub-passes (177 blocks) got 0 split/join pairs and died with
+# misaligned addresses / "IPDOM stack is empty". Raise the limit (compile time, not correctness).
+CUPBOP_DIV_MAX_BBS ?= 1000000
+VX_CFLAGS += -mllvm -vortex-divergence-max-bbs=$(CUPBOP_DIV_MAX_BBS)
