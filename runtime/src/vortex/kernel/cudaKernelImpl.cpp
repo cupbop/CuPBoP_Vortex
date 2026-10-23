@@ -1178,7 +1178,11 @@ static inline void __cupbop_mma_m16n8k16_glue16_impl(const uint32_t *stA, const 
     const float x = __cupbop_shflf(stC[j * 4 + ce], hp), y = __cupbop_shflf(stC[j * 4 + ce + 1], hp);
     fc.data[r] = (h & 1) ? y : x;
   }
+#ifdef CUPBOP_MMA_GLUE_NOP // bisection: skip the TCU op (D = C), keeps the staging/shuffle plumbing
+  fd = fc; (void)fa; (void)fb;
+#else
   CTX::mma_sync(fd, fa, fb, fc);
+#endif
   for (int j = 0; j < 2; j++)
     for (int q = 0; q < 4; q++) {
       const int re = 2 * j + ((q >= 2) ? 4 : 0), h0 = 4 * (h >> 2) + 2 * (h & 1) + (q & 1);
