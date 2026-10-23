@@ -1196,6 +1196,22 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_bf16f32_glue16(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
   __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx_bf16>(a, b, c, d);
 }
+// movmatrix.sync.aligned.m8n8.trans.b16 under sub-passes: lane L=h+16j holds M[g][2t..2t+1]
+// (g=L>>2, t=L&3) in its pass slot; the result {M[2t][g], M[2t+1][g]} lives in lanes 8t+(g>>1)
+// and 8t+4+(g>>1), i.e. pass (src>>4) of hardware lane (src&15). 8 index shuffles per site.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_movmatrix_m8n8_trans_b16_glue16(const uint32_t *st, uint32_t *out) {
+  const int h = vx_thread_id();
+  const uint32_t s0 = st[0], s1 = st[1];
+  for (int j = 0; j < 2; j++) {
+    const int g = (h >> 2) + 4 * j, t = h & 3;
+    const int src0 = 8 * t + (g >> 1), src1 = src0 + 4;
+    const uint32_t x0 = (uint32_t)vx_shfl_idx((size_t)s0, src0 & 15, 15, 0), x1 = (uint32_t)vx_shfl_idx((size_t)s1, src0 & 15, 15, 0);
+    const uint32_t y0 = (uint32_t)vx_shfl_idx((size_t)s0, src1 & 15, 15, 0), y1 = (uint32_t)vx_shfl_idx((size_t)s1, src1 & 15, 15, 0);
+    const uint32_t x = (src0 >> 4) ? x1 : x0, y = (src1 >> 4) ? y1 : y0;
+    const int sh = 16 * (g & 1);
+    out[j] = ((x >> sh) & 0xffffu) | (((y >> sh) & 0xffffu) << 16);
+  }
+}
 #endif // NT=32 helpers / NT=16 glue
 #endif // TCU-backed variant
 

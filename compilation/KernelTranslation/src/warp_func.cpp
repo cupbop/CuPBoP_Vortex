@@ -113,9 +113,11 @@ static void foldReconvergenceMasks(Module &m) {
 }
 
 static void replaceMmaStaged(Module &m);
+static void replaceMovmatrixStaged(Module &m);
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m); // virt sub-pass form: mma.sync -> NT=16 TCU glue
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   // In FLAT mode, skip shfl replacement here — it's handled by
   // replace_warp_shfl_early() after init_block (barrier insertion order matters).
   if (mapping_ != MAPPING_FLAT)
@@ -933,6 +935,51 @@ static void replaceMmaStaged(Module &m) {
     n++;
   }
   fprintf(stderr, "[virt-stage] %d mma.sync m16n8k16 sites staged over 2 sub-passes of 16 lanes (TCU glue)\n", n);
+}
+
+// virt sub-pass form: CuLifter's `movmatrix.sync.aligned.m8n8.trans.b16` (inline asm, i32 -> i32)
+// staged the same way; the transpose itself is done once per CUDA warp by the NT=16 glue.
+static void replaceMovmatrixStaged(Module &m) {
+  std::vector<CallInst *> sites;
+  for (auto &f : m) {
+    if (!isKernelFunction(&m, &f)) continue;
+    for (auto &bb : f)
+      for (auto &i : bb)
+        if (auto *ci = dyn_cast<CallInst>(&i))
+          if (ci->isInlineAsm())
+            if (auto *IA = dyn_cast<InlineAsm>(ci->getCalledOperand()))
+              if (IA->getAsmString().find("movmatrix.sync.aligned.m8n8.trans.b16") != std::string::npos) sites.push_back(ci);
+  }
+  if (sites.empty()) return;
+  if (getVirtGeom().lanes != 16) { fprintf(stderr, "error: virt sub-pass form stages movmatrix for 16 lanes only\n"); exit(1); }
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
+  FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
+  if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  FunctionCallee glue = m.getOrInsertFunction("__cupbop_movmatrix_m8n8_trans_b16_glue16", FunctionType::get(VoidT, {PtrTy, PtrTy}, false));
+  if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  auto *ArrTy = ArrayType::get(I32, 2);
+  int n = 0;
+  for (auto *ci : sites) {
+    Function *F = ci->getFunction();
+    IRBuilder<> eb(virtEntryInsertPt(F));
+    auto *stIn = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_mm_in");
+    auto *stOut = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_mm_out");
+    IRBuilder<> b(ci);
+    Value *j = b.CreateLShr(virtLogicalLane(b, m), ConstantInt::get(I32, 4), "mmsub");
+    Value *v = ci->getArgOperand(0);
+    if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32);
+    vstore(b, v, b.CreateInBoundsGEP(ArrTy, stIn, {ConstantInt::get(I32, 0), j}));
+    CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
+    b.CreateCall(glue, {stIn, stOut})->addFnAttr(Attribute::Convergent);
+    b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
+    Value *res = vload(b, I32, b.CreateInBoundsGEP(ArrTy, stOut, {ConstantInt::get(I32, 0), j}), "movmatrix.trans");
+    if (res->getType() != ci->getType()) res = b.CreateBitCast(res, ci->getType());
+    ci->replaceAllUsesWith(res);
+    ci->eraseFromParent();
+    n++;
+  }
+  fprintf(stderr, "[virt-stage] %d movmatrix sites staged over 2 sub-passes of 16 lanes\n", n);
 }
 
 } // namespace cupbop
