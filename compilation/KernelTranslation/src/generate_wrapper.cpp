@@ -605,7 +605,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    block_index_z = blockIdx.z;\n"
             "    callbacks[kernel_arg->kernel_idx](args);\n"
             "}\n";
-      } else
+      } else {
+      ss << "    const bool getenv_dbg_virt = " << (std::getenv("CUPBOP_VIRT_DEBUG_PRINT") ? "true" : "false") << ";\n";
       ss << "    const uint32_t __bs = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
             "    const uint32_t __L = ctx->virt_lanes ? ctx->virt_lanes : (uint32_t)vx_num_threads();\n"
             "    const uint32_t __lane = (uint32_t)vx_thread_id();\n"
@@ -613,6 +614,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // Grid constants: one lane per warp writes them (the warp reads in lockstep\n"
             "    // after the fence); every hardware thread writing them cost small kernels\n"
             "    // more than their body (nn: stores 2.4x of 1:1).\n"
+            "    if (__lane == 0 && blockIdx.x == 0 && blockIdx.y == 0 && __rank == 0 && getenv_dbg_virt) vx_printf(\"[virt] L=%d g=%d bs=%d nt=%d ctxL=%d\\n\", (int)__L, __cupbop_virt_lanes_g, (int)__bs, (int)vx_num_threads(), (int)ctx->virt_lanes);\n"
             "    if (__lane == 0) {\n"
             "        __cupbop_virt_lanes_g = (int)__L;\n"
             "        grid_size_x = ctx->num_groups[0];\n"
@@ -636,6 +638,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    if (__lane >= __L || __rank * __L + __lane >= __bs) return;\n"
             "    callbacks[kernel_arg->kernel_idx](args);\n"
             "}\n";
+      }
     } else {
       ss <<           "    callbacks[kernel_arg->kernel_idx](args);\n"
           "}\n"
