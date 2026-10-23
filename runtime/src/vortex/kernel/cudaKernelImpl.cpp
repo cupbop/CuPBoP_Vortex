@@ -1238,7 +1238,7 @@ extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const
 }
 extern "C" __attribute__((always_inline)) int __cupbop_activemask() { return (int)vx_active_threads(); }
 
-#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE)
+#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE) && VX_CFG_NUM_THREADS == 32 // wgmma: NT=32 fragments
 // PTX matrix descriptor (wgmma smem operand): [13:0] addr>>4, [29:16] LBO>>4, [45:32] SBO>>4,
 // [63:62] swizzle. Canonical no-swizzle K-major layout: 8-row x 16-byte core matrices, LBO = next
 // core matrix along K, SBO = next 8-row group; element (r,k) at (r>>3)*SBO + (k>>3)*LBO + (r&7)*16 + (k&7)*2.
