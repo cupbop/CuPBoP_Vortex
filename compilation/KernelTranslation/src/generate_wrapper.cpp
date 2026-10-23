@@ -341,7 +341,6 @@ void create_kernel_wrapper_function(llvm::Module *M){
       "uint32_t printf_buffer_capacity; \n"
       "uint32_t work_dim; \n"
       "uint32_t dyn_shared_mem_size; \n"
-      "uint32_t virt_lanes; \n"
       "}; \n"
       "\n"
 
@@ -366,8 +365,6 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "\n"
 
             "int block_size;\n"
-            "extern int __cupbop_virt_lanes_g;\n"
-            "extern int __thread __cupbop_virt_lanes_tls;\n"
             "\n"
 
             "__attribute__((used)) int __thread block_index_x;\n"
@@ -593,33 +590,18 @@ void create_kernel_wrapper_function(llvm::Module *M){
       // Core mapping (virt): CTA == CUDA block but only P physical warps; the
       // translated kernel loops over logical warps rank, rank+P, ... (insert_warp_loop)
       // and __syncthreads is a real CTA barrier. Logical geometry comes from ctx.
-      if (std::getenv("CUPBOP_VIRT_PROLOGUE_OLD")) { // bisection aid: per-thread writes, no lane gating
-      ss << "    grid_size_x = ctx->num_groups[0];\n"
-            "    grid_size_y = ctx->num_groups[1];\n"
-            "    grid_size_z = ctx->num_groups[2];\n"
-            "    block_size_x = ctx->local_size[0];\n"
-            "    block_size_y = ctx->local_size[1];\n"
-            "    block_size_z = ctx->local_size[2];\n"
-            "    block_size = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
-            "    block_index_x = blockIdx.x;\n"
-            "    block_index_y = blockIdx.y;\n"
-            "    block_index_z = blockIdx.z;\n"
-            "    callbacks[kernel_arg->kernel_idx](args);\n"
-            "}\n";
-      } else {
+      {
+      int vl = 0; if (const char *e = std::getenv("CUPBOP_VIRT_LANES")) vl = std::atoi(e);
       ss << "    const bool getenv_dbg_virt = " << (std::getenv("CUPBOP_VIRT_DEBUG_PRINT") ? "true" : "false") << ";\n";
       ss << "    const uint32_t __bs = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
-            "    const uint32_t __L = ctx->virt_lanes ? ctx->virt_lanes : (uint32_t)vx_num_threads();\n"
+            "    const uint32_t __L = " << std::string(vl > 0 ? std::to_string(vl) + "u" : std::string("(uint32_t)vx_num_threads()")) << "; // lanes per warp: CUPBOP_VIRT_LANES at translation, else NT\n"
             "    const uint32_t __lane = (uint32_t)vx_thread_id();\n"
             "    const uint32_t __rank = (uint32_t)csr_read_nv(VX_CSR_CTA_RANK);\n"
             "    // Grid constants: one lane per warp writes them (the warp reads in lockstep\n"
             "    // after the fence); every hardware thread writing them cost small kernels\n"
             "    // more than their body (nn: stores 2.4x of 1:1).\n"
-            "    if (__lane == 0 && blockIdx.x == 0 && blockIdx.y == 0 && __rank == 0 && getenv_dbg_virt) vx_printf(\"[virt] L=%d g=%d bs=%d nt=%d ctxL=%d\\n\", (int)__L, __cupbop_virt_lanes_g, (int)__bs, (int)vx_num_threads(), (int)ctx->virt_lanes);\n"
-            "    if (" << (std::getenv("CUPBOP_VIRT_G_ALL_LANES") ? "true" : "false") << ") __cupbop_virt_lanes_g = (int)__L; // bisection: every lane writes\n"
-            "    if (" << (std::getenv("CUPBOP_VIRT_L_TLS") ? "true" : "false") << ") __cupbop_virt_lanes_tls = (int)__L; // bisection: per-thread copy\n"
+            "    if (__lane == 0 && blockIdx.x == 0 && blockIdx.y == 0 && __rank == 0 && getenv_dbg_virt) vx_printf(\"[virt] L=%d bs=%d nt=%d\\n\", (int)__L, (int)__bs, (int)vx_num_threads());\n"
             "    if (__lane == 0) {\n"
-            "        __cupbop_virt_lanes_g = (int)__L;\n"
             "        grid_size_x = ctx->num_groups[0];\n"
             "        grid_size_y = ctx->num_groups[1];\n"
             "        grid_size_z = ctx->num_groups[2];\n"

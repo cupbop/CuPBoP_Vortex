@@ -262,14 +262,6 @@ extern "C" __attribute__((always_inline)) int __cupbop_cta_rank(void) {
 extern "C" __attribute__((always_inline)) int __cupbop_cta_size(void) {
   return (int)csr_read_nv(VX_CSR_CTA_SIZE);
 }
-// Lanes per physical warp used by the core mapping: CUPBOP_VIRT_LANES (lane gating
-// of a wider bitstream, kernel_main stores it from ctx) or the hardware NT.
-int __cupbop_virt_lanes_g = 0;
-__attribute__((used)) int __thread __cupbop_virt_lanes_tls = 0; // per-thread copy (bisection: CUPBOP_VIRT_L_TLS)
-extern "C" __attribute__((always_inline)) int __cupbop_virt_lanes(void) {
-  if (__cupbop_virt_lanes_tls) return __cupbop_virt_lanes_tls;
-  return __cupbop_virt_lanes_g ? __cupbop_virt_lanes_g : vx_num_threads();
-}
 // Get number of warps per CTA (runtime value from vx_spawn_threads)
 __attribute__((always_inline)) unsigned int __vx_warps_per_group(void) {
   return __warps_per_group;

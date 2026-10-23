@@ -295,23 +295,18 @@ static llvm::FunctionCallee getVirtHelper(llvm::Module *M, const char *name,
   }
   return C;
 }
-// Lanes per physical warp that the core mapping uses: L = CUPBOP_VIRT_LANES
-// (lane gating of a wider bitstream) or the hardware NT. kernel_main stores it
-// before the kernel runs, so this one is declared read-only, not memory(none).
-static llvm::FunctionCallee getVirtLanes(llvm::Module *M) {
+// Lanes per physical warp that the core mapping uses. Lane gating (CUPBOP_VIRT_LANES,
+// a recipe knob) bakes L in as a constant at translation time; otherwise L is the
+// hardware NT read from a CSR. It must never come from memory: the Vortex backend's
+// branch-divergence pass gave up on the whole lifted hotspot kernel (0 split/join,
+// wrong results) when L was loaded from a global or TLS, while a CSR value was fine.
+static llvm::Value *getVirtLanes(llvm::Module *M, llvm::IRBuilder<> &builder) {
   auto I32 = llvm::Type::getInt32Ty(M->getContext());
-  if (std::getenv("CUPBOP_VIRT_LANES_NT")) // bisection aid: the hardware NT (memory(none) helper) as before
-    return getVirtHelper(M, "__cupbop_num_threads", llvm::FunctionType::get(I32, false));
-  auto C = M->getOrInsertFunction("__cupbop_virt_lanes", llvm::FunctionType::get(I32, false));
-  if (auto *Fn = llvm::dyn_cast<llvm::Function>(C.getCallee())) {
-    if (std::getenv("CUPBOP_VIRT_LANES_READNONE")) // bisection aid: attribute only
-      Fn->setDoesNotAccessMemory();
-    else
-      Fn->setOnlyReadsMemory();
-    Fn->setDoesNotThrow();
-    Fn->setWillReturn();
+  if (const char *e = std::getenv("CUPBOP_VIRT_LANES")) {
+    int L = std::atoi(e);
+    if (L > 0) return llvm::ConstantInt::get(I32, L);
   }
-  return C;
+  return builder.CreateCall(getVirtHelper(M, "__cupbop_num_threads", llvm::FunctionType::get(I32, false)), {}, "virt_lanes");
 }
 
 // adding multiple kenerl in file support
@@ -474,7 +469,7 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
       // size constant: NT and L are runtime values.
       auto I32c = Type::getInt32Ty(C);
       auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32c, false)), {}, "cta_warps");
-      auto L = builder.CreateCall(getVirtLanes(M), {}, "virt_lanes");
+      auto L = getVirtLanes(M, builder);
       auto stride = builder.CreateMul(P, L, "ctx_stride");
       count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(block_size, stride), ConstantInt::get(I32c, 1)), stride, "ctx_slots");
     }
@@ -519,13 +514,8 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) { // virt: the pass number of the warp loop (see intra_warp_slot)
-    if (std::getenv("CUPBOP_VIRT_SLOT_UDIV")) { // bisection aid: the NT=32-only formula
-      auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
-      thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
-    } else
-      thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
-  }
+  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
+    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size (per-block), so adding block_index_x
   // would write OOB. ctx_pool allocas are sized MAX_BLK (multi-block).
@@ -578,13 +568,8 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) { // virt: the pass number of the warp loop (see intra_warp_slot)
-    if (std::getenv("CUPBOP_VIRT_SLOT_UDIV")) { // bisection aid: the NT=32-only formula
-      auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
-      thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
-    } else
-      thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
-  }
+  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
+    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size, so block_index_x offset would OOB.
   // Direct global load (not threadlocal.address intrinsic) — see
@@ -1299,7 +1284,7 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
     if (!need_nested_loop) {
       // Chunk mapping over L lanes per physical warp (L = NT unless lane-gated):
       // t = rank*L + lane + k*(P*L). Independent of the CUDA warp width.
-      auto L = builder.CreateCall(getVirtLanes(M), {}, "virt_lanes");
+      auto L = getVirtLanes(M, builder);
       sche_data.inner_loop_init =
           builder.CreateAdd(tid, builder.CreateMul(wid, L, "hw_"), "hw_tlid");
       sche_data.inner_loop_inc = builder.CreateMul(L, nHW, "hw_tpc");
@@ -1463,13 +1448,8 @@ static llvm::Value *computeThreadIdxForCtx(llvm::IRBuilder<> &builder,
       builder.CreateMul(inter_warp_index,
                         ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) { // virt: the pass number of the warp loop (see intra_warp_slot)
-    if (std::getenv("CUPBOP_VIRT_SLOT_UDIV")) { // bisection aid: the NT=32-only formula
-      auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32, false)), {}, "cta_warps");
-      thread_idx_in_block = builder.CreateUDiv(builder.CreateLShr(thread_idx_in_block, ConstantInt::get(I32, 5)), P, "ctx_slot");
-    } else
-      thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
-  }
+  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
+    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
   if (g_schedule_flag == 0 && need_nested_loop) {
     auto block_index_x =
         createLoad(builder, M->getGlobalVariable("block_index_x"));

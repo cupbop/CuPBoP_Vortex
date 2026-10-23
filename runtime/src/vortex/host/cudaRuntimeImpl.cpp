@@ -113,7 +113,6 @@ static bool cupbop_debug_enabled() {
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
     uint32_t dyn_shared_mem_size;
-    uint32_t virt_lanes;   // core mapping: lanes per physical warp (0 = hardware NT)
   };
 
 #else
@@ -126,7 +125,6 @@ static bool cupbop_debug_enabled() {
     uint32_t printf_buffer_capacity;
     uint32_t work_dim;
     uint32_t dyn_shared_mem_size;
-    uint32_t virt_lanes;   // core mapping: lanes per physical warp (0 = hardware NT)
   };
 #endif
 
@@ -1261,7 +1259,8 @@ cudaError_t cudaLaunchKernel_vortex(
                (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);
         std::abort();
       }
-      ctx.virt_lanes = (L == nt) ? 0u : L;
+      // L reaches the kernel at translation time (CUPBOP_VIRT_LANES is a recipe knob: the
+      // Vortex backend needs a memory-free lane count); the host only sizes the CTA.
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
       // Never more hardware threads than logical ones: hardware thread h owns the
       // logical threads h, h+P*nt, ... and the kernel's uniform control flow
