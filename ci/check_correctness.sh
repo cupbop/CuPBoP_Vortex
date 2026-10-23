@@ -34,7 +34,7 @@ case $TEST_NAME in
     check_marker "PASSED" ;;
   huffman)  # its checker (comparison_helpers.h) prints "PASS! vectors are matching!" / "FAIL! vectors are NOT matching!", never "PASSED"
     check_marker "PASS! vectors are matching" ;;
-  backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda)
+  backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda|virt_warp_test)
     check_golden "${EXAMPLE_DIR}/golden_output.txt" "$CI_OUTPUT" ;;
   nw)
     check_diff "${EXAMPLE_DIR}/golden_result_nw.txt" "${EXAMPLE_DIR}/result_vortex.txt" ;;
