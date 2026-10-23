@@ -198,7 +198,15 @@ public:
     std::vector<BasicBlock *> conditionalBarriers;
     for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
       BasicBlock *b = &*i;
-      if (!has_barrier(b))
+      // virt sub-pass form: a warp sync (staged warp-op marker, glue_end, native
+      // __syncwarp) is a region boundary too, so an `if` that contains only warp
+      // syncs needs the same treatment (barrier before the branch, at the merge and
+      // at the merge's predecessors). has_barrier() lists block barriers and the
+      // FLAT shfl barrier only; without this the merge had two entry barriers, no
+      // region was formed there, and the code after the `if` ran once per hardware
+      // thread (if-body results visible to all lanes, post-loop stores to sub-pass 0).
+      const bool virt_subpass = (getVirtGeom().schedule == 1 && getVirtGeom().subpasses > 1);
+      if (!has_barrier(b) && !(virt_subpass && has_warp_barrier(b)))
         continue;
 
       // Unconditional barrier postdominates the entry node.
