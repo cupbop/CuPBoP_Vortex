@@ -1216,7 +1216,9 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
              // virt staging slots are per hardware thread by design (both sub-passes
              // of a thread share them through the slot index; the uniform glue
              // writes them once). A per-lane copy would leave sub-pass 1 unwritten.
-             instruction->getName().starts_with("shfl_")))
+             // Only the virt slots: FLAT's shfl emulation temporaries (shfl_off,
+             // shfl_res) need their per-thread copies here (jacobi-cuda SCHE_0).
+             instruction->getName().starts_with("shfl_virt_")))
           continue;
         if (ShouldNotBeContextSaved(instruction, DI))
           continue;

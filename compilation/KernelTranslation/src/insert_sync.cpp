@@ -147,6 +147,10 @@ public:
   }
 };
 
+// Core mapping (schedule 1) changed three schedule-independent rules below while the
+// sub-pass form was being made to work; they are gated here so FLAT (schedule 0)
+// keeps its pre-virt behaviour (jacobi-cuda SCHE_0 regressed otherwise).
+static bool virtSchedule() { return getVirtGeom().schedule == 1; }
 // A sync call (block barrier, FLAT shfl barrier, warp sync / staged marker)?
 static bool isSyncCallInst(llvm::Instruction *I) {
   auto *CI = llvm::dyn_cast_or_null<llvm::CallInst>(I);
@@ -281,7 +285,7 @@ public:
 
 
       // we should create warp/block barrier based on the conditional barrier
-      if ((has_warp_barrier(b) && !has_block_barrier(b))) {
+      if ((has_warp_barrier(b) && !(virtSchedule() && has_block_barrier(b)))) {
         insIntra(pred->getTerminator());
       } else {
         insInter(pred->getTerminator());
@@ -310,7 +314,7 @@ public:
         if (PDT->getPostDomTree().dominates(curr, pred)) {
           // find the truly merge point
           merge_point = curr;
-          if ((has_warp_barrier(b) && !has_block_barrier(b))) {
+          if ((has_warp_barrier(b) && !(virtSchedule() && has_block_barrier(b)))) {
             insIntra(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               insIntra(&(*Pred->getTerminator()));
@@ -376,7 +380,7 @@ public:
           // we should insert barrier at the beginning and
           // end of its predecessor
           //printf("insert [255]: %s\n", curr->getName().str().c_str());
-          if ((has_warp_barrier(b) && !has_block_barrier(b))) {
+          if ((has_warp_barrier(b) && !(virtSchedule() && has_block_barrier(b)))) {
             insIntra(&(*curr->begin()));
             for (BasicBlock *Pred : predecessors(curr)) {
               //printf("insert [262]: %s\n", Pred->getName().str().c_str());
@@ -486,7 +490,7 @@ public:
       Builder.SetInsertPoint(Block);
       auto br_inst = Builder.CreateBr(merge_point);
       if (!has_barrier(head)) continue;  // skip if O1 removed barrier
-      if ((has_warp_barrier(head) && !has_block_barrier(head))) {
+      if ((has_warp_barrier(head) && !(virtSchedule() && has_block_barrier(head)))) {
         CreateIntraWarpBarrier(br_inst);
       } else {
         CreateInterWarpBarrier(br_inst);
@@ -530,6 +534,7 @@ public:
     // it met, so a staged warp op (virt sub-passes) ahead of a __syncthreads turned a
     // CTA-barrier loop into a warp-level one and the inter-warp regions vanished.
     bool has_block_sync = false, has_warp_sync = false;
+    int first_sync = -1; // legacy rule (schedule 0): the first sync met decides; 1 = warp-level
     for (Loop::block_iterator i = L->block_begin(), e = L->block_end(); i != e;
          ++i) {
       for (BasicBlock::iterator j = (*i)->begin(), e = (*i)->end(); j != e;
@@ -538,15 +543,18 @@ public:
           if (Call->isInlineAsm() || !Call->getCalledFunction())
             continue;
           auto func_name = Call->getCalledFunction()->getName().str();
-          if (func_name == "llvm.nvvm.barrier0" || func_name == "llvm.nvvm.barrier.sync")
+          if (func_name == "llvm.nvvm.barrier0" || func_name == "llvm.nvvm.barrier.sync") {
             has_block_sync = true;
-          else if (isWarpSync(func_name) || func_name == "cupbop.shfl.barrier")
+            if (first_sync < 0) first_sync = 0;
+          } else if (isWarpSync(func_name) || func_name == "cupbop.shfl.barrier") {
             has_warp_sync = true;
+            if (first_sync < 0) first_sync = 1;
+          }
         }
       }
     }
     is_conditional_loop = has_block_sync || has_warp_sync;
-    is_warp = has_warp_sync && !has_block_sync;
+    is_warp = virtSchedule() ? (has_warp_sync && !has_block_sync) : (first_sync == 1);
     if (!is_conditional_loop)
       return 0;
     // insert barrier at the beginning of header (for_cond)
@@ -616,7 +624,7 @@ public:
       // desync); the barrier at the header start already synchronizes every
       // iteration.
       BasicBlock *for_body = NULL;
-      bool header_exits = false;
+      bool header_exits = !virtSchedule(); // legacy (schedule 0): always place the body barrier
       for (int i = 0; i < header_block->getTerminator()->getNumSuccessors(); i++)
         if (!L->contains(header_block->getTerminator()->getSuccessor(i)))
           header_exits = true;
