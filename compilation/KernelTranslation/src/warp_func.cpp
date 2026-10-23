@@ -591,7 +591,6 @@ void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
 void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
     Module &m, const set<CallInst *> &replace) {}
 
-} // namespace cupbop
 
 
 // ---------------------------------------------------------------------------
@@ -763,3 +762,5 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
   }
   fprintf(stderr, "[virt-stage] %d shfl sites staged over %d sub-passes of %d lanes\n", n, S, L);
 }
+
+} // namespace cupbop
