@@ -41,13 +41,14 @@ def load(p):
     return rows
 g=load(d+'/golden_s2_nt32.out')
 names=["ballot","any","all","shfl5","down1","up3","xor16","fdown2","redsum","actmask","ballot_am","idx_w16","up1_w8","down8_v","popc_hi","t"]
+names2=["uniform_if_shfl","warpuni_if_shfl","welford","halfwarp_shfl","ballot_in_if_mask","nested_if_ballot","nested_if_ballot2","div_loop_ballot","syncwarp_smem","t0_store","t","t","t","t","t","t"]
 for f in sorted(glob.glob(d+'/s1_*.out')):
     r=load(f); bad={}
     for t,gv in g.items():
         rv=r.get(t)
         if rv is None: bad.setdefault('missing',[]).append(t); continue
         for i,(a,b) in enumerate(zip(gv,rv)):
-            if a!=b: bad.setdefault(names[i],[]).append((t,a,b))
+            if a!=b: bad.setdefault((names2[i] if t>=1000 else names[i]),[]).append((t,a,b))
     print(f"== {os.path.basename(f)}: {'PASS' if not bad else 'FAIL'}")
     for k,v in bad.items():
         print(f"   {k}: {len(v)} mismatches, e.g. {v[:4]}")
