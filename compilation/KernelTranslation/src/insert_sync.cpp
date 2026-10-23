@@ -643,7 +643,7 @@ static RegisterPass<InsertBuiltInBarrier>
 // split_block_by_sync, and (c) stop the parallel-region walk in insert_warp_loop
 // right in front of every CTA barrier, so lifted hotspot/pathfinder/backprop
 // ended up with 0 regions and wrote nothing.
-static void erase_warp_syncs_for_virt(llvm::Module *M) {
+static void erase_warp_syncs_for_virt(llvm::Module *M, bool keep_markers = false) {
   std::vector<llvm::CallInst *> dead;
   for (auto &F : *M)
     for (auto &BB : F)
@@ -651,6 +651,9 @@ static void erase_warp_syncs_for_virt(llvm::Module *M) {
         if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
           if (CI->isInlineAsm() || !CI->getCalledFunction())
             continue;
+          if (keep_markers && (CI->getMetadata("cupbop.virt_marker") ||
+                               CI->getCalledFunction()->getName().contains("glue_end")))
+            continue; // staged warp-op markers stay
           if (isWarpSync(CI->getCalledFunction()->getName().str()))
             dead.push_back(CI);
         }
@@ -667,6 +670,8 @@ void insert_sync(llvm::Module *M) {
   }
   if (schedule == 1 && getVirtGeom().subpasses == 1) // sub-pass form keeps them as boundaries
     erase_warp_syncs_for_virt(M);
+  else if (schedule == 1 && std::getenv("CUPBOP_VIRT_ERASE_NATIVE_WS")) // experiment: keep only the staged markers
+    erase_warp_syncs_for_virt(M, /*keep_markers=*/true);
 
   auto Registry = PassRegistry::getPassRegistry();
 

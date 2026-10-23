@@ -666,7 +666,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
     Value *inm = b.CreateAnd(b.CreateLShr(mask, l), ConstantInt::get(I32, 1));
     Value *v = b.CreateAnd(inm, b.CreateZExt(pred, I32), "vote_v");
     vstore(b, v, b.CreateInBoundsGEP(ArrTy, stage, {ConstantInt::get(I32, 0), j}));
-    CreateIntraWarpBarrier(ci); // marker: all sub-passes of this logical warp are done
+    CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {})); // marker: all sub-passes of this logical warp are done
     // glue (uniform, all lanes): OR of the hardware ballots of the S slots, then clean
     Value *bits = ConstantInt::get(I32, 0);
     for (int jj = 0; jj < S; jj++) {
@@ -748,7 +748,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
     vstore(b, varBits, b.CreateInBoundsGEP(ArrTy, stV, {zero, j}));
     vstore(b, bArg, b.CreateInBoundsGEP(ArrTy, stB, {zero, j}));
     vstore(b, cArg, b.CreateInBoundsGEP(ArrTy, stC, {zero, j}));
-    CreateIntraWarpBarrier(ci);
+    CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
     // glue: for every reader sub-pass jr, source logical lane s -> hardware shuffle of slot s>>LG from lane s&(L-1)
     Value *hl = b.CreateAnd(b.CreateCall(laneId, {}, "hwlane"), ConstantInt::get(I32, L - 1));
     for (int jr = 0; jr < S; jr++) {
