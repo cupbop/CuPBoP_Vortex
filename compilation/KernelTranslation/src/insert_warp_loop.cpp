@@ -15,6 +15,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
@@ -75,6 +76,11 @@ public:
   // exit test, e.g. lifted lud after the warp syncs are erased) re-queued its
   // own branch forever and the translator never returned.
   std::unordered_set<const Instruction *> BranchQueued;
+  // Values forced divergent by the caller (virt sub-pass form: allocas that are
+  // stored inside a lane-looped region -- the store runs once per lane, so the
+  // variable must be per-lane even when the stored value is uniform).
+  std::unordered_set<const Value *> ExtraSources;
+  void addSource(const Value *V) { ExtraSources.insert(V); }
 
   void setAnalyzers(DominatorTree &DomTree, PostDominatorTree &PostDomTree,
                     LoopInfo &LoopInf) {
@@ -84,6 +90,14 @@ public:
     }
 
   void analyze(Function &F) {
+    DivergentValues.clear();
+    BranchQueued.clear();
+    while (!Worklist.empty()) Worklist.pop();
+    for (const Value *V : ExtraSources)
+      if (auto *I = dyn_cast<Instruction>(V)) {
+        DivergentValues.insert(I);
+        Worklist.push(I);
+      }
 
     //printf("analyze divergence\n");
     // Identify divergence sources
@@ -230,7 +244,23 @@ private:
           if (IA->getAsmString().find("%laneid") != std::string::npos)
             return true;
       }
+      // virt: warp-level results are per lane. The staged glue (hw ballot/shuffle,
+      // hardware lane id) and the native intrinsics were invisible to this analysis,
+      // so an alloca holding a ballot/shuffle result stayed a single per-thread copy
+      // and every lane of the warp loop read the last lane's value.
+      if (g_schedule_flag == 1)
+        if (const Function *F = CI->getCalledFunction()) {
+          auto n = F->getName();
+          if (n.starts_with("__cupbop_hw_") || n == "__cupbop_laneid" || n == "__cupbop_activemask" ||
+              n.starts_with("llvm.nvvm.vote") || n.starts_with("llvm.nvvm.shfl") || n.starts_with("llvm.nvvm.match"))
+            return true;
+        }
     }
+    if (g_schedule_flag == 1)
+      if (const LoadInst *LI = dyn_cast<LoadInst>(I))
+        if (auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(LI->getPointerOperand())))
+          if (AI->getName().starts_with("shfl_virt_")) // staged result slots (vote_bits, shfl_r)
+            return true;
     // For SCHE_0 nested loop: tool.cpp replaces threadIdx intrinsics with
     // calculations based on local_intra_warp_idx / local_inter_warp_idx.
     // Only needed for nested-loop kernels (warp_shfl); in single-loop mode,
@@ -1128,7 +1158,7 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
         for (auto *U : AI->users()) {
           if (auto *SI = dyn_cast<StoreInst>(U)) {
             found_store = true;
-            bool div = DI.isDivergent(SI->getValueOperand());
+            bool div = DI.isDivergent(SI->getValueOperand()) || DI.isDivergent(AI);
             fprintf(stderr, "[alloca]   store user divergent=%d\n", div);
             if (div) {
               cross_region_allocas.insert(AI);
@@ -2525,6 +2555,32 @@ public:
     // print function
     // F.print(llvm::errs());
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+    // virt sub-pass form: a region is a lane loop, so a store inside it runs once
+    // per lane. An alloca stored there must be per-lane even if the stored value is
+    // uniform (a loop counter `off >>= 1` split by a staged shuffle was halved once
+    // per sub-pass). Force such allocas divergent and recompute: their other
+    // accesses then also land in lane loops (consistent copies), and the
+    // expansion below gives them a context array.
+    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop) {
+      for (int iter = 0; iter < 8; iter++) {
+        std::set<const AllocaInst *> add;
+        for (auto &pr : parallel_regions)
+          for (auto *bb : pr.wrapped_block)
+            for (auto &I : *bb)
+              if (auto *SI = dyn_cast<StoreInst>(&I))
+                if (auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(SI->getPointerOperand()))) {
+                  auto n = AI->getName();
+                  if (n.contains("_intra_warp_") || n.contains("_inter_warp_") || n.starts_with("shfl_"))
+                    continue;
+                  if (!DI.isDivergent(AI)) add.insert(AI);
+                }
+        if (add.empty()) break;
+        fprintf(stderr, "[warp_loop] virt: %zu allocas stored inside lane loops forced per-lane (pass %d)\n", add.size(), iter);
+        for (auto *AI : add) DI.addSource(AI);
+        DI.analyze(F);
+        parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+      }
+    }
     fprintf(stderr, "[warp_loop] %s: %zu parallel regions, intra_warp=%d\n",
             func_name.c_str(), parallel_regions.size(), intra_warp_loop);
     for (size_t r = 0; r < parallel_regions.size(); r++) {
