@@ -592,6 +592,20 @@ void create_kernel_wrapper_function(llvm::Module *M){
       // Core mapping (virt): CTA == CUDA block but only P physical warps; the
       // translated kernel loops over logical warps rank, rank+P, ... (insert_warp_loop)
       // and __syncthreads is a real CTA barrier. Logical geometry comes from ctx.
+      if (std::getenv("CUPBOP_VIRT_PROLOGUE_OLD")) { // bisection aid: per-thread writes, no lane gating
+      ss << "    grid_size_x = ctx->num_groups[0];\n"
+            "    grid_size_y = ctx->num_groups[1];\n"
+            "    grid_size_z = ctx->num_groups[2];\n"
+            "    block_size_x = ctx->local_size[0];\n"
+            "    block_size_y = ctx->local_size[1];\n"
+            "    block_size_z = ctx->local_size[2];\n"
+            "    block_size = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
+            "    block_index_x = blockIdx.x;\n"
+            "    block_index_y = blockIdx.y;\n"
+            "    block_index_z = blockIdx.z;\n"
+            "    callbacks[kernel_arg->kernel_idx](args);\n"
+            "}\n";
+      } else
       ss << "    const uint32_t __bs = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
             "    const uint32_t __L = ctx->virt_lanes ? ctx->virt_lanes : (uint32_t)vx_num_threads();\n"
             "    const uint32_t __lane = (uint32_t)vx_thread_id();\n"
