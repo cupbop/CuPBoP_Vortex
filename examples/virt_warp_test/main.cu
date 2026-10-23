@@ -68,7 +68,11 @@ __global__ void warp_test2(int *out) {
   out[o + 0] = f0; out[o + 1] = f1; out[o + 2] = v; out[o + 3] = f3; out[o + 4] = f4;
   out[o + 5] = f5; out[o + 6] = f6; out[o + 7] = f7; out[o + 8] = f8;
   out[o + 9] = (t == 0) ? 777 : 1;                   // final store under a thread-0 test
-  for (int f = 10; f < NF; f++) out[o + f] = t;
+  int k1 = t, k2 = t;                                 // GEMM shape: uniform loop around staged ops, divergent if inside
+  for (int a = 0; a < 3; a++) { k1 = wsum(k1) & 1023; if (lane < 8) k1 += a; }
+  for (int a = 0; a < (lane & 1) + 1; a++) k2 = wsum(k2) & 1023; // divergent trip count around staged ops
+  out[o + 10] = k1; out[o + 11] = k2;
+  for (int f = 12; f < NF; f++) out[o + f] = t;
 }
 int main() {
   int *d = NULL; size_t sz = NTHREADS * NF * sizeof(int);
