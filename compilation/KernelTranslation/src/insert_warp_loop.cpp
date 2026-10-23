@@ -2218,6 +2218,13 @@ public:
       // if we reach a block which only has a single condtional branch,
       // it is the start point of a B-condition, we have to stop here
       bool is_single_conditional_branch_block = 0;
+      // virt sub-pass form, inter pass: a block left with only a conditional branch
+      // is a uniform branch between two intra loops (a staged warp op's marker sat
+      // in front of it and the intra pass erased it); it belongs inside the
+      // inter-warp region, it is not a B-condition boundary. Stopping there left
+      // the whole leading part of the kernel outside the inter loop (logical warp 0
+      // only ran it).
+      if (!(g_schedule_flag == 1 && !intra_warp_loop))
       if (auto br = dyn_cast<llvm::BranchInst>(current->getTerminator())) {
         if (br->isConditional()) {
           if (current->size() == 1) {

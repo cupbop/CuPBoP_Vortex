@@ -73,6 +73,17 @@ public:
             ++iter;
             continue;
         }
+        // virt sub-pass staging: the zero-init stores of the per-thread stage slots
+        // (shfl_virt_* allocas, and the GEPs into them) belong before the entry
+        // barrier; inside the first region loop every sub-pass would re-zero them.
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+            if (auto *A = dyn_cast<AllocaInst>(GEP->getPointerOperand()->stripPointerCasts()))
+                if (A->getName().starts_with("shfl_virt_")) { ++iter; continue; }
+        }
+        if (auto *ST = dyn_cast<StoreInst>(I)) {
+            if (auto *A = dyn_cast<AllocaInst>(ST->getPointerOperand()->stripPointerCasts()))
+                if (A->getName().starts_with("shfl_virt_")) { ++iter; continue; }
+        }
 
         // vx_local_alloc + gep + addrspacecast + store 시퀀스 예외
         if (auto call = dyn_cast<CallInst>(I)) {
