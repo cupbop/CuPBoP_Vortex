@@ -2628,6 +2628,10 @@ void insert_warp_loop(llvm::Module *M) {
   // flat schedule, where one hardware thread emulates a whole warp, and its
   // region detection does not survive the lifted (SASS-derived, ballot-driven)
   // control flow: lifted hotspot/pathfinder/backprop/lud wrote nothing or trapped.
+  if (schedule == 1 && !need_nested_loop && std::getenv("CUPBOP_VIRT_FORCE_NESTED") && getVirtGeom().subpasses > 1) {
+    fprintf(stderr, "[IWL] CUPBOP_VIRT_FORCE_NESTED: sub-pass form without warp-level ops (mechanics test)\n");
+    need_nested_loop = 1;
+  }
   if (schedule == 1 && need_nested_loop) {
     auto vg = getVirtGeom();
     if (vg.subpasses == 1) {
