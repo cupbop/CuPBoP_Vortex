@@ -367,6 +367,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
 
             "int block_size;\n"
             "extern int __cupbop_virt_lanes_g;\n"
+            "extern int __thread __cupbop_virt_lanes_tls;\n"
             "\n"
 
             "__attribute__((used)) int __thread block_index_x;\n"
@@ -615,6 +616,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // after the fence); every hardware thread writing them cost small kernels\n"
             "    // more than their body (nn: stores 2.4x of 1:1).\n"
             "    if (__lane == 0 && blockIdx.x == 0 && blockIdx.y == 0 && __rank == 0 && getenv_dbg_virt) vx_printf(\"[virt] L=%d g=%d bs=%d nt=%d ctxL=%d\\n\", (int)__L, __cupbop_virt_lanes_g, (int)__bs, (int)vx_num_threads(), (int)ctx->virt_lanes);\n"
+            "    if (" << (std::getenv("CUPBOP_VIRT_G_ALL_LANES") ? "true" : "false") << ") __cupbop_virt_lanes_g = (int)__L; // bisection: every lane writes\n"
+            "    if (" << (std::getenv("CUPBOP_VIRT_L_TLS") ? "true" : "false") << ") __cupbop_virt_lanes_tls = (int)__L; // bisection: per-thread copy\n"
             "    if (__lane == 0) {\n"
             "        __cupbop_virt_lanes_g = (int)__L;\n"
             "        grid_size_x = ctx->num_groups[0];\n"
