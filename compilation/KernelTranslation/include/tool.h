@@ -18,6 +18,12 @@ void replace_block(llvm::Function *F, llvm::BasicBlock *before,
                    llvm::BasicBlock *after);
 llvm::CallInst *CreateInterWarpBarrier(llvm::Instruction *InsertBefore);
 llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore);
+// Core mapping (virt) geometry known at translation time: hardware NT
+// (VORTEX_NUM_THREADS, exported by the example makefile), lanes per warp used
+// (CUPBOP_VIRT_LANES, lane gating; at most 32) and the number of sub-passes a
+// 32-lane CUDA warp needs on them (32/L). The kernel IR is therefore per NT.
+struct VirtGeom { int schedule; int nt; int lanes; int subpasses; int lg_lanes; };
+VirtGeom getVirtGeom();
 void VerifyModule(llvm::Module *);
 void phi2alloc(llvm::Module *M);
 void remove_cuda_built_in(llvm::Module *M);

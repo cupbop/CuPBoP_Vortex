@@ -262,6 +262,29 @@ extern "C" __attribute__((always_inline)) int __cupbop_cta_rank(void) {
 extern "C" __attribute__((always_inline)) int __cupbop_cta_size(void) {
   return (int)csr_read_nv(VX_CSR_CTA_SIZE);
 }
+// Core mapping with sub-passes (L < 32 lanes per warp): the translator stages each
+// sub-pass's operands and combines them in uniform glue with these hardware ops.
+extern "C" __attribute__((always_inline, convergent)) int __cupbop_hw_ballot(int v) {
+  return (int)vx_vote_ballot(v);
+}
+extern "C" __attribute__((always_inline, convergent)) int __cupbop_hw_shfl_idx(int v, int lane, int clamp) {
+  return vx_shfl_idx((size_t)v, lane, clamp, 0);
+}
+// PTX shfl.sync source lane (ISA 'shfl.sync' semantics) for a logical 32-lane warp:
+// mode 0 idx, 1 up, 2 down, 3 bfly; b = srcLane/delta/laneMask; c = clamp | segmask<<8.
+extern "C" __attribute__((always_inline)) int __cupbop_shfl_srclane(int mode, int lane, int b, int c) {
+  int bval = b & 31, cval = c & 31, segmask = (c >> 8) & 31;
+  int maxLane = (lane & segmask) | (cval & ~segmask);
+  int minLane = lane & segmask;
+  int j; int pval;
+  switch (mode) {
+    case 1:  j = lane - bval; pval = (j >= maxLane); break;
+    case 2:  j = lane + bval; pval = (j <= maxLane); break;
+    case 3:  j = lane ^ bval; pval = (j <= maxLane); break;
+    default: j = minLane | (bval & ~segmask); pval = (j <= maxLane); break;
+  }
+  return pval ? j : lane;
+}
 // Get number of warps per CTA (runtime value from vx_spawn_threads)
 __attribute__((always_inline)) unsigned int __vx_warps_per_group(void) {
   return __warps_per_group;

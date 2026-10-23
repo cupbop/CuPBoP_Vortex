@@ -45,6 +45,10 @@ CUDA_PATH      ?= $(CuPBoP_PATH)/cuda-12.1
 
 export VORTEX_SCHEDULE_FLAG := $(SCHEDULE)
 export VORTEX_LOCALMEM_FLAG := $(LOCALMEM)
+# the translator's core-mapping geometry (sub-passes = 32 / lanes) needs the hardware NT
+export VORTEX_NUM_THREADS
+export VORTEX_NUM_WARPS
+export VORTEX_NUM_CORES
 
 # ─── Toolchain ────────────────────────────────────────────────────────────────
 LLVM_BIN = $(LLVM_PREFIX)/bin

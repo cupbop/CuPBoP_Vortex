@@ -301,12 +301,8 @@ static llvm::FunctionCallee getVirtHelper(llvm::Module *M, const char *name,
 // branch-divergence pass gave up on the whole lifted hotspot kernel (0 split/join,
 // wrong results) when L was loaded from a global or TLS, while a CSR value was fine.
 static llvm::Value *getVirtLanes(llvm::Module *M, llvm::IRBuilder<> &builder) {
-  auto I32 = llvm::Type::getInt32Ty(M->getContext());
-  if (const char *e = std::getenv("CUPBOP_VIRT_LANES")) {
-    int L = std::atoi(e);
-    if (L > 0) return llvm::ConstantInt::get(I32, L);
-  }
-  return builder.CreateCall(getVirtHelper(M, "__cupbop_num_threads", llvm::FunctionType::get(I32, false)), {}, "virt_lanes");
+  (void)builder;
+  return llvm::ConstantInt::get(llvm::Type::getInt32Ty(M->getContext()), getVirtGeom().lanes);
 }
 
 // adding multiple kenerl in file support
@@ -464,14 +460,22 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
     auto block_size = createLoad(builder, block_size_addr);
     llvm::Value *count = block_size;
     if (g_schedule_flag == 1) {
-      // virt: hardware thread h owns logical threads h, h+P*L, ... (P physical
-      // warps of L lanes), so it needs ceil(block_size / (P*L)) slots. No warp
-      // size constant: NT and L are runtime values.
       auto I32c = Type::getInt32Ty(C);
       auto P = builder.CreateCall(getVirtHelper(M, "__cupbop_cta_size", FunctionType::get(I32c, false)), {}, "cta_warps");
       auto L = getVirtLanes(M, builder);
-      auto stride = builder.CreateMul(P, L, "ctx_stride");
-      count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(block_size, stride), ConstantInt::get(I32c, 1)), stride, "ctx_slots");
+      if (need_nested_loop) {
+        // sub-pass form: physical warp rank owns logical warps rank, rank+P, ...
+        // (ceil(ceil(block/32)/P) of them) and each hardware thread owns S = 32/L
+        // logical lanes of every one of them -> slots x S entries.
+        auto warps = builder.CreateLShr(builder.CreateAdd(block_size, ConstantInt::get(I32c, 31)), ConstantInt::get(I32c, 5), "block_warps");
+        auto slots = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(warps, P), ConstantInt::get(I32c, 1)), P, "warp_slots");
+        count = builder.CreateMul(slots, ConstantInt::get(I32c, getVirtGeom().subpasses), "ctx_slots");
+      } else {
+        // single loop: hardware thread h owns logical threads h, h+P*L, ... ->
+        // ceil(block_size / (P*L)) slots
+        auto stride = builder.CreateMul(P, L, "ctx_stride");
+        count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(block_size, stride), ConstantInt::get(I32c, 1)), stride, "ctx_slots");
+      }
     }
     auto *AI = builder.CreateAlloca(AllocType, count, varName);
     // Byte-array slots (e.g. a lifter's 400-byte parameter block) are accessed as
@@ -514,8 +518,15 @@ llvm::Instruction *AddContextSave(llvm::Instruction *instruction,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
-    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+  if (g_schedule_flag == 1) { // virt: pass number of the warp loop (intra_warp_slot), x sub-pass when nested
+    llvm::Value *slot = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+    if (need_nested_loop) {
+      auto vg = getVirtGeom();
+      slot = builder.CreateAdd(builder.CreateMul(slot, ConstantInt::get(I32, vg.subpasses)),
+                               builder.CreateLShr(intra_warp_index, ConstantInt::get(I32, vg.lg_lanes)), "ctx_slot");
+    }
+    thread_idx_in_block = slot;
+  }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size (per-block), so adding block_index_x
   // would write OOB. ctx_pool allocas are sized MAX_BLK (multi-block).
@@ -568,8 +579,15 @@ llvm::Instruction *AddContextRestore(llvm::Value *val,
       builder.CreateBinOp(Instruction::Mul, inter_warp_index,
                           ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
-    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+  if (g_schedule_flag == 1) { // virt: pass number of the warp loop (intra_warp_slot), x sub-pass when nested
+    llvm::Value *slot = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+    if (need_nested_loop) {
+      auto vg = getVirtGeom();
+      slot = builder.CreateAdd(builder.CreateMul(slot, ConstantInt::get(I32, vg.subpasses)),
+                               builder.CreateLShr(intra_warp_index, ConstantInt::get(I32, vg.lg_lanes)), "ctx_slot");
+    }
+    thread_idx_in_block = slot;
+  }
   // Include block_index_x ONLY when using ctx_pool (need_nested_loop path).
   // Stack allocas are sized by block_size, so block_index_x offset would OOB.
   // Direct global load (not threadlocal.address intrinsic) — see
@@ -1255,7 +1273,8 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
       tid->setMetadata("divergence", MDNode::get(M->getContext(), MDString::get(M->getContext(), "divergence")));
       auto nHT = builder.CreateCall(nHTC, {}, "nHT");
       sche_data.inner_loop_init = tid;
-      sche_data.inner_loop_inc = nHT;
+      (void)nHT;
+      sche_data.inner_loop_inc = getVirtLanes(M, builder); // sub-passes: logical lane = hw lane + L*j
       sche_data.inner_loop_cond = sw_warp_size;
     } else { // Schedule 0
       sche_data.inner_loop_init = builder.getInt32(0);
@@ -1294,7 +1313,8 @@ void add_mapping_variable(llvm::Function* F, bool intra_warp_loop,
     } else {
       // sche_data.inner_loop_init = M->getGlobalVariable("intra_warp_index");
       sche_data.inner_loop_init = tid;
-      sche_data.inner_loop_inc = nHT;
+      (void)nHT;
+      sche_data.inner_loop_inc = getVirtLanes(M, builder); // sub-passes: logical lane = hw lane + L*j
       sche_data.inner_loop_cond = sw_warp_size;
 
       sche_data.outer_loop_init = wid;
@@ -1346,6 +1366,8 @@ BasicBlock *insert_loop_init(llvm::BasicBlock *InsertInitBefore,
   if (!intra_warp_loop) { // inter warp
     auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
     builder.CreateStore(sche_data.outer_loop_init, inter_warp_index);
+    if (g_schedule_flag == 1 && need_nested_loop) // virt (sub-pass form): first logical warp of this region loop
+      builder.CreateStore(ConstantInt::get(I32, 0), M->getGlobalVariable("intra_warp_slot"));
   } else { // intra warp
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
     // Add TLS divergent seed to loop init value so LLVM recognizes
@@ -1362,7 +1384,7 @@ BasicBlock *insert_loop_init(llvm::BasicBlock *InsertInitBefore,
     } else {
       builder.CreateStore(sche_data.inner_loop_init, intra_warp_index);
     }
-    if (g_schedule_flag == 1) // virt: first pass of this region loop
+    if (g_schedule_flag == 1 && !need_nested_loop) // virt (single loop): first pass of this region loop
       builder.CreateStore(ConstantInt::get(I32, 0), M->getGlobalVariable("intra_warp_slot"));
   }
 
@@ -1391,6 +1413,16 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
     cmpResult = builder.CreateICmpULT(createLoad(builder, intra_warp_index),
                                       sche_data.inner_loop_cond);
+    if (g_schedule_flag == 1 && need_nested_loop) {
+      // sub-pass form: a partial last CUDA warp (block not a multiple of 32) has no
+      // logical lanes beyond block_size; the hardware lanes of the first sub-pass
+      // passed the kernel-entry test, later sub-passes must check here.
+      auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
+      auto tid = builder.CreateAdd(builder.CreateMul(createLoad(builder, inter_warp_index), ConstantInt::get(I32, 32)),
+                                   createLoad(builder, intra_warp_index), "logical_tid");
+      auto inb = builder.CreateICmpULT(tid, createLoad(builder, M->getGlobalVariable("block_size")));
+      cmpResult = builder.CreateAnd(cmpResult, inb);
+    }
   }
 
   builder.CreateCondBr(cmpResult, InsertCondBefore, LoopEnd);
@@ -1416,13 +1448,17 @@ BasicBlock *insert_loop_inc(llvm::BasicBlock *InsertIncBefore,
         Instruction::Add, createLoad(builder, inter_warp_index),
         sche_data.outer_loop_inc, "inter_warp_index_increment");
     builder.CreateStore(new_index, inter_warp_index);
+    if (g_schedule_flag == 1 && need_nested_loop) { // virt (sub-pass form): next logical warp
+      auto slot = M->getGlobalVariable("intra_warp_slot");
+      builder.CreateStore(builder.CreateAdd(createLoad(builder, slot), ConstantInt::get(I32, 1), "intra_warp_slot_increment"), slot);
+    }
   } else { // intra warp
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
       auto new_index = builder.CreateBinOp(
           Instruction::Add, createLoad(builder, intra_warp_index),
           sche_data.inner_loop_inc, "intra_warp_index_increment");
       builder.CreateStore(new_index, intra_warp_index);
-      if (g_schedule_flag == 1) { // virt: next pass
+      if (g_schedule_flag == 1 && !need_nested_loop) { // virt (single loop): next pass
         auto slot = M->getGlobalVariable("intra_warp_slot");
         builder.CreateStore(builder.CreateAdd(createLoad(builder, slot), ConstantInt::get(I32, 1), "intra_warp_slot_increment"), slot);
       }
@@ -1448,8 +1484,15 @@ static llvm::Value *computeThreadIdxForCtx(llvm::IRBuilder<> &builder,
       builder.CreateMul(inter_warp_index,
                         ConstantInt::get(I32, SW_WARP_SIZE)),
       "thread_idx_in_block");
-  if (g_schedule_flag == 1) // virt: the pass number of the warp loop (see intra_warp_slot)
-    thread_idx_in_block = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+  if (g_schedule_flag == 1) { // virt: pass number of the warp loop (intra_warp_slot), x sub-pass when nested
+    llvm::Value *slot = createLoad(builder, M->getGlobalVariable("intra_warp_slot"));
+    if (need_nested_loop) {
+      auto vg = getVirtGeom();
+      slot = builder.CreateAdd(builder.CreateMul(slot, ConstantInt::get(I32, vg.subpasses)),
+                               builder.CreateLShr(intra_warp_index, ConstantInt::get(I32, vg.lg_lanes)), "ctx_slot");
+    }
+    thread_idx_in_block = slot;
+  }
   if (g_schedule_flag == 0 && need_nested_loop) {
     auto block_index_x =
         createLoad(builder, M->getGlobalVariable("block_index_x"));
@@ -1928,11 +1971,13 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     if (intra_warp_loop) { // intra warp
       auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
       builder.CreateStore(ConstantInt::get(I32, 0), intra_warp_index);
-      if (g_schedule_flag == 1) // virt: uniform code after the loop reads slot 0 (its first logical thread)
+      if (g_schedule_flag == 1 && !need_nested_loop) // virt (single loop): uniform code after the loop reads slot 0
         builder.CreateStore(ConstantInt::get(I32, 0), M->getGlobalVariable("intra_warp_slot"));
     } else { // inter warp
       auto inter_warp_index = M->getGlobalVariable("inter_warp_index");
       builder.CreateStore(ConstantInt::get(I32, 0), inter_warp_index);
+      if (g_schedule_flag == 1 && need_nested_loop) // virt (sub-pass form): uniform code reads slot 0
+        builder.CreateStore(ConstantInt::get(I32, 0), M->getGlobalVariable("intra_warp_slot"));
     }
     builder.CreateBr(next_block);
     loop_cond->getTerminator()->replaceUsesOfWith(next_block, reset_index);
@@ -2118,6 +2163,14 @@ public:
     BasicBlock *exit = B->getSinglePredecessor();
     fprintf(stderr, "[PR] === getParallelRegionBefore: B=%s, preds=%d ===\n",
             B->getName().str().c_str(), (int)std::distance(pred_begin(B), pred_end(B)));
+    // virt sub-pass form: the blocks between a staged warp op's marker and its
+    // glue_end marker are uniform glue (all lanes, once per logical warp) that
+    // combines the sub-passes with hardware shuffles/ballots; never a region.
+    if (auto *GC = dyn_cast<CallInst>(B->getFirstNonPHI()))
+      if (GC->getCalledFunction() && GC->getCalledFunction()->getName().contains("glue_end")) {
+        fprintf(stderr, "[PR]   glue_end exit: uniform glue, no region\n");
+        return;
+      }
     for (BasicBlock *Pred : predecessors(B)) {
       pending_blocks.push_back(Pred);
     }
@@ -2150,8 +2203,8 @@ public:
           if (func_name == "llvm.nvvm.barrier0" ||
               func_name == "llvm.nvvm.barrier.sync")
             has_barrier = 1;
-          if (isWarpSync(func_name) && intra_warp_loop && g_schedule_flag != 1)
-            has_barrier = 1; // (schedule 1 / virt: warp syncs are erased in insert_sync; never a boundary)
+          if (isWarpSync(func_name) && intra_warp_loop && !(g_schedule_flag == 1 && !need_nested_loop))
+            has_barrier = 1; // (virt single loop: warp syncs are erased in insert_sync; sub-pass form: boundaries)
           if (func_name == "cupbop.shfl.barrier")
             has_barrier = 1;
         }
@@ -2366,13 +2419,13 @@ public:
         // when handling intra warp loop, we need also split the blocks
         // between warp barrier and shfl barrier
         // (schedule 1 / virt: lanes are hardware, warp syncs are not boundaries)
-        if (intra_warp_loop && g_schedule_flag != 1 && (isWarpSync(func_name) ||
+        if (intra_warp_loop && !(g_schedule_flag == 1 && !need_nested_loop) && (isWarpSync(func_name) ||
             func_name == "cupbop.shfl.barrier")) {
           exit_blocks.push_back(&(*s));
         }
 
         // split the blocks between thread group barrier
-        if (intra_warp_loop && g_schedule_flag != 1 && isCGThreadGroupSync(func_name)) {
+        if (intra_warp_loop && !(g_schedule_flag == 1 && !need_nested_loop) && isCGThreadGroupSync(func_name)) {
           exit_blocks.push_back(&(*s));
         }
       }
@@ -2576,8 +2629,13 @@ void insert_warp_loop(llvm::Module *M) {
   // region detection does not survive the lifted (SASS-derived, ballot-driven)
   // control flow: lifted hotspot/pathfinder/backprop/lud wrote nothing or trapped.
   if (schedule == 1 && need_nested_loop) {
-    fprintf(stderr, "[IWL] schedule 1 (virt): warp-level syncs are hardware, using the single block-sized loop (no nested loop)\n");
-    need_nested_loop = 0;
+    auto vg = getVirtGeom();
+    if (vg.subpasses == 1) {
+      fprintf(stderr, "[IWL] schedule 1 (virt): %d lanes = the CUDA warp, warp-level ops are hardware, single block-sized loop\n", vg.lanes);
+      need_nested_loop = 0;
+    } else {
+      fprintf(stderr, "[IWL] schedule 1 (virt): %d lanes per warp -> %d sub-passes per CUDA warp; staged warp-level ops, nested loop\n", vg.lanes, vg.subpasses);
+    }
   }
 
   fprintf(stderr, "[IWL] schedule=%d, need_loop_serialize=%d, need_nested_loop=%d\n",

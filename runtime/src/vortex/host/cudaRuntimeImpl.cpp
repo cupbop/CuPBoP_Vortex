@@ -1247,11 +1247,15 @@ cudaError_t cudaLaunchKernel_vortex(
       // Lane gating: use only L of the NT lanes of each physical warp
       // (CUPBOP_VIRT_LANES, default NT). Emulates a narrower issue width on a wider
       // bitstream; TCU tile geometry, LSU lanes and the memory side stay the bitstream's.
-      uint32_t L = nt;
-      if (char *env = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < nt) L = (uint32_t)v; }
+      uint32_t L = std::min<uint32_t>(nt, 32u); // a wider warp runs one 32-lane logical warp at a time
+      if (char *env = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < L) L = (uint32_t)v; }
+      while (32 % L) L >>= 1;
       // Every physical warp must own at least one logical thread (its lanes leave
       // early otherwise and the CTA barrier would wait for it): P <= ceil(block/L).
-      const uint32_t block_warps = (uint32_t)((block_threads + L - 1) / L);
+      // Every physical warp must own a logical thread in whichever form the kernel took
+      // (chunk of L per pass, or a 32-lane logical warp per pass when it stages warp ops),
+      // so with L < 32 the cap is the number of CUDA warps.
+      const uint32_t block_warps = (uint32_t)((block_threads + (L < 32 ? 32 : L) - 1) / (L < 32 ? 32 : L));
       uint32_t P = block_warps;
       if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
       if ((uint64_t)P * nt > NUM_WARPS_VX * NUM_THREADS_VX) {

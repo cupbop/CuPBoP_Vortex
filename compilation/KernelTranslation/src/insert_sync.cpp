@@ -655,7 +655,7 @@ void insert_sync(llvm::Module *M) {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     schedule = std::stoi(std::string(env));
   }
-  if (schedule == 1)
+  if (schedule == 1 && getVirtGeom().subpasses == 1) // sub-pass form keeps them as boundaries
     erase_warp_syncs_for_virt(M);
 
   auto Registry = PassRegistry::getPassRegistry();

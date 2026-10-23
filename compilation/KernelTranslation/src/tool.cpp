@@ -194,6 +194,19 @@ llvm::CallInst *CreateInterWarpBarrier(llvm::Instruction *InsertBefore) {
   return llvm::CallInst::Create(F, "", InsertBefore);
 }
 
+VirtGeom getVirtGeom() {
+  VirtGeom g; g.schedule = 0; g.nt = 32;
+  if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) g.schedule = std::atoi(e);
+  if (const char *e = std::getenv("VORTEX_NUM_THREADS")) { int v = std::atoi(e); if (v > 0) g.nt = v; }
+  int L = g.nt;
+  if (const char *e = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::atoi(e); if (v > 0 && v < L) L = v; }
+  if (L > 32) L = 32;              // a wider warp runs one 32-lane logical warp at a time
+  while (32 % L) L >>= 1;          // L must divide the CUDA warp
+  g.lanes = L; g.subpasses = 32 / L; g.lg_lanes = 0;
+  while ((1 << g.lg_lanes) < L) g.lg_lanes++;
+  return g;
+}
+
 llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore) {
   llvm::Module *M = InsertBefore->getParent()->getParent()->getParent();
 

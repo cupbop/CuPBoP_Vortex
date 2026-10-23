@@ -69,8 +69,9 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
   }
   // handle different mappings
   switch (mapping_) {
-  case MAPPING_CORE: // virt: hardware lanes -> same lowering as 1:1
-    replaceWarpVote1to1(m, replace);
+  case MAPPING_CORE: // virt: hardware lanes; with sub-passes (L < 32) staged + glue
+    if (getVirtGeom().subpasses > 1) replaceWarpVoteStaged(m, replace);
+    else replaceWarpVote1to1(m, replace);
     break;
   case MAPPING_FLAT:
     replaceWarpVoteFlat(m, replace);
@@ -237,7 +238,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
 
   // get the callee functions to be replaced
   set<CallInst *> replace;
-  if (mapping_ == MAPPING_FLAT) {
+  const bool coreStaged = (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1);
+  if (mapping_ == MAPPING_FLAT || coreStaged) {
     // FLAT mode: replace C++ wrapper CALLS in the kernel body directly.
     // Replacing NVVM intrinsics inside wrapper bodies doesn't work because
     // the wrapper function is not wrapped by the warp loop — only kernel
@@ -294,8 +296,19 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
   }
   // handle different mappings
   switch (mapping_) {
-  case MAPPING_CORE: // virt: hardware lanes -> same lowering as 1:1
-    replaceWarpShfl1to1(m, replace);
+  case MAPPING_CORE: // virt: hardware lanes; with sub-passes (L < 32) staged + glue
+    if (coreStaged) {
+      replaceWarpShflStaged(m, replace);
+      bool changed = true;
+      while (changed) { // drop the now-unused C++ wrappers (their NVVM bodies would reach the backend)
+        changed = false;
+        SmallVector<Function *, 8> toRemove;
+        for (auto &f : m.functions())
+          if (f.use_empty() && !isKernelFunction(&m, &f) && isShflCall(f.getName().str())) toRemove.push_back(&f);
+        for (auto *f : toRemove) { f->eraseFromParent(); changed = true; }
+      }
+    } else
+      replaceWarpShfl1to1(m, replace);
     break;
   case MAPPING_FLAT:
     replaceWarpShflFlat(m, replace);
@@ -579,3 +592,174 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
     Module &m, const set<CallInst *> &replace) {}
 
 } // namespace cupbop
+
+
+// ---------------------------------------------------------------------------
+// Core mapping with sub-passes (schedule 1, L < 32 lanes per physical warp).
+// A CUDA warp is S = 32/L sub-passes of the intra loop; a warp-level op needs
+// all 32 logical lanes. Each sub-pass stores its operands in per-thread stage
+// slots, a warp-sync marker ends the region, and uniform glue (all lanes, once
+// per logical warp, between the two intra loops) combines the S slots with
+// hardware ballots/shuffles into per-sub-pass results read after a second
+// marker (…glue_end, a warp sync by name so every pass treats it as one).
+// ---------------------------------------------------------------------------
+static Value *virtLogicalLane(IRBuilder<> &b, Module &m) {
+  return createLoad(b, m.getGlobalVariable("intra_warp_index"));
+}
+
+void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallInst *> &replace_in) {
+  const VirtGeom vg = getVirtGeom();
+  const int S = vg.subpasses, L = vg.lanes, LG = vg.lg_lanes;
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *I1 = Type::getInt1Ty(ctx), *VoidT = Type::getVoidTy(ctx);
+  set<CallInst *> replace = replace_in;
+  for (auto &f : m.functions())
+    for (auto &bb : f)
+      for (auto &i : bb)
+        if (auto *ci = dyn_cast<CallInst>(&i))
+          if (!ci->isInlineAsm() && ci->getCalledFunction() &&
+              ci->getCalledFunction()->getName() == "__cupbop_activemask")
+            replace.insert(ci);
+  if (replace.empty()) return;
+  FunctionCallee hwBallot = m.getOrInsertFunction("__cupbop_hw_ballot", FunctionType::get(I32, {I32}, false));
+  if (auto *Fn = dyn_cast<Function>(hwBallot.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
+  if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  auto *ArrTy = ArrayType::get(I32, S);
+  int n = 0;
+  for (auto *ci : replace) {
+    Function *F = ci->getFunction();
+    std::string name = ci->getCalledOperand()->getName().str();
+    if (!isKernelFunction(&m, F)) {
+      fprintf(stderr, "[virt-stage] WARNING: %s in non-kernel %s left to the hardware lowering\n", name.c_str(), F->getName().str().c_str());
+      set<CallInst *> one; one.insert(ci);
+      if (name != "__cupbop_activemask") replaceWarpVote1to1(m, one);
+      continue;
+    }
+    const bool isActive = (name == "__cupbop_activemask");
+    Value *mask = isActive ? ConstantInt::get(I32, -1) : ci->getArgOperand(0);
+    Value *pred = isActive ? ConstantInt::getTrue(ctx) : ci->getArgOperand(1);
+    if (mask->getType() != I32) { IRBuilder<> tb(ci); mask = tb.CreateIntCast(mask, I32, false); }
+    IRBuilder<> eb(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+    auto *stage = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_vote_stage");
+    auto *res = eb.CreateAlloca(I32, nullptr, "shfl_virt_vote_res");
+    for (int j = 0; j < S; j++) eb.CreateStore(ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, j));
+    IRBuilder<> b(ci);
+    // store phase (this sub-pass): in-mask predicate of the logical lane
+    Value *l = virtLogicalLane(b, m);
+    Value *j = b.CreateLShr(l, ConstantInt::get(I32, LG), "vsub");
+    Value *inm = b.CreateAnd(b.CreateLShr(mask, l), ConstantInt::get(I32, 1));
+    Value *v = b.CreateAnd(inm, b.CreateZExt(pred, I32), "vote_v");
+    b.CreateStore(v, b.CreateInBoundsGEP(ArrTy, stage, {ConstantInt::get(I32, 0), j}));
+    CreateIntraWarpBarrier(ci); // marker: all sub-passes of this logical warp are done
+    // glue (uniform, all lanes): OR of the hardware ballots of the S slots, then clean
+    Value *bits = ConstantInt::get(I32, 0);
+    for (int jj = 0; jj < S; jj++) {
+      auto *gep = b.CreateConstInBoundsGEP2_32(ArrTy, stage, 0, jj);
+      auto *hb = b.CreateCall(hwBallot, {b.CreateLoad(I32, gep)});
+      hb->addFnAttr(Attribute::Convergent);
+      bits = b.CreateOr(bits, b.CreateShl(hb, ConstantInt::get(I32, L * jj)));
+      b.CreateStore(ConstantInt::get(I32, 0), gep);
+    }
+    b.CreateStore(bits, res);
+    b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
+    // load phase (next region, per sub-pass)
+    Value *bm = b.CreateAnd(b.CreateLoad(I32, res, "vote_bits"), mask);
+    Value *result;
+    if (isActive || name.find(".ballot.") != string::npos) result = bm;
+    else if (name.find(".any.") != string::npos) result = b.CreateICmpNE(bm, ConstantInt::get(I32, 0));
+    else if (name.find(".all.") != string::npos) result = b.CreateICmpEQ(bm, mask);
+    else result = b.CreateOr(b.CreateICmpEQ(bm, ConstantInt::get(I32, 0)), b.CreateICmpEQ(bm, mask)); // uni
+    if (result->getType() != ci->getType()) {
+      if (ci->getType() == I1) result = b.CreateICmpNE(result, Constant::getNullValue(result->getType()));
+      else result = b.CreateZExtOrTrunc(result, ci->getType());
+    }
+    ci->replaceAllUsesWith(result);
+    ci->eraseFromParent();
+    n++;
+  }
+  fprintf(stderr, "[virt-stage] %d vote/activemask sites staged over %d sub-passes of %d lanes\n", n, S, L);
+}
+
+void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallInst *> &replace) {
+  const VirtGeom vg = getVirtGeom();
+  const int S = vg.subpasses, L = vg.lanes, LG = vg.lg_lanes;
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *F32 = Type::getFloatTy(ctx);
+  if (replace.empty()) return;
+  FunctionCallee hwShfl = m.getOrInsertFunction("__cupbop_hw_shfl_idx", FunctionType::get(I32, {I32, I32, I32}, false));
+  if (auto *Fn = dyn_cast<Function>(hwShfl.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  FunctionCallee srcLane = m.getOrInsertFunction("__cupbop_shfl_srclane", FunctionType::get(I32, {I32, I32, I32, I32}, false));
+  FunctionCallee laneId = m.getOrInsertFunction("__cupbop_laneid", FunctionType::get(I32, false));
+  FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
+  if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  auto *ArrTy = ArrayType::get(I32, S);
+  int n = 0;
+  for (auto *ci : replace) {
+    Function *F = ci->getFunction();
+    std::string name = ci->getCalledOperand()->getName().str();
+    if (!isKernelFunction(&m, F)) {
+      fprintf(stderr, "[virt-stage] WARNING: %s in non-kernel %s left to the hardware lowering\n", name.c_str(), F->getName().str().c_str());
+      set<CallInst *> one; one.insert(ci); replaceWarpShfl1to1(m, one);
+      continue;
+    }
+    const bool isIntrinsic = name.rfind("llvm.nvvm.shfl.sync.", 0) == 0;
+    int mode = 0;
+    if (name.find("up") != string::npos) mode = 1;
+    else if (name.find("down") != string::npos) mode = 2;
+    else if (name.find("bfly") != string::npos || name.find("xor") != string::npos) mode = 3;
+    Value *var = ci->getArgOperand(1);
+    Value *bArg = ci->getArgOperand(2);
+    Value *cArg = ci->getArgOperand(3);
+    Type *VT = var->getType();
+    const bool isFloat = VT->isFloatTy();
+    IRBuilder<> b(ci);
+    if (!isIntrinsic) { // C++ wrapper: 4th arg is width -> PTX c = (32-width)<<8 | (up ? 0 : 31)
+      Value *w = b.CreateIntCast(cArg, I32, false);
+      Value *seg = b.CreateShl(b.CreateSub(ConstantInt::get(I32, 32), w), ConstantInt::get(I32, 8));
+      cArg = b.CreateOr(seg, ConstantInt::get(I32, mode == 1 ? 0 : 31));
+    }
+    bArg = b.CreateIntCast(bArg, I32, true);
+    Value *varBits = isFloat ? b.CreateBitCast(var, I32) : b.CreateIntCast(var, I32, true);
+    IRBuilder<> eb(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+    auto *stV = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_val");
+    auto *stB = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_b");
+    auto *stC = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_c");
+    auto *stR = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_res");
+    // store phase (this sub-pass)
+    Value *l = virtLogicalLane(b, m);
+    Value *j = b.CreateLShr(l, ConstantInt::get(I32, LG), "ssub");
+    Value *zero = ConstantInt::get(I32, 0);
+    b.CreateStore(varBits, b.CreateInBoundsGEP(ArrTy, stV, {zero, j}));
+    b.CreateStore(bArg, b.CreateInBoundsGEP(ArrTy, stB, {zero, j}));
+    b.CreateStore(cArg, b.CreateInBoundsGEP(ArrTy, stC, {zero, j}));
+    CreateIntraWarpBarrier(ci);
+    // glue: for every reader sub-pass jr, source logical lane s -> hardware shuffle of slot s>>LG from lane s&(L-1)
+    Value *hl = b.CreateAnd(b.CreateCall(laneId, {}, "hwlane"), ConstantInt::get(I32, L - 1));
+    for (int jr = 0; jr < S; jr++) {
+      Value *lr = b.CreateAdd(hl, ConstantInt::get(I32, L * jr));
+      Value *bj = b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stB, 0, jr));
+      Value *cj = b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stC, 0, jr));
+      Value *s = b.CreateCall(srcLane, {ConstantInt::get(I32, mode), lr, bj, cj}, "srclane");
+      Value *js = b.CreateLShr(s, ConstantInt::get(I32, LG));
+      Value *hs = b.CreateAnd(s, ConstantInt::get(I32, L - 1));
+      Value *val = zero;
+      for (int jj = 0; jj < S; jj++) {
+        auto *x = b.CreateCall(hwShfl, {b.CreateLoad(I32, b.CreateConstInBoundsGEP2_32(ArrTy, stV, 0, jj)), hs, ConstantInt::get(I32, L - 1)});
+        x->addFnAttr(Attribute::Convergent);
+        val = b.CreateSelect(b.CreateICmpEQ(js, ConstantInt::get(I32, jj)), x, val);
+      }
+      b.CreateStore(val, b.CreateConstInBoundsGEP2_32(ArrTy, stR, 0, jr));
+    }
+    b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
+    // load phase (next region): this sub-pass's result
+    Value *l2 = virtLogicalLane(b, m);
+    Value *j2 = b.CreateLShr(l2, ConstantInt::get(I32, LG));
+    Value *r = b.CreateLoad(I32, b.CreateInBoundsGEP(ArrTy, stR, {zero, j2}), "shfl_r");
+    Value *result = isFloat ? b.CreateBitCast(r, F32) : b.CreateIntCast(r, VT, true);
+    ci->replaceAllUsesWith(result);
+    ci->eraseFromParent();
+    n++;
+  }
+  fprintf(stderr, "[virt-stage] %d shfl sites staged over %d sub-passes of %d lanes\n", n, S, L);
+}

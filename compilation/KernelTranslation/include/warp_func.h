@@ -43,6 +43,9 @@ private:
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
   void replaceWarpVote1to1(Module &m, const set<CallInst *> &replace);
+  // core mapping with sub-passes: staged operands + uniform glue (hardware ops per sub-pass)
+  void replaceWarpVoteStaged(Module &m, const set<CallInst *> &replace);
+  void replaceWarpShflStaged(Module &m, const set<CallInst *> &replace);
   /// @brief replace warp shuffle for flat mappping (x86)
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced

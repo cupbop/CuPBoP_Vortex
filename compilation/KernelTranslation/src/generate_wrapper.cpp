@@ -591,10 +591,12 @@ void create_kernel_wrapper_function(llvm::Module *M){
       // translated kernel loops over logical warps rank, rank+P, ... (insert_warp_loop)
       // and __syncthreads is a real CTA barrier. Logical geometry comes from ctx.
       {
-      int vl = 0; if (const char *e = std::getenv("CUPBOP_VIRT_LANES")) vl = std::atoi(e);
+      int vl = getVirtGeom().lanes;
+      extern int need_nested_loop; // set by insert_warp_loop (sub-pass form)
+      const int own_stride = need_nested_loop ? 32 : vl; // logical threads a physical warp owns per pass
       ss << "    const bool getenv_dbg_virt = " << (std::getenv("CUPBOP_VIRT_DEBUG_PRINT") ? "true" : "false") << ";\n";
       ss << "    const uint32_t __bs = ctx->local_size[0] * ctx->local_size[1] * ctx->local_size[2];\n"
-            "    const uint32_t __L = " << std::string(vl > 0 ? std::to_string(vl) + "u" : std::string("(uint32_t)vx_num_threads()")) << "; // lanes per warp: CUPBOP_VIRT_LANES at translation, else NT\n"
+            "    const uint32_t __L = " << (std::to_string(vl) + "u") << "; // lanes per warp: CUPBOP_VIRT_LANES at translation, else NT\n"
             "    const uint32_t __lane = (uint32_t)vx_thread_id();\n"
             "    const uint32_t __rank = (uint32_t)csr_read_nv(VX_CSR_CTA_RANK);\n"
             "    // Grid constants: one lane per warp writes them (the warp reads in lockstep\n"
@@ -620,7 +622,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // per-thread scalars. The warp keeps its other lanes, so CTA barriers\n"
             "    // (counted per warp) are unaffected; the host guarantees every warp owns\n"
             "    // at least one logical thread (P <= ceil(block/L)).\n"
-            "    if (__lane >= __L || __rank * __L + __lane >= __bs) return;\n"
+            "    if (__lane >= __L || __rank * " << own_stride << "u + __lane >= __bs) return;\n"
             "    callbacks[kernel_arg->kernel_idx](args);\n"
             "}\n";
       }
