@@ -1270,8 +1270,24 @@ cudaError_t cudaLaunchKernel_vortex(
       // so with L < 32 the cap is the number of CUDA warps.
       const uint32_t block_warps = (uint32_t)((block_threads + (L < 32 ? 32 : L) - 1) / (L < 32 ? 32 : L));
       uint32_t P = block_warps;
+      // CUPBOP_VIRT_TRIPS=k (translation-time constant, single-loop form with 32 lanes): every warp loop
+      // runs exactly k passes of P*32 logical threads, so the default P is ceil(block / (32*k)).
+      uint32_t virt_trips = 0;
+      if (char *env = std::getenv("CUPBOP_VIRT_TRIPS")) { int v = std::atoi(env); if (v > 0 && L == 32) virt_trips = (uint32_t)v; }
+      if (virt_trips) { uint32_t p = (uint32_t)((block_threads + 32ull * virt_trips - 1) / (32ull * virt_trips)); P = std::max<uint32_t>(1u, std::min(P, p)); }
       if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
       if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
+      const char *virt_exact_env = std::getenv("CUPBOP_VIRT_TRIPS_EXACT");
+      if (virt_trips && virt_exact_env && std::atoi(virt_exact_env) && (uint64_t)P * 32ull * virt_trips != block_threads) {
+        printf("Error: CUPBOP_VIRT_TRIPS_EXACT needs physical warps x 32 x trips == threads per block (%u x 32 x %u != %lu)\n",
+               P, virt_trips, (unsigned long)block_threads);
+        std::abort();
+      }
+      if (virt_trips && (uint64_t)P * 32ull * virt_trips < block_threads) {
+        printf("Error: CUPBOP_VIRT_TRIPS=%u with %u physical warps covers %llu of %lu threads per block; raise the trips or the warps\n",
+               virt_trips, P, (unsigned long long)P * 32ull * virt_trips, (unsigned long)block_threads);
+        std::abort();
+      }
       if ((uint64_t)P * nt > (uint64_t)CUPBOP_EFF_NUM_WARPS() * NUM_THREADS_VX) {
         printf("Error: block_size %lu exceeds threads_per_core %lu even with CUPBOP_VIRT_WARPS=%u\n",
                (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);

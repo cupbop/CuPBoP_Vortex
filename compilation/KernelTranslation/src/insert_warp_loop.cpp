@@ -507,6 +507,12 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
         count = builder.CreateUDiv(builder.CreateSub(builder.CreateAdd(block_size, stride), ConstantInt::get(I32c, 1)), stride, "ctx_slots");
       }
     }
+    // CUPBOP_VIRT_TRIPS=k: exactly k slots, a fixed-size array (SROA turns it into
+    // registers once the k-trip warp loops are unrolled).
+    const int virt_trips = (g_schedule_flag == 1 && !need_nested_loop) ? getVirtGeom().trips : 0;
+    // (allocated type stays the element type: other code loads/GEPs with getAllocatedType(); InstCombine
+    // canonicalizes a constant-count alloca to [k x T] before SROA)
+    if (virt_trips > 0) count = ConstantInt::get(Type::getInt32Ty(C), virt_trips);
     auto *AI = builder.CreateAlloca(AllocType, count, varName);
     // Byte-array slots (e.g. a lifter's 400-byte parameter block) are accessed as
     // i32/i64 inside; an align-1 base would put slots at odd addresses.
@@ -1449,6 +1455,12 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
     cmpResult = builder.CreateICmpULT(createLoad(builder, intra_warp_index),
                                       sche_data.inner_loop_cond);
+    if (g_schedule_flag == 1 && !need_nested_loop && getVirtGeom().trips > 0) {
+      // CUPBOP_VIRT_TRIPS=k: a uniform, constant trip count (pass number < k); the
+      // per-lane `index < block_size` test moves into a guard in front of the body.
+      cmpResult = builder.CreateICmpULT(createLoad(builder, M->getGlobalVariable("intra_warp_slot")),
+                                        ConstantInt::get(I32, getVirtGeom().trips), "virt_pass_cond");
+    }
     if (g_schedule_flag == 1 && need_nested_loop) {
       // sub-pass form: a partial last CUDA warp (block not a multiple of 32) has no
       // logical lanes beyond block_size; the hardware lanes of the first sub-pass
@@ -1998,6 +2010,17 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     }
     auto loop_inc = insert_loop_inc(loop_cond, intra_warp_loop);
     tail_block->getTerminator()->replaceUsesOfWith(next_block, loop_inc);
+    const bool virt_fixed_trips = intra_warp_loop && g_schedule_flag == 1 && !need_nested_loop && getVirtGeom().trips > 0;
+    if (virt_fixed_trips && !getVirtGeom().trips_exact) {
+      // index < block_size guard (the loop test is now the uniform pass count)
+      auto *Mg = start_block->getParent()->getParent();
+      BasicBlock *guard = BasicBlock::Create(start_block->getContext(), "intra_warp_guard", F, start_block);
+      IRBuilder<> gb(guard);
+      auto *in = gb.CreateICmpULT(createLoad(gb, Mg->getGlobalVariable("intra_warp_index")),
+                                  createLoad(gb, Mg->getGlobalVariable("block_size")), "virt_in_block");
+      gb.CreateCondBr(in, start_block, loop_inc);
+      loop_cond->getTerminator()->replaceUsesOfWith(start_block, guard);
+    }
     // we have to reset inter/intra warp index to 0, as these maybe used
     // outside PR when there are conditional loop/branch
     llvm::Module *M = start_block->getParent()->getParent();
@@ -2068,7 +2091,12 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     MDNode *DisableTransformMD = MDNode::get(
         context,
         {MDString::get(context, "llvm.loop.disable_nonforced")});
-    MDNode *Root = MDNode::get(context, {Dummy, ParallelAccessMD, DisableTransformMD});
+    MDNode *Root;
+    if (virt_fixed_trips) // forced, so it survives llvm.loop.disable_nonforced
+      Root = MDNode::get(context, {Dummy, ParallelAccessMD, DisableTransformMD,
+                                   MDNode::get(context, {MDString::get(context, "llvm.loop.unroll.full")})});
+    else
+      Root = MDNode::get(context, {Dummy, ParallelAccessMD, DisableTransformMD});
 
     Root->replaceOperandWith(0, Root);
     MDNode::deleteTemporary(Dummy);

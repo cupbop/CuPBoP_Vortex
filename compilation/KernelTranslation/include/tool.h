@@ -22,7 +22,12 @@ llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore);
 // (VORTEX_NUM_THREADS, exported by the example makefile), lanes per warp used
 // (CUPBOP_VIRT_LANES, lane gating; at most 32) and the number of sub-passes a
 // 32-lane CUDA warp needs on them (32/L). The kernel IR is therefore per NT.
-struct VirtGeom { int schedule; int nt; int lanes; int subpasses; int lg_lanes; };
+// trips: CUPBOP_VIRT_TRIPS=k (translation time, single-loop form with 32 lanes only): every warp loop runs
+// exactly k passes (P*32*k >= block_size, checked by the host) so loops unroll and context arrays become
+// registers. 0 = runtime trip count.
+// trips_exact: CUPBOP_VIRT_TRIPS_EXACT=1 promises P*32*k == block_size (host aborts otherwise), so the per-pass
+// index < block_size guard (a divergent split/join per region) is dropped.
+struct VirtGeom { int schedule; int nt; int lanes; int subpasses; int lg_lanes; int trips; int trips_exact; };
 VirtGeom getVirtGeom();
 void VerifyModule(llvm::Module *);
 void phi2alloc(llvm::Module *M);

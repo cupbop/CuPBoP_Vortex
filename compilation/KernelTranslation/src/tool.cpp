@@ -204,6 +204,9 @@ VirtGeom getVirtGeom() {
   while (32 % L) L >>= 1;          // L must divide the CUDA warp
   g.lanes = L; g.subpasses = 32 / L; g.lg_lanes = 0;
   while ((1 << g.lg_lanes) < L) g.lg_lanes++;
+  g.trips = 0; g.trips_exact = 0;
+  if (const char *e = std::getenv("CUPBOP_VIRT_TRIPS_EXACT")) g.trips_exact = (std::atoi(e) != 0);
+  if (const char *e = std::getenv("CUPBOP_VIRT_TRIPS")) { int v = std::atoi(e); if (v > 0 && g.schedule == 1 && g.subpasses == 1) g.trips = v; }
   return g;
 }
 
