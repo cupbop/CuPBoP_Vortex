@@ -2,6 +2,10 @@
 #include "warp_func.h"
 #include "flag.h"
 #include "tool.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
@@ -112,10 +116,140 @@ static void foldReconvergenceMasks(Module &m) {
     fprintf(stderr, "[virt] folded %d reconvergence ballot/activemask sites (mask-only results); erased %zu bar.warp.sync fed by them\n", folded, syncs_fed.size());
 }
 
+// virt sub-pass form (S > 1): a hardware thread runs the logical lanes l, l+L, ... through ONE copy of the
+// control flow, so a loop whose trip count differs between those lanes runs on sub-pass 0's count and the
+// warp ops staged inside it see the other sub-passes on the wrong iteration (conformance div_loop_ballot:
+// lane t+16 copied lane t's ballot pattern). Until a per-sub-pass gate exists (decision 2A, 2026-10-24) the
+// translator refuses such kernels instead of producing wrong results: a warp op that may legally run with
+// part of the warp (activemask, or a vote/shfl/match whose mask is not the constant 0xffffffff) inside a loop
+// with an exit condition that depends on the thread or lane id. A full-mask op is exempt: CUDA requires all
+// 32 lanes to reach it together, so in a valid program the enclosing loops run the same trips on every lane
+// (jaccard's rounded bound, cc-cuda's warp-uniform worklist loop). mma/movmatrix are warp-wide by definition.
+// CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 translates anyway (warning only; the conformance test uses it).
+static bool isLaneSource(const Instruction *I) {
+  auto *CI = dyn_cast<CallInst>(I);
+  if (!CI) return false;
+  if (CI->isInlineAsm()) {
+    auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand());
+    return IA && IA->getAsmString().find("%laneid") != std::string::npos;
+  }
+  const Function *F = CI->getCalledFunction();
+  if (!F) return false;
+  StringRef n = F->getName();
+  return n.starts_with("llvm.nvvm.read.ptx.sreg.tid.") || n == "llvm.nvvm.read.ptx.sreg.laneid" ||
+         n.starts_with("llvm.nvvm.shfl.") || n == "__cupbop_laneid"; // a shuffle result is per lane too
+}
+static bool isStagedWarpOp(const CallInst *CI) {
+  if (CI->isInlineAsm() || !CI->getCalledFunction()) return false;
+  StringRef n = CI->getCalledFunction()->getName();
+  return n.starts_with("llvm.nvvm.vote.") || n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.match.") ||
+         n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix") || n == "__cupbop_activemask";
+}
+// The mask of an inlined CUDA wrapper (__shfl_sync, __ballot_sync, ...) reaches the intrinsic through the
+// wrapper's parameter slot (an alloca the earlier mem2reg never saw): follow stores into that slot.
+static bool isFullMask(const Value *V) {
+  V = V->stripPointerCasts();
+  if (auto *C = dyn_cast<ConstantInt>(V)) return C->getBitWidth() >= 32 && C->getValue().trunc(32).isAllOnes();
+  auto *Ld = dyn_cast<LoadInst>(V);
+  auto *AI = Ld ? dyn_cast<AllocaInst>(getUnderlyingObject(Ld->getPointerOperand())) : nullptr;
+  if (!AI) return false;
+  bool stored = false;
+  for (const User *U : AI->users()) {
+    if (auto *St = dyn_cast<StoreInst>(U)) {
+      if (St->getPointerOperand() != AI || !isFullMask(St->getValueOperand())) return false;
+      stored = true;
+    } else if (!isa<LoadInst>(U) && !(isa<IntrinsicInst>(U) && cast<IntrinsicInst>(U)->isLifetimeStartOrEnd())) return false;
+  }
+  return stored;
+}
+static bool mayRunPartialWarp(const CallInst *CI) {
+  StringRef n = CI->getCalledFunction()->getName();
+  if (n == "__cupbop_activemask") return true;
+  if (n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix")) return false;
+  return !isFullMask(CI->getArgOperand(0));
+}
+// Runs before foldReconvergenceMasks, which turns a mask-only __activemask() into -1: the masks are judged
+// as the program wrote them (div_loop_ballot's __ballot_sync(__activemask(), ...) stays partial).
+static void markPartialMaskWarpOps(Module &m) {
+  for (auto &F : m.functions())
+    for (auto &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (isStagedWarpOp(CI) && mayRunPartialWarp(CI))
+          CI->setMetadata("cupbop.virt_partial_mask", MDNode::get(m.getContext(), {}));
+}
+static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
+  const bool allow = std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS") && std::atoi(std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS"));
+  int found = 0;
+  for (auto &F : m.functions()) {
+    if (F.isDeclaration()) continue;
+    std::vector<CallInst *> ops;
+    for (auto &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (isStagedWarpOp(CI)) ops.push_back(CI);
+    if (ops.empty()) continue;
+    DominatorTree DT(F);
+    LoopInfo LI(DT);
+    // lane-dependent values: SSA uses, memory written with one (by underlying object), loads at a
+    // lane-dependent address, and phis joining a lane-dependent branch (fixpoint)
+    std::set<const Value *> T, Tobj;
+    auto divBranch = [&](const BasicBlock *B) {
+      auto *Br = dyn_cast<BranchInst>(B->getTerminator());
+      return Br && Br->isConditional() && T.count(Br->getCondition());
+    };
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto &I : instructions(F)) {
+        if (auto *St = dyn_cast<StoreInst>(&I)) {
+          if (T.count(St->getValueOperand()) && Tobj.insert(getUnderlyingObject(St->getPointerOperand())).second) changed = true;
+          continue;
+        }
+        if (T.count(&I)) continue;
+        bool t = isLaneSource(&I);
+        if (!t) {
+          if (auto *Ld = dyn_cast<LoadInst>(&I)) t = T.count(Ld->getPointerOperand()) || Tobj.count(getUnderlyingObject(Ld->getPointerOperand()));
+          else if (auto *CI = dyn_cast<CallInst>(&I); CI && isStagedWarpOp(CI)) t = false; // vote/ballot results are warp-uniform
+          else for (auto &U : I.operands()) if (T.count(U.get())) { t = true; break; }
+          if (!t)
+            if (auto *Phi = dyn_cast<PHINode>(&I)) {
+              BasicBlock *D = nullptr;
+              for (auto *P : Phi->blocks()) { if (divBranch(P)) t = true; D = D ? DT.findNearestCommonDominator(D, P) : P; }
+              if (D && divBranch(D)) t = true;
+            }
+        }
+        if (t) { T.insert(&I); changed = true; }
+      }
+    }
+    for (auto *CI : ops)
+      for (Loop *L = CI->getMetadata("cupbop.virt_partial_mask") ? LI.getLoopFor(CI->getParent()) : nullptr; L; L = L->getParentLoop()) {
+        SmallVector<BasicBlock *, 4> exiting;
+        L->getExitingBlocks(exiting);
+        bool lane = false;
+        for (auto *E : exiting) lane |= divBranch(E);
+        if (!lane) continue;
+        found++;
+        std::string ms;
+        if (CI->arg_size()) { raw_string_ostream os(ms); CI->getArgOperand(0)->print(os); }
+        fprintf(stderr, "[virt-stage] %s: %s in %s inside loop %s whose trip count depends on the lane (mask:%s)\n",
+                allow ? "WARNING" : "error", CI->getCalledFunction()->getName().str().c_str(), F.getName().str().c_str(),
+                L->getHeader()->getName().str().c_str(), ms.c_str());
+        break;
+      }
+  }
+  if (found && !allow) {
+    fprintf(stderr, "error: virt sub-pass form (S=%d, %d lanes): %d warp op(s) in lane-dependent loops are unsupported at S>1 "
+                    "(per-sub-pass loop gate not implemented); use 32 lanes (NT32, no CUPBOP_VIRT_LANES) or set "
+                    "CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 to translate anyway\n",
+            getVirtGeom().subpasses, getVirtGeom().lanes, found);
+    exit(1);
+  }
+}
+
 static void replaceMmaStaged(Module &m);
 static void replaceMovmatrixStaged(Module &m);
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) markPartialMaskWarpOps(m);
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectLaneVariantLoopsAroundWarpOps(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m); // virt sub-pass form: mma.sync -> NT=16 TCU glue
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   // In FLAT mode, skip shfl replacement here — it's handled by

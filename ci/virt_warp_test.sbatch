@@ -25,10 +25,15 @@ run() { # tag sched vortex_path configs nt [env...]
 }
 run golden_s2_nt32 2 $VORTEX_PATH "$CFG32" 32
 run s1_nt32       1 $VORTEX_PATH "$CFG32" 32
-run s1_nt32_l16   1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16
-run s1_nt32_l16p1 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_WARPS=1
-run s1_nt16       1 $VXH/build64_cupbop_nt16 "$CFG16" 16
-run s1_nt16_p1    1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1
+# S>1: kernel 2 has warp ops in lane-dependent loops (div_loop_ballot, divtrip_loop_glue), which the
+# translator refuses by default (no per-sub-pass loop gate yet) -> translate anyway to test the rest
+run s1_nt32_l16   1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+run s1_nt32_l16p1 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+run s1_nt16       1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+run s1_nt16_p1    1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+( cd examples/virt_warp_test && make clean > /dev/null 2>&1
+  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
+echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops are unsupported at S>1' $OUT/reject_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)'); $(grep -c 'trip count depends on the lane' $OUT/reject_nt16.log) sites"
 cp -f $OUT/golden_s2_nt32.out examples/virt_warp_test/golden_output.txt
 python3 - $OUT <<'PY'
 import sys,glob,os
