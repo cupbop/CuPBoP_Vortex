@@ -33,6 +33,17 @@ static uint32_t cupbop_rt_num_warps() {   // 0 = no cap
   return v;
 }
 #define CUPBOP_EFF_NUM_WARPS() ((cupbop_rt_num_warps() > 0 && cupbop_rt_num_warps() < (uint32_t)NUM_WARPS_VX) ? cupbop_rt_num_warps() : (uint32_t)NUM_WARPS_VX)
+// DepthFlexGPU rt_simd_width knob ("as-if NT=k"): VX_RT_SIMD_WIDTH=<k> makes the Vortex CTA dispatcher split a
+// CTA into warps of k lanes (vortex VX_DCR_KMU_SIMD_WIDTH), so the launch geometry below uses k as the warp
+// width. The kernel must be translated and compiled for NT=k (VORTEX_NUM_THREADS=k) on the wider bitstream.
+static uint32_t cupbop_rt_simd_width() {   // 0 = full width
+  static const uint32_t v = []() -> uint32_t {
+    if (const char *e = getenv("VX_RT_SIMD_WIDTH")) { int k = atoi(e); if (k > 0) return (uint32_t)k; }
+    return 0;
+  }();
+  return v;
+}
+#define CUPBOP_EFF_NUM_THREADS() ((cupbop_rt_simd_width() > 0 && cupbop_rt_simd_width() < (uint32_t)NUM_THREADS_VX) ? cupbop_rt_simd_width() : (uint32_t)NUM_THREADS_VX)
 
 
 // Global variable to support CudaMemcpytoSymbol
@@ -1236,7 +1247,7 @@ cudaError_t cudaLaunchKernel_vortex(
     if (schedule == 2) {
       // 1:1 mapping: CUDA block == Vortex CTA (must fit one core), __shared__ in CTA local memory
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
-      const uint64_t core_threads = (uint64_t)CUPBOP_EFF_NUM_WARPS() * NUM_THREADS_VX;   // VX_RT_NUM_WARPS-aware
+      const uint64_t core_threads = (uint64_t)CUPBOP_EFF_NUM_WARPS() * CUPBOP_EFF_NUM_THREADS();   // VX_RT_NUM_WARPS/SIMD_WIDTH-aware
       if (block_threads > core_threads) {
         printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
                (unsigned long)block_threads, (unsigned long)core_threads);
@@ -1256,7 +1267,7 @@ cudaError_t cudaLaunchKernel_vortex(
       // (CUPBOP_VIRT_WARPS, default = all block warps). The kernel loops over
       // the logical warps; __shared__ in CTA local memory as in 1:1.
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
-      const uint32_t nt = (uint32_t)NUM_THREADS_VX;
+      const uint32_t nt = CUPBOP_EFF_NUM_THREADS();
       // Lane gating: use only L of the NT lanes of each physical warp
       // (CUPBOP_VIRT_LANES, default NT). Emulates a narrower issue width on a wider
       // bitstream; TCU tile geometry, LSU lanes and the memory side stay the bitstream's.
@@ -1288,7 +1299,7 @@ cudaError_t cudaLaunchKernel_vortex(
                virt_trips, P, (unsigned long long)P * 32ull * virt_trips, (unsigned long)block_threads);
         std::abort();
       }
-      if ((uint64_t)P * nt > (uint64_t)CUPBOP_EFF_NUM_WARPS() * NUM_THREADS_VX) {
+      if ((uint64_t)P * nt > (uint64_t)CUPBOP_EFF_NUM_WARPS() * nt) {
         printf("Error: block_size %lu exceeds threads_per_core %lu even with CUPBOP_VIRT_WARPS=%u\n",
                (unsigned long)((uint64_t)P * nt), (unsigned long)(NUM_WARPS_VX * NUM_THREADS_VX), P);
         std::abort();
@@ -1313,7 +1324,7 @@ cudaError_t cudaLaunchKernel_vortex(
       // flat schedule: one CUDA block per hardware thread; the device entry recovers
       // the block index from (CTA, thread). __shared__ lives in global memory.
       const uint64_t total_blocks = (uint64_t)gridDim.x * gridDim.y * gridDim.z;
-      const uint32_t nt = (uint32_t)NUM_THREADS_VX;
+      const uint32_t nt = CUPBOP_EFF_NUM_THREADS();
       grid[0] = (uint32_t)((total_blocks + nt - 1) / nt); grid[1] = 1; grid[2] = 1;
       block[0] = nt; block[1] = 1; block[2] = 1;
       ndim = 1;
