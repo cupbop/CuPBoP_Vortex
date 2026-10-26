@@ -55,6 +55,9 @@ int main(int argc, char **argv) {
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
 
+  DBG_LOG("drop_cta_membar_at_barriers\n");
+  drop_cta_membar_at_barriers(program);
+
   // Replace cp.async before init_block (PTX inline asm must be alive)
   DBG_LOG("replace_cp_async_dxa\n");
   replace_cp_async_with_dxa(program);

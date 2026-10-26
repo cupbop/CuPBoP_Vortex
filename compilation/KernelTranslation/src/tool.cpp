@@ -648,6 +648,34 @@ void replace_warp_shfl_early(llvm::Module *M) {
   fprintf(stderr, "[FLAT] early shfl replace done\n");
 }
 
+// llvm.nvvm.membar.cta right next to a CTA barrier -- CuLifter emits one after every bar.sync -- is
+// dropped: a CTA runs on one core and vx_barrier drains the LSU before it releases (RTL VX_wctl_unit),
+// so the barrier already orders the CTA's memory, while vx_fence is a whole-cache flush on the RTL (L1
+// and L2 written back and invalidated) that would run at every __syncthreads. Runs before insert_sync /
+// insert_warp_loop so the pair is still adjacent. A standalone membar.cta and membar.gl / membar.sys keep
+// their vx_fence. CUPBOP_KEEP_CTA_MEMBAR=1 keeps them all.
+void drop_cta_membar_at_barriers(llvm::Module *M) {
+  if (std::getenv("CUPBOP_KEEP_CTA_MEMBAR")) return;
+  auto isBarrier = [](llvm::Instruction *I) {
+    auto *C = llvm::dyn_cast_or_null<llvm::CallInst>(I);
+    return C && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("llvm.nvvm.barrier");
+  };
+  std::vector<llvm::CallInst *> dead;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *C = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!C || !C->getCalledFunction() || C->getCalledFunction()->getName() != "llvm.nvvm.membar.cta")
+          continue;
+        if (isBarrier(C->getPrevNonDebugInstruction()) || isBarrier(C->getNextNonDebugInstruction()))
+          dead.push_back(C);
+      }
+  for (auto *C : dead)
+    C->eraseFromParent();
+  if (cupbop_debug() && !dead.empty())
+    std::cout << "[membar] dropped " << dead.size() << " membar.cta next to a CTA barrier\n";
+}
+
 void replace_built_in_function(llvm::Module *M) {
 
   // Remove __vx_* stub function bodies (CUDA device stubs).
@@ -1209,7 +1237,8 @@ void replace_built_in_function(llvm::Module *M) {
             } else if (func_name == "llvm.nvvm.membar.gl" ||
                        func_name == "llvm.nvvm.membar.cta" ||
                        func_name == "llvm.nvvm.membar.sys") {
-              // Vortex has a single fence scope; lifted SASS (CuLifter) emits membar.cta.
+              // Vortex has a single fence scope (a whole-cache flush on the RTL); membar.cta next to a
+              // barrier was already dropped by drop_cta_membar_at_barriers.
               Call->getCalledFunction()->setName("__nvvm_membar_gl");
             } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") !=
                        std::string::npos) {
