@@ -2134,10 +2134,45 @@ void replace_asm_call(llvm::Module *M) {
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
               need_remove.push_back(Call);
+            } else if (asm_str.find(".f32.u32") != std::string::npos &&
+                       (asm_str.find("cvt.rn.") != std::string::npos ||
+                        asm_str.find("cvt.rz.") != std::string::npos ||
+                        asm_str.find("cvt.rm.") != std::string::npos ||
+                        asm_str.find("cvt.rp.") != std::string::npos)) {
+              // CuLifter form of SASS I2F.U32 with an explicit rounding mode, e.g. the
+              // integer-division emulation (cvt.rp + rcp.approx + correction):
+              //   %f = call float asm "cvt.rp.f32.u32 $0, $1;", "=f,r"(i32 %x)
+              // uitofp rounds to nearest; for rz/rm/rp step one ulp toward the requested
+              // direction when the rounded value landed on the wrong side of x (exact: the
+              // check goes through i64, and for unsigned x rz == rm).
+              IRBuilder<> builder(Call);
+              Value *x = Call->getArgOperand(0);
+              if (!x->getType()->isIntegerTy(32))
+                x = builder.CreateBitCast(x, I32);
+              Value *f = builder.CreateUIToFP(x, F32, "cvt.u32.f32");
+              bool up = asm_str.find("cvt.rp.") != std::string::npos;
+              if (asm_str.find("cvt.rn.") == std::string::npos) {
+                Value *back = builder.CreateFPToUI(f, I64);
+                Value *x64 = builder.CreateZExt(x, I64);
+                Value *wrong = up ? builder.CreateICmpULT(back, x64)
+                                  : builder.CreateICmpUGT(back, x64);
+                Value *bits = builder.CreateBitCast(f, I32);
+                Value *step = builder.CreateBitCast(
+                    up ? builder.CreateAdd(bits, ConstantInt::get(I32, 1))
+                       : builder.CreateSub(bits, ConstantInt::get(I32, 1)),
+                    F32);
+                f = builder.CreateSelect(wrong, step, f, "cvt.u32.f32.dir");
+              }
+              if (Call->getType() != F32)
+                f = builder.CreateBitCast(f, Call->getType());
+              Call->replaceAllUsesWith(f);
+              need_remove.push_back(Call);
             } else {
-              if (cupbop_debug())
-                printf("warning: unknown PTX InlineAsm: %s (removing)\n",
-                       asm_str.c_str());
+              // Anything left is dropped. A dropped asm that produces a value leaves undef
+              // behind, which silently changes the program, so say so on every run.
+              fprintf(stderr, "warning: unknown PTX InlineAsm: %s (removing%s)\n",
+                      asm_str.c_str(),
+                      Call->getType()->isVoidTy() ? "" : "; its result becomes undef");
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               if (!Call->getType()->isVoidTy()) {
