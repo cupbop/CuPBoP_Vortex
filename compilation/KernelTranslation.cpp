@@ -55,6 +55,8 @@ int main(int argc, char **argv) {
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
 
+  DBG_LOG("lower_named_barriers\n");
+  lower_named_barriers(program);
   DBG_LOG("drop_cta_membar_at_barriers\n");
   drop_cta_membar_at_barriers(program);
 

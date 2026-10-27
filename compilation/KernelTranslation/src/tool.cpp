@@ -659,7 +659,9 @@ void drop_cta_membar_at_barriers(llvm::Module *M) {
   if (std::getenv("CUPBOP_KEEP_CTA_MEMBAR")) return;
   auto isBarrier = [](llvm::Instruction *I) {
     auto *C = llvm::dyn_cast_or_null<llvm::CallInst>(I);
-    return C && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("llvm.nvvm.barrier");
+    if (!C || !C->getCalledFunction()) return false;
+    auto n = C->getCalledFunction()->getName();
+    return n.starts_with("llvm.nvvm.barrier") || n.starts_with("__cupbop_bar_"); // named barriers drain the LSU too
   };
   std::vector<llvm::CallInst *> dead;
   for (auto &F : *M)
@@ -675,6 +677,141 @@ void drop_cta_membar_at_barriers(llvm::Module *M) {
     C->eraseFromParent();
   if (cupbop_debug() && !dead.empty())
     std::cout << "[membar] dropped " << dead.size() << " membar.cta next to a CTA barrier\n";
+}
+
+// PTX named barriers: `bar.sync a{, b}` / `bar.arrive a, b` (and the barrier.{,cta.}{sync,arrive}[.aligned]
+// spellings) as inline asm -- how CUDA sources write them and how CuLifter lifts BAR.SYNC/BAR.ARV <id>,
+// <count> -- and llvm.nvvm.barrier.sync{,.cnt}. Runs first, so every later pass sees ordinary calls.
+// - Without a count every thread of the CTA takes part: a plain CTA barrier (llvm.nvvm.barrier0) whatever
+//   the id, on every schedule.
+// - With a count, or for an arrive, only some warps take part (warp specialization). On the 1:1 schedule
+//   that is Vortex barrier `id` of this CTA counting b/32 warps (__cupbop_bar_sync / __cupbop_bar_arrive,
+//   cudaKernelImpl.cpp). The warp-loop schedules run several CUDA warps on one hardware thread (flat) or
+//   warp (core mapping) and cannot express it, so translation stops instead of dropping the barrier.
+// Other barrier-family asm (bar.red, mbarrier, barrier.cluster, ...) is refused too: replace_asm_call would
+// otherwise drop it with only a warning.
+static std::string barrierAsmOpcode(llvm::CallInst *C, std::string *rest = nullptr) {
+  if (!C || !C->isInlineAsm()) return "";
+  auto *IA = llvm::dyn_cast<llvm::InlineAsm>(C->getCalledOperand());
+  if (!IA) return "";
+  const std::string &s = IA->getAsmString();
+  size_t b = s.find_first_not_of(" \t\n");
+  if (b == std::string::npos) return "";
+  size_t e = s.find_first_of(" \t\n;", b);
+  std::string op = s.substr(b, e == std::string::npos ? std::string::npos : e - b);
+  bool family = op.rfind("bar.", 0) == 0 || op.rfind("barrier.", 0) == 0 || op.rfind("mbarrier.", 0) == 0;
+  if (!family || op.rfind("bar.warp.", 0) == 0) return ""; // __syncwarp: no-op on Vortex, see replace_asm_call
+  if (rest) *rest = e == std::string::npos ? "" : s.substr(e);
+  return op;
+}
+
+void lower_named_barriers(llvm::Module *M) {
+  int schedule = 0;
+  if (const char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) schedule = std::atoi(env);
+#ifdef VX_CFG_NUM_BARRIERS
+  const uint64_t num_barriers = VX_CFG_NUM_BARRIERS;
+#else
+  const uint64_t num_barriers = 8;
+#endif
+  LLVMContext &ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *Void = Type::getVoidTy(ctx);
+  auto fail = [](CallInst *C, const std::string &what) {
+    std::string s;
+    raw_string_ostream os(s);
+    C->print(os);
+    fprintf(stderr, "error: %s\n  at:%s (in %s)\n", what.c_str(), os.str().c_str(),
+            C->getFunction()->getName().str().c_str());
+    exit(1);
+  };
+  enum Kind { CTA_SYNC, COUNTED_SYNC, ARRIVE };
+  struct Site { CallInst *call; Kind kind; std::vector<Value *> args; };
+  std::vector<Site> sites;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        auto *C = dyn_cast<CallInst>(&I);
+        if (!C) continue;
+        if (!C->isInlineAsm()) {
+          Function *Fn = C->getCalledFunction();
+          if (!Fn) continue;
+          if (Fn->getName() == "llvm.nvvm.barrier.sync")
+            sites.push_back({C, CTA_SYNC, {}});
+          else if (Fn->getName() == "llvm.nvvm.barrier.sync.cnt")
+            sites.push_back({C, COUNTED_SYNC, {C->getArgOperand(0), C->getArgOperand(1)}});
+          continue;
+        }
+        std::string rest, op = barrierAsmOpcode(C, &rest);
+        if (op.empty()) continue;
+        auto is = [&](const std::string &what) { // bar{.cta}.<what>, barrier{.cta}.<what>{.aligned}
+          return op == "bar." + what || op == "bar.cta." + what || op.rfind("barrier." + what, 0) == 0 ||
+                 op.rfind("barrier.cta." + what, 0) == 0;
+        };
+        bool sync = is("sync"), arrive = is("arrive");
+        if (!sync && !arrive)
+          fail(C, "unsupported PTX barrier asm `" + op + "` (dropping it would break synchronization)");
+        // operands up to the first ';': $k (the k-th asm argument) or an integer literal
+        size_t semi = rest.find(';');
+        if (semi != std::string::npos && rest.find_first_not_of(" \t\n;", semi) != std::string::npos)
+          fail(C, "barrier asm with more than one statement");
+        std::vector<Value *> args;
+        std::string list = rest.substr(0, semi), tok;
+        for (size_t p = 0; p <= list.size();) {
+          size_t q = list.find(',', p);
+          tok = list.substr(p, q == std::string::npos ? std::string::npos : q - p);
+          tok.erase(0, tok.find_first_not_of(" \t\n"));
+          tok.erase(tok.find_last_not_of(" \t\n") + 1);
+          char *end = nullptr;
+          if (!tok.empty() && tok[0] == '$') {
+            unsigned k = std::strtoul(tok.c_str() + 1, &end, 10);
+            if (*end || k >= C->arg_size()) fail(C, "barrier asm operand `" + tok + "` is not an input");
+            args.push_back(C->getArgOperand(k));
+          } else if (!tok.empty()) {
+            long long v = std::strtoll(tok.c_str(), &end, 0);
+            if (*end) fail(C, "barrier asm operand `" + tok + "` is neither $k nor an integer");
+            args.push_back(ConstantInt::get(I32, (uint64_t)v));
+          }
+          if (q == std::string::npos) break;
+          p = q + 1;
+        }
+        if (args.empty() || args.size() > 2 || (arrive && args.size() != 2))
+          fail(C, "barrier asm `" + op + "` needs an id and, for an arrive, a thread count");
+        sites.push_back({C, arrive ? ARRIVE : args.size() == 1 ? CTA_SYNC : COUNTED_SYNC, args});
+      }
+  if (sites.empty()) return;
+  FunctionCallee bar0 = M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(Void, false));
+  FunctionCallee bsync = M->getOrInsertFunction("__cupbop_bar_sync", FunctionType::get(Void, {I32, I32}, false));
+  FunctionCallee barrive = M->getOrInsertFunction("__cupbop_bar_arrive", FunctionType::get(Void, {I32, I32}, false));
+  // convergent, like the asm it replaces: otherwise LoopUnswitch copies the barrier into lane-dependent
+  // branches and a warp arrives once per branch (deadlock); same fix as the shfl/vote helpers (warp_func.cpp)
+  for (FunctionCallee f : {bsync, barrive})
+    cast<Function>(f.getCallee())->addFnAttr(Attribute::Convergent);
+  unsigned n_cta = 0, n_named = 0;
+  for (auto &s : sites) {
+    IRBuilder<> B(s.call);
+    if (s.kind == CTA_SYNC) {
+      B.CreateCall(bar0);
+      ++n_cta;
+    } else {
+      if (schedule != 2)
+        fail(s.call, "a named barrier with a thread count or an arrive (warp-specialized synchronization) is only "
+                     "supported on the 1:1 schedule (SCHEDULE=2); schedule " + std::to_string(schedule) +
+                     " runs several CUDA warps on one hardware " + (schedule == 1 ? "warp" : "thread"));
+      if (auto *K = dyn_cast<ConstantInt>(s.args[0]))
+        if (K->getZExtValue() >= num_barriers)
+          fail(s.call, "named barrier id " + std::to_string(K->getZExtValue()) + " >= the " +
+                       std::to_string(num_barriers) + " barriers per CTA of this Vortex configuration");
+      if (auto *K = dyn_cast<ConstantInt>(s.args[1]))
+        if (K->isZero() || K->getZExtValue() % 32)
+          fail(s.call, "named barrier thread count must be a non-zero multiple of 32");
+      B.CreateCall(s.kind == COUNTED_SYNC ? bsync : barrive,
+                   {B.CreateZExtOrTrunc(s.args[0], I32), B.CreateZExtOrTrunc(s.args[1], I32)})
+          ->addFnAttr(Attribute::Convergent);
+      ++n_named;
+    }
+    s.call->eraseFromParent();
+  }
+  if (cupbop_debug())
+    std::cout << "[named-barrier] " << n_cta << " CTA syncs, " << n_named << " counted syncs / arrives\n";
 }
 
 // block_index_*, block_size*, grid_size_* (and the virt barrier's __local_group_id / __warps_per_group)

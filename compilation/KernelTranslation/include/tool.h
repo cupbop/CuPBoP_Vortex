@@ -34,6 +34,7 @@ void phi2alloc(llvm::Module *M);
 void remove_cuda_built_in(llvm::Module *M);
 void replace_built_in_function(llvm::Module *M);
 void drop_cta_membar_at_barriers(llvm::Module *M);
+void lower_named_barriers(llvm::Module *M);
 void hoist_block_constant_loads(llvm::Module *M);
 void replace_warp_shfl_early(llvm::Module *M);
 void lower_cmpxchg_for_flat(llvm::Module *M);

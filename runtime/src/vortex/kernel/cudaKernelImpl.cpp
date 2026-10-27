@@ -235,6 +235,17 @@ __attribute__((always_inline)) void __vx_barrier_wait(unsigned int bar_id,
   vx_barrier_wait(bar_id, phase);
 }
 
+// PTX named barriers on the 1:1 schedule (lower_named_barriers in the translator): `bar.sync id, cnt`
+// and `bar.arrive id, cnt` use Vortex barrier `id` of this CTA (same packing as vortex::barrier and
+// __vx_dxa_barrier_id; id 0 is the __syncthreads barrier) with cnt threads = cnt / 32 warps (PTX requires
+// a multiple of the warp size). Both forms drain the LSU first, so a producer's stores precede its arrive.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_bar_sync(unsigned int id, unsigned int cnt) {
+  vx_barrier((int)((id << 8) + __local_group_id), (int)(cnt / 32));
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_bar_arrive(unsigned int id, unsigned int cnt) {
+  vx_barrier_arrive((int)((id << 8) + __local_group_id), (int)(cnt / 32));
+}
+
 // Get packed barrier id for DXA
 __attribute__((always_inline)) unsigned int
 __vx_dxa_barrier_id(unsigned int id) {
