@@ -2401,6 +2401,12 @@ void replace_asm_call(llvm::Module *M) {
                 f = builder.CreateBitCast(f, Call->getType());
               Call->replaceAllUsesWith(f);
               need_remove.push_back(Call);
+            } else if (asm_str.find("cp.async") != std::string::npos ||
+                       asm_str.find("mbarrier") != std::string::npos) {
+              // lower_cp_async handles (or refuses) these before init_block; never drop one here
+              fprintf(stderr, "error: async-copy / mbarrier PTX InlineAsm reached replace_asm_call: %s\n",
+                      asm_str.c_str());
+              exit(1);
             } else {
               // Anything left is dropped. A dropped asm that produces a value leaves undef
               // behind, which silently changes the program, so say so on every run.
@@ -3330,6 +3336,8 @@ void replace_cp_async_with_dxa(llvm::Module *M) {
                     << std::flush;
       }
       dxa_ofs.close();
+      extern bool cupbop_dxa_sidecar_written; // async_copy.cpp: !vx.dxa.desc entries append to this file
+      cupbop_dxa_sidecar_written = true;
     }
   }
 }

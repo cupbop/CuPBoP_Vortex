@@ -2,6 +2,7 @@
 #include "generate_wrapper.h"
 #include "handle_sync.h"
 #include "init.h"
+#include "async_copy.h"
 #include "insert_sync.h"
 #include "insert_warp_loop.h"
 #include "performance.h"
@@ -60,9 +61,23 @@ int main(int argc, char **argv) {
   DBG_LOG("drop_cta_membar_at_barriers\n");
   drop_cta_membar_at_barriers(program);
 
-  // Replace cp.async before init_block (PTX inline asm must be alive)
-  DBG_LOG("replace_cp_async_dxa\n");
-  replace_cp_async_with_dxa(program);
+  // cp.async family (before init_block: replace_asm_call would drop the PTX asm).
+  // Default: synchronous copies (lower_cp_async), correct whatever the commit/wait groups say.
+  // CUPBOP_CP_ASYNC_DXA=1: the old automatic cp.async -> DXA conversion first (an SGEMM-only prototype that
+  // produces wrong code for other kernels: fixed coordinates, square tensors, per-thread smem destinations).
+  if (const char *e = std::getenv("CUPBOP_CP_ASYNC_DXA"); e && std::atoi(e) != 0) {
+    fprintf(stderr, "\n*** WARNING: CUPBOP_CP_ASYNC_DXA=1: automatic cp.async -> DXA conversion is an SGEMM-only "
+                    "prototype.\n*** It assumes fixed tile coordinates (0 / blockIdx*TILE), square tensors and the "
+                    "SGEMM argument order,\n*** and silently produces WRONG results for other kernels (e.g. "
+                    "transpose). Use __vx_dxa_issue_* + descriptors instead.\n\n");
+    DBG_LOG("replace_cp_async_dxa\n");
+    replace_cp_async_with_dxa(program);
+  }
+  DBG_LOG("lower_cp_async\n");
+  lower_cp_async(program);
+  // DXA: !vx.dxa.desc metadata -> dxa_descriptors.txt; tag the DXA waits for the core-mapping pass
+  emit_dxa_desc_sidecar(program);
+  mark_dxa_waits(program);
 
 
   DBG_LOG("init_block\n");
@@ -133,6 +148,11 @@ int main(int argc, char **argv) {
   dumpFile(program, "3_after_warp_loop.ll");
 
   VerifyModule(program);
+
+  // core mapping: a DXA issue once per CTA, a DXA wait once per hardware warp (before the warp-loop
+  // pass counter is localized by replace_built_in_function)
+  DBG_LOG("virt_dxa_cta_once\n");
+  virt_dxa_cta_once(program);
 
   DBG_LOG("replace_built_in_function\n");
   replace_built_in_function(program);
