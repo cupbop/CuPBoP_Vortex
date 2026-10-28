@@ -2171,8 +2171,14 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
     auto M = F->getParent();
     LLVMContext &context = M->getContext();
     auto I32 = IntegerType::getInt32Ty(context);
+    // The device runtime's always_inline __vx_barrier_arrive_and_wait (cudaKernelImpl.cpp) is
+    // LTO-linked into the kernel, so the barrier becomes the bare vx_barrier instruction; plain
+    // "vx_barrier" resolves to an out-of-line copy in the separately compiled kernel_wrapper.cpp,
+    // i.e. a real call (and caller-saved spills) at every __syncthreads.
+    // CUPBOP_VIRT_EXTERN_BARRIER=1 keeps the old call.
     FunctionCallee VXBarC = M->getOrInsertFunction(
-        "vx_barrier", FunctionType::get(Type::getVoidTy(context), {I32, I32}, false));
+        std::getenv("CUPBOP_VIRT_EXTERN_BARRIER") ? "vx_barrier" : "_Z28__vx_barrier_arrive_and_waitjj",
+        FunctionType::get(Type::getVoidTy(context), {I32, I32}, false));
     auto *gidGV = M->getNamedGlobal("__local_group_id");
     auto *wpgGV = M->getNamedGlobal("__warps_per_group");
     assert(gidGV && wpgGV && "virt: __local_group_id/__warps_per_group globals missing");
