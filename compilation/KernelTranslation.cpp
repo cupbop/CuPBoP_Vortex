@@ -155,6 +155,9 @@ int main(int argc, char **argv) {
   performance_optimization(program);
   dumpFile(program, "7_after_perf_opt.ll");
 
+  DBG_LOG("hoist_block_constant_loads\n");
+  hoist_block_constant_loads(program);
+
   VerifyModule(program);
 
   // Run LoopSimplify to ensure all loops have preheaders.

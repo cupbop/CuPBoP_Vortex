@@ -38,6 +38,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 
 using namespace llvm;
@@ -674,6 +675,62 @@ void drop_cta_membar_at_barriers(llvm::Module *M) {
     C->eraseFromParent();
   if (cupbop_debug() && !dead.empty())
     std::cout << "[membar] dropped " << dead.size() << " membar.cta next to a CTA barrier\n";
+}
+
+// block_index_*, block_size*, grid_size_* (and the virt barrier's __local_group_id / __warps_per_group)
+// are written by the wrapper / kernel_main before a kernel
+// runs and never inside it, but every store through a kernel pointer may alias them, so -O3 reloads
+// them after each store -- and block_index_* is __thread, i.e. a different address (and cache line) per
+// lane on Vortex. In every function that neither writes them nor calls a function that does, load each
+// one once at entry and use that value. (Not !invariant.load: that claims the value for the whole
+// program, and once the kernel is inlined into a wrapper that loops over blocks the load would be
+// hoisted out of the loop.)
+void hoist_block_constant_loads(llvm::Module *M) {
+  // Off by default: on the flat schedule (bh-cuda) and the core-mapping sub-pass form (virt_warp_test L16) it
+  // breaks the build or the run, and with sreg->CSR its main target (the per-lane TLS block index) is gone.
+  // CUPBOP_HOIST_BLOCK_CONST_LOADS=1 turns it on.
+  if (!std::getenv("CUPBOP_HOIST_BLOCK_CONST_LOADS")) return;
+  std::set<llvm::GlobalVariable *> G;
+  for (const char *n : {"block_index_x", "block_index_y", "block_index_z", "block_size_x", "block_size_y",
+                        "block_size_z", "block_size", "grid_size_x", "grid_size_y", "grid_size_z",
+                        "__local_group_id", "__warps_per_group"})   // the last two: virt CTA barrier args
+    if (auto *gv = M->getGlobalVariable(n)) G.insert(gv);
+  if (G.empty()) return;
+  auto base = [&](llvm::Value *p) {
+    auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(p->stripPointerCasts());
+    return gv && G.count(gv) ? gv : nullptr;
+  };
+  std::set<llvm::Function *> writers;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *S = llvm::dyn_cast<llvm::StoreInst>(&I))
+          if (base(S->getPointerOperand())) writers.insert(&F);
+  unsigned replaced = 0;
+  for (auto &F : *M) {
+    if (F.isDeclaration() || writers.count(&F)) continue;
+    bool calls_writer = false;
+    std::map<llvm::GlobalVariable *, std::vector<llvm::LoadInst *>> loads;
+    for (auto &BB : F)
+      for (auto &I : BB) {
+        if (auto *C = llvm::dyn_cast<llvm::CallBase>(&I))
+          if (C->getCalledFunction() && writers.count(C->getCalledFunction())) calls_writer = true;
+        if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I))
+          if (!L->isVolatile())
+            if (auto *gv = base(L->getPointerOperand())) loads[gv].push_back(L);
+      }
+    if (calls_writer) continue;
+    llvm::IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
+    for (auto &[gv, ls] : loads) {
+      if (ls.size() < 2) continue;
+      llvm::Type *T = ls.front()->getType();
+      llvm::LoadInst *V = B.CreateLoad(T, gv, gv->getName() + ".entry");
+      for (auto *L : ls)
+        if (L->getType() == T) { L->replaceAllUsesWith(V); L->eraseFromParent(); ++replaced; }
+    }
+  }
+  if (cupbop_debug() && replaced)
+    std::cout << "[block-const] " << replaced << " loads of block/grid constants folded to one entry load per function\n";
 }
 
 void replace_built_in_function(llvm::Module *M) {
