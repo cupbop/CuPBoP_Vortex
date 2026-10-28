@@ -30,7 +30,7 @@ check_diff() { # <golden> <result>: exact match
 }
 
 case $TEST_NAME in
-  saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa|sgemm_wgmma_bf16|sgemm_tcu_bf16|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
+  saxpy|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa|sgemm_wgmma_bf16|sgemm_tcu_bf16|tcu_dt_*|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda)
     check_marker "PASSED" ;;
   huffman)  # its checker (comparison_helpers.h) prints "PASS! vectors are matching!" / "FAIL! vectors are NOT matching!", never "PASSED"
     check_marker "PASS! vectors are matching" ;;

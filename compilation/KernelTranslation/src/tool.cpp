@@ -10,6 +10,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <vector>
 #include "llvm/IR/Instructions.h"
@@ -1758,6 +1759,348 @@ void replace_built_in_function(llvm::Module *M) {
   }
 }
 
+// =============================================================================
+// Tensor-core data types (mma.sync / wmma): shared classification and lowering-mode selection
+// =============================================================================
+// One mma.sync form m16n8kK.row.col (NVVM intrinsic llvm.nvvm.mma.*, CuLifter output; or the
+// cupbop.mma.* pseudo-intrinsic that replace_asm_call makes from inline-asm mma.sync) maps to the
+// runtime helper __cupbop_mma_<geom>_<tag>[_sw|_tcu] (cudaKernelImpl.cpp, cudaKernelImpl_dtypes.inc):
+//   f16/bf16 -> f32  m16n8k16 (A 4 regs, B 2) / m16n8k8 (A 2, B 1)     tag f16f32 / bf16f32
+//   tf32 -> f32      m16n8k8 (4/2) / m16n8k4 (2/1)                     tag tf32f32
+//   s8/u8 -> s32     m16n8k32 (4/2) / m16n8k16 (2/1), [.satfinite]      tag s8s32, u8s32, s8u8s32, u8s8s32 [+sat]
+//   e4m3/e5m2 -> f32 m16n8k32 (4/2)                                     tag e4m3f32, e5m2f32, e4m3e5m2f32, e5m2e4m3f32
+// Everything else (f16 accumulators, m8n8k4, m8n8k16/m16n8k64 int4, b1, f64, sparse) is refused.
+namespace {
+struct TensorForm {
+  std::string geom, ta, tb; // geometry, A/B element types
+  bool sat = false, intAcc = false, full = false;
+  int nA = 0, nB = 0;
+  std::string tag;          // runtime tag
+};
+} // namespace
+
+static bool tensor_is_f16ish(const std::string &t) { return t == "f16" || t == "bf16"; }
+static bool tensor_is_int8(const std::string &t) { return t == "s8" || t == "u8"; }
+static bool tensor_is_fp8(const std::string &t) { return t == "e4m3" || t == "e5m2"; }
+
+// acc: "f32" or "s32"
+static bool classify_mma_form(const std::string &geom, const std::string &ta, const std::string &tb, bool sat,
+                              const std::string &acc, TensorForm &S, std::string &err) {
+  S = TensorForm(); S.geom = geom; S.ta = ta; S.tb = tb; S.sat = sat;
+  auto shapes = [&](const char *fullG, const char *halfG) {
+    if (geom == fullG) { S.full = true; S.nA = 4; S.nB = 2; return true; }
+    if (halfG && geom == halfG) { S.full = false; S.nA = 2; S.nB = 1; return true; }
+    err = "shape " + geom + " not supported for " + ta + " (supported: " + fullG + (halfG ? std::string(", ") + halfG : std::string("")) + ")";
+    return false;
+  };
+  if (tensor_is_f16ish(ta) || ta == "tf32") {
+    if (tb != ta) { err = "mixed A/B types " + ta + "/" + tb; return false; }
+    if (acc != "f32") { err = ta + " with " + acc + " accumulator (only f32 accumulators are lowered)"; return false; }
+    if (sat) { err = ".satfinite with " + ta; return false; }
+    if (!(ta == "tf32" ? shapes("m16n8k8", "m16n8k4") : shapes("m16n8k16", "m16n8k8"))) return false;
+    S.tag = ta + "f32";
+    return true;
+  }
+  if (tensor_is_int8(ta)) {
+    if (!tensor_is_int8(tb)) { err = "A " + ta + " with B " + tb; return false; }
+    if (acc != "s32") { err = "int8 with " + acc + " accumulator"; return false; }
+    if (!shapes("m16n8k32", "m16n8k16")) return false;
+    S.intAcc = true;
+    S.tag = ta + (tb != ta ? tb : std::string("")) + "s32" + (sat ? "sat" : "");
+    return true;
+  }
+  if (tensor_is_fp8(ta)) {
+    if (!tensor_is_fp8(tb)) { err = "A " + ta + " with B " + tb; return false; }
+    if (acc != "f32") { err = "fp8 with " + acc + " accumulator (only f32 accumulators are lowered)"; return false; }
+    if (sat) { err = ".satfinite with fp8"; return false; }
+    if (!shapes("m16n8k32", nullptr)) return false;
+    S.tag = ta + (tb != ta ? tb : std::string("")) + "f32";
+    return true;
+  }
+  err = "element type " + ta + " not supported (f16, bf16, tf32, s8, u8, e4m3, e5m2)";
+  return false;
+}
+
+// VORTEX_CONFIGS (exported by examples/common.mk callers: ci/rg-ci-setup-v3.sh, the coadapt harness) holds the
+// -DVX_CFG_* flags of the SimX build the kernel is compiled for. Unset: unknown build (the link then decides).
+static bool tensor_cfg_known() { return std::getenv("VORTEX_CONFIGS") != nullptr; }
+static bool tensor_cfg_has(const char *flag) {
+  const char *e = std::getenv("VORTEX_CONFIGS");
+  if (!e) return true;
+  std::string s(e), f(flag);
+  for (size_t p = s.find(f); p != std::string::npos; p = s.find(f, p + 1)) {
+    size_t q = p + f.size();
+    if (q == s.size() || s[q] == ' ' || s[q] == '=' || s[q] == '\t') return true;
+  }
+  return false;
+}
+// Vortex config flag that gates element type t on the TCU (RTL: VX_tcu_pkg / tfr_mul_join; SimX implements
+// every dense type once VX_CFG_EXT_TCU_ENABLE is on, but a build for a type the RTL leaves out is not real).
+static const char *tensor_type_flag(const std::string &t) {
+  if (tensor_is_f16ish(t)) return nullptr;            // VX_CFG_TCU_FP16_ENABLE, on by default (VX_config.toml)
+  if (t == "tf32") return "-DVX_CFG_TCU_TF32_ENABLE";
+  if (tensor_is_int8(t)) return "-DVX_CFG_TCU_INT8_ENABLE";
+  if (tensor_is_fp8(t)) return "-DVX_CFG_TCU_FP8_ENABLE";
+  return "?";
+}
+static bool tensor_build_enables(const std::string &t, std::string &why) {
+  if (!tensor_cfg_has("-DVX_CFG_EXT_TCU_ENABLE")) { why = "VORTEX_CONFIGS has no -DVX_CFG_EXT_TCU_ENABLE"; return false; }
+  if (tensor_is_f16ish(t)) {
+    if (tensor_cfg_known() && tensor_cfg_has("-DVX_CFG_TCU_FP16_DISABLE")) { why = "VORTEX_CONFIGS has -DVX_CFG_TCU_FP16_DISABLE"; return false; }
+    return true;
+  }
+  const char *f = tensor_type_flag(t);
+  if (!tensor_cfg_has(f)) { why = std::string("VORTEX_CONFIGS has no ") + f; return false; }
+  return true;
+}
+static std::string tensor_lowering_mode() {
+  const char *env = std::getenv("CUPBOP_MMA_LOWERING");
+  std::string mode = env ? env : "auto";
+  if (mode.empty()) mode = "auto";
+  if (mode != "auto" && mode != "sw" && mode != "tcu") {
+    fprintf(stderr, "warning: CUPBOP_MMA_LOWERING=%s unknown (auto|sw|tcu); using auto\n", mode.c_str());
+    mode = "auto";
+  }
+  return mode;
+}
+// CUPBOP_MMA_SATFINITE=wrap: run .satfinite int8 forms on the TCU with a wrapping int32 sum (differs from NVIDIA
+// only when the exact sum leaves the int32 range). Default: .satfinite is software only.
+static bool tensor_satfinite_wrap() {
+  const char *e = std::getenv("CUPBOP_MMA_SATFINITE");
+  return e && std::string(e) == "wrap";
+}
+// Pick the runtime symbol for an operation on element types (ta, tb). base: dispatch symbol of the exact
+// operation; base_nosat: the same operation without .satfinite (== base when !sat). Exits on refusal.
+static std::string tensor_pick_symbol(const std::string &what, const std::string &base, const std::string &base_nosat,
+                                      const std::string &ta, const std::string &tb, bool sat) {
+  const std::string mode = tensor_lowering_mode();
+  std::string reason; // why the TCU cannot run it exactly
+  if (ta != tb) reason = "the Vortex TCU has one input format per op (A " + ta + ", B " + tb + ")";
+  else if (sat && !tensor_satfinite_wrap()) reason = ".satfinite clamps the exact sum, the Vortex TCU int32 accumulator wraps (CUPBOP_MMA_SATFINITE=wrap accepts that)";
+  const std::string tcu_base = (sat && tensor_satfinite_wrap() && ta == tb) ? base_nosat : base;
+  if (mode == "sw") return base + "_sw";
+  if (mode == "tcu") {
+    if (!reason.empty()) {
+      fprintf(stderr, "error: %s: CUPBOP_MMA_LOWERING=tcu cannot lower it: %s; use sw or auto\n", what.c_str(), reason.c_str());
+      exit(1);
+    }
+    std::string why;
+    if (!tensor_build_enables(ta, why)) {
+      fprintf(stderr, "error: %s: CUPBOP_MMA_LOWERING=tcu needs a TCU build that enables %s (%s); use sw or auto\n",
+              what.c_str(), ta.c_str(), why.c_str());
+      exit(1);
+    }
+    return tcu_base + "_tcu";
+  }
+  if (!reason.empty()) { // auto
+    static std::set<std::string> told;
+    if (told.insert(what).second)
+      fprintf(stderr, "[mma] %s: auto -> software (%s)\n", what.c_str(), reason.c_str());
+    return base + "_sw";
+  }
+  return tcu_base; // dispatch symbol: the runtime picks _tcu only when the kernel's build enables the type
+}
+
+// Mark a call (and its callee declaration) convergent: the helpers exchange values across the warp.
+static void tensor_set_convergent(CallInst *C) {
+  C->addFnAttr(Attribute::Convergent);
+  if (Function *F = C->getCalledFunction()) F->addFnAttr(Attribute::Convergent);
+}
+
+// ---- inline-asm mma.sync (CUDA source kernels: CUTLASS-style asm, the only way to reach fp8 mma) ---------
+// "mma.sync.aligned.<geom>.row.col[.satfinite].<d>.<a>.<b>.<c> {D}, {A}, {B}, {C};" (one or more statements)
+// becomes calls to the pseudo-intrinsic cupbop.mma.<geom>.row.col[.satfinite].<sig> (NVVM naming: sig .f32.f32
+// for f16, else .<a>[.<b>]), which the NT=16 staging and replace_nvvm_mma_intrinsics treat like llvm.nvvm.mma.*.
+// Returns false (asm left to the older handlers) when the string is not made of mma.sync statements or the
+// fragments come from ldmatrix asm (Triton path). Recognized but unsupported forms are a hard error.
+static std::string tensor_trim(const std::string &s) {
+  size_t a = s.find_first_not_of(" \t\n\r"), b = s.find_last_not_of(" \t\n\r");
+  return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
+  auto *IA = dyn_cast<InlineAsm>(Call->getCalledOperand());
+  if (!IA) return false;
+  const std::string asmStr = IA->getAsmString();
+  if (asmStr.find("mma.sync.aligned") == std::string::npos) return false;
+  std::vector<std::string> stmts;
+  {
+    size_t p = 0;
+    while (p < asmStr.size()) {
+      size_t q = asmStr.find(';', p);
+      std::string st = tensor_trim(asmStr.substr(p, q == std::string::npos ? std::string::npos : q - p));
+      if (!st.empty()) stmts.push_back(st);
+      if (q == std::string::npos) break;
+      p = q + 1;
+    }
+  }
+  if (stmts.empty()) return false;
+  for (auto &st : stmts)
+    if (st.rfind("mma.sync.aligned.", 0) != 0) return false; // braces, .reg, other instructions: not ours
+  // operand numbering: non-clobber constraints in order (outputs first)
+  InlineAsm::ConstraintInfoVector CV = IA->ParseConstraints();
+  struct Opnd { bool out; int pos; std::string code; };
+  std::vector<Opnd> ops;
+  int nOut = 0, nIn = 0;
+  for (auto &CI : CV) {
+    if (CI.Type == InlineAsm::isClobber) continue;
+    if (CI.isIndirect) return false;
+    Opnd o; o.out = CI.Type == InlineAsm::isOutput; o.pos = o.out ? nOut++ : nIn++; o.code = CI.Codes.empty() ? "" : CI.Codes[0];
+    ops.push_back(o);
+  }
+  if ((int)Call->arg_size() != nIn) return false;
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx), *F32 = Type::getFloatTy(Ctx);
+  auto outType = [&](int pos) -> Type * {
+    Type *RT = Call->getType();
+    if (auto *ST = dyn_cast<StructType>(RT)) return ST->getElementType(pos);
+    return RT;
+  };
+  std::vector<Value *> cur(nOut, nullptr);
+  IRBuilder<> B(Call);
+  auto as32 = [&](Value *V, Type *T) -> Value * {
+    if (V->getType() == T) return V;
+    if (V->getType()->getPrimitiveSizeInBits() == 32) return B.CreateBitCast(V, T);
+    return nullptr;
+  };
+  auto fromLdmatrix = [](Value *V) {
+    if (auto *EV = dyn_cast<ExtractValueInst>(V)) V = EV->getAggregateOperand();
+    if (auto *C = dyn_cast<CallInst>(V))
+      if (C->isInlineAsm())
+        if (auto *X = dyn_cast<InlineAsm>(C->getCalledOperand()))
+          return X->getAsmString().find("ldmatrix") != std::string::npos;
+    return false;
+  };
+  // value of template operand n read as an input
+  auto readOp = [&](int n) -> Value * {
+    if (n < 0 || n >= (int)ops.size()) return nullptr;
+    if (!ops[n].out) return Call->getArgOperand(ops[n].pos);
+    if (cur[ops[n].pos]) return cur[ops[n].pos];
+    for (auto &o : ops) // tied input ("0", "1", ...)
+      if (!o.out && o.code == std::to_string(n)) return Call->getArgOperand(o.pos);
+    return nullptr;
+  };
+  struct Plan { TensorForm S; std::string sig; std::vector<int> D, A, Bv, C; };
+  std::vector<Plan> plans;
+  for (auto &st : stmts) {
+    size_t sp = st.find_first_of(" \t\n");
+    if (sp == std::string::npos) return false;
+    std::string opc = st.substr(0, sp), rest = st.substr(sp);
+    std::vector<std::string> tk;
+    { size_t p = 0; while (true) { size_t q = opc.find('.', p); tk.push_back(opc.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+    // mma sync aligned <geom> <la> <lb> [satfinite] <d> <a> <b> <c>
+    if (tk.size() < 10) {
+      fprintf(stderr, "error: inline-asm %s: unsupported mma.sync form (expected mma.sync.aligned.<shape>.row.col[.satfinite].<d>.<a>.<b>.<c>)\n", opc.c_str());
+      exit(1);
+    }
+    bool sat = tk.size() == 11 && tk[6] == "satfinite";
+    size_t ti = sat ? 7 : 6;
+    if (tk.size() != ti + 4 || tk[4] != "row" || tk[5] != "col") {
+      fprintf(stderr, "error: inline-asm %s: only .row.col mma.sync is lowered\n", opc.c_str());
+      exit(1);
+    }
+    const std::string geom = tk[3], td = tk[ti], ta = tk[ti + 1], tb = tk[ti + 2], tc = tk[ti + 3];
+    Plan P; std::string err;
+    if (td != tc || !classify_mma_form(geom, ta, tb, sat, td, P.S, err)) {
+      if (err.empty()) err = "D type " + td + " differs from C type " + tc;
+      fprintf(stderr, "error: inline-asm %s: %s\n", opc.c_str(), err.c_str());
+      exit(1);
+    }
+    P.sig = tensor_is_f16ish(ta) && ta == "f16" ? ".f32.f32" : ("." + ta + (tb != ta ? "." + tb : std::string("")));
+    // four brace groups of $N operands
+    std::vector<std::vector<int>> groups;
+    size_t p = 0;
+    while ((p = rest.find('{', p)) != std::string::npos) {
+      size_t q = rest.find('}', p);
+      if (q == std::string::npos) return false;
+      std::vector<int> g;
+      std::string body = rest.substr(p + 1, q - p - 1);
+      for (size_t k = 0; k < body.size(); ++k)
+        if (body[k] == '$') {
+          size_t e = k + 1;
+          if (e < body.size() && body[e] == '{') ++e;
+          int v = 0; bool any = false;
+          while (e < body.size() && isdigit((unsigned char)body[e])) { v = v * 10 + (body[e] - '0'); ++e; any = true; }
+          if (!any) return false;
+          g.push_back(v);
+        }
+      groups.push_back(g);
+      p = q + 1;
+    }
+    if (groups.size() != 4 || groups[0].size() != 4 || (int)groups[1].size() != P.S.nA || (int)groups[2].size() != P.S.nB || groups[3].size() != 4) {
+      fprintf(stderr, "error: inline-asm %s: operand groups do not match the %s fragment sizes\n", opc.c_str(), geom.c_str());
+      exit(1);
+    }
+    for (int n : groups[0]) if (n >= (int)ops.size() || !ops[n].out) return false; // D must be outputs
+    P.D = groups[0]; P.A = groups[1]; P.Bv = groups[2]; P.C = groups[3];
+    plans.push_back(P);
+  }
+  // fragments loaded by ldmatrix asm: leave the whole asm to the Triton (WGMMA_SS) path
+  for (auto &P : plans)
+    for (int n : P.A) if (!ops[n].out && fromLdmatrix(Call->getArgOperand(ops[n].pos))) return false;
+  { // validate before emitting anything: every operand readable and 32-bit
+    std::vector<bool> written(nOut, false);
+    auto ok = [&](int n) {
+      if (n < 0 || n >= (int)ops.size()) return false;
+      if (!ops[n].out) return Call->getArgOperand(ops[n].pos)->getType()->getPrimitiveSizeInBits() == 32;
+      if (written[ops[n].pos]) return true;
+      for (auto &o : ops)
+        if (!o.out && o.code == std::to_string(n)) return Call->getArgOperand(o.pos)->getType()->getPrimitiveSizeInBits() == 32;
+      return false;
+    };
+    for (auto &P : plans) {
+      for (int n : P.A) if (!ok(n)) return false;
+      for (int n : P.Bv) if (!ok(n)) return false;
+      for (int n : P.C) if (!ok(n)) return false;
+      for (int n : P.D) written[ops[n].pos] = true;
+    }
+    for (int i = 0; i < nOut; ++i) {
+      if (outType(i)->getPrimitiveSizeInBits() != 32) return false;
+      if (!written[i]) { fprintf(stderr, "error: inline-asm mma.sync: output %d is never written\n", i); exit(1); }
+    }
+  }
+  for (auto &P : plans) {
+    Type *AccT = P.S.intAcc ? I32 : F32;
+    std::string name = "cupbop.mma." + P.S.geom + ".row.col" + (P.S.sat ? ".satfinite" : "") + P.sig;
+    SmallVector<Type *, 12> tys;
+    SmallVector<Value *, 12> args;
+    for (int n : P.A) { Value *v = readOp(n); if (!v || !(v = as32(v, I32))) return false; args.push_back(v); tys.push_back(I32); }
+    for (int n : P.Bv) { Value *v = readOp(n); if (!v || !(v = as32(v, I32))) return false; args.push_back(v); tys.push_back(I32); }
+    for (int n : P.C) { Value *v = readOp(n); if (!v || !(v = as32(v, AccT))) return false; args.push_back(v); tys.push_back(AccT); }
+    StructType *RT = StructType::get(Ctx, {AccT, AccT, AccT, AccT});
+    FunctionCallee FC = M->getOrInsertFunction(name, FunctionType::get(RT, tys, false));
+    CallInst *R = B.CreateCall(FC, args, "asm.mma");
+    tensor_set_convergent(R);
+    for (int i = 0; i < 4; ++i) cur[ops[P.D[i]].pos] = B.CreateExtractValue(R, i);
+  }
+  // results
+  if (Call->getType()->isVoidTy()) return true;
+  Value *res = UndefValue::get(Call->getType());
+  bool isStruct = isa<StructType>(Call->getType());
+  for (int i = 0; i < nOut; ++i) {
+    Value *v = as32(cur[i], outType(i));
+    if (isStruct) res = B.CreateInsertValue(res, v, i); else res = v;
+  }
+  Call->replaceAllUsesWith(res);
+  fprintf(stderr, "[mma] inline-asm mma.sync: %zu statement(s) -> cupbop.mma.%s\n", plans.size(), plans[0].S.geom.c_str());
+  return true;
+}
+
+// cvt.rna[.satfinite].tf32.f32 (wmma::__float_to_tf32, CUTLASS): round to the top 19 bits, ties away from zero,
+// result in fp32 layout (low 13 bits zero); NaN -> 0x7fffffff, infinities kept; overflow -> inf (satfinite: max).
+static Value *emit_cvt_rna_tf32(IRBuilder<> &B, Value *x, bool satfinite) {
+  Type *I32 = B.getInt32Ty();
+  if (!x->getType()->isIntegerTy(32)) x = B.CreateBitCast(x, I32);
+  Value *special = B.CreateICmpEQ(B.CreateAnd(x, 0x7f800000u), B.getInt32(0x7f800000u));
+  Value *r = B.CreateAnd(B.CreateAdd(x, B.getInt32(0x1000u)), B.getInt32(0xffffe000u));
+  if (satfinite) { // finite input rounded to infinity -> largest finite tf32 of that sign
+    Value *rinf = B.CreateICmpEQ(B.CreateAnd(r, 0x7fffffffu), B.getInt32(0x7f800000u));
+    r = B.CreateSelect(rinf, B.CreateOr(B.CreateAnd(x, 0x80000000u), B.getInt32(0x7f7fe000u)), r);
+  }
+  Value *nan = B.CreateICmpNE(B.CreateAnd(x, 0x007fffffu), B.getInt32(0));
+  Value *s = B.CreateSelect(nan, B.getInt32(0x7fffffffu), x);
+  return B.CreateSelect(special, s, r, "cvt.rna.tf32");
+}
+
 void replace_asm_call(llvm::Module *M) {
   // clang (CUDA 12, sm_90) emits __activemask() as the llvm.nvvm.activemask intrinsic,
   // not the `activemask.b32` asm the lifter uses; lower it the same way here so the
@@ -1858,6 +2201,23 @@ void replace_asm_call(llvm::Module *M) {
             if (asm_str.rfind("csrr ", 0) == 0)
               continue;
 
+            if (lower_inline_mma_sync(Call, M)) { // mma.sync (all element types) -> cupbop.mma.*
+              need_remove.push_back(Call);
+              continue;
+            }
+            if (asm_str.find("cvt.rna.tf32.f32") != std::string::npos ||
+                asm_str.find("cvt.rna.satfinite.tf32.f32") != std::string::npos) {
+              if (Call->arg_size() != 1 || Call->getType()->isVoidTy() || Call->getType()->getPrimitiveSizeInBits() != 32) {
+                fprintf(stderr, "error: unsupported cvt.rna.tf32.f32 asm form: %s\n", asm_str.c_str());
+                exit(1);
+              }
+              IRBuilder<> builder(Call);
+              Value *v = emit_cvt_rna_tf32(builder, Call->getArgOperand(0), asm_str.find("satfinite") != std::string::npos);
+              if (Call->getType() != v->getType()) v = builder.CreateBitCast(v, Call->getType());
+              Call->replaceAllUsesWith(v);
+              need_remove.push_back(Call);
+              continue;
+            }
             if (asm_str == "mov.u32 $0, %laneid;") {
               // return the rank within the warp
               IRBuilder<> builder(context);
@@ -3617,22 +3977,20 @@ void replace_wmma_intrinsics(llvm::Module *M) {
   }
 }
 
-// Replace raw NVVM WMMA intrinsics (llvm.nvvm.wmma.*) with Vortex runtime
-// calls. These appear when clang inlines the mma.hpp C++ helper functions
-// at compile time, leaving only the low-level NVVM intrinsics which
-// collectWMMADesc (demangled-name matcher) cannot catch.
 // =============================================================================
-// llvm.nvvm.mma.* (mma.sync) → runtime helpers
+// llvm.nvvm.mma.* (mma.sync) and cupbop.mma.* (inline-asm mma.sync) → runtime helpers
 //
-// CuLifter lifts SASS HMMA to the NVPTX mma.sync intrinsics (never to wmma):
-//   {f32,f32,f32,f32} @llvm.nvvm.mma.m16n8k16.row.col.f32.f32(<2 x half> a0..a3, <2 x half> b0,b1, f32 c0..c3)
-//   {f32,f32,f32,f32} @llvm.nvvm.mma.m16n8k8.row.col.f32.f32 (<2 x half> a0,a1,  <2 x half> b0,    f32 c0..c3)
-// Left alone they reach the Vortex RISC-V backend, which crashes in ISel. Lower them to
-//   void __cupbop_mma_m16n8k16_f16f32(i32 a0..a3, i32 b0,b1, f32 c0..c3, ptr d4)
-//   void __cupbop_mma_m16n8k8_f16f32 (i32 a0,a1,  i32 b0,    f32 c0..c3, ptr d4)
-// (cudaKernelImpl.cpp; PTX fragment layouts, fp32 FMAs over hardware shuffles; a TCU-backed
-// variant can replace them behind the same symbols). Only the f16 x f16 -> f32 row.col forms
-// are implemented; anything else is reported and aborts the translation.
+// CuLifter lifts SASS HMMA/IMMA to the NVPTX mma.sync intrinsics (never to wmma), e.g.
+//   {f32 x4} @llvm.nvvm.mma.m16n8k16.row.col.f32.f32(<2 x half> a0..a3, <2 x half> b0,b1, f32 c0..c3)  (HMMA.16816.F32)
+//   {f32 x4} @llvm.nvvm.mma.m16n8k16.row.col.bf16   (i32 a0..a3, i32 b0,b1, f32 c0..c3)                (HMMA.16816.F32.BF16)
+//   {f32 x4} @llvm.nvvm.mma.m16n8k8.row.col.tf32    (i32 a0..a3, i32 b0,b1, f32 c0..c3)                (HMMA.1688.F32.TF32)
+//   {i32 x4} @llvm.nvvm.mma.m16n8k32.row.col[.satfinite].s8 (i32 a0..a3, i32 b0,b1, i32 c0..c3)       (IMMA.16832.S8.S8[.SAT])
+// Left alone they reach the Vortex RISC-V backend, which crashes in ISel. Each form (classify_mma_form) is
+// lowered to
+//   void __cupbop_mma_<geom>_<tag>[_sw|_tcu](i32 a.., i32 b.., ACC c0..c3, ptr d4)    ACC = f32 | i32
+// (cudaKernelImpl.cpp / cudaKernelImpl_dtypes.inc: PTX fragment layouts; _sw = arithmetic over hardware
+// shuffles, _tcu = Vortex TCU, no suffix = dispatch). CUPBOP_MMA_LOWERING=auto|sw|tcu picks the suffix
+// (tensor_pick_symbol). Anything else is reported and aborts the translation.
 // =============================================================================
 void replace_nvvm_mma_intrinsics(llvm::Module *M) {
   LLVMContext &Ctx = M->getContext();
@@ -3647,7 +4005,7 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
       for (Instruction &I : BB)
         if (auto *CI = dyn_cast<CallInst>(&I))
           if (Function *Callee = CI->getCalledFunction())
-            if (Callee->getName().starts_with("llvm.nvvm.mma."))
+            if (Callee->getName().starts_with("llvm.nvvm.mma.") || Callee->getName().starts_with("cupbop.mma."))
               ToReplace.push_back(CI);
   if (ToReplace.empty())
     return;
@@ -3656,53 +4014,60 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
             ToReplace.size());
 
   for (CallInst *CI : ToReplace) {
-    StringRef Name = CI->getCalledFunction()->getName();
-    bool k16 = Name.contains(".m16n8k16.");
-    bool k8 = Name.contains(".m16n8k8.");
-    // f16 inputs: ...row.col.f32.f32 (<2 x half> operands); bf16 inputs: ...row.col.bf16 (i32 operands)
-    bool isBf16 = Name.ends_with(".bf16");
-    bool ok = (k16 || k8) && Name.contains(".row.col.") && (Name.ends_with(".f32.f32") || isBf16);
-    unsigned nA = k16 ? 4 : 2, nB = k16 ? 2 : 1;
-    if (!ok || CI->arg_size() != nA + nB + 4) {
+    const std::string Name = CI->getCalledFunction()->getName().str();
+    // <prefix><geom>.<la>.<lb>[.satfinite].<sig...>
+    std::string rest = Name.substr(Name.rfind("llvm.nvvm.mma.", 0) == 0 ? strlen("llvm.nvvm.mma.") : strlen("cupbop.mma."));
+    std::vector<std::string> tk;
+    { size_t p = 0; while (true) { size_t q = rest.find('.', p); tk.push_back(rest.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+    std::string err;
+    TensorForm S;
+    bool ok = tk.size() >= 4 && tk[1] == "row" && tk[2] == "col";
+    if (!ok) err = "only .row.col mma.sync is lowered";
+    if (ok) {
+      bool sat = tk[3] == "satfinite";
+      std::vector<std::string> sig(tk.begin() + (sat ? 4 : 3), tk.end());
+      std::string ta, tb, acc;
+      if (sig.size() == 2 && sig[0] == "f32" && sig[1] == "f32") { ta = tb = "f16"; acc = "f32"; }    // f16 in, D/C f32
+      else if (sig.size() == 2 && (sig[0] == "f16" || sig[1] == "f16")) { err = "f16 accumulators are not lowered"; ok = false; }
+      else if (sig.size() == 1 || sig.size() == 2) {
+        ta = sig[0]; tb = sig.size() == 2 ? sig[1] : sig[0];
+        acc = (tensor_is_int8(ta) || ta == "s4" || ta == "u4" || ta == "b1") ? "s32" : "f32";
+      } else { err = "unrecognized signature"; ok = false; }
+      if (ok) ok = classify_mma_form(tk[0], ta, tb, sat, acc, S, err);
+    }
+    if (!ok || CI->arg_size() != (unsigned)(S.nA + S.nB + 4)) {
       fprintf(stderr,
-              "error: unsupported mma.sync intrinsic %s (%u operands); only "
-              "m16n8k16/m16n8k8 .row.col f16*f16->f32 and bf16*bf16->f32 are lowered\n",
-              Name.str().c_str(), (unsigned)CI->arg_size());
+              "error: unsupported mma.sync intrinsic %s (%u operands): %s. Lowered: m16n8k16/m16n8k8 .row.col "
+              "f16|bf16 -> f32, m16n8k8/m16n8k4 tf32 -> f32, m16n8k32/m16n8k16 s8|u8 -> s32 [.satfinite], "
+              "m16n8k32 e4m3|e5m2 -> f32\n",
+              Name.c_str(), (unsigned)CI->arg_size(), err.empty() ? "operand count" : err.c_str());
       exit(1);
     }
-    // CUPBOP_MMA_LOWERING: auto (default; the runtime dispatches to its TCU-backed
-    // helper when the kernel is built for a TCU-enabled Vortex, else software),
-    // sw (force the software reference), tcu (force the TCU-backed helper; links
-    // only against a TCU build). A lowering-recipe knob for lifted tensor kernels.
-    std::string rtName = std::string(k16 ? "__cupbop_mma_m16n8k16_" : "__cupbop_mma_m16n8k8_") +
-                         (isBf16 ? "bf16f32" : "f16f32");
-    if (const char *env = std::getenv("CUPBOP_MMA_LOWERING")) {
-      std::string mode(env);
-      if (mode == "sw" || mode == "tcu")
-        rtName += "_" + mode;
-      else if (mode != "auto" && !mode.empty())
-        fprintf(stderr, "warning: CUPBOP_MMA_LOWERING=%s unknown (auto|sw|tcu); using auto\n", env);
-    }
-    DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.str().c_str(), rtName.c_str());
+    const std::string base = "__cupbop_mma_" + S.geom + "_" + S.tag;
+    std::string nosat = S.tag;
+    if (S.sat) nosat = nosat.substr(0, nosat.size() - 3);
+    const std::string rtName = tensor_pick_symbol(Name, base, "__cupbop_mma_" + S.geom + "_" + nosat, S.ta, S.tb, S.sat);
+    DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.c_str(), rtName.c_str());
 
+    Type *AccT = S.intAcc ? I32 : F32;
     IRBuilder<> B(CI);
     SmallVector<Value *, 12> Args;
     SmallVector<Type *, 12> ArgTys;
-    for (unsigned i = 0; i < nA + nB; i++) { // <2 x half> fragments as packed i32
+    for (int i = 0; i < S.nA + S.nB; i++) { // packed A/B fragments as i32
       Value *V = CI->getArgOperand(i);
       if (!V->getType()->isIntegerTy(32))
         V = B.CreateBitCast(V, I32);
       Args.push_back(V);
       ArgTys.push_back(I32);
     }
-    for (unsigned i = 0; i < 4; i++) { // fp32 accumulators
-      Value *V = CI->getArgOperand(nA + nB + i);
-      if (!V->getType()->isFloatTy())
-        V = B.CreateBitCast(V, F32);
+    for (int i = 0; i < 4; i++) { // accumulators
+      Value *V = CI->getArgOperand(S.nA + S.nB + i);
+      if (V->getType() != AccT)
+        V = B.CreateBitCast(V, AccT);
       Args.push_back(V);
-      ArgTys.push_back(F32);
+      ArgTys.push_back(AccT);
     }
-    Type *DTy = ArrayType::get(F32, 4);
+    Type *DTy = ArrayType::get(AccT, 4);
     IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
     Value *D = AB.CreateAlloca(DTy, nullptr, "mma.d");
     Args.push_back(D);
@@ -3710,42 +4075,59 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
 
     FunctionCallee FC =
         M->getOrInsertFunction(rtName.c_str(), FunctionType::get(VoidTy, ArgTys, false));
-    B.CreateCall(FC, Args);
+    tensor_set_convergent(B.CreateCall(FC, Args));
 
-    Value *Result = UndefValue::get(CI->getType()); // {f32, f32, f32, f32}
+    auto *RT = cast<StructType>(CI->getType());
+    Value *Result = UndefValue::get(RT);
     for (unsigned i = 0; i < 4; i++) {
       Value *GEP = B.CreateConstInBoundsGEP2_32(DTy, D, 0, i);
-      Result = B.CreateInsertValue(Result, B.CreateLoad(F32, GEP), i);
+      Value *V = B.CreateLoad(AccT, GEP);
+      if (RT->getElementType(i) != AccT) V = B.CreateBitCast(V, RT->getElementType(i));
+      Result = B.CreateInsertValue(Result, V, i);
     }
     CI->replaceAllUsesWith(Result);
     CI->eraseFromParent();
   }
 }
 
+// =============================================================================
+// llvm.nvvm.wmma.* (CUDA wmma after init_block inlined the mma.hpp helpers) → runtime helpers
+//
+// Supported (NT=32): m16n16k16 f16 (f32 accumulators), m16n16k16 bf16, m16n16k8 tf32, m16n16k16 s8/u8 (s32,
+// [.satfinite]); loads of A/B (row|col), C (row|col, f32|s32), stores of D (row|col). The fragment storage is
+// the NVVM return type (bf16/tf32 A,B: 4 x i32; s8/u8 A,B: 2 x i32; f16 A,B: 8 x <2 x half>; C/D: 8 x 32-bit)
+// and holds the Vortex TCU layout (cudaKernelImpl_dtypes.inc), so software and TCU mma read the same fragments.
+//   f16  : loads __vx_wmma_load_{a,b}_m16n16k16_{row,col}_f16 (sw: __cupbop_wmma_load_{a,b}_f16_*), mma
+//          __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32 (auto) / __cupbop_wmma_mma_f16_{sw,tcu}
+//   other: __cupbop_wmma_load_{a,b}_<t>_{row,col}, __cupbop_wmma_mma_<t>[sat][_sw|_tcu]
+//   C/D  : __cupbop_wmma_load_c_{f32,s32}_{row,col}; stores __vx_wmma_store_d_m16n16k16_f32 (f32, not sw) /
+//          __cupbop_wmma_store_d_{f32,s32}_{row,col}
+// Other shapes (m32n8k16, m8n32k16, m8n8k32 int4, m8n8k128 b1, m8n8k4 f64) and f16 accumulators are refused.
+// =============================================================================
 void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
   LLVMContext &Ctx = M->getContext();
-  Type *F32 = Type::getFloatTy(Ctx);
-  Type *HalfTy = Type::getHalfTy(Ctx);
   Type *I32 = Type::getInt32Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
   Type *VoidTy = Type::getVoidTy(Ctx);
-  Type *V2HalfTy = FixedVectorType::get(HalfTy, 2);
 
   SmallVector<CallInst *, 16> ToReplace;
-
-  for (Function &F : *M) {
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        auto *CI = dyn_cast<CallInst>(&I);
-        if (!CI)
-          continue;
-        Function *Callee = CI->getCalledFunction();
-        if (!Callee)
-          continue;
-        if (Callee->getName().starts_with("llvm.nvvm.wmma."))
-          ToReplace.push_back(CI);
-      }
-    }
+  SmallVector<CallInst *, 8> Tf32Cvt;
+  for (Function &F : *M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Callee = CI->getCalledFunction()) {
+            if (Callee->getName().starts_with("llvm.nvvm.wmma."))
+              ToReplace.push_back(CI);
+            else if (Callee->getName().starts_with("llvm.nvvm.f2tf32.rna"))
+              Tf32Cvt.push_back(CI);
+          }
+  for (CallInst *CI : Tf32Cvt) { // __nvvm_f2tf32_rna[_satfinite]
+    IRBuilder<> B(CI);
+    Value *v = emit_cvt_rna_tf32(B, CI->getArgOperand(0), CI->getCalledFunction()->getName().contains("satfinite"));
+    if (v->getType() != CI->getType()) v = B.CreateBitCast(v, CI->getType());
+    CI->replaceAllUsesWith(v);
+    CI->eraseFromParent();
   }
 
   if (ToReplace.empty())
@@ -3753,137 +4135,139 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
 
   DBG_PRINT("[nvvm-wmma] found %zu NVVM WMMA intrinsics to replace\n",
             ToReplace.size());
+  const std::string mode = tensor_lowering_mode();
+
+  auto refuse = [](const std::string &name, const std::string &why) {
+    fprintf(stderr, "error: CUDA wmma intrinsic %s: %s. Lowered: m16n16k16 f16 (f32 accumulators), bf16, s8, u8 "
+                    "(s32, [.satfinite]) and m16n16k8 tf32; .stride loads/stores, row|col\n", name.c_str(), why.c_str());
+    exit(1);
+  };
+  auto geomOf = [](const std::string &t) -> std::string {
+    if (t == "f16" || t == "bf16" || tensor_is_int8(t)) return "m16n16k16";
+    if (t == "tf32") return "m16n16k8";
+    return "";
+  };
 
   for (CallInst *CI : ToReplace) {
-    Function *Callee = CI->getCalledFunction();
-    StringRef Name = Callee->getName();
+    const std::string Name = CI->getCalledFunction()->getName().str();
+    std::vector<std::string> tk;
+    { const std::string rest = Name.substr(strlen("llvm.nvvm.wmma.")); size_t p = 0; while (true) { size_t q = rest.find('.', p); tk.push_back(rest.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+    if (!tk.empty() && tk.back().size() >= 2 && tk.back()[0] == 'p' && isdigit((unsigned char)tk.back()[1])) tk.pop_back(); // .p0 / .p1 / .p3
+    if (tk.size() < 3) refuse(Name, "unrecognized name");
+    const std::string geom = tk[0], op = tk[1];
     IRBuilder<> B(CI);
+    IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
+    auto genericPtr = [&](Value *P) -> Value * {
+      if (P->getType() != PtrTy) P = B.CreateAddrSpaceCast(P, PtrTy);
+      return P;
+    };
 
-    if (Name.contains(".bf16") || Name.contains(".tf32") || Name.contains(".s8") || Name.contains(".u8")) {
-      // the wrappers below assume the f16 m16n16k16 fragment shape (8 x <2 x half>); other
-      // element types have other fragment shapes. Lifted kernels do not hit this (HMMA lifts
-      // to mma.sync intrinsics, handled in replace_nvvm_mma_intrinsics).
-      fprintf(stderr, "error: CUDA wmma intrinsic %s: only f16 inputs are lowered on the wmma path "
-                      "(bf16/tf32/int8 wmma not implemented)\n", Name.str().c_str());
-      exit(1);
+    if (op == "load" || op == "store") {
+      // load.<a|b|c>.<row|col>.stride.<t> / store.d.<row|col>.stride.<t>
+      if (tk.size() != 6 || tk[4] != "stride") refuse(Name, "only the .stride forms are lowered");
+      const std::string frag = tk[2], lay = tk[3], t = tk[5];
+      if (lay != "row" && lay != "col") refuse(Name, "layout " + lay);
+      const bool row = lay == "row";
+      std::string rt;
+      if (op == "load" && (frag == "a" || frag == "b")) {
+        if (geomOf(t).empty() || geomOf(t) != geom) refuse(Name, "type " + t + " with shape " + geom);
+        if (t == "f16" && mode != "sw")
+          rt = std::string("__vx_wmma_load_") + frag + "_m16n16k16_" + lay + "_f16";
+        else
+          rt = "__cupbop_wmma_load_" + frag + "_" + t + "_" + lay;
+      } else if (op == "load" && frag == "c") {
+        if (t != "f32" && t != "s32") refuse(Name, t + " accumulators are not lowered");
+        if (geom != "m16n16k16" && geom != "m16n16k8") refuse(Name, "shape " + geom);
+        rt = "__cupbop_wmma_load_c_" + t + "_" + lay;
+      } else if (op == "store" && frag == "d") {
+        if (t != "f32" && t != "s32") refuse(Name, t + " accumulators are not lowered");
+        if (geom != "m16n16k16" && geom != "m16n16k8") refuse(Name, "shape " + geom);
+        rt = (t == "f32" && mode != "sw") ? std::string("__vx_wmma_store_d_m16n16k16_f32") : "__cupbop_wmma_store_d_" + t + "_" + lay;
+      } else {
+        refuse(Name, "fragment " + frag);
+      }
+      DBG_PRINT("[nvvm-wmma] %s -> %s\n", Name.c_str(), rt.c_str());
+      if (op == "load") {
+        auto *RT = dyn_cast<StructType>(CI->getType());
+        if (!RT || CI->arg_size() != 2) refuse(Name, "unexpected signature");
+        const unsigned NR = RT->getNumElements();
+        Type *FragTy = ArrayType::get(I32, NR);
+        Value *Frag = AB.CreateAlloca(FragTy, nullptr, "wmma.frag");
+        FunctionCallee FC = M->getOrInsertFunction(rt, FunctionType::get(VoidTy, {PtrTy, PtrTy, I32}, false));
+        B.CreateCall(FC, {Frag, genericPtr(CI->getArgOperand(0)), CI->getArgOperand(1)});
+        Value *Result = UndefValue::get(RT);
+        for (unsigned i = 0; i < NR; i++) {
+          Value *GEP = B.CreateConstInBoundsGEP2_32(FragTy, Frag, 0, i);
+          Result = B.CreateInsertValue(Result, B.CreateLoad(RT->getElementType(i), GEP), i);
+        }
+        CI->replaceAllUsesWith(Result);
+      } else {
+        // (ptr dst, v0..v7, i32 stride)
+        if (CI->arg_size() != 10) refuse(Name, "unexpected signature");
+        Type *FragTy = ArrayType::get(I32, 8);
+        Value *Frag = AB.CreateAlloca(FragTy, nullptr, "wmma.store");
+        for (unsigned i = 0; i < 8; i++)
+          B.CreateStore(CI->getArgOperand(1 + i), B.CreateConstInBoundsGEP2_32(FragTy, Frag, 0, i));
+        Value *Dst = genericPtr(CI->getArgOperand(0)), *Stride = CI->getArgOperand(9);
+        if (rt.rfind("__vx_", 0) == 0) { // void (ptr p, ptr frag, i32 ldm, i32 layout)
+          FunctionCallee FC = M->getOrInsertFunction(rt, FunctionType::get(VoidTy, {PtrTy, PtrTy, I32, I32}, false));
+          B.CreateCall(FC, {Dst, Frag, Stride, ConstantInt::get(I32, row ? 0 : 1)});
+        } else {
+          FunctionCallee FC = M->getOrInsertFunction(rt, FunctionType::get(VoidTy, {PtrTy, PtrTy, I32}, false));
+          B.CreateCall(FC, {Dst, Frag, Stride});
+        }
+      }
+      CI->eraseFromParent();
+      continue;
     }
-    if (Name.contains(".load.a.") || Name.contains(".load.b.")) {
-      // llvm.nvvm.wmma.m16n16k16.load.{a,b}.{row,col}.stride.f16.p0
-      // Args: (ptr src, i32 stride) -> {<2 x half> x8}
-      bool isA = Name.contains(".load.a.");
-      bool isRow = Name.contains(".row.");
-      const char *rtName = isA
-          ? (isRow ? "__vx_wmma_load_a_m16n16k16_row_f16"
-                   : "__vx_wmma_load_a_m16n16k16_col_f16")
-          : (isRow ? "__vx_wmma_load_b_m16n16k16_row_f16"
-                   : "__vx_wmma_load_b_m16n16k16_col_f16");
 
-      DBG_PRINT("[nvvm-wmma] %s -> %s\n", Name.str().c_str(), rtName);
-
-      Value *Src = CI->getArgOperand(0);
-      Value *Stride = CI->getArgOperand(1);
-
-      // Alloca [8 x <2 x half>] at function entry
-      Type *FragTy = ArrayType::get(V2HalfTy, 8);
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *Frag = AB.CreateAlloca(FragTy, nullptr, "wmma.frag");
-
-      // void runtime(ptr frag, ptr src, i32 ldm)
-      FunctionType *FT = FunctionType::get(VoidTy, {PtrTy, PtrTy, I32}, false);
-      FunctionCallee FC = M->getOrInsertFunction(rtName, FT);
-      B.CreateCall(FC, {Frag, Src, Stride});
-
-      // Load 8 x <2 x half> and build return struct
-      Value *Result = UndefValue::get(CI->getType());
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(FragTy, Frag, 0, i);
-        Value *Val = B.CreateLoad(V2HalfTy, GEP);
-        Result = B.CreateInsertValue(Result, Val, i);
-      }
-      CI->replaceAllUsesWith(Result);
-      CI->eraseFromParent();
-
-    } else if (Name.contains(".mma.")) {
-      // llvm.nvvm.wmma.m16n16k16.mma.{row}.{row}.f32.f32
-      // Args: (<2 x half> a0..a7, <2 x half> b0..b7, float c0..c7) -> {float x8}
-      DBG_PRINT("[nvvm-wmma] %s -> __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32\n",
-                Name.str().c_str());
-
-      Type *AFragTy = ArrayType::get(V2HalfTy, 8);
-      Type *CFragTy = ArrayType::get(F32, 8);
-
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *AAlloca = AB.CreateAlloca(AFragTy, nullptr, "wmma.a");
-      Value *BAlloca = AB.CreateAlloca(AFragTy, nullptr, "wmma.b");
-      Value *CAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.c");
-      Value *DAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.d");
-
-      // Store a0..a7 (<2 x half> args 0-7)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(AFragTy, AAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(i), GEP);
-      }
-      // Store b0..b7 (<2 x half> args 8-15)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(AFragTy, BAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(8 + i), GEP);
-      }
-      // Store c0..c7 (float args 16-23)
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, CAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(16 + i), GEP);
-      }
-
-      // void __vx_wmma_mma_...(ptr d, ptr a, ptr b, ptr c)
-      FunctionType *FT = FunctionType::get(VoidTy,
-          {PtrTy, PtrTy, PtrTy, PtrTy}, false);
-      FunctionCallee FC = M->getOrInsertFunction(
-          "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32", FT);
-      B.CreateCall(FC, {DAlloca, AAlloca, BAlloca, CAlloca});
-
-      // Load d0..d7 and build return struct
-      Value *Result = UndefValue::get(CI->getType());
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, DAlloca, 0, i);
-        Value *Val = B.CreateLoad(F32, GEP);
-        Result = B.CreateInsertValue(Result, Val, i);
-      }
-      CI->replaceAllUsesWith(Result);
-      CI->eraseFromParent();
-
-    } else if (Name.contains(".store.d.")) {
-      // llvm.nvvm.wmma.m16n16k16.store.d.{row,col}.stride.f32.p0
-      // Args: (ptr dst, float f0..f7, i32 stride) -> void
-      int layout = Name.contains(".store.d.row.") ? 0 : 1;
-      DBG_PRINT("[nvvm-wmma] %s -> __vx_wmma_store_d_m16n16k16_f32 (layout=%d)\n",
-                Name.str().c_str(), layout);
-
-      Type *CFragTy = ArrayType::get(F32, 8);
-      IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-      Value *FragAlloca = AB.CreateAlloca(CFragTy, nullptr, "wmma.store");
-
-      Value *Dst = CI->getArgOperand(0);
-      for (unsigned i = 0; i < 8; i++) {
-        Value *GEP = B.CreateConstInBoundsGEP2_32(CFragTy, FragAlloca, 0, i);
-        B.CreateStore(CI->getArgOperand(1 + i), GEP);
-      }
-      Value *Stride = CI->getArgOperand(9);
-
-      // void __vx_wmma_store_d_m16n16k16_f32(ptr p, ptr frag, i32 ldm, i32 layout)
-      FunctionType *FT = FunctionType::get(VoidTy,
-          {PtrTy, PtrTy, I32, I32}, false);
-      FunctionCallee FC = M->getOrInsertFunction(
-          "__vx_wmma_store_d_m16n16k16_f32", FT);
-      B.CreateCall(FC, {Dst, FragAlloca, Stride,
-                        ConstantInt::get(I32, layout)});
-      CI->eraseFromParent();
+    if (op != "mma") refuse(Name, "operation " + op);
+    // mma.<la>.<lb>[.<rnd>].<sig>[.satfinite]; the layouts only matter to the loads (the fragments are layout-free here)
+    std::vector<std::string> sig(tk.begin() + 4, tk.end());
+    bool sat = !sig.empty() && sig.back() == "satfinite";
+    if (sat) sig.pop_back();
+    std::string t;
+    if (sig.size() == 2 && sig[0] == "f32" && sig[1] == "f32") t = "f16";
+    else if (sig.size() == 2 && (sig[0] == "f16" || sig[1] == "f16")) refuse(Name, "f16 accumulators are not lowered");
+    else if (sig.size() == 1) t = sig[0];
+    else refuse(Name, "unrecognized signature");
+    if (geomOf(t).empty() || geomOf(t) != geom) refuse(Name, "type " + t + " with shape " + geom);
+    if (sat && !tensor_is_int8(t)) refuse(Name, ".satfinite with " + t);
+    const int nAB = t == "f16" ? 8 : (tensor_is_int8(t) ? 2 : 4);
+    auto *RT = dyn_cast<StructType>(CI->getType());
+    if (!RT || RT->getNumElements() != 8 || CI->arg_size() != (unsigned)(2 * nAB + 8)) refuse(Name, "unexpected signature");
+    std::string rt;
+    if (t == "f16") {
+      if (mode == "sw") rt = "__cupbop_wmma_mma_f16_sw";
+      else if (mode == "tcu") rt = tensor_pick_symbol(Name, "__cupbop_wmma_mma_f16", "__cupbop_wmma_mma_f16", "f16", "f16", false);
+      else rt = "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32"; // auto: TCU on TCU builds, software otherwise (runtime)
+    } else {
+      const std::string base = "__cupbop_wmma_mma_" + t + (sat ? "sat" : "");
+      rt = tensor_pick_symbol(Name, base, "__cupbop_wmma_mma_" + t, t, t, sat);
     }
+    DBG_PRINT("[nvvm-wmma] %s -> %s\n", Name.c_str(), rt.c_str());
+    Type *ABTy = ArrayType::get(I32, nAB), *CTy = ArrayType::get(I32, 8);
+    Value *AA = AB.CreateAlloca(ABTy, nullptr, "wmma.a");
+    Value *BA = AB.CreateAlloca(ABTy, nullptr, "wmma.b");
+    Value *CA = AB.CreateAlloca(CTy, nullptr, "wmma.c");
+    Value *DA = AB.CreateAlloca(CTy, nullptr, "wmma.d");
+    for (int i = 0; i < nAB; i++) B.CreateStore(CI->getArgOperand(i), B.CreateConstInBoundsGEP2_32(ABTy, AA, 0, i));
+    for (int i = 0; i < nAB; i++) B.CreateStore(CI->getArgOperand(nAB + i), B.CreateConstInBoundsGEP2_32(ABTy, BA, 0, i));
+    for (int i = 0; i < 8; i++) B.CreateStore(CI->getArgOperand(2 * nAB + i), B.CreateConstInBoundsGEP2_32(CTy, CA, 0, i));
+    // void (ptr d, ptr a, ptr b, ptr c)
+    FunctionCallee FC = M->getOrInsertFunction(rt, FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy, PtrTy}, false));
+    tensor_set_convergent(B.CreateCall(FC, {DA, AA, BA, CA}));
+    Value *Result = UndefValue::get(RT);
+    for (unsigned i = 0; i < 8; i++)
+      Result = B.CreateInsertValue(Result, B.CreateLoad(RT->getElementType(i), B.CreateConstInBoundsGEP2_32(CTy, DA, 0, i)), i);
+    CI->replaceAllUsesWith(Result);
+    CI->eraseFromParent();
   }
 
   // Remove unused NVVM intrinsic declarations
   SmallVector<Function *, 8> DeadDecls;
   for (Function &F : *M) {
-    if (F.getName().starts_with("llvm.nvvm.wmma.") && F.use_empty())
+    if ((F.getName().starts_with("llvm.nvvm.wmma.") || F.getName().starts_with("llvm.nvvm.f2tf32.")) && F.use_empty())
       DeadDecls.push_back(&F);
   }
   for (Function *F : DeadDecls)

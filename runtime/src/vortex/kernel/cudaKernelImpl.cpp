@@ -1342,3 +1342,6 @@ extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_bf16f32(i
   __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
 }
 #endif // wgmma (TCU builds)
+
+// bf16 wmma, tf32, int8 and fp8 tensor ops (sw reference + TCU), see the file header
+#include "cudaKernelImpl_dtypes.inc"
