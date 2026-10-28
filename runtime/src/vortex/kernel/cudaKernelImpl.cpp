@@ -191,12 +191,20 @@ __attribute__((always_inline, convergent)) float __shfl_xor_sync(int mem_mask, f
 // (__local_group_id is read from VX_CSR_CTA_ID below, not from the legacy TLS copy)
 extern uint32_t __warps_per_group __attribute__((weak));
 
-// Issue a 2D DXA tile copy: global memory → shared memory
-// Only the first warp in the CTA actually issues the DXA command.
-// Safe to call from all threads — non-DXA warps are no-ops.
-__attribute__((always_inline)) void
-__vx_dxa_issue_2d(unsigned int desc_slot, unsigned int barrier_id,
-                  void *smem_addr, unsigned int coord0, unsigned int coord1) {
+// DXA tile copies (global -> CTA shared memory), ranks 1-5: __vx_dxa_issue_{1..5}d(desc_slot, barrier_id,
+// smem_dst, coord0, ...). desc_slot names a descriptor the host programmed (cudaDxaProgramDesc*, or the
+// dxa_descriptors.txt sidecar); coords are element coordinates of the box origin per dimension (unsigned:
+// a box partly outside the tensor reads the descriptor's fill value there). A CTA-collective operation:
+// every thread may call it, exactly one transfer happens per CTA -- the 1:1 schedule filters the CTA's
+// first warp here, the core mapping (schedule 1) also runs it on the first warp-loop pass only
+// (translator, virt_dxa_cta_once). The transfer registers one transaction on barrier_id; wait with
+// __vx_dxa_wait(barrier_id) (all warps) before reading the tile.
+//
+// The DXA reads its packed operands from lanes 0-3 of the warp-gather registers x31 (and x30 for rank > 2)
+// whatever the thread mask, so they are bound there as in vortex sw/kernel/include/vx_dxa.h.
+static __attribute__((always_inline)) inline void
+cupbop_dxa_issue(unsigned int desc_slot, unsigned int barrier_id, void *smem_addr, unsigned int rank,
+                 unsigned int c0, unsigned int c1, unsigned int c2, unsigned int c3, unsigned int c4) {
   // Only the first warp in the CTA issues DXA. Vortex 3.0 KMU launch: the CTA's
   // warp rank comes from VX_CSR_CTA_RANK (CTA warps need not be aligned hardware warps).
   if ((uint32_t)csr_read_nv(VX_CSR_CTA_RANK) != 0)
@@ -208,13 +216,70 @@ __vx_dxa_issue_2d(unsigned int desc_slot, unsigned int barrier_id,
   vx_barrier_expect_tx((int)barrier_id, 1);
 #endif
   unsigned int meta = (barrier_id << 4) | desc_slot;
+#ifdef __VX_WGATHER_IN
+  const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem_addr, (size_t)meta, (size_t)c0, (size_t)c1);
+  if (rank <= 2) {
+    register uint32_t rs1 __asm__("x31") = a0;
+    __asm__ volatile(".insn r %0, 0, %1, x0, %2, x0\n\t"
+                     :
+                     : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(rs1)
+                     : "memory");
+  } else {
+    const uint32_t a1 = (uint32_t)__VX_WGATHER_IN("x30", 0, (size_t)c2, (size_t)c3, (size_t)c4, (size_t)0u);
+    register uint32_t rs1 __asm__("x31") = a0;
+    register uint32_t rs2 __asm__("x30") = a1;
+    __asm__ volatile(".insn r %0, 0, %1, x0, %2, %3\n\t"
+                     :
+                     : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(rs1), "r"(rs2)
+                     : "memory");
+  }
+#else
+  (void)rank; (void)c2; (void)c3; (void)c4;
   unsigned int a0 =
       (unsigned int)vx_wgather((size_t)(uintptr_t)smem_addr, (size_t)meta,
-                               (size_t)coord0, (size_t)coord1);
+                               (size_t)c0, (size_t)c1);
   __asm__ volatile(".insn r %0, 0, %1, x0, %2, x0\n\t"
                    :
                    : "i"(VX_DXA_EXT_OPCODE), "i"(VX_DXA_FUNCT7), "r"(a0)
                    : "memory");
+#endif
+}
+
+__attribute__((always_inline, convergent)) void
+__vx_dxa_issue_1d(unsigned int desc_slot, unsigned int barrier_id, void *smem_addr, unsigned int coord0) {
+  cupbop_dxa_issue(desc_slot, barrier_id, smem_addr, 1, coord0, 0, 0, 0, 0);
+}
+__attribute__((always_inline, convergent)) void
+__vx_dxa_issue_2d(unsigned int desc_slot, unsigned int barrier_id,
+                  void *smem_addr, unsigned int coord0, unsigned int coord1) {
+  cupbop_dxa_issue(desc_slot, barrier_id, smem_addr, 2, coord0, coord1, 0, 0, 0);
+}
+__attribute__((always_inline, convergent)) void
+__vx_dxa_issue_3d(unsigned int desc_slot, unsigned int barrier_id, void *smem_addr,
+                  unsigned int coord0, unsigned int coord1, unsigned int coord2) {
+  cupbop_dxa_issue(desc_slot, barrier_id, smem_addr, 3, coord0, coord1, coord2, 0, 0);
+}
+__attribute__((always_inline, convergent)) void
+__vx_dxa_issue_4d(unsigned int desc_slot, unsigned int barrier_id, void *smem_addr,
+                  unsigned int coord0, unsigned int coord1, unsigned int coord2, unsigned int coord3) {
+  cupbop_dxa_issue(desc_slot, barrier_id, smem_addr, 4, coord0, coord1, coord2, coord3, 0);
+}
+__attribute__((always_inline, convergent)) void
+__vx_dxa_issue_5d(unsigned int desc_slot, unsigned int barrier_id, void *smem_addr,
+                  unsigned int coord0, unsigned int coord1, unsigned int coord2, unsigned int coord3,
+                  unsigned int coord4) {
+  cupbop_dxa_issue(desc_slot, barrier_id, smem_addr, 5, coord0, coord1, coord2, coord3, coord4);
+}
+
+// Wait for the DXA transfers registered on barrier_id (and for every warp of the CTA): all warps call it.
+// __cupbop_dxa_wait is what the translator turns __vx_barrier_arrive_and_wait(__vx_dxa_barrier_id(i), n)
+// into (mark_dxa_waits), so the core mapping can run it once per hardware warp.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_dxa_wait(unsigned int barrier_id,
+                                                                            unsigned int num_warps) {
+  vx_barrier((int)barrier_id, (int)num_warps);
+}
+__attribute__((always_inline, convergent)) void __vx_dxa_wait(unsigned int barrier_id) {
+  vx_barrier((int)barrier_id, (int)csr_read_nv(VX_CSR_CTA_SIZE)); // the CTA's hardware warps
 }
 
 // Async barrier: arrive and wait (blocking)
