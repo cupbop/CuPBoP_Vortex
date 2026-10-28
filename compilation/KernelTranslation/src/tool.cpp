@@ -9,6 +9,9 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -38,6 +41,8 @@
 #include "llvm_type_utils.h"
 
 #include <fstream>
+#include <functional>
+#include <tuple>
 #include <iostream>
 #include <map>
 #include <set>
@@ -815,60 +820,185 @@ void lower_named_barriers(llvm::Module *M) {
     std::cout << "[named-barrier] " << n_cta << " CTA syncs, " << n_named << " counted syncs / arrives\n";
 }
 
-// block_index_*, block_size*, grid_size_* (and the virt barrier's __local_group_id / __warps_per_group)
-// are written by the wrapper / kernel_main before a kernel
-// runs and never inside it, but every store through a kernel pointer may alias them, so -O3 reloads
-// them after each store -- and block_index_* is __thread, i.e. a different address (and cache line) per
-// lane on Vortex. In every function that neither writes them nor calls a function that does, load each
-// one once at entry and use that value. (Not !invariant.load: that claims the value for the whole
-// program, and once the kernel is inlined into a wrapper that loops over blocks the load would be
-// hoisted out of the loop.)
+// Block/grid constants: block_index_* (TLS, flat schedule), block_size*, grid_size_* (schedules 0/1) and the
+// virt barrier's __local_group_id / __warps_per_group. They are written before a kernel runs, by kernel_main / __cupbop_fill_spawn_globals / cuda_*_wrapper in
+// kernel_wrapper.cpp -- a separate translation unit that is never linked into this module (also not with
+// CUPBOP_LTO=1, which links only the device runtime) and is never called from kernel code -- and never
+// while it runs. Every store through a kernel pointer may alias them, though, so -O3 reloads them after
+// each store, and GVN load-PRE turns the reloads into phis.
+//
+// CUPBOP_BLOCK_CONST_LOADS selects what this pass does with the loads in every function that neither
+// writes these globals nor calls (directly, transitively or through an unknown pointer) a function that does:
+//   hoist      (default) one load per constant at function entry, all others replaced by it (2+ loads only)
+//   keep       nothing (the loads stay as the translator emitted them; the behavior before this pass)
+//   invariant  the loads stay where they are but get !invariant.load, so the final -O3 may CSE them across
+//              stores and hoist them out of loops (measured: about the same as hoist; experimental)
+// Short forms: CUPBOP_KEEP_BLOCK_CONST_LOADS=1 = keep, CUPBOP_HOIST_BLOCK_CONST_LOADS=1 = hoist.
+// Measured (experiments/hoist/, same build, every output identical): on 203 core-mapping sweep and round-4 points
+// hoist vs keep median -0.9%, geomean -2.7%, best -21.8% (lifted transpose), worst +6.5% (lifted sgemm, P=1
+// dynamic loop). Flat schedule: neutral (14 source kernels, -1.1%..+1.2%). Core mapping with all block warps
+// (no virtualization, one pass per warp) has little to remove and pays for the longer live range: about
+// neutral, with backprop +7% (the hoisted value or one it displaces is saved around the exp2f call of the
+// reduction loop on the per-lane stack) and lud -11%. The 1:1 schedule's blockDim / gridDim structs are not
+// included: hoisting them changed nothing measurable on 58 s2 points (geomean +0.1%, worst +2.0%), so
+// schedule 2 keeps its loads.
+//
+// Straight-line guard (hoist and invariant): a function where one basic block holds more than
+// CUPBOP_BLOCK_CONST_MAX_PER_BLOCK (default 2) loads of the same constant is left alone. That shape is a
+// fully unrolled, branch-free warp loop (core mapping with fixed trips): the reload after each trip's store is
+// then the only thing that keeps a trip's index arithmetic inside the trip. Without it the backend's pre-RA
+// machine scheduler (GenericScheduler, latency heuristic) issues the divides of all trips up front and the
+// register allocator spills: an agent-optimized conv3 went from 15 to 74 stack stores and 3.7-7.2x the cycles
+// (-mllvm -enable-misched=false or -misched=ilpmin on the same bitcode: 3 stores). With branches between
+// trips, scheduling regions end at each trip and hoisting only removes loads.
+//
+// !invariant.load is a claim about the whole program; it holds for what this module (and the final
+// optimizer, which sees this module plus the device runtime) can observe, because the only writers live in
+// kernel_wrapper.cpp, which is compiled separately and calls the kernel once per CTA through a table of
+// function pointers. The legacy CuPBoP wrappers that looped over blocks around an inlined kernel are gone.
+enum class BlockConstMode { Keep, Hoist, Invariant };
+static BlockConstMode block_const_mode() {
+  if (const char *e = std::getenv("CUPBOP_BLOCK_CONST_LOADS")) {
+    std::string s(e);
+    if (s == "keep" || s == "off" || s == "0") return BlockConstMode::Keep;
+    if (s == "hoist" || s == "on" || s == "1") return BlockConstMode::Hoist;
+    if (s == "invariant") return BlockConstMode::Invariant;
+    std::cerr << "kernelTranslator: CUPBOP_BLOCK_CONST_LOADS=" << s << ": expected keep, hoist or invariant\n";
+    std::exit(1);
+  }
+  if (std::getenv("CUPBOP_KEEP_BLOCK_CONST_LOADS")) return BlockConstMode::Keep;
+  return BlockConstMode::Hoist;
+}
+
 void hoist_block_constant_loads(llvm::Module *M) {
-  // Off by default: on the flat schedule (bh-cuda) and the core-mapping sub-pass form (virt_warp_test L16) it
-  // breaks the build or the run, and with sreg->CSR its main target (the per-lane TLS block index) is gone.
-  // CUPBOP_HOIST_BLOCK_CONST_LOADS=1 turns it on.
-  if (!std::getenv("CUPBOP_HOIST_BLOCK_CONST_LOADS")) return;
+  const BlockConstMode mode = block_const_mode();
+  if (mode == BlockConstMode::Keep) return;
+  unsigned max_per_block = 2;
+  if (const char *e = std::getenv("CUPBOP_BLOCK_CONST_MAX_PER_BLOCK")) max_per_block = std::max(1, std::atoi(e));
   std::set<llvm::GlobalVariable *> G;
   for (const char *n : {"block_index_x", "block_index_y", "block_index_z", "block_size_x", "block_size_y",
                         "block_size_z", "block_size", "grid_size_x", "grid_size_y", "grid_size_z",
-                        "__local_group_id", "__warps_per_group"})   // the last two: virt CTA barrier args
+                        "__local_group_id", "__warps_per_group"})   // virt CTA barrier args
     if (auto *gv = M->getGlobalVariable(n)) G.insert(gv);
   if (G.empty()) return;
-  auto base = [&](llvm::Value *p) {
-    auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(p->stripPointerCasts());
-    return gv && G.count(gv) ? gv : nullptr;
-  };
+  const llvm::DataLayout &DL = M->getDataLayout();
+
+  // Every use of a constant must end in a simple load (through constant GEPs/casts and, for __thread ones,
+  // llvm.threadlocal.address). Anything else in a function (a store, an atomic, a call argument, a
+  // ptrtoint, ...) makes that function a writer; a use outside any function (other than llvm.used) means the
+  // address escapes and the constant is left alone.
   std::set<llvm::Function *> writers;
-  for (auto &F : *M)
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *S = llvm::dyn_cast<llvm::StoreInst>(&I))
-          if (base(S->getPointerOperand())) writers.insert(&F);
-  unsigned replaced = 0;
-  for (auto &F : *M) {
-    if (F.isDeclaration() || writers.count(&F)) continue;
-    bool calls_writer = false;
-    std::map<llvm::GlobalVariable *, std::vector<llvm::LoadInst *>> loads;
-    for (auto &BB : F)
-      for (auto &I : BB) {
-        if (auto *C = llvm::dyn_cast<llvm::CallBase>(&I))
-          if (C->getCalledFunction() && writers.count(C->getCalledFunction())) calls_writer = true;
-        if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I))
-          if (!L->isVolatile())
-            if (auto *gv = base(L->getPointerOperand())) loads[gv].push_back(L);
+  std::set<llvm::GlobalVariable *> escaped;
+  std::function<void(llvm::GlobalVariable *, llvm::Value *)> walk = [&](llvm::GlobalVariable *gv, llvm::Value *V) {
+    for (llvm::User *U : V->users()) {
+      if (auto *L = llvm::dyn_cast<llvm::LoadInst>(U)) {
+        if (!L->isSimple()) writers.insert(L->getFunction());   // atomic / volatile: leave the function alone
+        continue;
       }
-    if (calls_writer) continue;
-    llvm::IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
-    for (auto &[gv, ls] : loads) {
-      if (ls.size() < 2) continue;
-      llvm::Type *T = ls.front()->getType();
-      llvm::LoadInst *V = B.CreateLoad(T, gv, gv->getName() + ".entry");
-      for (auto *L : ls)
-        if (L->getType() == T) { L->replaceAllUsesWith(V); L->eraseFromParent(); ++replaced; }
+      if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(U))
+        if (II->getIntrinsicID() == llvm::Intrinsic::threadlocal_address) { walk(gv, II); continue; }
+      if (llvm::isa<llvm::GetElementPtrInst>(U) || llvm::isa<llvm::BitCastInst>(U) ||
+          llvm::isa<llvm::AddrSpaceCastInst>(U)) { walk(gv, U); continue; }
+      if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
+        if (CE->getOpcode() == llvm::Instruction::GetElementPtr || CE->isCast()) walk(gv, CE);
+        else escaped.insert(gv);
+        continue;
+      }
+      if (auto *I = llvm::dyn_cast<llvm::Instruction>(U)) { writers.insert(I->getFunction()); continue; }
+      bool in_used = false;   // @llvm.used / @llvm.compiler.used keep the symbol, they do not write it
+      if (auto *C = llvm::dyn_cast<llvm::Constant>(U))
+        for (llvm::User *UU : C->users())
+          if (auto *UG = llvm::dyn_cast<llvm::GlobalVariable>(UU))
+            if (UG->getName().starts_with("llvm.")) in_used = true;
+      if (!in_used) escaped.insert(gv);
+    }
+  };
+  for (auto *gv : G) walk(gv, gv);
+  for (auto *gv : escaped) G.erase(gv);
+  if (G.empty()) return;
+  // callers of writers are writers; so is any function with an indirect call (it could reach one)
+  unsigned n_indirect = 0;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto &F : *M) {
+      if (F.isDeclaration() || writers.count(&F)) continue;
+      for (auto &I : llvm::instructions(F)) {
+        auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!C || C->isInlineAsm()) continue;
+        auto *callee = llvm::dyn_cast<llvm::Function>(C->getCalledOperand()->stripPointerCasts());
+        if (!callee) ++n_indirect;
+        if (!callee || writers.count(callee)) { writers.insert(&F); changed = true; break; }
+      }
     }
   }
-  if (cupbop_debug() && replaced)
-    std::cout << "[block-const] " << replaced << " loads of block/grid constants folded to one entry load per function\n";
+
+  // (global, __thread?, byte offset, type) -> the simple loads of that constant
+  using Key = std::tuple<llvm::GlobalVariable *, bool, int64_t, llvm::Type *>;
+  auto key_of = [&](llvm::LoadInst *L, Key &k) {
+    llvm::Value *P = L->getPointerOperand();
+    llvm::APInt off(DL.getIndexTypeSizeInBits(P->getType()), 0);
+    llvm::Value *B = P->stripAndAccumulateConstantOffsets(DL, off, /*AllowNonInbounds=*/true);
+    bool tls = false;
+    if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(B))
+      if (II->getIntrinsicID() == llvm::Intrinsic::threadlocal_address) { B = II->getArgOperand(0); tls = true; }
+    auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(B->stripPointerCasts());
+    if (!gv || !G.count(gv) || gv->isThreadLocal() != tls) return false;
+    k = Key(gv, tls, off.getSExtValue(), L->getType());
+    return true;
+  };
+  unsigned n_funcs = 0, n_loads = 0, n_entry = 0, n_straight = 0;
+  llvm::MDNode *empty = llvm::MDNode::get(M->getContext(), {});
+  for (auto &F : *M) {
+    if (F.isDeclaration() || writers.count(&F)) continue;
+    std::map<Key, std::vector<llvm::LoadInst *>> loads;
+    unsigned most_in_one_block = 0;
+    for (auto &BB : F) {
+      std::map<Key, unsigned> here;
+      for (auto &I : BB)
+        if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          Key k;
+          if (L->isSimple() && key_of(L, k)) { loads[k].push_back(L); most_in_one_block = std::max(most_in_one_block, ++here[k]); }
+        }
+    }
+    if (loads.empty()) continue;
+    if (most_in_one_block > max_per_block) {   // straight-line guard (see above)
+      ++n_straight;
+      if (cupbop_debug() || std::getenv("CUPBOP_BLOCK_CONST_REPORT"))
+        std::cout << "[block-const] " << F.getName().str() << ": " << most_in_one_block
+                  << " loads of one constant in one basic block (unrolled straight-line trips), left alone\n";
+      continue;
+    }
+    ++n_funcs;
+    if (mode == BlockConstMode::Invariant) {
+      for (auto &kv : loads)
+        for (auto *L : kv.second) { L->setMetadata(llvm::LLVMContext::MD_invariant_load, empty); ++n_loads; }
+      continue;
+    }
+    // hoist: create every entry load first, then replace. The insertion point may itself be one of the
+    // loads being replaced (kernels often start with `load @block_size`): erasing it while the builder still
+    // pointed at it was the translator crash of the first version (bh-cuda flat schedule, virt_warp_test L16).
+    llvm::IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
+    std::vector<std::pair<llvm::LoadInst *, llvm::Value *>> repl;
+    for (auto &[k, ls] : loads) {
+      if (ls.size() < 2) continue;
+      auto [gv, tls, off, T] = k;
+      llvm::Value *addr = gv;
+      if (tls) addr = B.CreateIntrinsic(llvm::Intrinsic::threadlocal_address, {gv->getType()}, {gv});
+      if (off) addr = B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), addr, off);
+      llvm::Align al = ls.front()->getAlign();
+      for (auto *L : ls) al = std::min(al, L->getAlign());
+      llvm::LoadInst *V = B.CreateAlignedLoad(T, addr, al, gv->getName() + ".entry");
+      ++n_entry;
+      for (auto *L : ls) repl.push_back({L, V});
+    }
+    for (auto &[L, V] : repl) { L->replaceAllUsesWith(V); L->eraseFromParent(); ++n_loads; }
+  }
+  if (cupbop_debug() || std::getenv("CUPBOP_BLOCK_CONST_REPORT"))
+    std::cout << "[block-const] mode=" << (mode == BlockConstMode::Hoist ? "hoist" : "invariant") << ": " << n_loads
+              << " loads in " << n_funcs << " functions"
+              << (mode == BlockConstMode::Hoist ? " -> " + std::to_string(n_entry) + " entry loads" : std::string(" marked"))
+              << "; left alone: " << writers.size() << " writer function(s) (" << n_indirect << " with indirect calls), "
+              << n_straight << " straight-line function(s), " << escaped.size() << " escaped constant(s)\n";
 }
 
 // KMU launch (launch2): the CTA dispatcher loads the CUDA block index (and, on the 1:1 schedule, the thread index)
