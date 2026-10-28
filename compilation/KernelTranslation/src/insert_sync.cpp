@@ -3,6 +3,9 @@
 #include "handle_sync.h"
 #include "tool.h"
 #include "cg_sync.h"
+#include <cstdlib>
+#include <set>
+#include <vector>
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -66,9 +69,59 @@ public:
     //   }
     // }
     
+    // The local-memory prologue memory_hierarchy puts after the allocas -- [dyn_bytes load,
+    // total_stride add,] vx_local_alloc(stride), then a GEP + cast per shared array -- is uniform
+    // across the CTA (vx_local_alloc only reads VX_CSR_CTA_LMEM_ADDR), so it belongs before the
+    // entry barrier. Collect all of it (the call, the side-effect-free instructions computing its
+    // argument, and the GEP/cast chains derived from its result) instead of matching one exact
+    // call/gep/addrspacecast/store sequence: any other shape (two shared arrays, dynamic shared
+    // memory, a kernel whose first instruction is not a store) put the call inside the first
+    // warp-loop region, i.e. one real call -- with register save/restore -- per trip.
+    std::set<Instruction *> lmem_prologue;
+    if (!std::getenv("CUPBOP_OLD_LMEM_PROLOGUE")) {   // =1: the old exact call/gep/addrspacecast/store rule only
+        std::vector<Instruction *> work;
+        for (Instruction &J : *entry)
+            if (auto *C = dyn_cast<CallInst>(&J))
+                if (C->getCalledFunction() &&
+                    C->getCalledFunction()->getName().contains("vx_local_alloc"))
+                    work.push_back(C);
+        std::vector<Instruction *> users(work.begin(), work.end());
+        while (!work.empty()) {          // argument computation: pure, in the entry block
+            Instruction *J = work.back(); work.pop_back();
+            if (!lmem_prologue.insert(J).second) continue;
+            for (Value *Op : J->operands())
+                if (auto *OI = dyn_cast<Instruction>(Op))
+                    if (OI->getParent() == entry &&
+                        (isa<BinaryOperator>(OI) || isa<CastInst>(OI) ||
+                         (isa<LoadInst>(OI) && !cast<LoadInst>(OI)->isVolatile())))
+                        work.push_back(OI);
+        }
+        while (!users.empty()) {         // GEP / cast chains on the allocated pointer
+            Instruction *J = users.back(); users.pop_back();
+            for (User *U : J->users())
+                if (auto *UI = dyn_cast<Instruction>(U))
+                    if (UI->getParent() == entry &&
+                        (isa<GetElementPtrInst>(UI) || isa<CastInst>(UI)) &&
+                        lmem_prologue.insert(UI).second)
+                        users.push_back(UI);
+        }
+    }
+
     auto iter = entry->begin();
     while (iter != entry->end()) {
         Instruction* I = &*iter;
+
+        if (lmem_prologue.count(I)) {
+            ++iter;
+            continue;
+        }
+        // ...and, as the old exact-sequence rule did, a store of a prologue pointer into an alloca
+        if (auto *ST = dyn_cast<StoreInst>(I))
+            if (auto *VI = dyn_cast<Instruction>(ST->getValueOperand()))
+                if (lmem_prologue.count(VI) && isa<AllocaInst>(ST->getPointerOperand()->stripPointerCasts())) {
+                    ++iter;
+                    continue;
+                }
 
         // 기존 예외: AllocaInst, LoadInst, CastInst
         if (isa<AllocaInst>(I) || isa<LoadInst>(I) || isa<CastInst>(I)) {
