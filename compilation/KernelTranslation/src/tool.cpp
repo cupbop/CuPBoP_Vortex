@@ -870,6 +870,26 @@ void hoist_block_constant_loads(llvm::Module *M) {
     std::cout << "[block-const] " << replaced << " loads of block/grid constants folded to one entry load per function\n";
 }
 
+// KMU launch (launch2): the CTA dispatcher loads the CUDA block index (and, on the 1:1 schedule, the thread index)
+// into CTA CSRs; kernel_main only copies them into the legacy vx_spawn TLS. Reading the CSR is one instruction with
+// no memory traffic, while each TLS load touches one 64 B line per lane (32 lines per warp) and is reloaded after
+// every store alias analysis cannot separate from it. The asm is pure, so LLVM may CSE and hoist it.
+// CUPBOP_SREG_TLS=1 keeps the TLS loads.
+bool sreg_from_csr() {
+  static const bool off = std::getenv("CUPBOP_SREG_TLS") != nullptr;
+  return !off;
+}
+llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *name) {
+  auto *FT = llvm::FunctionType::get(B.getInt32Ty(), false);
+  char asm_str[32];
+  snprintf(asm_str, sizeof(asm_str), "csrr $0, 0x%x", csr);
+  auto *IA = llvm::InlineAsm::get(FT, asm_str, "=r", /*hasSideEffects=*/false);
+  llvm::CallInst *C = B.CreateCall(FT, IA, {}, name);
+  C->setDoesNotAccessMemory();
+  C->setDoesNotThrow();
+  return C;
+}
+
 void replace_built_in_function(llvm::Module *M) {
 
   // Remove __vx_* stub function bodies (CUDA device stubs).
@@ -993,7 +1013,9 @@ void replace_built_in_function(llvm::Module *M) {
                     {threadIdxGV});
                 auto field_ptr = builder.CreateStructGEP(
                     threadIdxGV->getValueType(), tls_ptr, 0);
-                auto tidx = builder.CreateLoad(I32, field_ptr, "tidx");
+                Instruction *tidx = sreg_from_csr()
+                    ? (Instruction *)read_cta_csr(builder, 0xCD3, "tidx") // VX_CSR_CTA_THREAD_ID_X
+                    : (Instruction *)builder.CreateLoad(I32, field_ptr, "tidx");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -1077,7 +1099,9 @@ void replace_built_in_function(llvm::Module *M) {
                     {threadIdxGV});
                 auto field_ptr = builder.CreateStructGEP(
                     threadIdxGV->getValueType(), tls_ptr, 1);
-                auto tidy = builder.CreateLoad(I32, field_ptr, "tidy");
+                Instruction *tidy = sreg_from_csr()
+                    ? (Instruction *)read_cta_csr(builder, 0xCD4, "tidy") // VX_CSR_CTA_THREAD_ID_Y
+                    : (Instruction *)builder.CreateLoad(I32, field_ptr, "tidy");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -1123,7 +1147,9 @@ void replace_built_in_function(llvm::Module *M) {
                     {threadIdxGV});
                 auto field_ptr = builder.CreateStructGEP(
                     threadIdxGV->getValueType(), tls_ptr, 2);
-                auto tidz = builder.CreateLoad(I32, field_ptr, "tidz");
+                Instruction *tidz = sreg_from_csr()
+                    ? (Instruction *)read_cta_csr(builder, 0xCD5, "tidz") // VX_CSR_CTA_THREAD_ID_Z
+                    : (Instruction *)builder.CreateLoad(I32, field_ptr, "tidz");
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -1169,7 +1195,9 @@ void replace_built_in_function(llvm::Module *M) {
               builder.SetInsertPoint(Call);
 
               Value *block_idx;
-              if (schedule == 2) {
+              if ((schedule == 1 || schedule == 2) && sreg_from_csr()) {
+                block_idx = read_cta_csr(builder, 0xCD6 + field, "ctaid"); // VX_CSR_CTA_BLOCK_ID_{X,Y,Z}
+              } else if (schedule == 2) {
                 // Load from vx_spawn's blockIdx struct field
                 auto blockIdxGV = M->getGlobalVariable("blockIdx");
                 auto tls_ptr = builder.CreateCall(
@@ -1287,13 +1315,22 @@ void replace_built_in_function(llvm::Module *M) {
                                                      Type::getInt32Ty(context)},
                                                     false));
 
-                auto localGroupId = builder.CreateLoad(
-                    localGroupIdGV->getValueType(), localGroupIdGV);
-                auto warpsPerGroup = builder.CreateLoad(
-                    warpsPerGroupGV->getValueType(), warpsPerGroupGV);
+                Value *localGroupId, *warpsPerGroup;
+                if (sreg_from_csr()) {
+                  localGroupId = read_cta_csr(builder, 0xCD0, "cta_id");     // VX_CSR_CTA_ID
+                  warpsPerGroup = read_cta_csr(builder, 0xCD2, "cta_warps"); // VX_CSR_CTA_SIZE
+                } else {
+                  localGroupId = builder.CreateLoad(localGroupIdGV->getValueType(), localGroupIdGV);
+                  warpsPerGroup = builder.CreateLoad(warpsPerGroupGV->getValueType(), warpsPerGroupGV);
+                }
 
                 CallInst *syncThreads = builder.CreateCall(
                     threadIdxFunc, {localGroupId, warpsPerGroup});
+                // convergent like the llvm.nvvm.barrier0 it replaces: without it LLVM may copy the barrier into
+                // lane-dependent branches (a warp then arrives once per branch and the CTA deadlocks); the TLS
+                // loads that used to feed it happened to keep it in place, the pure CSR reads do not
+                syncThreads->addFnAttr(Attribute::Convergent);
+                cast<Function>(threadIdxFunc.getCallee())->addFnAttr(Attribute::Convergent);
 
                 MDNode *N =
                     MDNode::get(context, MDString::get(context, "divergence"));
@@ -1817,6 +1854,9 @@ void replace_asm_call(llvm::Module *M) {
             if (!asm_inst)
               continue;
             auto asm_str = asm_inst->getAsmString();
+            // RISC-V asm the translator emitted itself (read_cta_csr), not PTX: keep it
+            if (asm_str.rfind("csrr ", 0) == 0)
+              continue;
 
             if (asm_str == "mov.u32 $0, %laneid;") {
               // return the rank within the warp

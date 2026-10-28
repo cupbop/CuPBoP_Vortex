@@ -333,6 +333,19 @@ void mem_share2global_sche_2(llvm::Module *M) {
 
   // (a) Load block index: individual TLS (SCHE_0) or blockIdx struct (SCHE_2)
   auto getTLSLoadI32 = [&](IRBuilder<> &B, const char *Name) -> Value* {
+    // 1:1 and core mapping: with sreg_from_csr the legacy TLS copies below are no longer made (kernel_main), so
+    // ask for the CUDA block index like the kernel does; replace_built_in_function lowers the sreg to the CTA's
+    // block-id CSR. (Not a csrr asm here: this runs before replace_asm_call, which drops asm it does not know.)
+    if (sreg_from_csr()) {
+      int sched = 0;
+      if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) sched = std::atoi(e);
+      if (sched == 1 || sched == 2) {
+        FunctionCallee sreg = M->getOrInsertFunction(
+            strcmp(Name, "block_index_x") == 0 ? "llvm.nvvm.read.ptx.sreg.ctaid.x" : "llvm.nvvm.read.ptx.sreg.ctaid.y",
+            FunctionType::get(I32, false));
+        return B.CreateCall(sreg, {}, Name);
+      }
+    }
     auto *GV = M->getGlobalVariable(Name, /*AllowInternal*/true);
     if (GV) {
       // SCHE_0: individual TLS global (block_index_x, block_index_y)
@@ -701,6 +714,10 @@ void mem_share2local(llvm::Module *M) {
     IRBuilder<> IB_Entry(EntryBB);
     auto mkIsZero = [&](GlobalVariable *GV, const char *nm) -> Value* {
       if (!GV) return ConstantInt::get(I1, 1); // if that axis does not exist, assume zero
+      // thread_id_x/y are never written on the 1:1 and core-mapping schedules (zero in every thread), so every
+      // thread already took the allocation path; with the TLS copies gone (sreg_from_csr) say so directly.
+      // vx_local_alloc only reads the CTA's local-memory CSR, so each thread computing it is harmless.
+      if (sreg_from_csr()) return ConstantInt::get(I1, 1);
       Value *p = IB_Entry.CreateCall(tlsAddr(GV), {GV});
       Value *v = IB_Entry.CreateLoad(I32, p, nm);
       return IB_Entry.CreateICmpEQ(v, ConstantInt::get(I32, 0));

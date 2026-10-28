@@ -2179,6 +2179,7 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
     FunctionCallee VXBarC = M->getOrInsertFunction(
         std::getenv("CUPBOP_VIRT_EXTERN_BARRIER") ? "vx_barrier" : "_Z28__vx_barrier_arrive_and_waitjj",
         FunctionType::get(Type::getVoidTy(context), {I32, I32}, false));
+    cast<Function>(VXBarC.getCallee())->addFnAttr(Attribute::Convergent);
     auto *gidGV = M->getNamedGlobal("__local_group_id");
     auto *wpgGV = M->getNamedGlobal("__warps_per_group");
     assert(gidGV && wpgGV && "virt: __local_group_id/__warps_per_group globals missing");
@@ -2189,9 +2190,11 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
       if (name != "llvm.nvvm.barrier0" && name != "llvm.nvvm.barrier.sync") continue;
       if (CI->getMetadata("cupbop.builtin_barrier")) continue; // entry/exit marker: region boundary only
       IRBuilder<> builder(CI);
-      auto gid = builder.CreateLoad(I32, gidGV, "cta_id");
-      auto wpg = builder.CreateLoad(I32, wpgGV, "cta_warps");
-      builder.CreateCall(VXBarC, {gid, wpg});
+      Value *gid = sreg_from_csr() ? (Value *)read_cta_csr(builder, 0xCD0, "cta_id")      // VX_CSR_CTA_ID
+                                   : (Value *)builder.CreateLoad(I32, gidGV, "cta_id");
+      Value *wpg = sreg_from_csr() ? (Value *)read_cta_csr(builder, 0xCD2, "cta_warps")   // VX_CSR_CTA_SIZE
+                                   : (Value *)builder.CreateLoad(I32, wpgGV, "cta_warps");
+      builder.CreateCall(VXBarC, {gid, wpg})->addFnAttr(Attribute::Convergent);   // see the 1:1 barrier in tool.cpp
     }
   }
   for (auto inst : barriers) {

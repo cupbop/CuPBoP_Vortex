@@ -35,6 +35,10 @@ void remove_cuda_built_in(llvm::Module *M);
 void replace_built_in_function(llvm::Module *M);
 void drop_cta_membar_at_barriers(llvm::Module *M);
 void lower_named_barriers(llvm::Module *M);
+// KMU CTA CSR reads instead of the legacy vx_spawn TLS copies (tool.cpp; CUPBOP_SREG_TLS=1 turns them off)
+bool sreg_from_csr();
+llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *name);
+
 void hoist_block_constant_loads(llvm::Module *M);
 void replace_warp_shfl_early(llvm::Module *M);
 void lower_cmpxchg_for_flat(llvm::Module *M);

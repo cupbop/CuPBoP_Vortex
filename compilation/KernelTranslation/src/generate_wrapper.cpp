@@ -222,6 +222,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
     if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
       schedule = std::stoi(std::string(env));
     }
+    // The legacy vx_spawn TLS copies (threadIdx/blockIdx/__local_group_id, block_index_*, thread_id_*) are made only
+    // where something reads them: the flat schedule (one CUDA block per hardware thread, block index computed
+    // below) or CUPBOP_SREG_TLS=1. Otherwise translated kernels and the device runtime read the CTA CSRs, the
+    // kernel has no TLS at all, and the start code has nothing to zero per hardware thread.
+    const bool tls_copies = schedule == 0 || !sreg_from_csr();
 
     
     std::fstream outfile;
@@ -424,9 +429,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
       for (auto f : wrapper_name) {
         ss << "void cuda_" << f << "(void* args) {\n"
                   "    // block_index_{x,y,z} were set by the KMU entry (one CUDA block per hardware thread)\n"
+           << (schedule == 0 || tls_copies ?
                   "    thread_id_x = 0;\n"
                   "    thread_id_y = 0;\n"
-                  "    thread_id_z = 0;\n"
+                  "    thread_id_z = 0;\n" : "") <<
                   "\n"
                   "//    vx_printf(\"kernel_warpper: group=(%d, %d) thread=(%d, %d)\\n\", blockIdx.x, blockIdx.y, thread_id_x, thread_id_y);\n"
                   "\n"
@@ -519,19 +525,20 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "// __local_group_id, __warps_per_group) from the CTA CSRs so the translated kernel IR\n"
           "// and the device runtime keep working unchanged.\n"
           "static inline __attribute__((always_inline)) void __cupbop_fill_spawn_globals() {\n"
+          << (tls_copies ?
           "    threadIdx.x = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_X);\n"
           "    threadIdx.y = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_Y);\n"
           "    threadIdx.z = (uint32_t)csr_read_nv(VX_CSR_CTA_THREAD_ID_Z);\n"
           "    blockIdx.x  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_X);\n"
           "    blockIdx.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y);\n"
           "    blockIdx.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z);\n"
+          "    __local_group_id = (uint32_t)csr_read_nv(VX_CSR_CTA_ID);\n" : "") <<
           "    blockDim.x  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_X);\n"
           "    blockDim.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Y);\n"
           "    blockDim.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Z);\n"
           "    gridDim.x   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_X);\n"
           "    gridDim.y   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Y);\n"
           "    gridDim.z   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Z);\n"
-          "    __local_group_id = (uint32_t)csr_read_nv(VX_CSR_CTA_ID);\n"
           "    __warps_per_group = (uint32_t)csr_read_nv(VX_CSR_CTA_SIZE);\n"
           "}\n"
           "\n"
@@ -606,7 +613,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // checked; every writer stores the same values, so program order on one thread suffices.\n"
             "    // (Storing from every thread unconditionally cost small kernels more than their body:\n"
             "    // nn stores 2.4x of 1:1.)\n"
-            "    if (__lane == 0 && blockIdx.x == 0 && blockIdx.y == 0 && __rank == 0 && getenv_dbg_virt) vx_printf(\"[virt] L=%d bs=%d nt=%d\\n\", (int)__L, (int)__bs, (int)vx_num_threads());\n"
+            "    if (getenv_dbg_virt && __lane == 0 && __rank == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_X) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y) == 0) vx_printf(\"[virt] L=%d bs=%d nt=%d\\n\", (int)__L, (int)__bs, (int)vx_num_threads());\n"
             "    {\n"
             "        const int __gx = (int)ctx->num_groups[0], __gy = (int)ctx->num_groups[1], __gz = (int)ctx->num_groups[2];\n"
             "        const int __lx = (int)ctx->local_size[0], __ly = (int)ctx->local_size[1], __lz = (int)ctx->local_size[2];\n"
@@ -617,9 +624,10 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "            block_size = (int)__bs;\n"
             "        }\n"
             "    }\n"
+            << (tls_copies ?
             "    block_index_x = blockIdx.x;\n"
             "    block_index_y = blockIdx.y;\n"
-            "    block_index_z = blockIdx.z;\n"
+            "    block_index_z = blockIdx.z;\n" : "") <<
             "    // Lane gating and partial blocks: hardware thread (rank, lane) owns logical\n"
             "    // threads rank*L + lane + k*(P*L); one without any (lane >= L, or beyond the\n"
             "    // block) leaves now, before the kernel's uniform control flow reads its\n"
