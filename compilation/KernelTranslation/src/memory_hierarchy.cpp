@@ -540,8 +540,16 @@ void mem_share2local(llvm::Module *M) {
   auto *I8Ptr = PointerType::get(I8, 0);
 
   // runtime hooks
+  // The CTA's shared-memory base. The device runtime's always_inline __cupbop_vx_local_alloc
+  // (cudaKernelImpl.cpp, a read of VX_CSR_CTA_LMEM_ADDR) is LTO-linked into the kernel, so the base
+  // becomes one csrr; plain "vx_local_alloc" resolves to an out-of-line copy in the separately
+  // compiled kernel_wrapper.cpp, i.e. a real call that makes every shared-memory kernel non-leaf
+  // (ra and callee-saved saves, a larger stack frame). The name must keep containing
+  // "vx_local_alloc" (insert_sync hoists the prologue by that name) and must not contain "__vx_"
+  // (init_block marks those noinline). CUPBOP_EXTERN_LOCAL_ALLOC=1 keeps the old call.
   FunctionCallee vxAlloc = M->getOrInsertFunction(
-      "vx_local_alloc", FunctionType::get(I8Ptr, {I32}, false));
+      std::getenv("CUPBOP_EXTERN_LOCAL_ALLOC") ? "vx_local_alloc" : "__cupbop_vx_local_alloc",
+      FunctionType::get(I8Ptr, {I32}, false));
   FunctionCallee vxBarrier = M->getOrInsertFunction(
       "vx_barrier", FunctionType::get(Type::getVoidTy(C), {I32, I32}, false));
 

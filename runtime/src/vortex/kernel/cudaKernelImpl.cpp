@@ -393,6 +393,16 @@ __attribute__((always_inline)) void *__vx_local_mem_offset(unsigned int size) {
   return (void *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
 }
 
+// The translator's shared-memory base (mem_share2local, schedules 1 and 2 with LOCALMEM=1): same value
+// as kernel_wrapper.cpp's vx_local_alloc, but defined here so that with CUPBOP_LTO=1 it inlines into the
+// kernel as one csrr instead of a call (which made every shared-memory kernel non-leaf). The stride
+// argument is unused: the KMU already hands each CTA its own window. CUPBOP_EXTERN_LOCAL_ALLOC=1 at
+// translation time calls kernel_wrapper.cpp's vx_local_alloc instead.
+extern "C" __attribute__((always_inline)) void *__cupbop_vx_local_alloc(uint32_t size) {
+  (void)size;
+  return (void *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
+}
+
 struct __vx_dim3 {
   uint32_t x;
   uint32_t y;
