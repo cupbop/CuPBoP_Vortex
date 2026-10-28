@@ -20,9 +20,24 @@ ifeq ($(CUPBOP_LTO),1)
 # arrays the translator passes to them by pointer become registers (SROA) instead of stack
 # traffic in DRAM. Separate objects otherwise.
 VX_SRCS := $(CUPBOP_WORK)/kernel_lto.bc $(CUPBOP_WORK)/kernel_wrapper.cpp
+# The libdevice compat definitions are weak (so that cudaKernelImpl.cpp and the translator's own
+# definitions take precedence), and LLVM never inlines a weak (interposable) function: every
+# __nv_min/__nv_fmaxf/... stayed a real call and made the kernel non-leaf. In the LTO bitcode they are
+# rewritten to weak_odr: llvm-link and the final link still prefer a strong definition, the
+# definitions stay in the module as before (an --internalize link let GlobalDCE drop them and their
+# libm declarations early, which changed libcall simplification: backprop's powf(2, i) became
+# exp2f calls), and the optimizer may inline them. Nothing outside this module (kernel_wrapper.cpp,
+# libvortex, libc/libm) defines __nv_*, so the ODR promise holds. CUPBOP_NV_COMPAT_NOINLINE=1 keeps
+# them weak (the old calls).
+CUPBOP_NV_COMPAT_NOINLINE ?= 0
 $(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS)
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 1,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/cudaKernelImpl.lto.bc
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 2,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc
+ifneq ($(CUPBOP_NV_COMPAT_NOINLINE),1)
+	$(LLVM_PATH)/bin/llvm-dis $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc -o $(CUPBOP_WORK)/nv_libdevice_compat.lto.ll
+	sed -i -E 's/^define weak /define weak_odr /' $(CUPBOP_WORK)/nv_libdevice_compat.lto.ll
+	$(LLVM_PATH)/bin/llvm-as $(CUPBOP_WORK)/nv_libdevice_compat.lto.ll -o $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc
+endif
 	$(LLVM_PATH)/bin/llvm-link $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/cudaKernelImpl.lto.bc $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc -o $@
 else
 VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CUPBOP_RT_SRCS)
