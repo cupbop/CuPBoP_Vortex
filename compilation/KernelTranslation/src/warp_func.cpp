@@ -1015,7 +1015,7 @@ static void replaceMmaStaged(Module &m) {
       for (auto &i : bb)
         if (auto *ci = dyn_cast<CallInst>(&i))
           if (Function *cf = ci->getCalledFunction())
-            if (cf->getName().starts_with("llvm.nvvm.mma.")) sites.push_back(ci);
+            if (cf->getName().starts_with("llvm.nvvm.mma.") || cf->getName().starts_with("cupbop.mma.")) sites.push_back(ci);
   }
   if (sites.empty()) return;
   if (vg.lanes != 16) {
@@ -1037,8 +1037,10 @@ static void replaceMmaStaged(Module &m) {
   for (auto *ci : sites) {
     StringRef Name = ci->getCalledFunction()->getName();
     const bool bf16 = Name.ends_with(".bf16");
-    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != 10) {
-      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col only)\n", Name.str().c_str());
+    // the NT=16 glue is the f16/bf16 m16n8k16 TCU tile only: tf32 / int8 / fp8 forms have no sub-pass form yet
+    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != 10 ||
+        !(Name.ends_with(".row.col.f32.f32") || Name.ends_with(".row.col.bf16"))) {
+      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col f16/bf16 -> f32 only)\n", Name.str().c_str());
       exit(1);
     }
     Function *F = ci->getFunction();
