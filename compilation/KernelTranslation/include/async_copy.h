@@ -30,4 +30,8 @@ void virt_dxa_cta_once(llvm::Module *M);
 // translated kernel, which the host runtime reads at launch: an IR-only DXA user needs no host change.
 void emit_dxa_desc_sidecar(llvm::Module *M);
 
+// The pointer an address operand (integer or pointer) was computed from: integer casts, ptrtoint, address-
+// space casts, NVVM / -O0 cvta helpers and single-store -O0 locals are looked through. nullptr if none.
+llvm::Value *cupbop_trace_pointer(llvm::Value *V);
+
 #endif
