@@ -298,7 +298,7 @@ host.out: host.o $(EXTRA_OBJS) kernel.vxbin lookup_global_symbols.txt
 	g++ -g -O0 -Wall \
 		-L../../build/runtime -L../../build/runtime/threadPool \
 		$(HOST_VX_LIBDIRS) -I$(VORTEX_PATH)/kernel/include \
-		-o $@ -fPIC -no-pie \
+		-o $@ -fPIE -pie \
 		host.o $(EXTRA_OBJS) \
 		-lc -lvortexRuntime -lvortex -lThreadPool -lpthread
 	@echo "--- Host compilation completed!"
