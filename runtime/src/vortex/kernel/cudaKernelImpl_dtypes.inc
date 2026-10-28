@@ -461,6 +461,136 @@ CUPBOP_EXPAND(CUPBOP_XWD(tf32, CUPBOP_D_TF32))
 CUPBOP_EXPAND(CUPBOP_XWD(s8, CUPBOP_D_INT8))
 CUPBOP_EXPAND(CUPBOP_XWD(u8, CUPBOP_D_INT8))
 
+// ---- wgmma.mma_async (Hopper warpgroup MMA): software reference for every type, TCU for tf32/fp8/int8 ----
+// m64nNk{16 f16/bf16, 8 tf32, 32 e4m3/e5m2/s8/u8}: K is 32 bytes = 8 words per row for every type, so A (64xK)
+// and B (NxK) use the canonical no-swizzle K-major core-matrix layout with word w of row r at
+// (r>>3)*SBO + (w>>2)*LBO + (r&7)*16 + (w&3)*4 (the f16 __cupbop_core_ld in word units). Warp w of the
+// warpgroup owns rows 16w..16w+15; acc: N/2 32-bit accumulators per thread (f32 or s32), PTX layout
+//   acc[4j+0] = (g, 8j+2t)  acc[4j+1] = (g, 8j+2t+1)  acc[4j+2] = (g+8, 8j+2t)  acc[4j+3] = (g+8, 8j+2t+1)
+// scale_d = 0: D = A*B. Swizzled descriptors are not modelled: trap rather than compute from the wrong bytes.
+struct __cupbop_wg_desc { const char *base; uint32_t lbo, sbo, swz; };
+static inline __cupbop_wg_desc __cupbop_wg_decode(uint64_t d) {
+  __cupbop_wg_desc m;
+  const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
+  m.base = (const char *)(lmem + ((((d & 0x3FFFu) << 4) - (lmem & 0x3FFFFu)) & 0x3FFFFu)); // window addr -> pointer
+  m.lbo = (uint32_t)((d >> 16) & 0x3FFFu) << 4;
+  m.sbo = (uint32_t)((d >> 32) & 0x3FFFu) << 4;
+  m.swz = (uint32_t)(d >> 62);
+  if (m.swz) __builtin_trap();
+  return m;
+}
+static inline uint32_t __cupbop_wg_word(const __cupbop_wg_desc &m, int r, int w) {
+  return *(const uint32_t *)(m.base + (r >> 3) * m.sbo + (w >> 2) * m.lbo + (r & 7) * 16 + (w & 3) * 4);
+}
+template <class EA, class EB, bool SAT>
+static inline void __cupbop_wgmma_sw(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, uint32_t *acc) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const __cupbop_wg_desc A = __cupbop_wg_decode(desc_a), B = __cupbop_wg_decode(desc_b);
+  const int row0 = 16 * warp_in_wg;
+  for (int j = 0; j < n_cols / 8; ++j)
+    for (int s = 0; s < 4; ++s) {
+      const int r = row0 + g + 8 * (s >> 1), c = 8 * j + 2 * t + (s & 1);
+      if constexpr (EA::is_int) {
+        int64_t sum = scale_d ? (int64_t)(int32_t)acc[4 * j + s] : 0; uint32_t u = scale_d ? acc[4 * j + s] : 0u;
+        for (int w = 0; w < 8; ++w) {
+          const uint32_t aw = __cupbop_wg_word(A, r, w), bw = __cupbop_wg_word(B, c, w);
+          for (int i = 0; i < EA::n; ++i) {
+            const int32_t p = EA::get(aw, i) * EB::get(bw, i);
+            if constexpr (SAT) sum += p; else u += (uint32_t)p;
+          }
+        }
+        acc[4 * j + s] = SAT ? (uint32_t)(int32_t)(sum > 2147483647LL ? 2147483647LL : (sum < -2147483648LL ? -2147483648LL : sum)) : u;
+      } else {
+        float d = scale_d ? __cupbop_bits_f32(acc[4 * j + s]) : 0.f;
+        for (int w = 0; w < 8; ++w) {
+          const uint32_t aw = __cupbop_wg_word(A, r, w), bw = __cupbop_wg_word(B, c, w);
+          for (int i = 0; i < EA::n; ++i) d += EA::get(aw, i) * EB::get(bw, i);
+        }
+        acc[4 * j + s] = __cupbop_f32_bits(d);
+      }
+    }
+}
+#if defined(CUPBOP_MMA_TCU_AVAILABLE)
+// TCU: same decomposition as __cupbop_wgmma_m64nNk16_impl (N/16 m16n16 ops per warp, the upper-k half of the
+// tile zero), word loads, tf32 moved to the 19-bit Vortex encoding, accumulators handled as 32-bit patterns.
+template <class CTX, bool TF32>
+static inline void __cupbop_wgmma_tcu(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, uint32_t *acc) {
+  auto in = [](uint32_t w) { return __cupbop_bits_f32(TF32 ? (w >> 13) : w); };
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const __cupbop_wg_desc A = __cupbop_wg_decode(desc_a), B = __cupbop_wg_decode(desc_b);
+  const int row0 = 16 * warp_in_wg;
+  typename CTX::fragment_a fa;
+  fa.data = {{in(__cupbop_wg_word(A, row0 + g, t)), in(__cupbop_wg_word(A, row0 + g, 4 + t)), 0.f, 0.f,
+              in(__cupbop_wg_word(A, row0 + g + 8, t)), in(__cupbop_wg_word(A, row0 + g + 8, 4 + t)), 0.f, 0.f}};
+  const bool odd = t & 1, hi = t >> 1;
+  for (int nb = 0; nb < n_cols / 16; ++nb) {
+    const int n0 = 16 * nb;
+    typename CTX::fragment_b fb;
+    fb.data = {{in(__cupbop_wg_word(B, n0 + g, t)), in(__cupbop_wg_word(B, n0 + g + 8, t)),
+                in(__cupbop_wg_word(B, n0 + g, 4 + t)), in(__cupbop_wg_word(B, n0 + g + 8, 4 + t)), 0.f, 0.f, 0.f, 0.f}};
+    typename CTX::fragment_acc fc, fd;
+    for (int r = 0; r < 8; ++r) {
+      if (scale_d) {
+        const int jl = (r & 3) >> 1, q = (r & 3) & 1;
+        const int src = (g << 2) | ((t >> 1) + 2 * q);
+        const int base = 4 * (2 * nb + jl) + 2 * (r >> 2);
+        const float v0 = __cupbop_shflf(__cupbop_bits_f32(acc[base]), src), v1 = __cupbop_shflf(__cupbop_bits_f32(acc[base + 1]), src);
+        fc.data[r] = odd ? v1 : v0;
+      } else {
+        fc.data[r] = 0.f;
+      }
+    }
+    CTX::mma_sync(fd, fa, fb, fc);
+    for (int jl = 0; jl < 2; ++jl) {
+      const int j = 2 * nb + jl;
+      for (int s = 0; s < 4; ++s) {
+        const int c = 8 * jl + 2 * t + (s & 1);
+        const int src = (g << 2) | (c & 3), rb = 4 * (s >> 1) + 2 * jl;
+        const float p0 = __cupbop_shflf(fd.data[rb], src), p1 = __cupbop_shflf(fd.data[rb + 1], src);
+        acc[4 * j + s] = __cupbop_f32_bits(hi ? p1 : p0);
+      }
+    }
+  }
+}
+#endif
+#define CUPBOP_WG_ARGS(ACC) int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, ACC *acc
+#define CUPBOP_GEN_WG_SW(NAME, ACC, EA, EB, SAT) \
+  extern "C" __attribute__((always_inline, convergent)) void NAME##_sw(CUPBOP_WG_ARGS(ACC)) { __cupbop_wgmma_sw<EA, EB, SAT>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, (uint32_t *)acc); }
+#define CUPBOP_GEN_WG_TCU(NAME, ACC, CTX, TF32) \
+  extern "C" __attribute__((always_inline, convergent)) void NAME##_tcu(CUPBOP_WG_ARGS(ACC)) { __cupbop_wgmma_tcu<CTX, TF32>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, (uint32_t *)acc); }
+#define CUPBOP_GEN_WG_DISPATCH(NAME, ACC, OK) \
+  extern "C" __attribute__((always_inline, convergent)) void NAME(CUPBOP_WG_ARGS(ACC)) { CUPBOP_WG_DISPATCH_BODY_##OK(NAME) }
+#define CUPBOP_WG_DISPATCH_BODY_1(NAME) NAME##_tcu(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
+#define CUPBOP_WG_DISPATCH_BODY_0(NAME) NAME##_sw(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
+#define CUPBOP_XWG(NAME, ACC, OK) CUPBOP_GEN_WG_DISPATCH(NAME, ACC, OK)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk16_f16f32, float, __cupbop_el_f16, __cupbop_el_f16, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk16_bf16f32, float, __cupbop_el_bf16, __cupbop_el_bf16, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk8_tf32f32, float, __cupbop_el_tf32, __cupbop_el_tf32, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e4m3f32, float, __cupbop_el_e4m3, __cupbop_el_e4m3, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e5m2f32, float, __cupbop_el_e5m2, __cupbop_el_e5m2, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e4m3e5m2f32, float, __cupbop_el_e4m3, __cupbop_el_e5m2, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e5m2e4m3f32, float, __cupbop_el_e5m2, __cupbop_el_e4m3, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_s8s32, int32_t, __cupbop_el_s8, __cupbop_el_s8, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_u8s32, int32_t, __cupbop_el_u8, __cupbop_el_u8, false)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_s8s32sat, int32_t, __cupbop_el_s8, __cupbop_el_s8, true)
+CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_u8s32sat, int32_t, __cupbop_el_u8, __cupbop_el_u8, true)
+#if defined(CUPBOP_TCU_TF32)
+CUPBOP_GEN_WG_TCU(__cupbop_wgmma_m64nNk8_tf32f32, float, tcu_ctx_tf32, true)
+#endif
+#if defined(CUPBOP_TCU_FP8)
+CUPBOP_GEN_WG_TCU(__cupbop_wgmma_m64nNk32_e4m3f32, float, tcu_ctx_e4m3, false)
+CUPBOP_GEN_WG_TCU(__cupbop_wgmma_m64nNk32_e5m2f32, float, tcu_ctx_e5m2, false)
+#endif
+#if defined(CUPBOP_TCU_INT8)
+CUPBOP_GEN_WG_TCU(__cupbop_wgmma_m64nNk32_s8s32, int32_t, tcu_ctx_s8, false)
+CUPBOP_GEN_WG_TCU(__cupbop_wgmma_m64nNk32_u8s32, int32_t, tcu_ctx_u8, false)
+#endif
+CUPBOP_EXPAND(CUPBOP_XWG(__cupbop_wgmma_m64nNk8_tf32f32, float, CUPBOP_D_TF32))
+CUPBOP_EXPAND(CUPBOP_XWG(__cupbop_wgmma_m64nNk32_e4m3f32, float, CUPBOP_D_FP8))
+CUPBOP_EXPAND(CUPBOP_XWG(__cupbop_wgmma_m64nNk32_e5m2f32, float, CUPBOP_D_FP8))
+CUPBOP_EXPAND(CUPBOP_XWG(__cupbop_wgmma_m64nNk32_s8s32, int32_t, CUPBOP_D_INT8))
+CUPBOP_EXPAND(CUPBOP_XWG(__cupbop_wgmma_m64nNk32_u8s32, int32_t, CUPBOP_D_INT8))
+
 #if !defined(VX_CFG_EXT_TCU_ENABLE)
 // Builds without the TCU: the existing f16 wmma symbols (what CUPBOP_MMA_LOWERING=auto emits for f16)
 // run the software path on the same 8-register fragments instead of failing to link.

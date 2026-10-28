@@ -2613,32 +2613,61 @@ void replace_asm_call(llvm::Module *M) {
               // ordinary load path, so the async-proxy fences and group bookkeeping are no-ops
               need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.mma_async") != std::string::npos) {
-              // wgmma.mma_async.sync.aligned.m64n<N>k16.f32.f16.f16 {d0..d(N/2-1)}, desc-a, desc-b, p, sA, sB, tA, tB
-              // LLVM operands: [0] desc_a (i64), [1] desc_b (i64), [2] scale-d (i32), [3..] N/2 tied f32 accumulators
-              // (plus "n" immediates between [2] and the accumulators when passed as operands).
-              // -> __cupbop_wgmma_m64nNk16_f16f32(N, desc_a, desc_b, scale_d, warp_in_warpgroup, acc[N/2])
+              // wgmma.mma_async.sync.aligned.m64n<N>k<K>[.satfinite].<d>.<a>.<b> {d0..d(N/2-1)}, desc-a, desc-b, <tail>
+              //   f16/bf16 (k16, f32): tail = scale-d, scale-a, scale-b, trans-a, trans-b
+              //   tf32 (k8) / e4m3|e5m2 (k32), f32: tail = scale-d, scale-a, scale-b   (K-major only)
+              //   s8|u8 (k32, s32):                tail = scale-d
+              // LLVM operands: [0] desc_a (i64), [1] desc_b (i64), [2] scale-d (i32, when it is a register), then the
+              // N/2 tied accumulators. -> __cupbop_wgmma_m64nNk<K>_<tag>[_sw|_tcu](N, desc_a, desc_b, scale_d, warp_in_wg, acc[N/2])
               size_t sp = asm_str.find("m64n");
               int N = (sp == std::string::npos) ? 0 : atoi(asm_str.c_str() + sp + 4);
-              bool wgF16 = asm_str.find("k16.f32.f16.f16") != std::string::npos;
-              bool wgBf16 = asm_str.find("k16.f32.bf16.bf16") != std::string::npos;
-              bool ok = N >= 8 && (N % 16) == 0 && (wgF16 || wgBf16);
+              std::string opc;
+              if (sp != std::string::npos) {
+                size_t e = asm_str.find_first_of(" \t\n{", sp);
+                opc = asm_str.substr(sp, e == std::string::npos ? std::string::npos : e - sp);
+              }
+              std::vector<std::string> otk; // m64nNkK [satfinite] d a b
+              { size_t p = 0; while (!opc.empty()) { size_t q = opc.find('.', p); otk.push_back(opc.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+              bool wsat = false;
+              for (size_t i = 1; i < otk.size(); ++i) if (otk[i] == "satfinite") { wsat = true; otk.erase(otk.begin() + i); break; }
+              std::string wd = otk.size() == 4 ? otk[1] : "", wa = otk.size() == 4 ? otk[2] : "", wb = otk.size() == 4 ? otk[3] : "";
+              int wK = 0;
+              if (!otk.empty()) { size_t kp = otk[0].find('k'); if (kp != std::string::npos) wK = atoi(otk[0].c_str() + kp + 1); }
+              std::string wtag, werr;
+              int ntrail = 0;          // trailing immediates after scale-d
+              int want[4] = {1, 1, 0, 0};
+              bool wint = tensor_is_int8(wa);
+              if (otk.size() != 4) werr = "unrecognized opcode";
+              else if (tensor_is_f16ish(wa)) {
+                if (wb != wa || wd != "f32" || wK != 16 || wsat) werr = "f16/bf16 wgmma needs m64nNk16 .f32 with equal A/B types";
+                wtag = wa + "f32"; ntrail = 4;
+              } else if (wa == "tf32") {
+                if (wb != wa || wd != "f32" || wK != 8 || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
+                wtag = "tf32f32"; ntrail = 2;
+              } else if (tensor_is_fp8(wa)) {
+                if (!tensor_is_fp8(wb) || wd != "f32" || wK != 32 || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
+                wtag = wa + (wb != wa ? wb : std::string("")) + "f32"; ntrail = 2;
+              } else if (wint) {
+                if (wb != wa || wd != "s32" || wK != 32) werr = "int8 wgmma needs m64nNk32 .s32 with equal A/B types (PTX has no mixed s8/u8 wgmma)";
+                wtag = wa + "s32" + (wsat ? "sat" : ""); ntrail = 0;
+              } else werr = "element type " + wa + " not lowered (f16, bf16, tf32, e4m3, e5m2, s8, u8)";
+              bool ok = werr.empty() && N >= 16 && N <= 256 && (N % 16) == 0;
+              if (werr.empty() && !ok) werr = "N must be a multiple of 16";
               unsigned nacc = ok ? (unsigned)N / 2 : 0;
-              unsigned firstAcc = 0;
-              while (firstAcc < Call->arg_size() &&
-                     !Call->getArgOperand(firstAcc)->getType()->isFloatTy())
-                firstAcc++;
-              // operands before the accumulators: desc_a, desc_b and, when scale-d is a
-              // register ("r" operand, clang/CUTLASS form) rather than a literal in the string
-              // (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"), the i32 scale-d
-              ok = ok && firstAcc >= 2 && Call->arg_size() == firstAcc + nacc &&
+              unsigned firstAcc = Call->arg_size() >= nacc ? Call->arg_size() - nacc : 0;
+              // operands before the accumulators: desc_a, desc_b and, when scale-d is a register ("r" operand,
+              // clang/CUTLASS form) rather than a literal in the string (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"),
+              // the i32 scale-d
+              ok = ok && (firstAcc == 2 || firstAcc == 3) &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
                    Call->getArgOperand(1)->getType()->isIntegerTy(64);
+              for (unsigned i = firstAcc; ok && i < Call->arg_size(); i++)
+                if (Call->getArgOperand(i)->getType()->getPrimitiveSizeInBits() != 32) ok = false;
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
-              // trailing operands of the instruction: [p|scale-d], scale-a, scale-b, trans-a, trans-b
               if (ok) {
-                size_t k16 = asm_str.find(wgBf16 ? "k16.f32.bf16.bf16" : "k16.f32.f16.f16");
-                size_t semi = asm_str.find(';', k16);
-                std::string tail = asm_str.substr(k16, semi - k16);
+                size_t kpos = asm_str.find(opc);
+                size_t semi = asm_str.find(';', kpos);
+                std::string tail = asm_str.substr(kpos, semi - kpos);
                 std::vector<std::string> toks; size_t st = 0;
                 for (size_t c = tail.find(','); ; c = tail.find(',', st)) {
                   toks.push_back(tail.substr(st, (c == std::string::npos ? tail.size() : c) - st));
@@ -2659,14 +2688,13 @@ void replace_asm_call(llvm::Module *M) {
                     v = atol(tk.c_str());
                   }
                 };
-                int want[4] = {1, 1, 0, 0}; // scale-a, scale-b, trans-a, trans-b
-                if (toks.size() >= 5) {
+                if ((int)toks.size() >= ntrail + 1 + 2) {
                   long v; Value *reg;
-                  for (int i = 0; i < 4; i++) {
-                    resolve(toks[toks.size() - 4 + i], v, reg);
+                  for (int i = 0; i < ntrail; i++) {
+                    resolve(toks[toks.size() - ntrail + i], v, reg);
                     if (v != want[i]) ok = false;
                   }
-                  resolve(toks[toks.size() - 5], v, reg); // scale-d
+                  resolve(toks[toks.size() - ntrail - 1], v, reg); // scale-d
                   if (reg) scaleD = reg;
                   else if (v == 0 || v == 1) scaleD = ConstantInt::get(I32, (uint64_t)v);
                   else ok = false;
@@ -2676,10 +2704,18 @@ void replace_asm_call(llvm::Module *M) {
               }
               if (!ok) {
                 fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
-                        "  only m64nNk16 .f32.f16.f16 / .f32.bf16.bf16, K-major A and B (trans 0,0), scale 1,1 are lowered\n",
-                        (unsigned)Call->arg_size(), asm_str.c_str());
+                        "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (K-major A and B, trans 0,0, scale 1,1), "
+                        "m64nNk8 .f32.tf32.tf32 and m64nNk32 .f32.e4m3|e5m2 (scale 1,1), m64nNk32 [.satfinite].s32.s8.s8 / .u8.u8\n",
+                        (unsigned)Call->arg_size(), asm_str.c_str(), werr.empty() ? "operands" : werr.c_str());
                 exit(1);
               }
+              const std::string wbase = "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wtag;
+              std::string wname;
+              if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
+                wname = wbase; // f16/bf16: the TCU wrappers as before (TCU builds)
+              else
+                wname = tensor_pick_symbol("wgmma " + opc, wbase, "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wa + "s32", wa, wb, wsat);
+              Type *AccT = wint ? I32 : F32;
               IRBuilder<> builder(Call);
               auto sreg = [&](const char *name) -> Value * {
                 return builder.CreateCall(
@@ -2694,21 +2730,26 @@ void replace_asm_call(llvm::Module *M) {
               lin = builder.CreateAdd(lin, builder.CreateMul(sreg("llvm.nvvm.read.ptx.sreg.tid.z"),
                                                              builder.CreateMul(ntx, nty)));
               Value *wig = builder.CreateAnd(builder.CreateLShr(lin, 5), 3, "warp.in.wg");
-              Type *AccTy = ArrayType::get(F32, nacc);
+              Type *AccTy = ArrayType::get(AccT, nacc);
               IRBuilder<> AB(&Call->getFunction()->getEntryBlock().front());
               Value *Acc = AB.CreateAlloca(AccTy, nullptr, "wgmma.acc");
-              for (unsigned i = 0; i < nacc; i++)
-                builder.CreateStore(Call->getArgOperand(firstAcc + i),
-                                    builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
+              for (unsigned i = 0; i < nacc; i++) {
+                Value *v = Call->getArgOperand(firstAcc + i);
+                if (v->getType() != AccT) v = builder.CreateBitCast(v, AccT);
+                builder.CreateStore(v, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
+              }
               FunctionCallee FC = M->getOrInsertFunction(
-                  wgBf16 ? "__cupbop_wgmma_m64nNk16_bf16f32" : "__cupbop_wgmma_m64nNk16_f16f32",
-                  FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
-              builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
-                                      Call->getArgOperand(1), scaleD, wig, Acc});
+                  wname, FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
+              tensor_set_convergent(builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
+                                                            Call->getArgOperand(1), scaleD, wig, Acc}));
               Value *Res = UndefValue::get(Call->getType());
-              for (unsigned i = 0; i < nacc; i++)
-                Res = builder.CreateInsertValue(
-                    Res, builder.CreateLoad(F32, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i)), i);
+              auto *RST = dyn_cast<StructType>(Call->getType());
+              for (unsigned i = 0; i < nacc; i++) {
+                Value *v = builder.CreateLoad(AccT, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
+                Type *ET = RST ? RST->getElementType(i) : Call->getType();
+                if (v->getType() != ET) v = builder.CreateBitCast(v, ET);
+                Res = builder.CreateInsertValue(Res, v, i);
+              }
               Call->replaceAllUsesWith(Res);
               need_remove.push_back(Call);
             } else if (asm_str.find("movmatrix.sync.aligned.m8n8.trans.b16") !=
