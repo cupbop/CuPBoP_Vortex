@@ -60,3 +60,7 @@ VX_CFLAGS += -Wno-error -w -mllvm -disable-loop-idiom-all
 # misaligned addresses / "IPDOM stack is empty". Raise the limit (compile time, not correctness).
 CUPBOP_DIV_MAX_BBS ?= 1000000
 VX_CFLAGS += -mllvm -vortex-divergence-max-bbs=$(CUPBOP_DIV_MAX_BBS)
+# Extra kernel-compile flags from the environment (empty by default), e.g. CUPBOP_VX_EXTRA_CFLAGS="-mllvm
+# -split-spill-mode=size" works around an LLVM 20 RAGreedy crash (SplitEditor::deleteRematVictims) seen on the
+# lifted PyTorch reduce_kernel (global_avgpool).
+VX_CFLAGS += $(CUPBOP_VX_EXTRA_CFLAGS)

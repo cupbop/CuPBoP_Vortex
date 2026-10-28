@@ -56,6 +56,19 @@ int main(int argc, char **argv) {
   // LLVM 20 clang: kernels carry the ptx_kernel calling convention (no "kernel" annotation)
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
+  {
+    // A module without any kernel entry (no nvvm.annotations "kernel" / ptx_kernel function) used to translate
+    // into an ELF with an empty kernel table that only fails at launch. CuLifter's CPU-lifter output (kernel
+    // `void K()` reading a thread_local const_mem image, ir/platform_porting/raw) is such a module.
+    int nkern = 0;
+    for (auto &F : *program)
+      if (!F.isDeclaration() && isKernelFunction(program, &F)) ++nkern;
+    if (nkern == 0) {
+      fprintf(stderr, "kernelTranslator: error: %s has no kernel entry (no nvvm.annotations \"kernel\" or ptx_kernel "
+                      "function); CuLifter CPU-lifter IR must be converted to NVVM form first\n", argv[1]);
+      return 1;
+    }
+  }
 
   // Hopper/Ampere async PTX (mbarrier, TMA, bulk copy, elect, cluster registers; async_ptx.h): first, so that
   // lower_named_barriers and lower_cp_async only see what is left, and every later pass sees plain calls
