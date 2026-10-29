@@ -2455,7 +2455,77 @@ public:
       // llvm::errs() << "--------------\n";
     } while (iter != exit);
     
-    bool any_divergent_var = region_is_divergent();
+    // Schedule 1 (core mapping) uses the whole-region test above; schedules 0/2 keep the original single-path
+    // walk unchanged (it is part of their CI baseline: score-cuda s0 changed behaviour with the new test).
+    bool any_divergent_var = false;
+    if (g_schedule_flag == 1) {
+      any_divergent_var = region_is_divergent();
+    } else {
+    iter = entry;
+    // create a vector of BasicBlock*
+    std::vector<BasicBlock *> checked_blocks;
+    checked_blocks.push_back(entry);
+    do {
+      // llvm::errs() << "divergent iteration check: \n";
+      //  go through every variable in the block and check whether they have any
+      //  divergent variable
+      for (auto &I : *iter) {
+        // get all the operands of the instruction
+        if (llvm::dyn_cast<llvm::BranchInst>(&I) != nullptr ||
+            llvm::dyn_cast<llvm::ReturnInst>(&I) != nullptr ||
+            llvm::dyn_cast<llvm::CallInst>(&I) != nullptr ||
+            I.getNumOperands() == 0) {
+          continue;
+        }
+        // llvm::errs() << "Instruction check: ";
+        // I.print(llvm::errs());
+        // llvm::errs() << "number of operands: " << I.getNumOperands();
+        for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
+
+          llvm::Value *v = I.getOperand(i);
+          if (!v || llvm::dyn_cast<llvm::Constant>(v) != nullptr) {
+            continue;
+          }
+          // v->print(llvm::errs());
+          // llvm::errs() << "checking operand: \n";
+          if (DI.isDivergent(v)) {
+            any_divergent_var = true;
+            goto divergent_found;
+          }
+        }
+      }
+      if (iter == exit) {
+        break;
+      }
+
+      if (auto *BI = dyn_cast<BranchInst>(iter->getTerminator())) {
+        if (BI->isConditional()) {
+          // pick the “other” successor that isn’t the back‐edge
+          BasicBlock *succ0 = BI->getSuccessor(0);
+          BasicBlock *succ1 = BI->getSuccessor(1);
+          
+          // check if the successor is in the checked_blocks
+          if (std::find(checked_blocks.begin(), checked_blocks.end(), succ0) ==
+              checked_blocks.end()) {
+            checked_blocks.push_back(succ0);
+            iter = succ0;
+          } else {
+            checked_blocks.push_back(succ1);
+            iter = succ1;
+          }
+        } else {
+          iter = iter->getTerminator()->getSuccessor(0);
+        }
+      }
+        
+      // llvm::errs() << iter->getName().str() << "\n";
+      // llvm::errs() << exit->getName().str() << "\n";
+      // llvm::errs() << "iter, exit check--------------\n";
+
+    } while (iter != exit);
+    }
+
+    divergent_found:
 
     // virt sub-pass form: a region that is not looped runs once per hardware thread, but
     // allocas written there may be per-lane copies (e.g. kernel-argument stores into the

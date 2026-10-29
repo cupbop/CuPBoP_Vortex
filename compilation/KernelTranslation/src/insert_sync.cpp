@@ -936,6 +936,6 @@ void insert_sync(llvm::Module *M) {
     }
   }
   Passes.run(*M);
-  if (schedule == 0 || schedule == 1)
+  if (schedule == 1)   // core mapping only: with it, score-cuda s0 (warp_shfl, nested loops) left its CI baseline
     separate_multi_entry_regions(M);
 }

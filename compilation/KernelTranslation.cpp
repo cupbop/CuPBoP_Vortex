@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
   mark_dxa_waits(program);
 
 
-  // Warp loops (schedule 0 / core mapping 1) need reducible control flow. insert_sync places the
+  // Warp loops (core mapping, schedule 1) need reducible control flow. insert_sync places the
   // loop-boundary barriers with LoopInfo, which does not see an irreducible cycle, and the parallel
   // region before a barrier that such a cycle enters twice gets two entries and is left without a warp
   // loop: its code then runs once per hardware thread instead of once per logical thread. Lifted
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
   // preheaders; reducible functions are left untouched.
   int irr_schedule = 2;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) irr_schedule = std::stoi(std::string(env));
-  if (irr_schedule == 0 || irr_schedule == 1) {
+  if (irr_schedule == 1) {   // core mapping only; schedule 0 keeps its CI baseline
     // before init_block, so that the guard PHIs FixIrreducible creates are demoted with all the others
     PassBuilder IPB;
     LoopAnalysisManager ILAM; FunctionAnalysisManager FAM; CGSCCAnalysisManager ICGAM; ModuleAnalysisManager IMAM;
