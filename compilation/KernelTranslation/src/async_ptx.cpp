@@ -224,6 +224,8 @@ struct PassState {
   std::map<Function *, std::vector<CallInst *>> arrives; // candidates for the §5.3 move
   std::set<CallInst *> txCopies;                          // copies that complete on an mbarrier
   std::set<Function *> needWarps;                         // functions with ops that need real warps
+  std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
+  std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
   unsigned n_asm = 0, n_intr = 0, n_moved = 0;
   explicit PassState(Module *m)
       : M(m), ctx(m->getContext()), I1(Type::getInt1Ty(ctx)), I32(Type::getInt32Ty(ctx)), I64(Type::getInt64Ty(ctx)),
@@ -718,9 +720,10 @@ struct AsmLowering {
         underPred(pred, [&]() -> Value * {
           Value *dst = addr(ops[0], "shared destination");
           Value *desc = nullptr;
-          std::vector<Value *> c = coords(ops[1], desc); // the mbarrier operand: completion is synchronous
+          std::vector<Value *> c = coords(ops[1], desc);
+          Value *mb = addr(ops[2], "mbarrier"); // DXA mode completes the transfer there; software mode ignores it
           CallInst *k = S.call(B, kTmaLoad, S.Void,
-                               {dst, desc, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
+                               {dst, desc, mb, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
           S.txCopies.insert(k);
           return nullptr;
         });
@@ -961,6 +964,7 @@ void moveArrives(PassState &S, Function *F) {
       }
     }
     const bool tx = A->getCalledFunction()->getName() == kArriveTx;
+    for (CallInst *Cp : copies) S.orderedCopies.insert(Cp);
     if (copies.empty()) {
       if (tx) {
         auto *K = dyn_cast<ConstantInt>(A->getArgOperand(1));
@@ -1045,9 +1049,46 @@ void moveArrives(PassState &S, Function *F) {
         }
       }
     }
+    // TMA loads among the copies queue their DXA issue (DXA mode) until the moved arrive has arrived: see
+    // __cupbop_tma_load_q in cudaKernelImpl_async.inc (a DXA completion must not overtake the arrival)
+    bool anyTma = false;
+    for (CallInst *Cp : copies) anyTma |= Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoad;
+    Value *Q = nullptr;
+    if (anyTma) {
+      Q = S.txq[F];
+      if (!Q) {
+        IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+        AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
+        AI->setAlignment(Align(8));
+        // n = 0 after the entry block's allocas (the core-mapping passes expect them contiguous at the top)
+        Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
+        while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
+        IRBuilder<>(firstNonAlloca).CreateStore(ConstantInt::get(S.I32, 0), AI);
+        S.txq[F] = Q = AI;
+      }
+      for (CallInst *Cp : copies) {
+        if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
+        IRBuilder<> CB(Cp);
+        std::vector<Value *> args{Q};
+        for (auto &U : Cp->args()) args.push_back(U.get());
+        CallInst *N = S.call(CB, "__cupbop_tma_load_q", S.Void, args, true);
+        S.txCopies.erase(Cp);
+        S.txCopies.insert(N);
+        S.orderedCopies.erase(Cp);
+        S.orderedCopies.insert(N);
+        Cp->eraseFromParent();
+      }
+    }
     for (Instruction *IP : IPs) {
-      Instruction *Cl = A->clone();
-      Cl->insertBefore(IP);
+      if (Q) {
+        IRBuilder<> IB(IP);
+        const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+        S.call(IB, isTx ? "__cupbop_mbar_arrive_tx_q" : "__cupbop_mbar_arrive_q", S.I32,
+               {Q, A->getArgOperand(0), A->getArgOperand(1)});
+      } else {
+        Instruction *Cl = A->clone();
+        Cl->insertBefore(IP);
+      }
     }
     A->eraseFromParent();
     S.n_moved++;
@@ -1182,6 +1223,15 @@ void lower_async_ptx(Module *M) {
   for (auto *F : touched) foldIntegers(*F);
   for (auto &F : *M)
     if (!F.isDeclaration()) moveArrives(S, &F);
+  // A copy completing on an mbarrier that no arrive of its own thread follows (before a wait) relies on the
+  // transaction count to hold the phase open -- e.g. a standalone mbarrier.expect_tx and the copy here, the
+  // arrival in another thread -- which the synchronous copies do not model: refuse instead of racing.
+  if (!std::getenv("CUPBOP_ASYNC_NO_MOVE"))
+    for (CallInst *Cp : S.txCopies)
+      if (!S.orderedCopies.count(Cp))
+        fail_at(Cp, "a bulk / TMA copy completing on an mbarrier is not followed, in the same thread and before any "
+                    "wait, by an arrive on it: without a transaction count the synchronous copy cannot hold the "
+                    "phase open (async design §5.3); refusing");
 
   // 4. schedules
   if (!S.needWarps.empty()) {

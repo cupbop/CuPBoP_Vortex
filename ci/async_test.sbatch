@@ -48,5 +48,18 @@ expect_refused s0_async_mbar_ws   'only supported on the 1:1 schedule' async_mba
 expect_refused s0_async_tma2d     'only supported on the 1:1 schedule' async_tma2d 0
 expect_refused s2_neg_wait_before_copy '5.3)' async_tma2d 2 EXTRA_CLANG_FLAGS=-DASYNC_NEG_WAIT_BEFORE_COPY
 expect_refused s2_neg_other_thread     '5.3)' async_tma2d 2 EXTRA_CLANG_FLAGS=-DASYNC_NEG_OTHER_THREAD
+expect_refused s2_neg_expect_only      '5.3)' async_tma2d 2 EXTRA_CLANG_FLAGS=-DASYNC_NEG_EXPECT_ONLY
 expect_fail    s2_control_no_move async_tma2d 2 CUPBOP_ASYNC_NO_MOVE=1
+# stage 3: TMA in DXA mode (CUPBOP_TMA_DXA=1, a 64-byte-row tensor) on the TCU+DXA SimX build; must PASS and be
+# far faster than the software copies (about 3.6M cycles), i.e. the DXA really carried the boxes
+cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU" > /dev/null || { echo "SIMX (TCU/DXA) BUILD FAILED"; exit 1; }
+for sch in 2 1; do
+  tag=s${sch}_async_tma2d_dxa
+  ( cd examples/async_tma2d && make clean > /dev/null 2>&1; rm -f ci_output.txt
+    env VORTEX_PATH=$VORTEX_PATH_TCU VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" CUPBOP_TMA_DXA=1 make ci SCHEDULE=$sch CI_RUN_ARGS="-w 48" > $OUT/$tag.log 2>&1
+    cp -f ci_output.txt $OUT/$tag.out 2>/dev/null; cat Perf_counter_*SCHE_${sch}*.txt > $OUT/$tag.perf 2>/dev/null )
+  cyc=$(grep -h -o 'cycles=[0-9]*' $OUT/$tag.perf $OUT/$tag.out 2>/dev/null | tail -1 | cut -d= -f2)
+  if grep -q '^PASSED!' $OUT/$tag.out 2>/dev/null && [ -n "$cyc" ] && [ "$cyc" -lt 1000000 ]; then echo "$tag: PASS (cycles=$cyc)"
+  else echo "$tag: FAIL (unexpected; cycles=${cyc:-?}, see $OUT/$tag.log)"; fi
+done
 INNER

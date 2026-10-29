@@ -18,7 +18,13 @@ __global__ void tma2d(const __grid_constant__ CUtensorMap tmap, float *__restric
   float acc = 0.f;
   for (int k = 0; k < ntiles; ++k) {
     int s = k & 1;
-#if defined(ASYNC_NEG_OTHER_THREAD) // refusal test: the copy is issued by another thread than the arrive
+#if defined(ASYNC_NEG_EXPECT_ONLY) // refusal test: a standalone expect_tx and the copy here, the arrival elsewhere
+    if (t == 0) {
+      asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(&full[s])), "r"(BX * BY * 4) : "memory");
+      tma_load_2d(tile[s], &tmap, &full[s], 0, (blockIdx.x * ntiles + k) * BY);
+    }
+    if (t == 32) mbar_arrive(&full[s]);
+#elif defined(ASYNC_NEG_OTHER_THREAD) // refusal test: the copy is issued by another thread than the arrive
     if (t == 0) mbar_arrive_expect_tx(&full[s], BX * BY * 4);
     if (t == 32) tma_load_2d(tile[s], &tmap, &full[s], 0, (blockIdx.x * ntiles + k) * BY);
 #else
@@ -42,6 +48,7 @@ int main(int argc, char **argv) {
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!strcmp(argv[i], "-b")) blocks = atoi(argv[i + 1]);
     if (!strcmp(argv[i], "-t")) ntiles = atoi(argv[i + 1]);
+    if (!strcmp(argv[i], "-w")) W = atoi(argv[i + 1]);
   }
   const int H = blocks * ntiles * BY - 5, threads = 128;
   printf("async_tma2d: blocks=%d ntiles=%d tensor %dx%d box %dx%d\n", blocks, ntiles, W, H, BX, BY);

@@ -240,6 +240,17 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
       return bad("globalStrides must be multiples of 16 below 2^40");
     r.stride[i] = globalStrides[i];
   }
+  // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
+  // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
+  r.dxa_slot = 0xFFFFFFFFu;
+  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e)) {
+    bool ok = (r.gaddr % 64 == 0) && ((uint64_t)r.dim[0] * r.elem % 64 == 0);
+    for (uint32_t i = 0; i + 1 < tensorRank; ++i) ok = ok && r.stride[i] % 64 == 0 && r.stride[i] <= 0xFFFFFFFFull;
+    if (ok) r.mode = CUPBOP_TMAP_MODE_DXA;
+    else
+      fprintf(stderr, "cuTensorMapEncodeTiled (CuPBoP): DXA mode needs 64-byte aligned rows (base, dim0 * element "
+                      "size and strides multiples of 64); software copies for this tensor map\n");
+  }
   void *dev = nullptr;
   if (cudaMalloc(&dev, 128) != cudaSuccess || !dev) return bad("cudaMalloc of the device record failed");
   r.self = (uint64_t)(uintptr_t)dev;
@@ -1501,6 +1512,36 @@ cudaError_t cudaLaunchKernel_vortex(
     dxa_program(DC->device(), d);
   }
 
+
+  // ── TMA tensor maps in DXA mode (cuTensorMapEncodeTiled with CUPBOP_TMA_DXA=1): a DXA slot per by-value
+  // CUtensorMap argument of this launch, from slot 15 down (explicit descriptors use the low slots); the device
+  // record learns its slot. A tensor map reached otherwise (e.g. through a pointer) keeps no slot and is copied
+  // in software by the device helper.
+  {
+    uint32_t next_slot = 15;
+    std::map<uint64_t, uint32_t> given;
+    for (int i = 0; i < num_args; ++i) {
+      cupbop_tmap r;
+      memcpy(&r, args[i], sizeof(r)); // args[i] points at the argument's host value (128 bytes for a CUtensorMap)
+      if (r.magic != CUPBOP_TMAP_MAGIC || r.mode != CUPBOP_TMAP_MODE_DXA || !r.self || given.count(r.self)) continue;
+      if (next_slot < 8) {
+        fprintf(stderr, "cudaLaunchKernel: more than 8 DXA-mode tensor maps; the rest are copied in software\n");
+        break;
+      }
+      DxaDescEntry d{};
+      d.slot = next_slot--; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem;
+      for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
+      for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
+      d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
+      std::string err = dxa_desc_check(d);
+      if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
+      dxa_program(DC->device(), d);
+      given[r.self] = d.slot;
+      cudaMemcpy((void *)(uintptr_t)(r.self + offsetof(cupbop_tmap, dxa_slot)), &d.slot, sizeof(uint32_t),
+                 cudaMemcpyHostToDevice);
+      DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
+    }
+  }
 
   // ── CUPBOP_LAUNCH2: hardware CTA dispatch via vx_enqueue_launch ─────────────
   {
