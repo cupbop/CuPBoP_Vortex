@@ -794,8 +794,9 @@ static void erase_warp_syncs_for_virt(llvm::Module *M, bool keep_markers = false
 // The conditional-if/for passes above produce single-entry regions for structured source code; lifted
 // (SASS-derived) control flow leaves merge points whose predecessors come from different barriers (the
 // cuBLAS ampere_sgemm main loop after FixIrreducible: the loop header and the bottom test both branch
-// into the same block). At such a merge M whose predecessors all contain a barrier, put a region boundary
-// at the end of every predecessor and
+// into the same block; an early `return` path and the code after the last barrier both reaching the shared return
+// block). At such a merge M whose predecessors are all reached by every thread (each contains a barrier or
+// post-dominates the barriers it is entered from), put a region boundary at the end of every predecessor and
 // at the start of M: each incoming path then ends its own region, and the code from M on starts a
 // single-entry one; the region left between them holds only branches. The boundaries are entry/exit
 // markers (no hardware barrier under the core mapping): they only order logical warps inside a
@@ -814,9 +815,28 @@ static void separate_multi_entry_regions(llvm::Module *M) {
   for (llvm::Function &F : *M) {
     if (F.isDeclaration() || !isKernelFunction(M, &F)) continue;
     int added = 0;
-    for (int iter = 0; iter < 64; ++iter) {
+    // A predecessor is safe for a boundary when every thread that passes the barriers leading to it also passes
+    // it: it contains a barrier itself, or it post-dominates every barrier block (or the entry) it is entered from.
+    // (The boundaries below do not change the CFG, so one post-dominator tree serves all iterations.)
+    llvm::PostDominatorTree PDT(F);
+    std::map<llvm::BasicBlock *, std::set<llvm::BasicBlock *>> in, out;
+    std::set<llvm::BasicBlock *> done;
+    auto hasBarB = [](llvm::BasicBlock &B) { for (auto &I : B) if (isCtaBarrierCall(I)) return true; return false; };
+    // A block entered only from barrier blocks also qualifies: at a merge of differently-entered regions the
+    // branch that split the paths chose between different barrier sequences, which CUDA requires to be uniform
+    // (the loop exit after a barrier-carrying loop body, e.g. `common.ret.loopexit` in lifted Warp cholesky).
+    auto uniformlyReached = [&](llvm::BasicBlock *P) {
+      if (hasBarB(*P)) return true;
+      bool all_bar_preds = P->hasNPredecessorsOrMore(1);
+      for (auto *Q : llvm::predecessors(P)) all_bar_preds &= hasBarB(*Q);
+      if (all_bar_preds) return true;
+      if (in[P].empty()) return false;
+      for (auto *E : in[P]) if (!PDT.dominates(P, E)) return false;
+      return true;
+    };
+    for (int iter = 0; iter < 4096; ++iter) {
       // out[b]: the barriers a path leaving b last crossed (b itself if it has a barrier); in[b]: union over preds
-      std::map<llvm::BasicBlock *, std::set<llvm::BasicBlock *>> in, out;
+      in.clear(); out.clear();
       auto hasBar = [](llvm::BasicBlock &B) { for (auto &I : B) if (isCtaBarrierCall(I)) return true; return false; };
       bool ch = true;
       while (ch) {
@@ -832,10 +852,10 @@ static void separate_multi_entry_regions(llvm::Module *M) {
       llvm::BasicBlock *merge = nullptr;
       for (llvm::BasicBlock &B : F) {
         if (in[&B].size() < 2) continue;
-        // Only where every predecessor itself contains a CTA barrier: those blocks are executed by every
-        // thread (CUDA requires it), so a boundary at their end cannot land in thread-divergent code.
+        // Only where every predecessor is reached by every thread (see uniformlyReached), so a boundary at
+        // its end cannot land in thread-divergent code.
         bool all_pred_bar = true;
-        for (auto *P : llvm::predecessors(&B)) all_pred_bar &= hasBar(*P);
+        for (auto *P : llvm::predecessors(&B)) all_pred_bar &= uniformlyReached(P);
         if (!all_pred_bar) continue;
         // only where the multi-entry region has real work: B up to its next barrier, or the region code
         // reaching B (preds back to their barriers)
@@ -846,19 +866,20 @@ static void separate_multi_entry_regions(llvm::Module *M) {
         while (!work && !st.empty()) {
           auto *P = st.back(); st.pop_back();
           if (!seen.insert(P).second) continue;
-          bool after_bar = !hasBar(*P);
-          for (auto &I : *P) {
-            if (isCtaBarrierCall(I)) { after_bar = true; continue; }
-            if (after_bar && !isTrivialInst(I)) { work = true; break; }
+          // only the part of P after its last barrier belongs to this region
+          for (auto it = P->rbegin(); it != P->rend(); ++it) {
+            if (isCtaBarrierCall(*it)) break;
+            if (!isTrivialInst(*it)) { work = true; break; }
           }
           if (!hasBar(*P)) st.insert(st.end(), llvm::pred_begin(P), llvm::pred_end(P));
         }
-        if (!work) continue;
+        if (!work || done.count(&B)) continue;
         // the forward part may itself be a trivial branch block (e.g. `br`) but the paths into it are not
         merge = &B;
         break;
       }
       if (!merge) break;
+      done.insert(merge);   // boundaries are placed once per merge; a merge that needs none is not retried
       auto marker = [&](llvm::Instruction *before) {
         auto *c = CreateInterWarpBarrier(before);
         auto &mctx = c->getContext();
