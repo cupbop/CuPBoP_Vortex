@@ -439,8 +439,12 @@ void lower_atomicrmw_fadd(llvm::Module *M) {
   size_t nuniform = 0, ngeneral = 0;
   for (auto *RMW : fadd_ops) {
     IRBuilder<> B(RMW);
-    auto *ptr = RMW->getPointerOperand();
+    Value *ptr = RMW->getPointerOperand();
     auto *addend = RMW->getValOperand();
+    // the helpers take a generic pointer; CuLifter's RED.E.ADD.F32 is an atomicrmw on ptr addrspace(1)
+    // (lifted CUTLASS FMHA backward: "Call parameter type does not match function signature")
+    if (ptr->getType()->getPointerAddressSpace() != 0)
+      ptr = B.CreateAddrSpaceCast(ptr, PtrTy);
 
     // Fast path: if the atomic result is unused AND the pointer is a
     // kernel argument (uniform across the warp — all 32 lanes add to
@@ -1600,8 +1604,12 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "llvm.nvvm.membar.cta" ||
                        func_name == "llvm.nvvm.membar.sys") {
               // Vortex has a single fence scope (a whole-cache flush on the RTL); membar.cta next to a
-              // barrier was already dropped by drop_cta_membar_at_barriers.
-              Call->getCalledFunction()->setName("__nvvm_membar_gl");
+              // barrier was already dropped by drop_cta_membar_at_barriers. The first kind renames its
+              // declaration (as before); a second kind is redirected to it (renaming made "__nvvm_membar_gl1").
+              if (Function *Prev = M->getFunction("__nvvm_membar_gl"))
+                Call->setCalledFunction(Prev);
+              else
+                Call->getCalledFunction()->setName("__nvvm_membar_gl");
             } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") !=
                        std::string::npos) {
               Call->getCalledFunction()->setName("__nvvm_atomic_load_inc_32");
@@ -4194,6 +4202,62 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
 
   for (CallInst *CI : ToReplace) {
     const std::string Name = CI->getCalledFunction()->getName().str();
+    // f16 accumulators (HMMA.16816.F16 / HMMA.1688.F16) and fp64 m8n8k4 (DMMA.884): two accumulator registers,
+    // runtime helpers __cupbop_mma_m16n8k{16,8}_f16f16 / __cupbop_mma_m8n8k4_f64f64 (cudaKernelImpl_dtypes.inc)
+    {
+      struct Acc2Form { const char *intr, *base; int nAB; bool f64; };
+      static const Acc2Form forms[] = {
+          {"llvm.nvvm.mma.m16n8k16.row.col.f16.f16", "__cupbop_mma_m16n8k16_f16f16", 6, false},
+          {"llvm.nvvm.mma.m16n8k8.row.col.f16.f16", "__cupbop_mma_m16n8k8_f16f16", 3, false},
+          {"llvm.nvvm.mma.m8n8k4.row.col.f64", "__cupbop_mma_m8n8k4_f64f64", 2, true},
+      };
+      const Acc2Form *form = nullptr;
+      for (auto &f : forms) if (Name == f.intr) form = &f;
+      if (form) {
+        if (CI->arg_size() != (unsigned)(form->nAB + 2)) {
+          fprintf(stderr, "error: mma.sync intrinsic %s with %u operands (expected %d)\n", Name.c_str(), (unsigned)CI->arg_size(), form->nAB + 2);
+          exit(1);
+        }
+        std::string rtName;
+        if (form->f64) {
+          if (tensor_lowering_mode() == "tcu") {
+            fprintf(stderr, "error: %s: CUPBOP_MMA_LOWERING=tcu cannot lower it: the Vortex TCU has no fp64; use sw or auto\n", Name.c_str());
+            exit(1);
+          }
+          rtName = std::string(form->base) + "_sw";
+        } else {
+          rtName = tensor_pick_symbol(Name, form->base, form->base, "f16", "f16", false);
+        }
+        Type *ElT = form->f64 ? Type::getDoubleTy(Ctx) : I32; // operand / accumulator register type
+        IRBuilder<> B(CI);
+        SmallVector<Value *, 10> Args;
+        SmallVector<Type *, 10> ArgTys;
+        for (unsigned i = 0; i < CI->arg_size(); i++) {
+          Value *V = CI->getArgOperand(i);
+          if (V->getType() != ElT) V = B.CreateBitCast(V, ElT);
+          Args.push_back(V);
+          ArgTys.push_back(ElT);
+        }
+        Type *DTy = ArrayType::get(ElT, 2);
+        IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
+        Value *D = AB.CreateAlloca(DTy, nullptr, "mma.d");
+        Args.push_back(D);
+        ArgTys.push_back(PtrTy);
+        FunctionCallee FC = M->getOrInsertFunction(rtName.c_str(), FunctionType::get(VoidTy, ArgTys, false));
+        tensor_set_convergent(B.CreateCall(FC, Args));
+        auto *RT = cast<StructType>(CI->getType());
+        Value *Result = UndefValue::get(RT);
+        for (unsigned i = 0; i < 2; i++) {
+          Value *V = B.CreateLoad(ElT, B.CreateConstInBoundsGEP2_32(DTy, D, 0, i));
+          if (RT->getElementType(i) != ElT) V = B.CreateBitCast(V, RT->getElementType(i));
+          Result = B.CreateInsertValue(Result, V, i);
+        }
+        DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.c_str(), rtName.c_str());
+        CI->replaceAllUsesWith(Result);
+        CI->eraseFromParent();
+        continue;
+      }
+    }
     // <prefix><geom>.<la>.<lb>[.satfinite].<sig...>
     std::string rest = Name.substr(Name.rfind("llvm.nvvm.mma.", 0) == 0 ? strlen("llvm.nvvm.mma.") : strlen("cupbop.mma."));
     std::vector<std::string> tk;
@@ -4217,7 +4281,7 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     if (!ok || CI->arg_size() != (unsigned)(S.nA + S.nB + 4)) {
       fprintf(stderr,
               "error: unsupported mma.sync intrinsic %s (%u operands): %s. Lowered: m16n8k16/m16n8k8 .row.col "
-              "f16|bf16 -> f32, m16n8k8/m16n8k4 tf32 -> f32, m16n8k32/m16n8k16 s8|u8 -> s32 [.satfinite], "
+              "f16|bf16 -> f32, m16n8k16/m16n8k8 f16 -> f16, m8n8k4 f64, m16n8k8/m16n8k4 tf32 -> f32, m16n8k32/m16n8k16 s8|u8 -> s32 [.satfinite], "
               "m16n8k32 e4m3|e5m2 -> f32\n",
               Name.c_str(), (unsigned)CI->arg_size(), err.empty() ? "operand count" : err.c_str());
       exit(1);

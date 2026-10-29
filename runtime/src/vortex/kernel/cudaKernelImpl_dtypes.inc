@@ -605,4 +605,157 @@ extern "C" void __vx_wmma_store_d_m16n16k16_f32(float *p, const float *frag, int
 extern "C" void __vx_wmma_mma_m16n16k16_row_row_f16_f16_f32(float *d, const uint32_t *a, const uint32_t *b, const float *c) { __cupbop_wmma_mma_f16_sw(d, a, b, c); }
 #endif
 #endif // NT=32 wmma
+
+// ---- mma.sync with f16 accumulators: m16n8k16 / m16n8k8 .row.col.f16.f16 (HMMA.16816.F16 / HMMA.1688.F16) -------
+// C/D are two f16x2 registers per lane: c0 = {C[g][2t], C[g][2t+1]}, c1 = {C[g+8][2t], C[g+8][2t+1]} (low half =
+// lower column), i.e. the f32-accumulator fragment's (c0,c1) and (c2,c3) packed. Model: the f32-accumulator helper
+// (exact f16 products, fp32 sums starting from C) and one round-to-nearest-even to f16 per element at the end.
+// PTX leaves the internal precision of f16 accumulation unspecified; NVIDIA tensor cores keep at least fp16 per
+// partial sum, so results can differ from a GPU by an f16 ulp or so when the k-sum is not exact.
+// Symbols: __cupbop_mma_m16n8k{16,8}_f16f16{,_sw,_tcu}(a.., b.., uint32 c0, uint32 c1, uint32 *d2); _tcu runs the f32
+// TCU helper (built only when the f16 one is), dispatch as for f16f32.
+// f32 -> f16 bits, round to nearest even, branch-free (selects; cf. __cupbop_f16_to_f32). NaN -> 0x7e00 (quiet).
+static inline uint32_t __cupbop_f32_to_f16_rne(float f) {
+  const uint32_t x = __cupbop_f32_bits(f), sign = (x >> 16) & 0x8000u, ax = x & 0x7fffffffu;
+  // subnormal / zero result (|f| < 2^-14): the fp32 add rounds |f| to a multiple of 2^-24 (RNE)
+  const float magic = __cupbop_bits_f32(0x3f000000u); // 0.5f: ((127-15)+(23-10)+1) << 23
+  const uint32_t sub = __cupbop_f32_bits(__cupbop_bits_f32(ax) + magic) - 0x3f000000u;
+  // normal result: rebias, add 0xfff + lsb (ties to even), shift; overflow carries into 0x7c00 (inf)
+  const uint32_t nrm = (ax + 0xc8000fffu + ((ax >> 13) & 1u)) >> 13; // 0xc8000000 = (15-127) << 23
+  uint32_t h = ax < 0x38800000u ? sub : nrm;
+  h = ax >= 0x47800000u ? 0x7c00u : h;   // >= 65536: inf
+  h = ax > 0x7f800000u ? 0x7e00u : h;    // NaN
+  return (h & 0x7fffu) | sign;
+}
+static inline uint32_t __cupbop_pack_f16x2_rne(float lo, float hi) {
+  return __cupbop_f32_to_f16_rne(lo) | (__cupbop_f32_to_f16_rne(hi) << 16);
+}
+#define CUPBOP_F16ACC_UNPACK float e0 = __cupbop_f16_to_f32(c0), e1 = __cupbop_f16_to_f32(c0 >> 16), e2 = __cupbop_f16_to_f32(c1), e3 = __cupbop_f16_to_f32(c1 >> 16); float dd[4]
+#define CUPBOP_F16ACC_PACK d[0] = __cupbop_pack_f16x2_rne(dd[0], dd[1]); d[1] = __cupbop_pack_f16x2_rne(dd[2], dd[3])
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_sw(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, uint32_t c0, uint32_t c1, uint32_t *d) {
+  CUPBOP_F16ACC_UNPACK;
+  __cupbop_mma_m16n8k16_f16f32_sw(a0, a1, a2, a3, b0, b1, e0, e1, e2, e3, dd);
+  CUPBOP_F16ACC_PACK;
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_f16f16_sw(uint32_t a0, uint32_t a1, uint32_t b0,
+    uint32_t c0, uint32_t c1, uint32_t *d) {
+  CUPBOP_F16ACC_UNPACK;
+  __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, e0, e1, e2, e3, dd);
+  CUPBOP_F16ACC_PACK;
+}
+#if defined(CUPBOP_MMA_TCU_AVAILABLE)
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, uint32_t c0, uint32_t c1, uint32_t *d) {
+  CUPBOP_F16ACC_UNPACK;
+  __cupbop_mma_m16n8k16_f16f32_tcu(a0, a1, a2, a3, b0, b1, e0, e1, e2, e3, dd);
+  CUPBOP_F16ACC_PACK;
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_f16f16_tcu(uint32_t a0, uint32_t a1, uint32_t b0,
+    uint32_t c0, uint32_t c1, uint32_t *d) {
+  CUPBOP_F16ACC_UNPACK;
+  __cupbop_mma_m16n8k8_f16f32_tcu(a0, a1, b0, e0, e1, e2, e3, dd);
+  CUPBOP_F16ACC_PACK;
+}
+#endif
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1, uint32_t c0, uint32_t c1, uint32_t *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k16_f16f16_tcu(a0, a1, a2, a3, b0, b1, c0, c1, d);
+#else
+  __cupbop_mma_m16n8k16_f16f16_sw(a0, a1, a2, a3, b0, b1, c0, c1, d);
+#endif
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_f16f16(uint32_t a0, uint32_t a1, uint32_t b0,
+    uint32_t c0, uint32_t c1, uint32_t *d) {
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && !defined(CUPBOP_MMA_SW)
+  __cupbop_mma_m16n8k8_f16f16_tcu(a0, a1, b0, c0, c1, d);
+#else
+  __cupbop_mma_m16n8k8_f16f16_sw(a0, a1, b0, c0, c1, d);
+#endif
+}
+
+// ---- mma.sync m8n8k4 .row.col.f64 (DMMA.884) ---------------------------------------------------------------------
+// Fragments (PTX ISA, g = lane>>2, t = lane&3): a0 = A[g][t] (8x4 row), b0 = B[t][g] (4x8 col), c0/c1 = C[g][2t],
+// C[g][2t+1]. D = A*B + C as k-ordered fp64 fused multiply-adds starting from C (the order DMMA uses is not
+// specified; this is exact whenever the products and partial sums are). Software only: the Vortex TCU has no fp64.
+static inline double __cupbop_shfl_f64(double v, int src) {
+  uint64_t u; __builtin_memcpy(&u, &v, 8);
+  const uint32_t lo = __cupbop_shfl32((uint32_t)u, src), hi = __cupbop_shfl32((uint32_t)(u >> 32), src);
+  u = ((uint64_t)hi << 32) | lo; double r; __builtin_memcpy(&r, &u, 8); return r;
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f64f64_sw(double a0, double b0, double c0, double c1, double *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  double d0 = c0, d1 = c1;
+  for (int k = 0; k < 4; ++k) {
+    const double a = __cupbop_shfl_f64(a0, (g << 2) | k);             // A[g][k]
+    const double x = __cupbop_shfl_f64(b0, ((2 * t) << 2) | k);       // B[k][2t]
+    const double y = __cupbop_shfl_f64(b0, ((2 * t + 1) << 2) | k);   // B[k][2t+1]
+    d0 = __builtin_fma(a, x, d0); d1 = __builtin_fma(a, y, d1);
+  }
+  d[0] = d0; d[1] = d1;
+}
+
+
+// ---- ldmatrix / stmatrix .m8n8 .b16 (inline asm of CuLifter-lifted kernels and CUTLASS-style CUDA code) ---------
+// ldmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].shared.b16 {d0..}, [a]: lanes 8j..8j+7 give the row addresses of
+// matrix j (row r from lane 8j+r); lane l (g = l>>2, t = l&3) receives d_j = {M_j[g][2t], M_j[g][2t+1]} (low half =
+// lower column), with .trans {M_j[2t][g], M_j[2t+1][g]}. stmatrix is the inverse (lane l holds d_j, the rows' lanes
+// give the addresses). The address operand is a 32-bit shared-window value: CuLifter's ptrtoint of @shared_mem + off
+// (32 or 64 bits, truncated here) or __cupbop_cvta_to_shared's offset; both decode to the local-memory pointer
+// lmem + ((a - lmem) mod 2^18), as the wgmma descriptors do (local memory < 256 KB). Software: index shuffles over the
+// hardware warp (1:1 / core mapping with 32 hardware lanes), all 32 lanes active as .sync requires.
+static inline char *__cupbop_smem_ptr(uint32_t a) {
+  const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
+  return (char *)(lmem + ((a - (uint32_t)lmem) & 0x3FFFFu));
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16(uint32_t a, int num, int trans, uint32_t *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  for (int j = 0; j < num; ++j) {
+    if (!trans) {
+      const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
+      d[j] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t);
+    } else {
+      const uint32_t r0 = __cupbop_shfl32(a, 8 * j + 2 * t), r1 = __cupbop_shfl32(a, 8 * j + 2 * t + 1);
+      const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g), hi = *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g);
+      d[j] = lo | (hi << 16);
+    }
+  }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16(uint32_t a, int num, int trans, const uint32_t *v) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  for (int j = 0; j < num; ++j) {
+    if (!trans) {
+      const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
+      *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t) = v[j];
+    } else {
+      const uint32_t r0 = __cupbop_shfl32(a, 8 * j + 2 * t), r1 = __cupbop_shfl32(a, 8 * j + 2 * t + 1);
+      *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[j];
+      *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[j] >> 16);
+    }
+  }
+}
+
+
+// ---- redux.sync.<op>.b32 v, membermask (sm_80+): reduction over the mask's lanes (index shuffles, any mask) ----------
+// op: 0 add, 1 umin, 2 umax, 3 min (s32), 4 max (s32), 5 and, 6 or, 7 xor
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_redux_sync(uint32_t v, uint32_t mask, int op) {
+  uint32_t r = (op == 1 || op == 5) ? 0xffffffffu : (op == 3) ? 0x7fffffffu : (op == 4) ? 0x80000000u : 0u;
+  for (int l = 0; l < 32; ++l) {
+    const uint32_t x = __cupbop_shfl32(v, l);
+    if (!((mask >> l) & 1u)) continue;
+    switch (op) {
+      case 0: r += x; break;
+      case 1: r = x < r ? x : r; break;
+      case 2: r = x > r ? x : r; break;
+      case 3: r = (int32_t)x < (int32_t)r ? x : r; break;
+      case 4: r = (int32_t)x > (int32_t)r ? x : r; break;
+      case 5: r &= x; break;
+      case 6: r |= x; break;
+      default: r ^= x; break;
+    }
+  }
+  return r;
+}
+
 #endif // VX_CFG_NUM_THREADS (Vortex 3.0)

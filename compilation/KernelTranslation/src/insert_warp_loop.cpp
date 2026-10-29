@@ -16,6 +16,7 @@
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
@@ -83,6 +84,35 @@ public:
   std::unordered_set<const Value *> ExtraSources;
   void addSource(const Value *V) { ExtraSources.insert(V); }
 
+  // a function body that may compute something thread-dependent on its own (not from its arguments)
+  static bool mayReadThreadIdentity(const Function &F) {
+    for (const Instruction &I : instructions(F))
+      if (auto *C = dyn_cast<CallInst>(&I)) {
+        if (C->isInlineAsm()) return true;
+        const Function *G = C->getCalledFunction();
+        if (!G) return true;
+        if (G->isIntrinsic()) {
+          if (G->getName().starts_with("llvm.nvvm.read.ptx.sreg.") || G->getName().starts_with("llvm.nvvm.shfl") ||
+              G->getName().starts_with("llvm.nvvm.vote") || G->getName().starts_with("llvm.nvvm.match"))
+            return true;
+          continue;
+        }
+        return true;
+      }
+    return false;
+  }
+
+  // the allocas a call gets pointers to (through GEPs / casts) become divergent
+  void markPointerArgsDivergent(const CallInst *CI, const char *why) {
+    for (const Value *A : CI->args())
+      if (A->getType()->isPointerTy())
+        if (auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(A)))
+          if (DivergentValues.insert(AI).second) {
+            Worklist.push(AI);
+            if (why) fprintf(stderr, "%s: %s\n", why, AI->getName().str().c_str());
+          }
+  }
+
   void setAnalyzers(DominatorTree &DomTree, PostDominatorTree &PostDomTree,
                     LoopInfo &LoopInf) {
         DT = &DomTree;
@@ -114,6 +144,40 @@ public:
         I.print(llvm::errs());
         fprintf(stderr, "\n");
       }
+      // virt (schedule 1): results the analysis cannot see through. It follows SSA values and stores only, but
+      // the core mapping keeps an alloca whose stores all look uniform as ONE copy per hardware thread, shared by
+      // the logical warps that hardware thread runs one after another; a later region then reads the last
+      // logical warp's value in every logical warp. Conservatively:
+      //  - an alloca passed (as a pointer argument) to a call of a function -- a device-runtime helper such as
+      //    __cupbop_ldmatrix_m8n8_b16(addr, num, trans, ptr d), whose result differs per lane whatever its
+      //    inputs -- or to inline asm is a divergence source (lifted CUTLASS 12_gemm_bias_relu s1: the ldmatrix
+      //    fragments loaded from the lower_ldmatrix_asm buffer and the PHI slots holding them across the main
+      //    loop's barrier looked uniform; 13951/32768 wrong, only the last trip's warps right);
+      //  - the value of a convergent call to a function that may read the thread's identity is a divergence
+      //    source: a warp-level runtime helper (elect, movmatrix, ...) can differ per lane or per warp with uniform
+      //    inputs. CUDA marks every device function convergent, so the test is on the callee: a declaration (body
+      //    not visible: device-runtime helpers) or a body with a special-register read, inline asm or another
+      //    non-intrinsic call. Not: memory(none) calls and libdevice (__nv_*, pure math; counting __nv_fast_powf
+      //    cost backprop's s1 v0 run +51% cycles for nothing), or bodies like the CUDA-side DXA query stubs;
+      //  - a divergent call (below) makes the allocas it gets pointers to divergent, as a divergent store does.
+      // Debug switches: CUPBOP_DIV_NO_CALL_ALLOCA, CUPBOP_DIV_NO_CONVERGENT, CUPBOP_DIV_NO_CALL_PROP turn the three off.
+      if (g_schedule_flag == 1)
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          const Function *Fn = CI->getCalledFunction();
+          const bool intrinsic = Fn && Fn->isIntrinsic();
+          if (!intrinsic) {
+            if (!std::getenv("CUPBOP_DIV_NO_CALL_ALLOCA"))
+              markPointerArgsDivergent(CI, "[div] source (alloca passed to a call)");
+            const bool pure = CI->doesNotAccessMemory() || (Fn && Fn->getName().starts_with("__nv_")) ||
+                              (Fn && !Fn->isDeclaration() && !mayReadThreadIdentity(*Fn));
+            if (!std::getenv("CUPBOP_DIV_NO_CONVERGENT") && !CI->getType()->isVoidTy() && CI->isConvergent() && !pure &&
+                DivergentValues.insert(CI).second) {
+              Worklist.push(CI);
+              fprintf(stderr, "[div] source (convergent call): %s\n",
+                      Fn ? Fn->getName().str().c_str() : "(indirect / asm)");
+            }
+          }
+        }
     }
 
     // Propagate divergence
@@ -201,6 +265,12 @@ public:
       
        else {
         not_st_not_br:
+        // schedule 1: a divergent call may write a per-lane value through any pointer it gets (memcpy from a
+        // divergent source, a helper with divergent inputs), like a divergent store
+        if (g_schedule_flag == 1 && !std::getenv("CUPBOP_DIV_NO_CALL_PROP"))
+          if (auto *CI = dyn_cast<CallInst>(Inst))
+            if (!(CI->getCalledFunction() && CI->getCalledFunction()->getName().starts_with("llvm.lifetime.")))
+              markPointerArgsDivergent(CI, "[div] alloca written by a divergent call");
         for (const Use &U : Inst->uses()) {
           const Instruction *UserInst = dyn_cast<Instruction>(U.getUser());
           if (UserInst && DivergentValues.insert(UserInst).second) {
@@ -2237,6 +2307,7 @@ public:
 
     SmallVector<BasicBlock *, 4> pending_blocks;
     BasicBlock *region_entry_barrier = NULL;
+    BasicBlock *second_entry_barrier = NULL; // a region entered after two different barriers cannot be one warp loop
     BasicBlock *entry = NULL;
     BasicBlock *exit = B->getSinglePredecessor();
     fprintf(stderr, "[PR] === getParallelRegionBefore: B=%s, preds=%d ===\n",
@@ -2331,9 +2402,8 @@ public:
                 current->getName().str().c_str(), has_barrier, is_single_conditional_branch_block);
         if (region_entry_barrier == NULL)
           region_entry_barrier = current;
-        else if (region_entry_barrier != current) {
-          return;
-        }
+        else if (region_entry_barrier != current && !second_entry_barrier)
+          second_entry_barrier = current;
         continue;
       }
 
@@ -2347,6 +2417,88 @@ public:
     }
 
     if (current_region.wrapped_block.empty()) {
+      return;
+    }
+
+    // Does any instruction of the region depend on the thread (or have a per-thread side effect)? The old test
+    // walked ONE path from the entry (first unvisited successor at every branch) and skipped calls, so a region
+    // whose thread-dependent work sits behind a branch the walk did not take (cuBLAS axpy: an early uniform
+    // `n <= 0` exit is successor 0) was judged uniform and got no warp loop: it then ran once per hardware thread,
+    // i.e. only the first logical warp of each physical warp did any work under the core mapping (0 regions).
+    // An alloca that the context-save step will replicate per thread (it does so for every alloca with a user
+    // other than a plain load/store, e.g. a GEP into a lifter's by-value parameter buffer): a region that writes
+    // it must run once per logical thread, or only one logical thread's copy is initialized (cuBLAS ger/dot under
+    // the core mapping read 0xbaadf00d from the other copies of `param_local`).
+    bool repl_anywhere = false; // set to re-check a region with the prod rule (diagnostic message below)
+    auto writes_replicated_alloca = [&](Instruction &I) {
+      Value *ptr = nullptr;
+      if (auto *SI = dyn_cast<StoreInst>(&I)) ptr = SI->getPointerOperand();
+      else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) ptr = MI->getDest();
+      if (!ptr) return false;
+      auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(ptr));
+      if (!AI) return false;
+      if (AI->getName().contains("_intra_warp_") || AI->getName().contains("_inter_warp_")) return false;
+      bool replicated = false;
+      for (User *U : AI->users())
+        if (!isa<LoadInst>(U) && !isa<StoreInst>(U)) { replicated = true; break; }
+      if (!replicated) return false;
+      // Only when another region reads it: an unlooped region uses one copy (slot 0) consistently, so a
+      // replicated alloca that lives inside this region (wmma / mma fragment arrays of a barrier-free kernel)
+      // needs no warp loop. Prod's rule counted every write (sgemm_tcu s1: the whole kernel looped once per
+      // logical thread for its fragment arrays, 6,580 -> 9,067 cycles at n=32). CUPBOP_S1_REPL_ALLOCA_ANYWHERE=1:
+      // that rule.
+      if (std::getenv("CUPBOP_S1_REPL_ALLOCA_ANYWHERE") || repl_anywhere) return true;
+      SmallVector<const Value *, 16> work{AI};
+      SmallPtrSet<const Value *, 16> seen{AI};
+      while (!work.empty()) {
+        const Value *V = work.pop_back_val();
+        for (const User *U : V->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI) return true; // constant expression user: be safe
+          if (auto *CB = dyn_cast<CallBase>(UI))
+            if (CB->getCalledFunction() && CB->getCalledFunction()->getName().starts_with("llvm.lifetime.")) continue;
+          if (!current_region.wrapped_block.count(const_cast<BasicBlock *>(UI->getParent()))) return true;
+          if ((isa<GetElementPtrInst>(UI) || isa<BitCastInst>(UI) || isa<AddrSpaceCastInst>(UI) || isa<PHINode>(UI) ||
+               isa<SelectInst>(UI)) && seen.insert(UI).second)
+            work.push_back(UI);
+        }
+      }
+      return false;
+    };
+    auto why = [&](const char *r, Instruction &I) {
+      if (std::getenv("CUPBOP_S1_REGION_WHY")) {
+        fprintf(stderr, "[PR-why] %s: ", r); I.print(llvm::errs()); fprintf(stderr, "\n");
+      }
+      return true;
+    };
+    auto region_is_divergent = [&]() {
+      for (BasicBlock *BB : current_region.wrapped_block)
+        for (Instruction &I : *BB) {
+          if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) return why("atomic", I); // once per thread, even if uniform
+          if (writes_replicated_alloca(I)) return why("writes replicated alloca", I);
+          if (DI.isDivergent(&I)) return why("divergent instruction", I);
+          for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
+            llvm::Value *v = I.getOperand(i);
+            if (v && !isa<Constant>(v) && DI.isDivergent(v)) return why("divergent operand", I);
+          }
+        }
+      return false;
+    };
+
+    if (second_entry_barrier) {
+      // Two barriers lead into this region (e.g. a barrier on each arm of an if, or an irreducible cycle that
+      // the caller did not make reducible): it cannot be wrapped in one warp loop. Under the core mapping its
+      // thread-dependent code would silently run once per hardware thread instead of once per logical thread,
+      // so refuse the kernel rather than miscompile it.
+      const bool div = region_is_divergent();
+      fprintf(stderr, "[PR] WARNING: region before %s has two entry barriers (%s, %s)%s: not looped\n",
+              B->getName().str().c_str(), region_entry_barrier->getName().str().c_str(),
+              second_entry_barrier->getName().str().c_str(), div ? " and thread-dependent code" : "");
+      if (div && g_schedule_flag == 1) {
+        fprintf(stderr, "[PR] ERROR: unsupported control flow around __syncthreads for the core mapping "
+                        "(schedule 1): a thread-dependent parallel region with two entry barriers\n");
+        ::exit(3);
+      }
       return;
     }
 
@@ -2402,8 +2554,20 @@ public:
       // llvm::errs() << "--------------\n";
     } while (iter != exit);
     
-    iter = entry;
+    // Schedule 1 (core mapping) uses the whole-region test above; schedules 0/2 keep the original single-path
+    // walk unchanged (it is part of their CI baseline: score-cuda s0 changed behaviour with the new test).
     bool any_divergent_var = false;
+    if (g_schedule_flag == 1 && !std::getenv("CUPBOP_S1_OLD_REGION_TEST")) {
+      any_divergent_var = region_is_divergent();
+      if (!any_divergent_var) {
+        repl_anywhere = true;
+        if (region_is_divergent())
+          fprintf(stderr, "[PR] region before %s: not looped (its replicated allocas are not used in another region)\n",
+                  B->getName().str().c_str());
+        repl_anywhere = false;
+      }
+    } else {
+    iter = entry;
     // create a vector of BasicBlock*
     std::vector<BasicBlock *> checked_blocks;
     checked_blocks.push_back(entry);
@@ -2465,8 +2629,10 @@ public:
       // llvm::errs() << "iter, exit check--------------\n";
 
     } while (iter != exit);
+    }
 
     divergent_found:
+
     // virt sub-pass form: a region that is not looped runs once per hardware thread, but
     // allocas written there may be per-lane copies (e.g. kernel-argument stores into the
     // lifter's param buffer in a tid-free entry region) -- the other sub-pass's copy then

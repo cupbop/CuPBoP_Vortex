@@ -4,6 +4,7 @@
 #include "tool.h"
 #include "cg_sync.h"
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <vector>
 #include "llvm/ADT/SmallVector.h"
@@ -220,6 +221,23 @@ static bool syncRightBefore(llvm::Instruction *I) {
   return false;
 }
 
+// Schedule 2 and a CuLifter-lifted kernel (parameters named arg_<cbank offset>, SASS-derived CFG): the
+// conditional-if / for / special-case CTA barriers are not inserted. They shape single-entry regions for the warp
+// loops of schedules 0/1; schedule 2 has none, and in a lifted kernel every barrier counts as conditional (an early
+// `exit` and predicated BARs: nothing post-dominates the entry), so the walk put CTA barriers on paths only some warps
+// take -- cuBLAS sdot/ddot reduce_1Block_kernel went from 6 to 332 CTA barriers and deadlocked (2026-10-29).
+// CUDA-source kernels keep them: btree's s2 result depends on them (all zeros without, CI 2026-10-29), so this is
+// not a general schedule-2 rule. CUPBOP_S2_COND_BARRIERS=1 keeps them for lifted kernels too.
+static bool s2_skip_cond_barriers(Function &F) {
+  static const int sched = [] { const char *e = std::getenv("VORTEX_SCHEDULE_FLAG"); return e ? std::atoi(e) : 0; }();
+  if (sched != 2 || std::getenv("CUPBOP_S2_COND_BARRIERS") || F.arg_empty()) return false;
+  for (Argument &A : F.args()) {
+    StringRef n = A.getName();
+    if (!n.consume_front("arg_") || n.empty() || !isdigit((unsigned char)n[0])) return false;
+  }
+  return true;
+}
+
 class InsertConditionalBarrier : public llvm::FunctionPass {
 
 public:
@@ -264,6 +282,8 @@ public:
 
   virtual bool runOnFunction(Function &F) {
     if (!isKernelFunction(F.getParent(), &F))
+      return 0;
+    if (s2_skip_cond_barriers(F))
       return 0;
 
     auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>();
@@ -503,6 +523,8 @@ public:
   virtual bool runOnFunction(Function &F) {
     if (!isKernelFunction(F.getParent(), &F))
       return 0;
+    if (s2_skip_cond_barriers(F))
+      return 0;
     bool changed = false;
     std::set<BasicBlock *> if_head;
     // insert an extra block for the following case
@@ -576,6 +598,8 @@ public:
   }
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) {
+    if (s2_skip_cond_barriers(*L->getHeader()->getParent()))
+      return 0;
     if (!isKernelFunction(L->getHeader()->getParent()->getParent(),
                           L->getHeader()->getParent()))
       return 0;
@@ -764,6 +788,119 @@ static void erase_warp_syncs_for_virt(llvm::Module *M, bool keep_markers = false
     fprintf(stderr, "[insert_sync] schedule 1 (virt): erased %zu warp-level syncs (lanes run in lockstep)\n", dead.size());
 }
 
+// Warp loops need every parallel region (the code between two barriers) to have ONE entry barrier.
+// insert_warp_loop cannot wrap a region that two different barriers lead into: it used to drop such a
+// region silently, so its code ran once per hardware thread instead of once per logical thread.
+// The conditional-if/for passes above produce single-entry regions for structured source code; lifted
+// (SASS-derived) control flow leaves merge points whose predecessors come from different barriers (the
+// cuBLAS ampere_sgemm main loop after FixIrreducible: the loop header and the bottom test both branch
+// into the same block; an early `return` path and the code after the last barrier both reaching the shared return
+// block). At such a merge M whose predecessors are all reached by every thread (each contains a barrier or
+// post-dominates the barriers it is entered from), put a region boundary at the end of every predecessor and
+// at the start of M: each incoming path then ends its own region, and the code from M on starts a
+// single-entry one; the region left between them holds only branches. The boundaries are entry/exit
+// markers (no hardware barrier under the core mapping): they only order logical warps inside a
+// physical warp, and the paths that reach them are CTA-uniform, as the barriers on them require.
+static bool isCtaBarrierCall(const llvm::Instruction &I) {
+  auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+  if (!CI || CI->isInlineAsm() || !CI->getCalledFunction()) return false;
+  auto n = CI->getCalledFunction()->getName();
+  return n == "llvm.nvvm.barrier0" || n == "llvm.nvvm.barrier.sync";
+}
+static bool isTrivialInst(const llvm::Instruction &I) {
+  return llvm::isa<llvm::BranchInst>(I) || llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::DbgInfoIntrinsic>(I) ||
+         I.isLifetimeStartOrEnd() || isCtaBarrierCall(I);
+}
+static void separate_multi_entry_regions(llvm::Module *M) {
+  for (llvm::Function &F : *M) {
+    if (F.isDeclaration() || !isKernelFunction(M, &F)) continue;
+    int added = 0;
+    // A predecessor is safe for a boundary when every thread that passes the barriers leading to it also passes
+    // it: it contains a barrier itself, or it post-dominates every barrier block (or the entry) it is entered from.
+    // (The boundaries below do not change the CFG, so one post-dominator tree serves all iterations.)
+    llvm::PostDominatorTree PDT(F);
+    std::map<llvm::BasicBlock *, std::set<llvm::BasicBlock *>> in, out;
+    std::set<llvm::BasicBlock *> done;
+    auto hasBarB = [](llvm::BasicBlock &B) { for (auto &I : B) if (isCtaBarrierCall(I)) return true; return false; };
+    // A block entered only from barrier blocks also qualifies: at a merge of differently-entered regions the
+    // branch that split the paths chose between different barrier sequences, which CUDA requires to be uniform
+    // (the loop exit after a barrier-carrying loop body, e.g. `common.ret.loopexit` in lifted Warp cholesky).
+    auto uniformlyReached = [&](llvm::BasicBlock *P) {
+      if (hasBarB(*P)) return true;
+      bool all_bar_preds = P->hasNPredecessorsOrMore(1);
+      for (auto *Q : llvm::predecessors(P)) all_bar_preds &= hasBarB(*Q);
+      if (all_bar_preds) return true;
+      if (in[P].empty()) return false;
+      for (auto *E : in[P]) if (!PDT.dominates(P, E)) return false;
+      return true;
+    };
+    for (int iter = 0; iter < 4096; ++iter) {
+      // out[b]: the barriers a path leaving b last crossed (b itself if it has a barrier); in[b]: union over preds
+      in.clear(); out.clear();
+      auto hasBar = [](llvm::BasicBlock &B) { for (auto &I : B) if (isCtaBarrierCall(I)) return true; return false; };
+      bool ch = true;
+      while (ch) {
+        ch = false;
+        for (llvm::BasicBlock &B : F) {
+          std::set<llvm::BasicBlock *> i;
+          if (&B == &F.getEntryBlock()) i.insert(&B);
+          for (auto *P : llvm::predecessors(&B)) i.insert(out[P].begin(), out[P].end());
+          std::set<llvm::BasicBlock *> o = hasBar(B) ? std::set<llvm::BasicBlock *>{&B} : i;
+          if (i != in[&B] || o != out[&B]) { in[&B] = i; out[&B] = o; ch = true; }
+        }
+      }
+      llvm::BasicBlock *merge = nullptr;
+      for (llvm::BasicBlock &B : F) {
+        if (in[&B].size() < 2) continue;
+        // Only where every predecessor is reached by every thread (see uniformlyReached), so a boundary at
+        // its end cannot land in thread-divergent code.
+        bool all_pred_bar = true;
+        for (auto *P : llvm::predecessors(&B)) all_pred_bar &= uniformlyReached(P);
+        if (!all_pred_bar) continue;
+        // only where the multi-entry region has real work: B up to its next barrier, or the region code
+        // reaching B (preds back to their barriers)
+        bool work = false;
+        for (auto &I : B) { if (isCtaBarrierCall(I)) break; if (!isTrivialInst(I)) { work = true; break; } }
+        std::vector<llvm::BasicBlock *> st(llvm::pred_begin(&B), llvm::pred_end(&B));
+        std::set<llvm::BasicBlock *> seen;
+        while (!work && !st.empty()) {
+          auto *P = st.back(); st.pop_back();
+          if (!seen.insert(P).second) continue;
+          // only the part of P after its last barrier belongs to this region
+          for (auto it = P->rbegin(); it != P->rend(); ++it) {
+            if (isCtaBarrierCall(*it)) break;
+            if (!isTrivialInst(*it)) { work = true; break; }
+          }
+          if (!hasBar(*P)) st.insert(st.end(), llvm::pred_begin(P), llvm::pred_end(P));
+        }
+        if (!work || done.count(&B)) continue;
+        // the forward part may itself be a trivial branch block (e.g. `br`) but the paths into it are not
+        merge = &B;
+        break;
+      }
+      if (!merge) break;
+      done.insert(merge);   // boundaries are placed once per merge; a merge that needs none is not retried
+      auto marker = [&](llvm::Instruction *before) {
+        auto *c = CreateInterWarpBarrier(before);
+        auto &mctx = c->getContext();
+        c->setMetadata("cupbop.builtin_barrier", llvm::MDNode::get(mctx, llvm::MDString::get(mctx, "region_split")));
+        ++added;
+      };
+      for (auto *P : llvm::predecessors(merge)) {
+        auto *T = P->getTerminator();
+        auto *prev = T->getPrevNode();
+        while (prev && llvm::isa<llvm::DbgInfoIntrinsic>(prev)) prev = prev->getPrevNode();
+        if (!(prev && isCtaBarrierCall(*prev))) marker(T);
+      }
+      auto *first = &*merge->getFirstNonPHIIt();
+      if (!isCtaBarrierCall(*first)) marker(first);
+    }
+    if (added)
+      fprintf(stderr, "[insert_sync] %s: %d region boundaries at merges of differently-entered regions\n",
+              F.getName().str().c_str(), added);
+  }
+}
+
 void insert_sync(llvm::Module *M) {
   int schedule = 0;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
@@ -785,6 +922,7 @@ void insert_sync(llvm::Module *M) {
   if (schedule == 0 || schedule == 1) {
     passes.push_back("insert-built-in-barriers");
   }
+  // (lifted kernels at schedule 2 skip these three: s2_skip_cond_barriers)
   passes.push_back("insert-conditional-if-barriers");
   passes.push_back("insert-conditional-for-barriers");
   passes.push_back("insert-special-case-barriers");
@@ -798,4 +936,6 @@ void insert_sync(llvm::Module *M) {
     }
   }
   Passes.run(*M);
+  if (schedule == 1)   // core mapping only: with it, score-cuda s0 (warp_shfl, nested loops) left its CI baseline
+    if (!std::getenv("CUPBOP_S1_NO_MULTI_ENTRY")) separate_multi_entry_regions(M);
 }
