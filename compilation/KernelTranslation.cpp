@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
   // preheaders; reducible functions are left untouched.
   int irr_schedule = 2;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) irr_schedule = std::stoi(std::string(env));
-  if (irr_schedule == 1) {   // core mapping only; schedule 0 keeps its CI baseline
+  if (irr_schedule == 1 && !std::getenv("CUPBOP_S1_NO_FIXIRR")) {   // core mapping only; schedule 0 keeps its CI baseline
     // before init_block, so that the guard PHIs FixIrreducible creates are demoted with all the others
     PassBuilder IPB;
     LoopAnalysisManager ILAM; FunctionAnalysisManager FAM; CGSCCAnalysisManager ICGAM; ModuleAnalysisManager IMAM;

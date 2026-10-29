@@ -2429,6 +2429,7 @@ public:
     // other than a plain load/store, e.g. a GEP into a lifter's by-value parameter buffer): a region that writes
     // it must run once per logical thread, or only one logical thread's copy is initialized (cuBLAS ger/dot under
     // the core mapping read 0xbaadf00d from the other copies of `param_local`).
+    bool repl_anywhere = false; // set to re-check a region with the prod rule (diagnostic message below)
     auto writes_replicated_alloca = [&](Instruction &I) {
       Value *ptr = nullptr;
       if (auto *SI = dyn_cast<StoreInst>(&I)) ptr = SI->getPointerOperand();
@@ -2437,19 +2438,48 @@ public:
       auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(ptr));
       if (!AI) return false;
       if (AI->getName().contains("_intra_warp_") || AI->getName().contains("_inter_warp_")) return false;
+      bool replicated = false;
       for (User *U : AI->users())
-        if (!isa<LoadInst>(U) && !isa<StoreInst>(U)) return true;
+        if (!isa<LoadInst>(U) && !isa<StoreInst>(U)) { replicated = true; break; }
+      if (!replicated) return false;
+      // Only when another region reads it: an unlooped region uses one copy (slot 0) consistently, so a
+      // replicated alloca that lives inside this region (wmma / mma fragment arrays of a barrier-free kernel)
+      // needs no warp loop. Prod's rule counted every write (sgemm_tcu s1: the whole kernel looped once per
+      // logical thread for its fragment arrays, 6,580 -> 9,067 cycles at n=32). CUPBOP_S1_REPL_ALLOCA_ANYWHERE=1:
+      // that rule.
+      if (std::getenv("CUPBOP_S1_REPL_ALLOCA_ANYWHERE") || repl_anywhere) return true;
+      SmallVector<const Value *, 16> work{AI};
+      SmallPtrSet<const Value *, 16> seen{AI};
+      while (!work.empty()) {
+        const Value *V = work.pop_back_val();
+        for (const User *U : V->users()) {
+          auto *UI = dyn_cast<Instruction>(U);
+          if (!UI) return true; // constant expression user: be safe
+          if (auto *CB = dyn_cast<CallBase>(UI))
+            if (CB->getCalledFunction() && CB->getCalledFunction()->getName().starts_with("llvm.lifetime.")) continue;
+          if (!current_region.wrapped_block.count(const_cast<BasicBlock *>(UI->getParent()))) return true;
+          if ((isa<GetElementPtrInst>(UI) || isa<BitCastInst>(UI) || isa<AddrSpaceCastInst>(UI) || isa<PHINode>(UI) ||
+               isa<SelectInst>(UI)) && seen.insert(UI).second)
+            work.push_back(UI);
+        }
+      }
       return false;
+    };
+    auto why = [&](const char *r, Instruction &I) {
+      if (std::getenv("CUPBOP_S1_REGION_WHY")) {
+        fprintf(stderr, "[PR-why] %s: ", r); I.print(llvm::errs()); fprintf(stderr, "\n");
+      }
+      return true;
     };
     auto region_is_divergent = [&]() {
       for (BasicBlock *BB : current_region.wrapped_block)
         for (Instruction &I : *BB) {
-          if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) return true; // once per thread, even if uniform
-          if (writes_replicated_alloca(I)) return true;
-          if (DI.isDivergent(&I)) return true;
+          if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) return why("atomic", I); // once per thread, even if uniform
+          if (writes_replicated_alloca(I)) return why("writes replicated alloca", I);
+          if (DI.isDivergent(&I)) return why("divergent instruction", I);
           for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
             llvm::Value *v = I.getOperand(i);
-            if (v && !isa<Constant>(v) && DI.isDivergent(v)) return true;
+            if (v && !isa<Constant>(v) && DI.isDivergent(v)) return why("divergent operand", I);
           }
         }
       return false;
@@ -2527,8 +2557,15 @@ public:
     // Schedule 1 (core mapping) uses the whole-region test above; schedules 0/2 keep the original single-path
     // walk unchanged (it is part of their CI baseline: score-cuda s0 changed behaviour with the new test).
     bool any_divergent_var = false;
-    if (g_schedule_flag == 1) {
+    if (g_schedule_flag == 1 && !std::getenv("CUPBOP_S1_OLD_REGION_TEST")) {
       any_divergent_var = region_is_divergent();
+      if (!any_divergent_var) {
+        repl_anywhere = true;
+        if (region_is_divergent())
+          fprintf(stderr, "[PR] region before %s: not looped (its replicated allocas are not used in another region)\n",
+                  B->getName().str().c_str());
+        repl_anywhere = false;
+      }
     } else {
     iter = entry;
     // create a vector of BasicBlock*
