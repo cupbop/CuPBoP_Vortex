@@ -16,6 +16,7 @@
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
@@ -2237,6 +2238,7 @@ public:
 
     SmallVector<BasicBlock *, 4> pending_blocks;
     BasicBlock *region_entry_barrier = NULL;
+    BasicBlock *second_entry_barrier = NULL; // a region entered after two different barriers cannot be one warp loop
     BasicBlock *entry = NULL;
     BasicBlock *exit = B->getSinglePredecessor();
     fprintf(stderr, "[PR] === getParallelRegionBefore: B=%s, preds=%d ===\n",
@@ -2331,9 +2333,8 @@ public:
                 current->getName().str().c_str(), has_barrier, is_single_conditional_branch_block);
         if (region_entry_barrier == NULL)
           region_entry_barrier = current;
-        else if (region_entry_barrier != current) {
-          return;
-        }
+        else if (region_entry_barrier != current && !second_entry_barrier)
+          second_entry_barrier = current;
         continue;
       }
 
@@ -2347,6 +2348,58 @@ public:
     }
 
     if (current_region.wrapped_block.empty()) {
+      return;
+    }
+
+    // Does any instruction of the region depend on the thread (or have a per-thread side effect)? The old test
+    // walked ONE path from the entry (first unvisited successor at every branch) and skipped calls, so a region
+    // whose thread-dependent work sits behind a branch the walk did not take (cuBLAS axpy: an early uniform
+    // `n <= 0` exit is successor 0) was judged uniform and got no warp loop: it then ran once per hardware thread,
+    // i.e. only the first logical warp of each physical warp did any work under the core mapping (0 regions).
+    // An alloca that the context-save step will replicate per thread (it does so for every alloca with a user
+    // other than a plain load/store, e.g. a GEP into a lifter's by-value parameter buffer): a region that writes
+    // it must run once per logical thread, or only one logical thread's copy is initialized (cuBLAS ger/dot under
+    // the core mapping read 0xbaadf00d from the other copies of `param_local`).
+    auto writes_replicated_alloca = [&](Instruction &I) {
+      Value *ptr = nullptr;
+      if (auto *SI = dyn_cast<StoreInst>(&I)) ptr = SI->getPointerOperand();
+      else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) ptr = MI->getDest();
+      if (!ptr) return false;
+      auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(ptr));
+      if (!AI) return false;
+      if (AI->getName().contains("_intra_warp_") || AI->getName().contains("_inter_warp_")) return false;
+      for (User *U : AI->users())
+        if (!isa<LoadInst>(U) && !isa<StoreInst>(U)) return true;
+      return false;
+    };
+    auto region_is_divergent = [&]() {
+      for (BasicBlock *BB : current_region.wrapped_block)
+        for (Instruction &I : *BB) {
+          if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) return true; // once per thread, even if uniform
+          if (writes_replicated_alloca(I)) return true;
+          if (DI.isDivergent(&I)) return true;
+          for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
+            llvm::Value *v = I.getOperand(i);
+            if (v && !isa<Constant>(v) && DI.isDivergent(v)) return true;
+          }
+        }
+      return false;
+    };
+
+    if (second_entry_barrier) {
+      // Two barriers lead into this region (e.g. a barrier on each arm of an if, or an irreducible cycle that
+      // the caller did not make reducible): it cannot be wrapped in one warp loop. Under the core mapping its
+      // thread-dependent code would silently run once per hardware thread instead of once per logical thread,
+      // so refuse the kernel rather than miscompile it.
+      const bool div = region_is_divergent();
+      fprintf(stderr, "[PR] WARNING: region before %s has two entry barriers (%s, %s)%s: not looped\n",
+              B->getName().str().c_str(), region_entry_barrier->getName().str().c_str(),
+              second_entry_barrier->getName().str().c_str(), div ? " and thread-dependent code" : "");
+      if (div && g_schedule_flag == 1) {
+        fprintf(stderr, "[PR] ERROR: unsupported control flow around __syncthreads for the core mapping "
+                        "(schedule 1): a thread-dependent parallel region with two entry barriers\n");
+        ::exit(3);
+      }
       return;
     }
 
@@ -2402,71 +2455,8 @@ public:
       // llvm::errs() << "--------------\n";
     } while (iter != exit);
     
-    iter = entry;
-    bool any_divergent_var = false;
-    // create a vector of BasicBlock*
-    std::vector<BasicBlock *> checked_blocks;
-    checked_blocks.push_back(entry);
-    do {
-      // llvm::errs() << "divergent iteration check: \n";
-      //  go through every variable in the block and check whether they have any
-      //  divergent variable
-      for (auto &I : *iter) {
-        // get all the operands of the instruction
-        if (llvm::dyn_cast<llvm::BranchInst>(&I) != nullptr ||
-            llvm::dyn_cast<llvm::ReturnInst>(&I) != nullptr ||
-            llvm::dyn_cast<llvm::CallInst>(&I) != nullptr ||
-            I.getNumOperands() == 0) {
-          continue;
-        }
-        // llvm::errs() << "Instruction check: ";
-        // I.print(llvm::errs());
-        // llvm::errs() << "number of operands: " << I.getNumOperands();
-        for (unsigned i = 0, e = I.getNumOperands(); i != e; ++i) {
+    bool any_divergent_var = region_is_divergent();
 
-          llvm::Value *v = I.getOperand(i);
-          if (!v || llvm::dyn_cast<llvm::Constant>(v) != nullptr) {
-            continue;
-          }
-          // v->print(llvm::errs());
-          // llvm::errs() << "checking operand: \n";
-          if (DI.isDivergent(v)) {
-            any_divergent_var = true;
-            goto divergent_found;
-          }
-        }
-      }
-      if (iter == exit) {
-        break;
-      }
-
-      if (auto *BI = dyn_cast<BranchInst>(iter->getTerminator())) {
-        if (BI->isConditional()) {
-          // pick the “other” successor that isn’t the back‐edge
-          BasicBlock *succ0 = BI->getSuccessor(0);
-          BasicBlock *succ1 = BI->getSuccessor(1);
-          
-          // check if the successor is in the checked_blocks
-          if (std::find(checked_blocks.begin(), checked_blocks.end(), succ0) ==
-              checked_blocks.end()) {
-            checked_blocks.push_back(succ0);
-            iter = succ0;
-          } else {
-            checked_blocks.push_back(succ1);
-            iter = succ1;
-          }
-        } else {
-          iter = iter->getTerminator()->getSuccessor(0);
-        }
-      }
-        
-      // llvm::errs() << iter->getName().str() << "\n";
-      // llvm::errs() << exit->getName().str() << "\n";
-      // llvm::errs() << "iter, exit check--------------\n";
-
-    } while (iter != exit);
-
-    divergent_found:
     // virt sub-pass form: a region that is not looped runs once per hardware thread, but
     // allocas written there may be per-lane copies (e.g. kernel-argument stores into the
     // lifter's param buffer in a tid-free entry region) -- the other sub-pass's copy then

@@ -17,6 +17,10 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Transforms/Utils/FixIrreducible.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -113,6 +117,45 @@ int main(int argc, char **argv) {
   mark_dxa_waits(program);
 
 
+  // Warp loops (schedule 0 / core mapping 1) need reducible control flow. insert_sync places the
+  // loop-boundary barriers with LoopInfo, which does not see an irreducible cycle, and the parallel
+  // region before a barrier that such a cycle enters twice gets two entries and is left without a warp
+  // loop: its code then runs once per hardware thread instead of once per logical thread. Lifted
+  // software-pipelined SASS has these (cuBLAS ampere_sgemm_*: the main loop is entered both at its
+  // head and in the middle), and under the core mapping with more than one logical warp per physical
+  // warp every logical warp read warp 0's shared-memory addresses (batched_gemm s1, P < warps/CTA).
+  // Make such functions reducible (node splitting through a guard block) and give the new loops
+  // preheaders; reducible functions are left untouched.
+  int irr_schedule = 2;
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) irr_schedule = std::stoi(std::string(env));
+  if (irr_schedule == 0 || irr_schedule == 1) {
+    // before init_block, so that the guard PHIs FixIrreducible creates are demoted with all the others
+    PassBuilder IPB;
+    LoopAnalysisManager ILAM; FunctionAnalysisManager FAM; CGSCCAnalysisManager ICGAM; ModuleAnalysisManager IMAM;
+    IPB.registerModuleAnalyses(IMAM); IPB.registerFunctionAnalyses(FAM); IPB.registerLoopAnalyses(ILAM);
+    IPB.registerCGSCCAnalyses(ICGAM); IPB.crossRegisterProxies(ILAM, FAM, ICGAM, IMAM);
+    for (Function &F : *program) {
+      if (F.isDeclaration()) continue;
+      bool irreducible = false;
+      std::vector<const CycleInfo::CycleT *> work;
+      for (const auto *C : FAM.getResult<CycleAnalysis>(F).toplevel_cycles()) work.push_back(C);
+      while (!work.empty() && !irreducible) {
+        const auto *C = work.back(); work.pop_back();
+        if (!C->isReducible()) irreducible = true;
+        for (const auto *Child : C->children()) work.push_back(Child);
+      }
+      if (!irreducible) continue;
+      bool has_switch = false;
+      for (BasicBlock &BB : F) has_switch |= isa<SwitchInst>(BB.getTerminator());
+      if (has_switch) FAM.invalidate(F, LowerSwitchPass().run(F, FAM));
+      FAM.invalidate(F, FixIrreduciblePass().run(F, FAM));
+      FAM.invalidate(F, LoopSimplifyPass().run(F, FAM));
+      fprintf(stderr, "[fixirr] %s: irreducible control flow made reducible (FixIrreducible%s + LoopSimplify)\n",
+              F.getName().str().c_str(), has_switch ? " after LowerSwitch" : "");
+    }
+    VerifyModule(program);
+  }
+
   DBG_LOG("init_block\n");
   init_block(program, fout);
   dumpFile(program, "0_after_init_block.ll");
@@ -139,6 +182,7 @@ int main(int argc, char **argv) {
   }
   MPM.addPass(ReplaceWarpLevelPrimitive(warp_mapping));
   MPM.run(*program, MAM);
+
 
   VerifyModule(program);
   insert_sync(program);
