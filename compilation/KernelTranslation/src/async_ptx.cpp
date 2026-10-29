@@ -226,6 +226,7 @@ struct PassState {
   std::set<Function *> needWarps;                         // functions with ops that need real warps
   std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
+  std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
   unsigned n_asm = 0, n_intr = 0, n_moved = 0;
   explicit PassState(Module *m)
       : M(m), ctx(m->getContext()), I1(Type::getInt1Ty(ctx)), I32(Type::getInt32Ty(ctx)), I64(Type::getInt64Ty(ctx)),
@@ -786,6 +787,7 @@ struct AsmLowering {
     if (fname != F->getName() && fname != F->getName().str().substr(F->getName().starts_with("__src_") ? 6 : 0))
       fail("cvta.param of another function's parameter (" + sym + ")");
     if (n >= F->arg_size()) fail("cvta.param of a parameter the function does not have (" + sym + ")");
+    S.paramAddrArgs.insert({F, n});
     Argument *A = F->getArg(n);
     AllocaInst *img = nullptr;
     for (auto &I : F->getEntryBlock())
@@ -1116,13 +1118,14 @@ void foldIntegers(Function &F) {
   }
 }
 
-// A vector-typed kernel parameter wider than 8 bytes (CuLifter passes a CUtensorMap as [2 x <8 x i64>])
-// becomes an i64: the launch packs 8 bytes per argument (cudaLaunchKernel_vortex), so only the first 8 bytes
-// arrive -- for a CUtensorMap the device address of its record (cuTensorMapEncodeTiled shim) -- and the RISC-V
-// back end cannot lower vector-typed formal arguments without the V extension. The body sees the old value
-// rebuilt from those 8 bytes, the rest zero.
-// Only vector-typed parameters: other wide parameters (CuLifter's [N x i8] parameter structs, i128) keep all their
-// bytes through pass_wide_kernel_args_by_slot (generate_wrapper.cpp).
+// A CUtensorMap kernel parameter (CuLifter: [2 x <8 x i64>], whose address the lifted code takes with
+// cvta.param) becomes an i64: the CUDA host passes it in one 8-byte launch slot (cudaLaunchKernel_vortex), which
+// holds the device address of its record (cuTensorMapEncodeTiled shim). The body sees the old value rebuilt from
+// those 8 bytes, the rest zero.
+// Only vector-typed parameters reached through cvta.param: CuLifter types EVERY 64-byte-multiple parameter as
+// [N/64 x <8 x i64>] (for the .align 64 of the PTX parameter), e.g. a 448-byte CUTLASS Kernel::Params, and those
+// keep all their bytes through pass_wide_kernel_args_by_slot (generate_wrapper.cpp) like the [N x i8] ones.
+// CUPBOP_NARROW_VECTOR_ARGS=1: the earlier rule (every vector-typed parameter wider than 8 bytes).
 static bool hasVectorType(Type *T) {
   if (T->isVectorTy()) return true;
   if (auto *AT = dyn_cast<ArrayType>(T)) return hasVectorType(AT->getElementType());
@@ -1130,10 +1133,12 @@ static bool hasVectorType(Type *T) {
     for (Type *E : ST->elements()) if (hasVectorType(E)) return true;
   return false;
 }
-void narrowWideKernelArgs(Module *M) {
+static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &paramAddrArgs) {
   const DataLayout &DL = M->getDataLayout();
+  const bool all = std::getenv("CUPBOP_NARROW_VECTOR_ARGS") != nullptr;
   auto isWide = [&](Argument &A) {
-    return !A.getType()->isPointerTy() && hasVectorType(A.getType()) && DL.getTypeStoreSize(A.getType()) > 8;
+    return !A.getType()->isPointerTy() && hasVectorType(A.getType()) && DL.getTypeStoreSize(A.getType()) > 8 &&
+           (all || paramAddrArgs.count({A.getParent(), A.getArgNo()}));
   };
   std::vector<Function *> todo;
   for (auto &F : *M)
@@ -1283,7 +1288,7 @@ void lower_async_ptx(Module *M) {
     std::remove("cupbop_async_kernels.txt");
   }
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
-  narrowWideKernelArgs(M);
+  narrowWideKernelArgs(M, S.paramAddrArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "
                   "copies\n", S.n_asm, S.n_intr, S.n_moved);
 }

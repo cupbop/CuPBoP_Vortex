@@ -46,25 +46,18 @@ void set_meta_data(llvm::Module *M) {
 // argument list of the lifted signature, in order, each parameter starting a new slot). The formal becomes a pointer
 // to those slots (attribute "cupbop-arg-slots"="<k>", decode_input passes the slot address) and the body loads the
 // old value from it: a first-class aggregate by value would otherwise be split into N scalar arguments of the
-// non-inlined kernel call (registers + several KB of stack). Vector-typed parameters (CuLifter's CUtensorMap
-// [2 x <8 x i64>]) keep the one-slot narrowing of lower_async_ptx. Before 2026-10-29 only the first 8 bytes of
+// non-inlined kernel call (registers + several KB of stack). This includes CuLifter's [N/64 x <8 x i64>] form of a
+// 64-byte-multiple parameter struct; a CUtensorMap parameter (cvta.param) was already narrowed to its one slot by
+// lower_async_ptx (narrowWideKernelArgs) and is no longer wide here. Before 2026-10-29 only the first 8 bytes of
 // every such parameter reached the kernel (narrowWideKernelArgs, when the module had async intrinsics) or the
 // parameter overlapped the slots of the following ones.
-static bool type_has_vector(Type *T) {
-  if (T->isVectorTy()) return true;
-  if (auto *AT = dyn_cast<ArrayType>(T)) return type_has_vector(AT->getElementType());
-  if (auto *ST = dyn_cast<StructType>(T)) {
-    for (Type *E : ST->elements()) if (type_has_vector(E)) return true;
-  }
-  return false;
-}
 void pass_wide_kernel_args_by_slot(llvm::Module *M) {
   if (std::getenv("CUPBOP_WIDE_ARGS_BYVAL")) return; // debug: the old by-value aggregate (slots must still be consecutive)
   const DataLayout &DL = M->getDataLayout();
   LLVMContext &ctx = M->getContext();
   auto wide = [&](Argument &A) {
     Type *T = A.getType();
-    return !T->isPointerTy() && !type_has_vector(T) && DL.getTypeStoreSize(T) > 8;
+    return !T->isPointerTy() && !T->isVectorTy() && DL.getTypeStoreSize(T) > 8;
   };
   std::vector<Function *> todo;
   for (auto &F : *M)
