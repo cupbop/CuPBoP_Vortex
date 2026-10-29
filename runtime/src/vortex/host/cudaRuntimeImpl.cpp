@@ -689,6 +689,59 @@ int caps_return3 = vx_dev_caps(DC_init->device(), VX_CAPS_NUM_CORES, &NUM_CORES_
 // dispatcher placing the grid; kernel_idx == -1 / -2 are single-thread service
 // launches (apply cudaMemcpyToSymbol list / device->device copies) used instead
 // of host-side writes into the module image.
+// Core mapping (schedule 1) launch geometry: lanes per physical warp L, physical warps per CTA P, translation-time
+// trips (CUPBOP_VIRT_TRIPS) and the block's CUDA warps. Shared by the launch itself and the context-scratch sizing.
+static void cupbop_virt_geometry(uint64_t block_threads, uint32_t &L, uint32_t &P, uint32_t &virt_trips,
+                                 uint32_t &block_warps) {
+  const uint32_t nt = CUPBOP_EFF_NUM_THREADS();
+  // Lane gating: use only L of the NT lanes of each physical warp
+  // (CUPBOP_VIRT_LANES, default NT). Emulates a narrower issue width on a wider
+  // bitstream; TCU tile geometry, LSU lanes and the memory side stay the bitstream's.
+  L = std::min<uint32_t>(nt, 32u); // a wider warp runs one 32-lane logical warp at a time
+  if (char *env = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < L) L = (uint32_t)v; }
+  while (32 % L) L >>= 1;
+  // Every physical warp must own at least one logical thread (its lanes leave
+  // early otherwise and the CTA barrier would wait for it): P <= ceil(block/L).
+  // Every physical warp must own a logical thread in whichever form the kernel took
+  // (chunk of L per pass, or a 32-lane logical warp per pass when it stages warp ops),
+  // so with L < 32 the cap is the number of CUDA warps.
+  block_warps = (uint32_t)((block_threads + (L < 32 ? 32 : L) - 1) / (L < 32 ? 32 : L));
+  P = block_warps;
+  // CUPBOP_VIRT_TRIPS=k (translation-time constant, single-loop form with 32 lanes): every warp loop
+  // runs exactly k passes of P*32 logical threads, so the default P is ceil(block / (32*k)).
+  virt_trips = 0;
+  if (char *env = std::getenv("CUPBOP_VIRT_TRIPS")) { int v = std::atoi(env); if (v > 0 && L == 32) virt_trips = (uint32_t)v; }
+  if (virt_trips) { uint32_t p = (uint32_t)((block_threads + 32ull * virt_trips - 1) / (32ull * virt_trips)); P = std::max<uint32_t>(1u, std::min(P, p)); }
+  if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
+  if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
+}
+// Core-mapping context scratch (translator: insert_warp_loop.cpp virt_ctx_to_scratch, cupbop_ctx_scratch.txt in the
+// working directory, one line per kernel: <name as in lookup.txt> <bytes per slot> <fixed slots or 0> <L>): bytes the
+// launch of kernel `lookup_name` needs = H * B * slots, H = all hardware threads of the device rounded up to 16
+// (the device's __cupbop_ctx_num_harts), slots = the fixed count or ceil(block / (P * L)). 0 when the kernel keeps
+// its context arrays on the stack.
+static uint64_t cupbop_ctx_scratch_bytes(const std::string &lookup_name, uint64_t block_threads) {
+  std::ifstream f("cupbop_ctx_scratch.txt");
+  if (!f.is_open()) return 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream is(line);
+    std::string name;
+    uint64_t B = 0, fixed = 0, Lt = 32;
+    if (!(is >> name >> B >> fixed >> Lt) || name != lookup_name) continue;
+    uint32_t L, P, trips, bw;
+    cupbop_virt_geometry(block_threads, L, P, trips, bw);
+    const uint64_t slots = fixed ? fixed : (block_threads + (uint64_t)P * Lt - 1) / ((uint64_t)P * Lt);
+    const uint64_t H = ((uint64_t)NUM_CORES_VX * NUM_WARPS_VX * NUM_THREADS_VX + 15) & ~15ull;
+    const uint64_t bytes = H * B * slots;
+    if (std::getenv("CUPBOP_CTX_SCRATCH_VERBOSE"))
+      fprintf(stderr, "[ctx-scratch] %s: %lu bytes/slot x %lu slots x %lu hardware threads = %lu bytes\n",
+              lookup_name.c_str(), (unsigned long)B, (unsigned long)slots, (unsigned long)H, (unsigned long)bytes);
+    return bytes;
+  }
+  return 0;
+}
 static int cupbop_schedule_flag() {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) return std::stoi(std::string(env));
   return 2;
@@ -1322,15 +1375,25 @@ cudaError_t cudaLaunchKernel_vortex(
   }
 
 
-  // Allocate context pool and set __ctx_pool pointer
+  // Allocate context pool and set __ctx_pool pointer. The pool also holds the core mapping's context scratch
+  // (cupbop_ctx_scratch.txt): grown, never shrunk, to what this launch needs.
   {
-    static uint64_t ctx_pool_addr = 0;
-    if (!ctx_pool_addr) {
+    static uint64_t ctx_pool_addr = 0, ctx_pool_size = 0;
+    uint64_t need = 32ull * 1024 * 1024; // 32MB pool — score-cuda has ~320 shfl_res allocas × 32KB = 10MB
+    if (cupbop_schedule_flag() == 1) {
+      const uint64_t sc = cupbop_ctx_scratch_bytes(kernel_name_tmp, (uint64_t)blockDim.x * blockDim.y * blockDim.z);
+      if (sc > need) need = (sc + 0xFFFFull) & ~0xFFFFull;
+    }
+    if (need > ctx_pool_size) {
+      if (ctx_pool_addr) cudaFree((void *)ctx_pool_addr);
       void *p = nullptr;
-      // 32MB pool — score-cuda has ~320 shfl_res allocas × 32KB = 10MB
-      cudaMalloc(&p, 32 * 1024 * 1024);
+      if (cudaMalloc(&p, need) != cudaSuccess || !p) {
+        fprintf(stderr, "cudaLaunchKernel: cannot allocate the %lu-byte context pool\n", (unsigned long)need);
+        std::abort();
+      }
       ctx_pool_addr = (uint64_t)p;
-      DBG_PRINT("ctx_pool: 0x%lx\n", ctx_pool_addr);
+      ctx_pool_size = need;
+      DBG_PRINT("ctx_pool: 0x%lx (%lu bytes)\n", ctx_pool_addr, (unsigned long)ctx_pool_size);
     }
     // Find __ctx_pool symbol address in ELF
     std::fstream sf("lookup_global_symbols.txt", std::ios::in);
@@ -1580,26 +1643,8 @@ cudaError_t cudaLaunchKernel_vortex(
       // the logical warps; __shared__ in CTA local memory as in 1:1.
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
       const uint32_t nt = CUPBOP_EFF_NUM_THREADS();
-      // Lane gating: use only L of the NT lanes of each physical warp
-      // (CUPBOP_VIRT_LANES, default NT). Emulates a narrower issue width on a wider
-      // bitstream; TCU tile geometry, LSU lanes and the memory side stay the bitstream's.
-      uint32_t L = std::min<uint32_t>(nt, 32u); // a wider warp runs one 32-lane logical warp at a time
-      if (char *env = std::getenv("CUPBOP_VIRT_LANES")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < L) L = (uint32_t)v; }
-      while (32 % L) L >>= 1;
-      // Every physical warp must own at least one logical thread (its lanes leave
-      // early otherwise and the CTA barrier would wait for it): P <= ceil(block/L).
-      // Every physical warp must own a logical thread in whichever form the kernel took
-      // (chunk of L per pass, or a 32-lane logical warp per pass when it stages warp ops),
-      // so with L < 32 the cap is the number of CUDA warps.
-      const uint32_t block_warps = (uint32_t)((block_threads + (L < 32 ? 32 : L) - 1) / (L < 32 ? 32 : L));
-      uint32_t P = block_warps;
-      // CUPBOP_VIRT_TRIPS=k (translation-time constant, single-loop form with 32 lanes): every warp loop
-      // runs exactly k passes of P*32 logical threads, so the default P is ceil(block / (32*k)).
-      uint32_t virt_trips = 0;
-      if (char *env = std::getenv("CUPBOP_VIRT_TRIPS")) { int v = std::atoi(env); if (v > 0 && L == 32) virt_trips = (uint32_t)v; }
-      if (virt_trips) { uint32_t p = (uint32_t)((block_threads + 32ull * virt_trips - 1) / (32ull * virt_trips)); P = std::max<uint32_t>(1u, std::min(P, p)); }
-      if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
-      if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
+      uint32_t L, P, virt_trips, block_warps;
+      cupbop_virt_geometry(block_threads, L, P, virt_trips, block_warps);
       if ((P != block_warps || L != 32) && (cupbop_async_kernel(kernel_name_tmp) || cupbop_async_kernel(func_stripped))) {
         printf("Error: kernel %s uses mbarrier waits / TMA / bulk copies (warp-specialized synchronization); the core "
                "mapping runs it only with one logical warp per physical warp of 32 lanes (CUPBOP_VIRT_WARPS = the "

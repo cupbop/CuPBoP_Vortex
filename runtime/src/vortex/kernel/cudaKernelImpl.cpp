@@ -338,6 +338,21 @@ extern "C" __attribute__((always_inline)) int __cupbop_num_threads(void) {
 extern "C" __attribute__((always_inline)) int __cupbop_cta_rank(void) {
   return (int)csr_read_nv(VX_CSR_CTA_RANK);
 }
+// Core-mapping context scratch (insert_warp_loop.cpp, virt_ctx_to_scratch): element `slot` of context array v of
+// hardware thread h is at __ctx_pool + (slot * B + off_v) * H + h * size_v. H = every hardware thread of the device,
+// rounded up to 16, a compile-time constant (with LTO the address arithmetic folds); the host sizes the buffer with
+// the same H from the device caps (cudaLaunchKernel_vortex).
+#include <VX_config.h>
+#define CUPBOP_CTX_NUM_HARTS ((((uint32_t)VX_CFG_NUM_CLUSTERS * VX_CFG_NUM_CORES * VX_CFG_NUM_WARPS * VX_CFG_NUM_THREADS) + 15u) & ~15u)
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_ctx_num_harts(void) {
+  return CUPBOP_CTX_NUM_HARTS;
+}
+// = mhartid, but built from the lane CSR: the Vortex backend's divergence analysis knows the thread-id CSR is per lane
+// (an mhartid read looked uniform to it, so a branch on a value loaded through this address got no split/join: wrong
+// hotspot results with LTO).
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_ctx_hart(void) {
+  return ((uint32_t)vx_core_id() * VX_CFG_NUM_WARPS + (uint32_t)vx_warp_id()) * VX_CFG_NUM_THREADS + (uint32_t)vx_thread_id();
+}
 extern "C" __attribute__((always_inline)) int __cupbop_cta_size(void) {
   return (int)csr_read_nv(VX_CSR_CTA_SIZE);
 }

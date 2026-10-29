@@ -45,6 +45,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <map>
+#include <fstream>
+#include <cstdio>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -2890,6 +2892,224 @@ static bool has_warp_shfl_usage(llvm::Module *M) {
     }
   }
   return false;
+}
+
+// ---- Core mapping (schedule 1): context arrays in a global scratch buffer instead of the stack ------------------
+// A hardware thread of the core mapping runs several CUDA warps one after the other (trips), so every value live
+// across a parallel region gets one copy per trip: a context array of `slots` elements on the hardware thread's stack
+// (GetContextArray, allocas named <value>_intra_warp_). Lifted GEMMs need tens of KB of them (cuBLAS batched_gemm at
+// P = 1, block 256: about 900 arrays x 8 slots), far over the 8 KB Vortex stack, and the array pointers themselves
+// fill the frame with spills. virt_ctx_to_scratch (run by KernelTranslation.cpp after the translator's -O3, so that
+// only the arrays the optimizer kept move) puts them in a scratch buffer in device memory that the host allocates per
+// launch (cudaLaunchKernel_vortex). Element `slot` of array v of hardware thread h is at
+//     __ctx_pool + (slot * B + off_v) * H + h * stride_v
+// B = bytes per slot of all moved arrays, off_v = array v's offset in a slot, stride_v = its element size rounded up
+// to 4 / 8 / 16 bytes, H = __cupbop_ctx_num_harts() (all hardware threads of the device, rounded up to 16; a
+// constant after LTO) and h = __cupbop_ctx_hart(). The lanes of a warp touch consecutive elements: the software
+// counterpart of the hardware stack interleave. The host reads B, the fixed slot count (CUPBOP_VIRT_TRIPS, else 0:
+// ceil(block / (P*L)) at launch) and L from cupbop_ctx_scratch.txt and sizes the buffer as H * B * slots.
+// CUPBOP_CTX_SCRATCH=auto (default) | on | off. auto moves a kernel's arrays only when its estimated context stack
+// (8 bytes of pointer spill per array + every array at CUPBOP_CTX_DYN_SLOTS slots, default 8, or the fixed trips)
+// exceeds CUPBOP_CTX_STACK_BYTES (default 7168 of the 8192-byte stack); otherwise nothing changes.
+// CUPBOP_CTX_SCRATCH_WHY=1 prints every kernel's numbers and decision. The sub-pass form (nested loops, L < 32 with
+// warp-level ops) keeps its arrays on the stack.
+static std::string ctx_lookup_name(llvm::Function *F) {
+  // the kernel name as generate_wrapper.cpp writes it to lookup.txt
+  std::string n = F->getName().str();
+  if ((triton_cupbop_enabled() && !n.empty() && n[0] == '_') || !triton_cupbop_enabled()) {
+    for (size_t i = 2; i < n.size(); i++) {
+      if (n[i] >= '0' && n[i] <= '9') continue;
+      n = n.substr(i);
+      break;
+    }
+  }
+  return n;
+}
+namespace {
+struct CtxArray {
+  AllocaInst *AI;
+  Type *elem;     // one slot
+  uint64_t size;  // alloc size of one slot
+  uint64_t stride, off;
+};
+} // namespace
+// Can every use of the array be rewritten slot by slot? (direct load / store / call of slot 0, or a GEP whose leading
+// index selects the slot: `gep elem, A, slot, ...` or, for a fixed-count array [k x elem], `gep [k x elem], A, 0, slot, ...`)
+static bool ctx_uses_ok(const CtxArray &c, std::string &why) {
+  for (Use &U : c.AI->uses()) {
+    Instruction *I = cast<Instruction>(U.getUser());
+    if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+      if (G->getPointerOperand() != c.AI) { why = "array used as a GEP index"; return false; }
+      Type *ST = G->getSourceElementType();
+      const DataLayout &DL = I->getModule()->getDataLayout();
+      const uint64_t t2 = DL.getTypeAllocSize(ST);
+      if (t2 == c.size) continue;
+      if (ST == c.AI->getAllocatedType() && G->getNumIndices() >= 2) {
+        auto *Z = dyn_cast<ConstantInt>(G->getOperand(1));
+        if (Z && Z->isZero()) continue;
+      }
+      // a flattened index over a smaller type (gep i8 A, slot*size + byte; gep i32 A, slot*4 + j): slot = idx / k
+      if (G->getNumIndices() == 1 && t2 && c.size % t2 == 0) continue;
+      why = "GEP over a type of another size";
+      return false;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(I)) { (void)LI; continue; }
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      if (SI->getValueOperand() == c.AI) { why = "array address stored"; return false; }
+      continue;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(I))
+      if (II->isLifetimeStartOrEnd()) continue;
+    if (auto *MI = dyn_cast<MemIntrinsic>(I)) { // must stay within slot 0
+      auto *Len = dyn_cast<ConstantInt>(MI->getLength());
+      if (!Len || Len->getZExtValue() > c.size) { why = "memory intrinsic over several slots"; return false; }
+      continue;
+    }
+    if (isa<CallBase>(I)) continue; // a pointer argument: slot 0 (e.g. a helper's result buffer)
+    why = std::string("user ") + I->getOpcodeName();
+    return false;
+  }
+  return true;
+}
+void virt_ctx_to_scratch(llvm::Module *M) {
+  if (need_nested_loop) { std::remove("cupbop_ctx_scratch.txt"); return; }
+  std::string mode = "auto";
+  if (const char *e = std::getenv("CUPBOP_CTX_SCRATCH")) mode = e;
+  const bool why = std::getenv("CUPBOP_CTX_SCRATCH_WHY") != nullptr;
+  long dyn_slots = 8, budget = 7168;
+  if (const char *e = std::getenv("CUPBOP_CTX_DYN_SLOTS")) dyn_slots = std::max(1L, std::atol(e));
+  if (const char *e = std::getenv("CUPBOP_CTX_STACK_BYTES")) budget = std::atol(e);
+  const VirtGeom vg = getVirtGeom();
+  const long fixed = vg.trips; // CUPBOP_VIRT_TRIPS at translation: arrays of exactly that many slots
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &C = M->getContext();
+  Type *I8 = Type::getInt8Ty(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  std::vector<std::string> sidecar;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    std::vector<CtxArray> arrays;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI) continue;
+        StringRef n = AI->getName();
+        size_t p = n.rfind("_intra_warp_");
+        if (p == StringRef::npos || n.substr(p + 12).find_first_not_of("0123456789") != StringRef::npos) continue;
+        if (n.starts_with("local_intra_warp")) continue;
+        CtxArray c{AI, AI->getAllocatedType(), 0, 0, 0};
+        if (!AI->isArrayAllocation()) {
+          // a constant slot count folded into the type ([k x elem]), or one slot
+          auto *AT = dyn_cast<ArrayType>(c.elem);
+          if (fixed > 1 && AT && (long)AT->getNumElements() == fixed) c.elem = AT->getElementType();
+          else if (fixed > 1) continue; // not recognizable as k slots: leave it alone
+        }
+        c.size = DL.getTypeAllocSize(c.elem);
+        if (!c.size) continue;
+        arrays.push_back(c);
+      }
+    if (arrays.empty()) continue;
+    // an array with a use the rewrite does not handle (e.g. a PHI of two arrays' addresses) stays on the stack
+    {
+      std::vector<CtxArray> ok;
+      for (auto &c : arrays) {
+        std::string bad;
+        if (ctx_uses_ok(c, bad)) ok.push_back(c);
+        else if (why)
+          fprintf(stderr, "[ctx-scratch] %s: context array %s stays on the stack: %s\n", F.getName().str().c_str(),
+                  c.AI->getName().str().c_str(), bad.c_str());
+      }
+      arrays.swap(ok);
+    }
+    if (arrays.empty()) continue;
+    const long S = fixed > 0 ? fixed : dyn_slots;
+    uint64_t B = 0, est = 0;
+    for (auto &c : arrays) {
+      uint64_t al = c.size >= 16 ? 16 : c.size >= 8 ? 8 : 4;
+      c.stride = (c.size + al - 1) / al * al;
+      B = (B + al - 1) / al * al;
+      c.off = B;
+      B += c.stride;
+      est += 8 + (c.stride * S + 15) / 16 * 16;
+    }
+    B = (B + 15) / 16 * 16;
+    const bool use = mode == "on" || (mode == "auto" && (long)est > budget);
+    if (why)
+      fprintf(stderr, "[ctx-scratch] %s: %zu context arrays, %lu bytes per slot, %s slots, estimated stack %lu bytes "
+                      "(budget %ld) -> %s\n", F.getName().str().c_str(), arrays.size(), (unsigned long)B,
+              fixed > 0 ? std::to_string(fixed).c_str() : ("dynamic, assumed " + std::to_string(dyn_slots)).c_str(),
+              (unsigned long)est, budget, use ? "scratch" : "stack");
+    if (!use) continue;
+    // per-function values at the top of the entry block
+    IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    GlobalVariable *pool = M->getGlobalVariable("__ctx_pool");
+    if (!pool) pool = new GlobalVariable(*M, PointerType::getUnqual(C), false, GlobalValue::ExternalLinkage, nullptr, "__ctx_pool");
+    LoadInst *base = EB.CreateLoad(PointerType::getUnqual(C), pool, "ctx_scratch_base");
+    base->setVolatile(true); // set by the host per launch (cudaMemcpyToSymbol service launch)
+    Value *H = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_num_harts", FunctionType::get(I32, false)), {}, "ctx_harts"), I64);
+    Value *h = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_hart", FunctionType::get(I32, false)), {}, "ctx_hart"), I64);
+    Value *SS = EB.CreateMul(ConstantInt::get(I64, B), H, "ctx_slot_bytes");
+    // base + h * stride, one per element stride class; an access is (that + slot * SS) + off_v * H, built in this
+    // order so that the per-array constant comes last: the optimizer folds it into the access instead of keeping one
+    // loop-invariant pointer per array live (hundreds of them, all spilled: the frame these arrays should leave)
+    std::map<uint64_t, Value *> hartBase;
+    for (auto &c : arrays) {
+      Value *&hb = hartBase[c.stride];
+      if (!hb) hb = EB.CreateGEP(I8, base, EB.CreateMul(h, ConstantInt::get(I64, c.stride)), "ctx_hart_base");
+      std::vector<Use *> uses;
+      for (Use &U : c.AI->uses()) uses.push_back(&U);
+      for (Use *U : uses) {
+        Instruction *I = cast<Instruction>(U->getUser());
+        if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+          IRBuilder<> B2(G);
+          Type *ST = G->getSourceElementType();
+          const uint64_t t2 = DL.getTypeAllocSize(ST);
+          unsigned slotIdx = 1; // operand index of the slot
+          Type *rest = ST;      // type the indices after the slot walk into
+          Value *within = nullptr; // byte offset inside the element (flattened index)
+          Value *slot;
+          if (t2 == c.size) {
+            slot = B2.CreateSExtOrTrunc(G->getOperand(1), I64);
+          } else if (ST == c.AI->getAllocatedType() && G->getNumIndices() >= 2) { // gep [k x elem], A, 0, slot, ...
+            slotIdx = 2; rest = c.elem;
+            slot = B2.CreateSExtOrTrunc(G->getOperand(2), I64);
+          } else { // gep T2, A, idx with size % sizeof(T2) == 0: slot = idx / k, element offset (idx % k) * sizeof(T2)
+            Value *idx = B2.CreateSExtOrTrunc(G->getOperand(1), I64);
+            Value *k = ConstantInt::get(I64, c.size / t2);
+            slot = B2.CreateUDiv(idx, k);
+            within = B2.CreateMul(B2.CreateURem(idx, k), ConstantInt::get(I64, t2));
+          }
+          Value *p = B2.CreateGEP(I8, B2.CreateGEP(I8, hb, B2.CreateMul(slot, SS)), B2.CreateMul(ConstantInt::get(I64, c.off), H));
+          if (within) p = B2.CreateGEP(I8, p, within);
+          if (!within && G->getNumOperands() > slotIdx + 1) {
+            std::vector<Value *> idx{ConstantInt::get(I64, 0)};
+            for (unsigned k = slotIdx + 1; k < G->getNumOperands(); k++) idx.push_back(G->getOperand(k));
+            p = B2.CreateGEP(rest, p, idx);
+          }
+          p->takeName(G);
+          G->replaceAllUsesWith(p);
+          G->eraseFromParent();
+        } else if (auto *II = dyn_cast<IntrinsicInst>(I); II && II->isLifetimeStartOrEnd()) {
+          II->eraseFromParent();
+        } else {
+          IRBuilder<> B2(I);
+          U->set(B2.CreateGEP(I8, hb, B2.CreateMul(ConstantInt::get(I64, c.off), H), c.AI->getName() + "slot0")); // slot 0
+        }
+      }
+      c.AI->eraseFromParent();
+    }
+    sidecar.push_back(ctx_lookup_name(&F) + " " + std::to_string(B) + " " + std::to_string(fixed > 0 ? fixed : 0) + " " +
+                      std::to_string(vg.lanes));
+    fprintf(stderr, "[ctx-scratch] %s: %zu context arrays in the scratch buffer (%lu bytes per slot)\n",
+            F.getName().str().c_str(), arrays.size(), (unsigned long)B);
+  }
+  if (sidecar.empty()) {
+    std::remove("cupbop_ctx_scratch.txt");
+  } else {
+    std::ofstream out("cupbop_ctx_scratch.txt");
+    out << "# CuPBoP core-mapping context scratch (translator -> cudaLaunchKernel_vortex): <kernel as in lookup.txt> "
+           "<bytes per slot> <fixed slots, 0 = ceil(block / (P*L))> <L>\n";
+    for (auto &l : sidecar) out << l << "\n";
+  }
 }
 
 void insert_warp_loop(llvm::Module *M) {
