@@ -14,4 +14,10 @@ void lower_barrier_reductions(llvm::Module *M);
 // helpers over hardware shuffles
 void lower_ldmatrix_asm(llvm::Module *M);
 
+// llvm.nvvm.{round,trunc,ceil,floor}.{f,d} -> branch-free IR
+void lower_nvvm_rounding(llvm::Module *M);
+
+// CuLifter's 32 KB `local_mem` alloca -> its accessed extent (constant offsets after integer folding)
+void shrink_lifter_local_mem(llvm::Module *M);
+
 #endif

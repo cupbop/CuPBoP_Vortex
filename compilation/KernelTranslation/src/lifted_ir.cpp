@@ -3,9 +3,12 @@
 #include "tool.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include <cstdio>
 #include <regex>
 #include <vector>
@@ -163,4 +166,124 @@ void lower_ldmatrix_asm(Module *M) {
     CI->eraseFromParent();
   }
   if (nld || nst) fprintf(stderr, "[CuPBoP] ldmatrix / stmatrix asm lowered: %u / %u\n", nld, nst);
+}
+
+// llvm.nvvm.{round,trunc,ceil,floor}[.ftz].{f,d} (CuLifter: FRND / DRND [.TRUNC/.CEIL/.FLOOR]; round = to nearest
+// even, as cvt.rni) -> branch-free IR: |x| >= 2^p (p = 23 / 52, also NaN / inf) is returned as is, otherwise rint is
+// (|x| + 2^p) - 2^p with x's sign and trunc goes through a 64-bit integer; ceil / floor adjust trunc by one. The
+// llvm.rint/round/... intrinsics would reach the RISC-V PseudoFROUND inserter, a branch the Vortex backend rejects
+// ("unimplemented divergent codegen").
+void lower_nvvm_rounding(Module *M) {
+  std::vector<CallInst *> calls;
+  for (auto &F : M->functions())
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Fn = CI->getCalledFunction()) {
+            StringRef n = Fn->getName();
+            if (n.starts_with("llvm.nvvm.round.") || n.starts_with("llvm.nvvm.trunc.") || n.starts_with("llvm.nvvm.ceil.") ||
+                n.starts_with("llvm.nvvm.floor."))
+              calls.push_back(CI);
+          }
+  if (calls.empty()) return;
+  Type *I64 = Type::getInt64Ty(M->getContext());
+  for (CallInst *CI : calls) {
+    StringRef n = CI->getCalledFunction()->getName();
+    Value *X = CI->getArgOperand(0);
+    Type *T = X->getType();
+    IRBuilder<> B(CI);
+    const double two_p = T->isDoubleTy() ? 4503599627370496.0 : 8388608.0;
+    Value *A = B.CreateUnaryIntrinsic(Intrinsic::fabs, X);
+    Value *Big = B.CreateFCmpUGE(A, ConstantFP::get(T, two_p)); // also NaN
+    Value *R;
+    if (n.starts_with("llvm.nvvm.round.")) {
+      Value *Rr = B.CreateFSub(B.CreateFAdd(A, ConstantFP::get(T, two_p)), ConstantFP::get(T, two_p));
+      R = B.CreateBinaryIntrinsic(Intrinsic::copysign, Rr, X);
+    } else {
+      // |x| < 2^p here (Big selects x otherwise): the conversion is exact; inputs >= 2^p are replaced by 0 so that
+      // fptosi never sees an out-of-range value
+      Value *Xs = B.CreateSelect(Big, ConstantFP::get(T, 0.0), X);
+      Value *Tr = B.CreateBinaryIntrinsic(Intrinsic::copysign, B.CreateSIToFP(B.CreateFPToSI(Xs, I64), T), Xs);
+      if (n.starts_with("llvm.nvvm.trunc.")) R = Tr;
+      else if (n.starts_with("llvm.nvvm.ceil.")) R = B.CreateSelect(B.CreateFCmpOLT(Tr, Xs), B.CreateFAdd(Tr, ConstantFP::get(T, 1.0)), Tr);
+      else R = B.CreateSelect(B.CreateFCmpOGT(Tr, Xs), B.CreateFSub(Tr, ConstantFP::get(T, 1.0)), Tr);
+    }
+    R = B.CreateSelect(Big, X, R);
+    CI->replaceAllUsesWith(R);
+    CI->eraseFromParent();
+  }
+  fprintf(stderr, "[CuPBoP] nvvm round/trunc/ceil/floor lowered: %zu\n", calls.size());
+}
+
+// CuLifter allocates the per-thread local window as `alloca [32768 x i8] %local_mem` in every function, whatever the
+// SASS frame size (CULIFTER_FIXES #9). Vortex stacks are 8 KB per thread, so a surviving 32 KB frame overflows into
+// the neighbour's stack at run time (or stops the RISC-V back end: "Incomplete scavenging"). After folding the
+// integer arithmetic (the lifted stack pointer is R1 = frame size - frame size + offset), every access is a
+// constant offset; the alloca is shrunk to the largest accessed byte, rounded up to 16. A non-constant offset keeps
+// the 32 KB array and is reported (CUPBOP_KEEP_LOCAL_MEM=1 keeps it always).
+void shrink_lifter_local_mem(Module *M) {
+  if (std::getenv("CUPBOP_KEEP_LOCAL_MEM")) return;
+  const DataLayout &DL = M->getDataLayout();
+  unsigned shrunk = 0, kept = 0;
+  for (auto &F : M->functions()) {
+    if (F.isDeclaration()) continue;
+    AllocaInst *AI = nullptr;
+    for (auto &I : F.getEntryBlock())
+      if (auto *A = dyn_cast<AllocaInst>(&I))
+        if (A->getName() == "local_mem" && A->getAllocatedType()->isArrayTy()) { AI = A; break; }
+    if (!AI) continue;
+    const uint64_t full = DL.getTypeAllocSize(AI->getAllocatedType());
+    // fold integer constants (the address arithmetic) in this function
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto &BB : F)
+        for (auto It = BB.begin(); It != BB.end();) {
+          Instruction *I = &*It++;
+          if (!I->getType()->isIntegerTy() || isa<CallBase>(I) || isa<LoadInst>(I) || isa<PHINode>(I)) continue;
+          if (Constant *K = ConstantFoldInstruction(I, DL))
+            if (isa<ConstantInt>(K)) { I->replaceAllUsesWith(K); I->eraseFromParent(); changed = true; }
+        }
+    }
+    uint64_t extent = 0;
+    bool ok = true;
+    std::vector<std::pair<Value *, int64_t>> work{{AI, 0}};
+    std::string why;
+    while (!work.empty() && ok) {
+      auto [V, base] = work.back();
+      work.pop_back();
+      for (User *U : V->users()) {
+        if (auto *G = dyn_cast<GEPOperator>(U)) {
+          APInt off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+          if (!G->accumulateConstantOffset(DL, off)) { ok = false; why = "non-constant offset"; break; }
+          work.push_back({G, base + off.getSExtValue()});
+        } else if (isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
+          work.push_back({U, base});
+        } else if (auto *L = dyn_cast<LoadInst>(U)) {
+          extent = std::max<int64_t>(extent, base + (int64_t)DL.getTypeStoreSize(L->getType()));
+        } else if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getValueOperand() == V) { ok = false; why = "address stored"; break; }
+          extent = std::max<int64_t>(extent, base + (int64_t)DL.getTypeStoreSize(S->getValueOperand()->getType()));
+        } else if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+          if (II->isLifetimeStartOrEnd()) continue;
+          auto *Len = dyn_cast<ConstantInt>(II->getNumOperands() > 2 ? II->getArgOperand(2) : nullptr);
+          if ((II->getIntrinsicID() == Intrinsic::memcpy || II->getIntrinsicID() == Intrinsic::memset ||
+               II->getIntrinsicID() == Intrinsic::memmove) && Len)
+            extent = std::max<int64_t>(extent, base + (int64_t)Len->getZExtValue());
+          else { ok = false; why = "intrinsic use"; break; }
+        } else { ok = false; why = "other use"; break; }
+        if (base < 0) { ok = false; why = "negative offset"; break; }
+      }
+    }
+    if (!ok || extent > full) {
+      kept++;
+      fprintf(stderr, "[CuPBoP] %s: local_mem kept at %llu bytes (%s); the Vortex stack is 8 KB per thread\n",
+              F.getName().str().c_str(), (unsigned long long)full, why.c_str());
+      continue;
+    }
+    const uint64_t n = std::max<uint64_t>(16, (extent + 15) / 16 * 16);
+    AI->setAllocatedType(ArrayType::get(Type::getInt8Ty(M->getContext()), n));
+    shrunk++;
+    if (cupbop_debug()) fprintf(stderr, "[CuPBoP] %s: local_mem %llu -> %llu bytes\n", F.getName().str().c_str(), (unsigned long long)full, (unsigned long long)n);
+  }
+  if (shrunk || kept) fprintf(stderr, "[CuPBoP] local_mem frames: %u shrunk to their accessed extent, %u kept\n", shrunk, kept);
 }

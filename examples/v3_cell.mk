@@ -60,6 +60,12 @@ VX_CFLAGS += -Wno-error -w -mllvm -disable-loop-idiom-all
 # misaligned addresses / "IPDOM stack is empty". Raise the limit (compile time, not correctness).
 CUPBOP_DIV_MAX_BBS ?= 1000000
 VX_CFLAGS += -mllvm -vortex-divergence-max-bbs=$(CUPBOP_DIV_MAX_BBS)
+# The same pipeline also skips StructurizeCFG for a *region* with more blocks than -structurizecfg-max-bbs (a much
+# smaller default) but still places split/join around its divergent branches; the unstructured region then joins a
+# token that was never pushed ("IPDOM stack is empty!"): lifted cuDNN ctc_loss compute_grads_deterministic and the
+# CUTLASS 00_basic_gemm SIMT sgemm (2026-10-29; both PASS with the limit raised).
+CUPBOP_STRUCT_MAX_BBS ?= 1000000
+VX_CFLAGS += -mllvm -structurizecfg-max-bbs=$(CUPBOP_STRUCT_MAX_BBS)
 # Extra kernel-compile flags from the environment (empty by default), e.g. CUPBOP_VX_EXTRA_CFLAGS="-mllvm
 # -split-spill-mode=size" works around an LLVM 20 RAGreedy crash (SplitEditor::deleteRematVictims) seen on the
 # lifted PyTorch reduce_kernel (global_avgpool).

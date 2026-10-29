@@ -81,6 +81,8 @@ int main(int argc, char **argv) {
   lower_barrier_reductions(program);
   // ldmatrix / stmatrix inline asm (CuLifter LDSM / STSM) -> shuffle-based runtime helpers
   lower_ldmatrix_asm(program);
+  lower_nvvm_rounding(program);
+  shrink_lifter_local_mem(program);
   dumpFile(program, "00_after_async_ptx.ll");
 
   DBG_LOG("lower_named_barriers\n");
