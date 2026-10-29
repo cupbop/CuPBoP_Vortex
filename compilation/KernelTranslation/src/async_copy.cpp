@@ -708,3 +708,10 @@ void emit_dxa_desc_sidecar(Module *M) {
   N->eraseFromParent(); // the descriptors live in the sidecar now
   fprintf(stderr, "[CuPBoP] wrote %zu DXA descriptor(s) from !vx.dxa.desc to dxa_descriptors.txt\n", lines.size());
 }
+
+// For lower_async_ptx (async_ptx.cpp): the pointer an address operand was computed from (see tracePointer),
+// with fresh dominator trees (the caller changes the CFG between calls). nullptr when it cannot be traced.
+Value *cupbop_trace_pointer(Value *V) {
+  std::map<Function *, std::unique_ptr<DominatorTree>> DTs;
+  return tracePointer(V, DTs);
+}

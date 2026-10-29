@@ -311,6 +311,9 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_bar_arrive(u
   vx_barrier_arrive((int)((id << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID)), (int)(cnt / 32));
 }
 
+// mbarrier / TMA / bulk copy helpers (software mode)
+#include "cudaKernelImpl_async.inc"
+
 // Get packed barrier id for DXA
 __attribute__((always_inline)) unsigned int
 __vx_dxa_barrier_id(unsigned int id) {

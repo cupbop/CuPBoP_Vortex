@@ -187,6 +187,102 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
   return cudaDxaProgramDescNd(slot, base_addr, 3, sz, st, bx, elem_bytes, 0, 0, 0);
 }
 
+// ── TMA tensor maps: CUDA driver API shim (software mode) ──────────────────────────────────────────
+// cuTensorMapEncodeTiled writes a cupbop_tmap record (runtime/include/cupbop_async.h) into the 128-byte
+// CUtensorMap and uploads a copy to device memory; record.self (the first 8 bytes) is that copy's device
+// address, which is what reaches the kernel for a by-value CUtensorMap argument (8 bytes per argument).
+// The device helpers (cudaKernelImpl_async.inc) copy boxes in software. Refused with an error (returned
+// CUDA_ERROR_INVALID_VALUE = 1 and a message), never encoded approximately: swizzle, interleave, element
+// strides other than 1, misaligned addresses or strides. Signature as in cuda.h (enums are int-sized).
+#include "cupbop_async.h"
+static_assert(sizeof(cupbop_tmap) <= 128, "cupbop_tmap must fit in a CUtensorMap");
+extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint32_t tensorRank, void *globalAddress,
+                                      const uint64_t *globalDim, const uint64_t *globalStrides,
+                                      const uint32_t *boxDim, const uint32_t *elementStrides, int interleave,
+                                      int swizzle, int l2Promotion, int oobFill) {
+  (void)l2Promotion; // a cache hint
+  auto bad = [](const std::string &why) {
+    fprintf(stderr, "cuTensorMapEncodeTiled (CuPBoP): %s\n", why.c_str());
+    return 1; // CUDA_ERROR_INVALID_VALUE
+  };
+  static const uint32_t elem_of[13] = {1, 2, 4, 4, 8, 8, 2, 4, 8, 2, 4, 4, 4};
+  if (!tensorMap || ((uintptr_t)tensorMap & 63)) return bad("tensorMap must be a 64-byte aligned CUtensorMap");
+  if (tensorDataType < 0 || tensorDataType > 12)
+    return bad("data type " + std::to_string(tensorDataType) + " is not supported (1/2/4/8-byte types only)");
+  if (tensorRank < 1 || tensorRank > 5) return bad("rank must be 1..5");
+  if (!globalAddress || ((uintptr_t)globalAddress & 15)) return bad("globalAddress must be 16-byte aligned");
+  if (!globalDim || !boxDim || (tensorRank > 1 && !globalStrides)) return bad("NULL globalDim / globalStrides / boxDim");
+  if (interleave != 0) return bad("interleave other than CU_TENSOR_MAP_INTERLEAVE_NONE is not supported");
+  if (swizzle != 0)
+    return bad("swizzle other than CU_TENSOR_MAP_SWIZZLE_NONE is not supported yet (async design stage 4)");
+  if (oobFill != 0 && oobFill != 1) return bad("unknown oobFill");
+  cupbop_tmap r;
+  memset(&r, 0, sizeof(r));
+  r.magic = CUPBOP_TMAP_MAGIC;
+  r.rank = tensorRank;
+  r.gaddr = (uint64_t)(uintptr_t)globalAddress;
+  r.elem = elem_of[tensorDataType];
+  r.dtype = (uint32_t)tensorDataType;
+  r.mode = CUPBOP_TMAP_MODE_SW;
+  const bool is_float = tensorDataType >= 6; // FLOAT16 .. TFLOAT32_FTZ
+  r.oob_nan = (oobFill == 1 && is_float) ? 1u : 0u;
+  for (uint32_t i = 0; i < tensorRank; ++i) {
+    if (globalDim[i] < 1 || globalDim[i] > (1ull << 32)) return bad("globalDim must be 1..2^32");
+    if (boxDim[i] < 1 || boxDim[i] > 256) return bad("boxDim must be 1..256");
+    if (elementStrides && elementStrides[i] != 1)
+      return bad("elementStrides other than 1 are not supported (software tensor maps)");
+    r.dim[i] = (uint32_t)std::min<uint64_t>(globalDim[i], 0xFFFFFFFFull);
+    r.box[i] = boxDim[i];
+  }
+  if ((uint64_t)boxDim[0] * r.elem % 16) return bad("boxDim[0] * element size must be a multiple of 16 bytes");
+  for (uint32_t i = 0; i + 1 < tensorRank; ++i) {
+    if (globalStrides[i] % 16 || globalStrides[i] >= (1ull << 40))
+      return bad("globalStrides must be multiples of 16 below 2^40");
+    r.stride[i] = globalStrides[i];
+  }
+  // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
+  // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
+  r.dxa_slot = 0xFFFFFFFFu;
+  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e)) {
+    bool ok = (r.gaddr % 64 == 0) && ((uint64_t)r.dim[0] * r.elem % 64 == 0);
+    for (uint32_t i = 0; i + 1 < tensorRank; ++i) ok = ok && r.stride[i] % 64 == 0 && r.stride[i] <= 0xFFFFFFFFull;
+    if (ok) r.mode = CUPBOP_TMAP_MODE_DXA;
+    else
+      fprintf(stderr, "cuTensorMapEncodeTiled (CuPBoP): DXA mode needs 64-byte aligned rows (base, dim0 * element "
+                      "size and strides multiples of 64); software copies for this tensor map\n");
+  }
+  void *dev = nullptr;
+  if (cudaMalloc(&dev, 128) != cudaSuccess || !dev) return bad("cudaMalloc of the device record failed");
+  r.self = (uint64_t)(uintptr_t)dev;
+  uint8_t img[128];
+  memset(img, 0, sizeof(img));
+  memcpy(img, &r, sizeof(r));
+  if (cudaMemcpy(dev, img, sizeof(img), cudaMemcpyHostToDevice) != cudaSuccess) return bad("upload of the record failed");
+  memcpy(tensorMap, img, sizeof(img));
+  return 0; // CUDA_SUCCESS
+}
+extern "C" int cuTensorMapEncodeIm2col(void *, int, uint32_t, void *, const uint64_t *, const uint64_t *, const int *,
+                                       const int *, uint32_t, uint32_t, const uint32_t *, int, int, int, int) {
+  fprintf(stderr, "cuTensorMapEncodeIm2col (CuPBoP): im2col tensor maps are not supported\n");
+  return 1;
+}
+
+// Kernels that use mbarrier waits / TMA / bulk copies (warp-specialized synchronization) are listed by the
+// translator in cupbop_async_kernels.txt. The core mapping (schedule 1) runs them only as a de facto 1:1
+// mapping, one logical warp per physical warp (P == the CTA's warps); anything else is refused at launch.
+static bool cupbop_async_kernel(const std::string &kname) {
+  static const std::vector<std::string> names = []() {
+    std::vector<std::string> v;
+    std::ifstream f("cupbop_async_kernels.txt");
+    std::string s;
+    while (f >> s) v.push_back(s);
+    return v;
+  }();
+  for (auto &n : names)
+    if (!kname.empty() && (kname.find(n) != std::string::npos || n.find(kname) != std::string::npos)) return true;
+  return false;
+}
+
 // ── dxa_descriptors.txt sidecar (read from the working directory at the first launch) ──
 // Legacy line (the automatic cp.async conversion): kernel slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes
 //   -> rank 2, sizes from the integer arguments, dense row stride.
@@ -1417,6 +1513,36 @@ cudaError_t cudaLaunchKernel_vortex(
   }
 
 
+  // ── TMA tensor maps in DXA mode (cuTensorMapEncodeTiled with CUPBOP_TMA_DXA=1): a DXA slot per by-value
+  // CUtensorMap argument of this launch, from slot 15 down (explicit descriptors use the low slots); the device
+  // record learns its slot. A tensor map reached otherwise (e.g. through a pointer) keeps no slot and is copied
+  // in software by the device helper.
+  {
+    uint32_t next_slot = 15;
+    std::map<uint64_t, uint32_t> given;
+    for (int i = 0; i < num_args; ++i) {
+      cupbop_tmap r;
+      memcpy(&r, args[i], sizeof(r)); // args[i] points at the argument's host value (128 bytes for a CUtensorMap)
+      if (r.magic != CUPBOP_TMAP_MAGIC || r.mode != CUPBOP_TMAP_MODE_DXA || !r.self || given.count(r.self)) continue;
+      if (next_slot < 8) {
+        fprintf(stderr, "cudaLaunchKernel: more than 8 DXA-mode tensor maps; the rest are copied in software\n");
+        break;
+      }
+      DxaDescEntry d{};
+      d.slot = next_slot--; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem;
+      for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
+      for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
+      d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
+      std::string err = dxa_desc_check(d);
+      if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
+      dxa_program(DC->device(), d);
+      given[r.self] = d.slot;
+      cudaMemcpy((void *)(uintptr_t)(r.self + offsetof(cupbop_tmap, dxa_slot)), &d.slot, sizeof(uint32_t),
+                 cudaMemcpyHostToDevice);
+      DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
+    }
+  }
+
   // ── CUPBOP_LAUNCH2: hardware CTA dispatch via vx_enqueue_launch ─────────────
   {
     const int schedule = cupbop_schedule_flag();
@@ -1474,6 +1600,13 @@ cudaError_t cudaLaunchKernel_vortex(
       if (virt_trips) { uint32_t p = (uint32_t)((block_threads + 32ull * virt_trips - 1) / (32ull * virt_trips)); P = std::max<uint32_t>(1u, std::min(P, p)); }
       if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
       if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
+      if ((P != block_warps || L != 32) && (cupbop_async_kernel(kernel_name_tmp) || cupbop_async_kernel(func_stripped))) {
+        printf("Error: kernel %s uses mbarrier waits / TMA / bulk copies (warp-specialized synchronization); the core "
+               "mapping runs it only with one logical warp per physical warp of 32 lanes (CUPBOP_VIRT_WARPS = the "
+               "block's %u warps, no trips / lane gating), got %u physical warps of %u lanes. Use SCHEDULE=2.\n",
+               func_stripped.c_str(), block_warps, P, L);
+        std::abort();
+      }
       const char *virt_exact_env = std::getenv("CUPBOP_VIRT_TRIPS_EXACT");
       if (virt_trips && virt_exact_env && std::atoi(virt_exact_env) && (uint64_t)P * 32ull * virt_trips != block_threads) {
         printf("Error: CUPBOP_VIRT_TRIPS_EXACT needs physical warps x 32 x trips == threads per block (%u x 32 x %u != %lu)\n",

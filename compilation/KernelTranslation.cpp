@@ -3,6 +3,7 @@
 #include "handle_sync.h"
 #include "init.h"
 #include "async_copy.h"
+#include "async_ptx.h"
 #include "insert_sync.h"
 #include "insert_warp_loop.h"
 #include "performance.h"
@@ -56,8 +57,16 @@ int main(int argc, char **argv) {
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
 
+  // Hopper/Ampere async PTX (mbarrier, TMA, bulk copy, elect, cluster registers; async_ptx.h): first, so that
+  // lower_named_barriers and lower_cp_async only see what is left, and every later pass sees plain calls
+  DBG_LOG("lower_async_ptx\n");
+  lower_async_ptx(program);
+  dumpFile(program, "00_after_async_ptx.ll");
+
   DBG_LOG("lower_named_barriers\n");
   lower_named_barriers(program);
+  // Vortex barrier numbers for the mbarriers, after the named barriers took theirs
+  finalize_mbarrier_ids(program);
   DBG_LOG("drop_cta_membar_at_barriers\n");
   drop_cta_membar_at_barriers(program);
 
