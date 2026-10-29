@@ -84,6 +84,17 @@ public:
   std::unordered_set<const Value *> ExtraSources;
   void addSource(const Value *V) { ExtraSources.insert(V); }
 
+  // the allocas a call gets pointers to (through GEPs / casts) become divergent
+  void markPointerArgsDivergent(const CallInst *CI, const char *why) {
+    for (const Value *A : CI->args())
+      if (A->getType()->isPointerTy())
+        if (auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(A)))
+          if (DivergentValues.insert(AI).second) {
+            Worklist.push(AI);
+            if (why) fprintf(stderr, "%s: %s\n", why, AI->getName().str().c_str());
+          }
+  }
+
   void setAnalyzers(DominatorTree &DomTree, PostDominatorTree &PostDomTree,
                     LoopInfo &LoopInf) {
         DT = &DomTree;
@@ -115,6 +126,35 @@ public:
         I.print(llvm::errs());
         fprintf(stderr, "\n");
       }
+      // virt (schedule 1): results the analysis cannot see through. It follows SSA values and stores only, but
+      // the core mapping keeps an alloca whose stores all look uniform as ONE copy per hardware thread, shared by
+      // the logical warps that hardware thread runs one after another; a later region then reads the last
+      // logical warp's value in every logical warp. Conservatively:
+      //  - an alloca passed (as a pointer argument) to a call of a function -- a device-runtime helper such as
+      //    __cupbop_ldmatrix_m8n8_b16(addr, num, trans, ptr d), whose result differs per lane whatever its
+      //    inputs -- or to inline asm is a divergence source (lifted CUTLASS 12_gemm_bias_relu s1: the ldmatrix
+      //    fragments loaded from the lower_ldmatrix_asm buffer and the PHI slots holding them across the main
+      //    loop's barrier looked uniform; 13951/32768 wrong, only the last trip's warps right);
+      //  - the value of a convergent call is a divergence source: a warp-level helper (elect, movmatrix, ...) can
+      //    differ per lane with uniform inputs. CUDA marks every device function convergent, so in practice this
+      //    is every non-intrinsic call with a value (libdevice too): conservative, it can only add replication;
+      //  - a divergent call (below) makes the allocas it gets pointers to divergent, as a divergent store does.
+      // Debug switches: CUPBOP_DIV_NO_CALL_ALLOCA, CUPBOP_DIV_NO_CONVERGENT, CUPBOP_DIV_NO_CALL_PROP turn the three off.
+      if (g_schedule_flag == 1)
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          const Function *Fn = CI->getCalledFunction();
+          const bool intrinsic = Fn && Fn->isIntrinsic();
+          if (!intrinsic) {
+            if (!std::getenv("CUPBOP_DIV_NO_CALL_ALLOCA"))
+              markPointerArgsDivergent(CI, "[div] source (alloca passed to a call)");
+            if (!std::getenv("CUPBOP_DIV_NO_CONVERGENT") && !CI->getType()->isVoidTy() && CI->isConvergent() &&
+                DivergentValues.insert(CI).second) {
+              Worklist.push(CI);
+              fprintf(stderr, "[div] source (convergent call): %s\n",
+                      Fn ? Fn->getName().str().c_str() : "(indirect / asm)");
+            }
+          }
+        }
     }
 
     // Propagate divergence
@@ -202,6 +242,12 @@ public:
       
        else {
         not_st_not_br:
+        // schedule 1: a divergent call may write a per-lane value through any pointer it gets (memcpy from a
+        // divergent source, a helper with divergent inputs), like a divergent store
+        if (g_schedule_flag == 1 && !std::getenv("CUPBOP_DIV_NO_CALL_PROP"))
+          if (auto *CI = dyn_cast<CallInst>(Inst))
+            if (!(CI->getCalledFunction() && CI->getCalledFunction()->getName().starts_with("llvm.lifetime.")))
+              markPointerArgsDivergent(CI, "[div] alloca written by a divergent call");
         for (const Use &U : Inst->uses()) {
           const Instruction *UserInst = dyn_cast<Instruction>(U.getUser());
           if (UserInst && DivergentValues.insert(UserInst).second) {
