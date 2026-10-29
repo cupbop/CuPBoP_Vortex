@@ -84,6 +84,24 @@ public:
   std::unordered_set<const Value *> ExtraSources;
   void addSource(const Value *V) { ExtraSources.insert(V); }
 
+  // a function body that may compute something thread-dependent on its own (not from its arguments)
+  static bool mayReadThreadIdentity(const Function &F) {
+    for (const Instruction &I : instructions(F))
+      if (auto *C = dyn_cast<CallInst>(&I)) {
+        if (C->isInlineAsm()) return true;
+        const Function *G = C->getCalledFunction();
+        if (!G) return true;
+        if (G->isIntrinsic()) {
+          if (G->getName().starts_with("llvm.nvvm.read.ptx.sreg.") || G->getName().starts_with("llvm.nvvm.shfl") ||
+              G->getName().starts_with("llvm.nvvm.vote") || G->getName().starts_with("llvm.nvvm.match"))
+            return true;
+          continue;
+        }
+        return true;
+      }
+    return false;
+  }
+
   // the allocas a call gets pointers to (through GEPs / casts) become divergent
   void markPointerArgsDivergent(const CallInst *CI, const char *why) {
     for (const Value *A : CI->args())
@@ -135,9 +153,12 @@ public:
       //    inputs -- or to inline asm is a divergence source (lifted CUTLASS 12_gemm_bias_relu s1: the ldmatrix
       //    fragments loaded from the lower_ldmatrix_asm buffer and the PHI slots holding them across the main
       //    loop's barrier looked uniform; 13951/32768 wrong, only the last trip's warps right);
-      //  - the value of a convergent call is a divergence source: a warp-level helper (elect, movmatrix, ...) can
-      //    differ per lane with uniform inputs. CUDA marks every device function convergent, so in practice this
-      //    is every non-intrinsic call with a value (libdevice too): conservative, it can only add replication;
+      //  - the value of a convergent call to a function that may read the thread's identity is a divergence
+      //    source: a warp-level runtime helper (elect, movmatrix, ...) can differ per lane or per warp with uniform
+      //    inputs. CUDA marks every device function convergent, so the test is on the callee: a declaration (body
+      //    not visible: device-runtime helpers) or a body with a special-register read, inline asm or another
+      //    non-intrinsic call. Not: memory(none) calls and libdevice (__nv_*, pure math; counting __nv_fast_powf
+      //    cost backprop's s1 v0 run +51% cycles for nothing), or bodies like the CUDA-side DXA query stubs;
       //  - a divergent call (below) makes the allocas it gets pointers to divergent, as a divergent store does.
       // Debug switches: CUPBOP_DIV_NO_CALL_ALLOCA, CUPBOP_DIV_NO_CONVERGENT, CUPBOP_DIV_NO_CALL_PROP turn the three off.
       if (g_schedule_flag == 1)
@@ -147,7 +168,9 @@ public:
           if (!intrinsic) {
             if (!std::getenv("CUPBOP_DIV_NO_CALL_ALLOCA"))
               markPointerArgsDivergent(CI, "[div] source (alloca passed to a call)");
-            if (!std::getenv("CUPBOP_DIV_NO_CONVERGENT") && !CI->getType()->isVoidTy() && CI->isConvergent() &&
+            const bool pure = CI->doesNotAccessMemory() || (Fn && Fn->getName().starts_with("__nv_")) ||
+                              (Fn && !Fn->isDeclaration() && !mayReadThreadIdentity(*Fn));
+            if (!std::getenv("CUPBOP_DIV_NO_CONVERGENT") && !CI->getType()->isVoidTy() && CI->isConvergent() && !pure &&
                 DivergentValues.insert(CI).second) {
               Worklist.push(CI);
               fprintf(stderr, "[div] source (convergent call): %s\n",
