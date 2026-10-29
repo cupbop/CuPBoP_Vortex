@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
   lower_ldmatrix_asm(program);
   lower_nvvm_rounding(program);
   shrink_lifter_local_mem(program);
+  lower_redux_sync(program);
+  lower_lanemask(program);
   dumpFile(program, "00_after_async_ptx.ll");
 
   DBG_LOG("lower_named_barriers\n");
@@ -223,6 +225,7 @@ int main(int argc, char **argv) {
     Passes.run(*program);
   }
 
+  fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
   DumpModule(program, argv[2]);
 
   fout.close();

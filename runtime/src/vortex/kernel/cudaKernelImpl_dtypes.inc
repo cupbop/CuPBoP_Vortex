@@ -736,4 +736,26 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n
   }
 }
 
+
+// ---- redux.sync.<op>.b32 v, membermask (sm_80+): reduction over the mask's lanes (index shuffles, any mask) ----------
+// op: 0 add, 1 umin, 2 umax, 3 min (s32), 4 max (s32), 5 and, 6 or, 7 xor
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_redux_sync(uint32_t v, uint32_t mask, int op) {
+  uint32_t r = (op == 1 || op == 5) ? 0xffffffffu : (op == 3) ? 0x7fffffffu : (op == 4) ? 0x80000000u : 0u;
+  for (int l = 0; l < 32; ++l) {
+    const uint32_t x = __cupbop_shfl32(v, l);
+    if (!((mask >> l) & 1u)) continue;
+    switch (op) {
+      case 0: r += x; break;
+      case 1: r = x < r ? x : r; break;
+      case 2: r = x > r ? x : r; break;
+      case 3: r = (int32_t)x < (int32_t)r ? x : r; break;
+      case 4: r = (int32_t)x > (int32_t)r ? x : r; break;
+      case 5: r &= x; break;
+      case 6: r |= x; break;
+      default: r ^= x; break;
+    }
+  }
+  return r;
+}
+
 #endif // VX_CFG_NUM_THREADS (Vortex 3.0)

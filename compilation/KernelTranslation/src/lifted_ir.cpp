@@ -287,3 +287,80 @@ void shrink_lifter_local_mem(Module *M) {
   }
   if (shrunk || kept) fprintf(stderr, "[CuPBoP] local_mem frames: %u shrunk to their accessed extent, %u kept\n", shrunk, kept);
 }
+
+// llvm.nvvm.redux.sync.{add,umin,umax,min,max,and,or,xor}(i32 v, i32 membermask) (redux.sync.op.b32/.u32/.s32, sm_80+)
+// -> __cupbop_redux_sync(v, mask, op): the lanes of the mask, gathered with index shuffles (any mask; the lanes in it
+// are active by the PTX contract). Software, hardware warp (1:1 / core mapping with 32 hardware lanes).
+void lower_redux_sync(Module *M) {
+  std::vector<CallInst *> calls;
+  for (auto &F : M->functions())
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Fn = CI->getCalledFunction())
+            if (Fn->getName().starts_with("llvm.nvvm.redux.sync.")) calls.push_back(CI);
+  if (calls.empty()) return;
+  LLVMContext &C = M->getContext();
+  Type *I32 = Type::getInt32Ty(C);
+  FunctionCallee H = M->getOrInsertFunction("__cupbop_redux_sync", FunctionType::get(I32, {I32, I32, I32}, false));
+  if (auto *Fn = dyn_cast<Function>(H.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  static const char *ops[] = {"add", "umin", "umax", "min", "max", "and", "or", "xor"};
+  for (CallInst *CI : calls) {
+    StringRef n = CI->getCalledFunction()->getName().drop_front(strlen("llvm.nvvm.redux.sync."));
+    int op = -1;
+    for (int i = 0; i < 8; ++i) if (n == ops[i]) op = i;
+    if (op < 0 || CI->arg_size() != 2) {
+      fprintf(stderr, "error: unsupported %s\n", CI->getCalledFunction()->getName().str().c_str());
+      exit(1);
+    }
+    IRBuilder<> B(CI);
+    CallInst *R = B.CreateCall(H, {CI->getArgOperand(0), CI->getArgOperand(1), ConstantInt::get(I32, op)});
+    R->addFnAttr(Attribute::Convergent);
+    CI->replaceAllUsesWith(R);
+    CI->eraseFromParent();
+  }
+  fprintf(stderr, "[CuPBoP] redux.sync lowered: %zu\n", calls.size());
+}
+
+// llvm.bitreverse.i1(x) == x. InstCombine makes it from lifted predicate shuffling; the RISC-V back end cannot type-
+// legalize it ("Do not know how to promote this operator!", CUTLASS 58_ada_fp8_gemm).
+void fold_bitreverse_i1(Module *M) {
+  std::vector<CallInst *> calls;
+  for (auto &F : M->functions())
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *II = dyn_cast<IntrinsicInst>(&I))
+          if (II->getIntrinsicID() == Intrinsic::bitreverse && II->getType()->isIntOrIntVectorTy(1)) calls.push_back(II);
+  for (CallInst *CI : calls) { CI->replaceAllUsesWith(CI->getArgOperand(0)); CI->eraseFromParent(); }
+}
+
+// llvm.nvvm.read.ptx.sreg.lanemask.{eq,le,lt,ge,gt} -> masks of llvm.nvvm.read.ptx.sreg.laneid (lowered later with
+// the other special registers). Left in place they reach the RISC-V back end, which crashed in
+// lowerGetVectorLength on the unknown intrinsic id (CUTLASS 41_fused_multi_head_attention_backward).
+void lower_lanemask(Module *M) {
+  std::vector<CallInst *> calls;
+  for (auto &F : M->functions())
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Fn = CI->getCalledFunction())
+            if (Fn->getName().starts_with("llvm.nvvm.read.ptx.sreg.lanemask.")) calls.push_back(CI);
+  if (calls.empty()) return;
+  Type *I32 = Type::getInt32Ty(M->getContext());
+  FunctionCallee Lane = M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.laneid", FunctionType::get(I32, false));
+  for (CallInst *CI : calls) {
+    StringRef k = CI->getCalledFunction()->getName().drop_front(strlen("llvm.nvvm.read.ptx.sreg.lanemask."));
+    IRBuilder<> B(CI);
+    Value *L = B.CreateCall(Lane);
+    Value *Bit = B.CreateShl(ConstantInt::get(I32, 1), L);              // 1 << lane
+    Value *R;
+    if (k == "eq") R = Bit;
+    else if (k == "lt") R = B.CreateSub(Bit, ConstantInt::get(I32, 1));
+    else if (k == "le") R = B.CreateOr(B.CreateSub(Bit, ConstantInt::get(I32, 1)), Bit);
+    else if (k == "gt") R = B.CreateNot(B.CreateOr(B.CreateSub(Bit, ConstantInt::get(I32, 1)), Bit));
+    else if (k == "ge") R = B.CreateNot(B.CreateSub(Bit, ConstantInt::get(I32, 1)));
+    else { fprintf(stderr, "error: unsupported %s\n", CI->getCalledFunction()->getName().str().c_str()); exit(1); }
+    CI->replaceAllUsesWith(R);
+    CI->eraseFromParent();
+  }
+}

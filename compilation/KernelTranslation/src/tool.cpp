@@ -439,8 +439,12 @@ void lower_atomicrmw_fadd(llvm::Module *M) {
   size_t nuniform = 0, ngeneral = 0;
   for (auto *RMW : fadd_ops) {
     IRBuilder<> B(RMW);
-    auto *ptr = RMW->getPointerOperand();
+    Value *ptr = RMW->getPointerOperand();
     auto *addend = RMW->getValOperand();
+    // the helpers take a generic pointer; CuLifter's RED.E.ADD.F32 is an atomicrmw on ptr addrspace(1)
+    // (lifted CUTLASS FMHA backward: "Call parameter type does not match function signature")
+    if (ptr->getType()->getPointerAddressSpace() != 0)
+      ptr = B.CreateAddrSpaceCast(ptr, PtrTy);
 
     // Fast path: if the atomic result is unused AND the pointer is a
     // kernel argument (uniform across the warp — all 32 lanes add to

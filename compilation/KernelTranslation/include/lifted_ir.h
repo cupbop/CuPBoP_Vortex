@@ -20,4 +20,13 @@ void lower_nvvm_rounding(llvm::Module *M);
 // CuLifter's 32 KB `local_mem` alloca -> its accessed extent (constant offsets after integer folding)
 void shrink_lifter_local_mem(llvm::Module *M);
 
+// llvm.nvvm.redux.sync.* -> shuffle-based runtime helper
+void lower_redux_sync(llvm::Module *M);
+
+// llvm.bitreverse.i1(x) -> x (the RISC-V back end cannot legalize it)
+void fold_bitreverse_i1(llvm::Module *M);
+
+// llvm.nvvm.read.ptx.sreg.lanemask.* -> masks of %laneid
+void lower_lanemask(llvm::Module *M);
+
 #endif
