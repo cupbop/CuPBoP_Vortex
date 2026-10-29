@@ -9,6 +9,7 @@
 #include "performance.h"
 #include "tool.h"
 #include "warp_func.h"
+#include "lifted_ir.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -74,6 +75,10 @@ int main(int argc, char **argv) {
   // lower_named_barriers and lower_cp_async only see what is left, and every later pass sees plain calls
   DBG_LOG("lower_async_ptx\n");
   lower_async_ptx(program);
+  // wide by-value parameters (CuLifter parameter structs) -> pointer to their consecutive launch slots
+  pass_wide_kernel_args_by_slot(program);
+  // __syncthreads_and / _or / _count (CuLifter: BAR.RED) -> barrier + shared-memory reduction
+  lower_barrier_reductions(program);
   dumpFile(program, "00_after_async_ptx.ll");
 
   DBG_LOG("lower_named_barriers\n");

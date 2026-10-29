@@ -1116,25 +1116,37 @@ void foldIntegers(Function &F) {
   }
 }
 
-// A kernel parameter wider than 8 bytes that is not a pointer (CuLifter passes a CUtensorMap as [2 x <8 x i64>])
+// A vector-typed kernel parameter wider than 8 bytes (CuLifter passes a CUtensorMap as [2 x <8 x i64>])
 // becomes an i64: the launch packs 8 bytes per argument (cudaLaunchKernel_vortex), so only the first 8 bytes
 // arrive -- for a CUtensorMap the device address of its record (cuTensorMapEncodeTiled shim) -- and the RISC-V
 // back end cannot lower vector-typed formal arguments without the V extension. The body sees the old value
 // rebuilt from those 8 bytes, the rest zero.
+// Only vector-typed parameters: other wide parameters (CuLifter's [N x i8] parameter structs, i128) keep all their
+// bytes through pass_wide_kernel_args_by_slot (generate_wrapper.cpp).
+static bool hasVectorType(Type *T) {
+  if (T->isVectorTy()) return true;
+  if (auto *AT = dyn_cast<ArrayType>(T)) return hasVectorType(AT->getElementType());
+  if (auto *ST = dyn_cast<StructType>(T))
+    for (Type *E : ST->elements()) if (hasVectorType(E)) return true;
+  return false;
+}
 void narrowWideKernelArgs(Module *M) {
   const DataLayout &DL = M->getDataLayout();
+  auto isWide = [&](Argument &A) {
+    return !A.getType()->isPointerTy() && hasVectorType(A.getType()) && DL.getTypeStoreSize(A.getType()) > 8;
+  };
   std::vector<Function *> todo;
   for (auto &F : *M)
     if (!F.isDeclaration() && isKernelFunction(M, &F))
       for (auto &A : F.args())
-        if (!A.getType()->isPointerTy() && DL.getTypeStoreSize(A.getType()) > 8) { todo.push_back(&F); break; }
+        if (isWide(A)) { todo.push_back(&F); break; }
   LLVMContext &ctx = M->getContext();
   Type *I64 = Type::getInt64Ty(ctx);
   for (Function *F : todo) {
     std::vector<Type *> params;
     std::vector<bool> wide;
     for (auto &A : F->args()) {
-      bool w = !A.getType()->isPointerTy() && DL.getTypeStoreSize(A.getType()) > 8;
+      bool w = isWide(A);
       wide.push_back(w);
       params.push_back(w ? I64 : A.getType());
     }

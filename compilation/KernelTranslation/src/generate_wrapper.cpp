@@ -40,6 +40,76 @@ void set_meta_data(llvm::Module *M) {
   }
 }
 
+// Kernel-argument ABI for parameters wider than one launch slot (CuLifter: the whole cuBLAS / cuDNN / CUTLASS
+// parameter struct as one `[N x i8] %arg_<cbank offset>`, or i128 members). cudaLaunchKernel_vortex packs 8 bytes
+// per slot; a host that launches such a kernel passes the parameter's bytes in ceil(N/8) consecutive slots (the
+// argument list of the lifted signature, in order, each parameter starting a new slot). The formal becomes a pointer
+// to those slots (attribute "cupbop-arg-slots"="<k>", decode_input passes the slot address) and the body loads the
+// old value from it: a first-class aggregate by value would otherwise be split into N scalar arguments of the
+// non-inlined kernel call (registers + several KB of stack). Vector-typed parameters (CuLifter's CUtensorMap
+// [2 x <8 x i64>]) keep the one-slot narrowing of lower_async_ptx. Before 2026-10-29 only the first 8 bytes of
+// every such parameter reached the kernel (narrowWideKernelArgs, when the module had async intrinsics) or the
+// parameter overlapped the slots of the following ones.
+static bool type_has_vector(Type *T) {
+  if (T->isVectorTy()) return true;
+  if (auto *AT = dyn_cast<ArrayType>(T)) return type_has_vector(AT->getElementType());
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    for (Type *E : ST->elements()) if (type_has_vector(E)) return true;
+  }
+  return false;
+}
+void pass_wide_kernel_args_by_slot(llvm::Module *M) {
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &ctx = M->getContext();
+  auto wide = [&](Argument &A) {
+    Type *T = A.getType();
+    return !T->isPointerTy() && !type_has_vector(T) && DL.getTypeStoreSize(T) > 8;
+  };
+  std::vector<Function *> todo;
+  for (auto &F : *M)
+    if (!F.isDeclaration() && isKernelFunction(M, &F))
+      for (auto &A : F.args())
+        if (wide(A)) { todo.push_back(&F); break; }
+  Type *PtrT = PointerType::get(ctx, 0);
+  for (Function *F : todo) {
+    std::vector<Type *> params;
+    std::vector<unsigned> slots;
+    for (auto &A : F->args()) {
+      unsigned k = wide(A) ? (unsigned)((DL.getTypeStoreSize(A.getType()) + 7) / 8) : 0;
+      slots.push_back(k);
+      params.push_back(k ? PtrT : A.getType());
+    }
+    FunctionType *FT = FunctionType::get(F->getReturnType(), params, F->isVarArg());
+    Function *NF = Function::Create(FT, F->getLinkage(), F->getAddressSpace(), "", M);
+    NF->copyAttributesFrom(F);
+    AttributeList AL = F->getAttributes();
+    for (unsigned i = 0; i < slots.size(); ++i)
+      if (slots[i]) {
+        AL = AL.removeParamAttributes(ctx, i);
+        AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, "cupbop-arg-slots", std::to_string(slots[i])));
+        AL = AL.addParamAttribute(ctx, i, Attribute::NoAlias);
+        AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, Attribute::Alignment, 8));
+      }
+    NF->setAttributes(AL);
+    NF->setCallingConv(F->getCallingConv());
+    NF->takeName(F);
+    NF->splice(NF->begin(), F);
+    IRBuilder<> B(&*NF->getEntryBlock().getFirstInsertionPt());
+    for (unsigned i = 0; i < slots.size(); ++i) {
+      Argument *OA = F->getArg(i), *NA = NF->getArg(i);
+      if (!slots[i]) { NA->takeName(OA); OA->replaceAllUsesWith(NA); continue; }
+      NA->setName(OA->getName() + ".slots");
+      Value *v = B.CreateAlignedLoad(OA->getType(), NA, Align(8), OA->getName());
+      OA->replaceAllUsesWith(v);
+      if (cupbop_debug())
+        fprintf(stderr, "[CuPBoP] %s: parameter %u (%u bytes) passed in %u launch slots\n", NF->getName().str().c_str(),
+                i, (unsigned)DL.getTypeStoreSize(OA->getType()), slots[i]);
+    }
+    F->replaceAllUsesWith(NF);
+    F->eraseFromParent();
+  }
+}
+
 // as pthread only accept a single void* for input
 // we have to decode this input inside the kernel
 void decode_input(llvm::Module *M) {
@@ -153,6 +223,16 @@ void decode_input(llvm::Module *M) {
     for (Function::const_arg_iterator ii = F->arg_begin(), ee = F->arg_end();
          ii != ee; ++ii) {
       Type *ArgType = ii->getType();
+      // A wide by-value parameter (pass_wide_kernel_args_by_slot) arrives in consecutive 8-byte slots: pass the
+      // address of its first slot and skip the rest.
+      if (F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-arg-slots")) {
+        unsigned nslots = 0;
+        F->getAttributes().getParamAttr(ii->getArgNo(), "cupbop-arg-slots").getValueAsString().getAsInteger(10, nslots);
+        Value *SlotP = Builder.CreateGEP(PointerType::get(Int32T, 0), input_arg, ConstantInt::get(Int32T, idx));
+        Arguments.push_back(SlotP);
+        idx += nslots;
+        continue;
+      }
 
       // calculate addr
       // LLVM 18 changes
