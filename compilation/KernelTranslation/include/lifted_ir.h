@@ -10,4 +10,8 @@
 // a reduction in a shared-memory word, so that every schedule's barrier handling applies.
 void lower_barrier_reductions(llvm::Module *M);
 
+// ldmatrix / stmatrix .m8n8.b16 inline asm (CuLifter LDSM / STSM, integer shared-window address) -> runtime
+// helpers over hardware shuffles
+void lower_ldmatrix_asm(llvm::Module *M);
+
 #endif

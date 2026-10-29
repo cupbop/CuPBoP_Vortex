@@ -696,4 +696,44 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f
   d[0] = d0; d[1] = d1;
 }
 
+
+// ---- ldmatrix / stmatrix .m8n8 .b16 (inline asm of CuLifter-lifted kernels and CUTLASS-style CUDA code) ---------
+// ldmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].shared.b16 {d0..}, [a]: lanes 8j..8j+7 give the row addresses of
+// matrix j (row r from lane 8j+r); lane l (g = l>>2, t = l&3) receives d_j = {M_j[g][2t], M_j[g][2t+1]} (low half =
+// lower column), with .trans {M_j[2t][g], M_j[2t+1][g]}. stmatrix is the inverse (lane l holds d_j, the rows' lanes
+// give the addresses). The address operand is a 32-bit shared-window value: CuLifter's ptrtoint of @shared_mem + off
+// (32 or 64 bits, truncated here) or __cupbop_cvta_to_shared's offset; both decode to the local-memory pointer
+// lmem + ((a - lmem) mod 2^18), as the wgmma descriptors do (local memory < 256 KB). Software: index shuffles over the
+// hardware warp (1:1 / core mapping with 32 hardware lanes), all 32 lanes active as .sync requires.
+static inline char *__cupbop_smem_ptr(uint32_t a) {
+  const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
+  return (char *)(lmem + ((a - (uint32_t)lmem) & 0x3FFFFu));
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16(uint32_t a, int num, int trans, uint32_t *d) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  for (int j = 0; j < num; ++j) {
+    if (!trans) {
+      const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
+      d[j] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t);
+    } else {
+      const uint32_t r0 = __cupbop_shfl32(a, 8 * j + 2 * t), r1 = __cupbop_shfl32(a, 8 * j + 2 * t + 1);
+      const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g), hi = *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g);
+      d[j] = lo | (hi << 16);
+    }
+  }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16(uint32_t a, int num, int trans, const uint32_t *v) {
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  for (int j = 0; j < num; ++j) {
+    if (!trans) {
+      const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
+      *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t) = v[j];
+    } else {
+      const uint32_t r0 = __cupbop_shfl32(a, 8 * j + 2 * t), r1 = __cupbop_shfl32(a, 8 * j + 2 * t + 1);
+      *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[j];
+      *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[j] >> 16);
+    }
+  }
+}
+
 #endif // VX_CFG_NUM_THREADS (Vortex 3.0)

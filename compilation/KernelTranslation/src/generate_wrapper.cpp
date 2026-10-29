@@ -59,6 +59,7 @@ static bool type_has_vector(Type *T) {
   return false;
 }
 void pass_wide_kernel_args_by_slot(llvm::Module *M) {
+  if (std::getenv("CUPBOP_WIDE_ARGS_BYVAL")) return; // debug: the old by-value aggregate (slots must still be consecutive)
   const DataLayout &DL = M->getDataLayout();
   LLVMContext &ctx = M->getContext();
   auto wide = [&](Argument &A) {

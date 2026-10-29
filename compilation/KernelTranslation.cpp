@@ -79,6 +79,8 @@ int main(int argc, char **argv) {
   pass_wide_kernel_args_by_slot(program);
   // __syncthreads_and / _or / _count (CuLifter: BAR.RED) -> barrier + shared-memory reduction
   lower_barrier_reductions(program);
+  // ldmatrix / stmatrix inline asm (CuLifter LDSM / STSM) -> shuffle-based runtime helpers
+  lower_ldmatrix_asm(program);
   dumpFile(program, "00_after_async_ptx.ll");
 
   DBG_LOG("lower_named_barriers\n");

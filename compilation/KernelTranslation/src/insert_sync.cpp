@@ -220,6 +220,23 @@ static bool syncRightBefore(llvm::Instruction *I) {
   return false;
 }
 
+// Schedule 2 and a CuLifter-lifted kernel (parameters named arg_<cbank offset>, SASS-derived CFG): the
+// conditional-if / for / special-case CTA barriers are not inserted. They shape single-entry regions for the warp
+// loops of schedules 0/1; schedule 2 has none, and in a lifted kernel every barrier counts as conditional (an early
+// `exit` and predicated BARs: nothing post-dominates the entry), so the walk put CTA barriers on paths only some warps
+// take -- cuBLAS sdot/ddot reduce_1Block_kernel went from 6 to 332 CTA barriers and deadlocked (2026-10-29).
+// CUDA-source kernels keep them: btree's s2 result depends on them (all zeros without, CI 2026-10-29), so this is
+// not a general schedule-2 rule. CUPBOP_S2_COND_BARRIERS=1 keeps them for lifted kernels too.
+static bool s2_skip_cond_barriers(Function &F) {
+  static const int sched = [] { const char *e = std::getenv("VORTEX_SCHEDULE_FLAG"); return e ? std::atoi(e) : 0; }();
+  if (sched != 2 || std::getenv("CUPBOP_S2_COND_BARRIERS") || F.arg_empty()) return false;
+  for (Argument &A : F.args()) {
+    StringRef n = A.getName();
+    if (!n.consume_front("arg_") || n.empty() || !isdigit((unsigned char)n[0])) return false;
+  }
+  return true;
+}
+
 class InsertConditionalBarrier : public llvm::FunctionPass {
 
 public:
@@ -264,6 +281,8 @@ public:
 
   virtual bool runOnFunction(Function &F) {
     if (!isKernelFunction(F.getParent(), &F))
+      return 0;
+    if (s2_skip_cond_barriers(F))
       return 0;
 
     auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>();
@@ -503,6 +522,8 @@ public:
   virtual bool runOnFunction(Function &F) {
     if (!isKernelFunction(F.getParent(), &F))
       return 0;
+    if (s2_skip_cond_barriers(F))
+      return 0;
     bool changed = false;
     std::set<BasicBlock *> if_head;
     // insert an extra block for the following case
@@ -576,6 +597,8 @@ public:
   }
 
   bool runOnLoop(Loop *L, LPPassManager &LPM) {
+    if (s2_skip_cond_barriers(*L->getHeader()->getParent()))
+      return 0;
     if (!isKernelFunction(L->getHeader()->getParent()->getParent(),
                           L->getHeader()->getParent()))
       return 0;
@@ -761,7 +784,7 @@ static void erase_warp_syncs_for_virt(llvm::Module *M, bool keep_markers = false
   for (auto *CI : dead)
     CI->eraseFromParent();
   if (!dead.empty())
-    fprintf(stderr, "[insert_sync] erased %zu warp-level syncs (lanes of a CUDA warp run in lockstep on one hardware warp)\n", dead.size());
+    fprintf(stderr, "[insert_sync] schedule 1 (virt): erased %zu warp-level syncs (lanes run in lockstep)\n", dead.size());
 }
 
 void insert_sync(llvm::Module *M) {
@@ -770,13 +793,6 @@ void insert_sync(llvm::Module *M) {
     schedule = std::stoi(std::string(env));
   }
   if (schedule == 1 && getVirtGeom().subpasses == 1) // sub-pass form keeps them as boundaries
-    erase_warp_syncs_for_virt(M);
-  else if (schedule == 2)
-    // 1:1: a CUDA warp is a hardware warp, so warp-level syncs are no-ops (replace_built_in_function used to drop
-    // them only after this pass). Left in place, the conditional-if / for passes below treat them as barriers and
-    // put CTA barriers around every block that holds one -- in a lifted kernel that is every reconvergence point
-    // (CuLifter: activemask + bar.warp.sync), including tid-divergent ones such as the warp-0 tail of a block
-    // reduction, where the CTA barrier then deadlocks (cuBLAS sdot/ddot reduce_1Block_kernel, 2026-10-29).
     erase_warp_syncs_for_virt(M);
   else if (schedule == 1 && std::getenv("CUPBOP_VIRT_ERASE_NATIVE_WS")) // experiment: keep only the staged markers
     erase_warp_syncs_for_virt(M, /*keep_markers=*/true);
@@ -792,18 +808,10 @@ void insert_sync(llvm::Module *M) {
   if (schedule == 0 || schedule == 1) {
     passes.push_back("insert-built-in-barriers");
   }
-  // The conditional-if / for / special-case barriers shape single-entry regions for the warp loops of schedules
-  // 0 and 1. Schedule 2 has no warp loops: a barrier in a uniform branch needs nothing around it, and the extra CTA
-  // barriers are wrong where the walk places them on a path only some warps take (the pass treats every barrier
-  // that does not post-dominate the entry as conditional; in a lifted kernel with an early `exit` that is all of
-  // them -- cuBLAS sdot/ddot reduce_1Block_kernel went from 6 to 332 CTA barriers and deadlocked, 2026-10-29).
-  // CUPBOP_S2_COND_BARRIERS=1 restores the old schedule-2 behaviour.
-  const bool s2_skip = schedule == 2 && !std::getenv("CUPBOP_S2_COND_BARRIERS");
-  if (!s2_skip) {
-    passes.push_back("insert-conditional-if-barriers");
-    passes.push_back("insert-conditional-for-barriers");
-    passes.push_back("insert-special-case-barriers");
-  }
+  // (lifted kernels at schedule 2 skip these three: s2_skip_cond_barriers)
+  passes.push_back("insert-conditional-if-barriers");
+  passes.push_back("insert-conditional-for-barriers");
+  passes.push_back("insert-special-case-barriers");
   for (auto pass : passes) {
     const PassInfo *PIs = Registry->getPassInfo(StringRef(pass));
     if (PIs) {

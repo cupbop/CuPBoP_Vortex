@@ -1600,10 +1600,12 @@ void replace_built_in_function(llvm::Module *M) {
                        func_name == "llvm.nvvm.membar.cta" ||
                        func_name == "llvm.nvvm.membar.sys") {
               // Vortex has a single fence scope (a whole-cache flush on the RTL); membar.cta next to a
-              // barrier was already dropped by drop_cta_membar_at_barriers. Redirect the call (renaming the
-              // declaration made "__nvvm_membar_gl1" when a module has two of the three kinds).
-              Call->setCalledFunction(M->getOrInsertFunction(
-                  "__nvvm_membar_gl", FunctionType::get(Type::getVoidTy(M->getContext()), false)));
+              // barrier was already dropped by drop_cta_membar_at_barriers. The first kind renames its
+              // declaration (as before); a second kind is redirected to it (renaming made "__nvvm_membar_gl1").
+              if (Function *Prev = M->getFunction("__nvvm_membar_gl"))
+                Call->setCalledFunction(Prev);
+              else
+                Call->getCalledFunction()->setName("__nvvm_membar_gl");
             } else if (func_name.find("llvm.nvvm.atomic.load.inc.32") !=
                        std::string::npos) {
               Call->getCalledFunction()->setName("__nvvm_atomic_load_inc_32");
