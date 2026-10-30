@@ -9,7 +9,9 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <regex>
 #include <vector>
 
@@ -363,4 +365,176 @@ void lower_lanemask(Module *M) {
     CI->replaceAllUsesWith(R);
     CI->eraseFromParent();
   }
+}
+
+// C plan (2026-10-29): CuLifter copies every kernel parameter into a per-thread byte buffer at the entry (`param_local`,
+// `vx_params`: a store of each parameter at its constant-bank offset) and reads the parameters back with loads at
+// constant offsets (LDC). Every thread holds the same bytes, but the buffer is an alloca: one copy per hardware thread
+// in every schedule (cuDNN's tensor descriptors: 340 byte loads + byte stores at the entry, the loaded bytes spilled),
+// and under the core mapping one more per logical-warp slot (insert_warp_loop replicates an alloca whose stores it
+// cannot prove uniform, 805137e then makes the entry region a warp loop so that every slot's copy is written).
+// Each load whose bytes lie inside one parameter's copy reads the parameter instead:
+//   - a parameter passed in launch slots (pass_wide_kernel_args_by_slot, "cupbop-arg-slots"): a load of the same type
+//     from the slots, i.e. from the kernel-argument buffer (read only, not written while the kernel runs);
+//   - a scalar parameter: its bits (lshr + trunc, then bitcast / inttoptr to the loaded type).
+// The copies and the alloca go when no load of it is left. Conditions, otherwise the alloca is left alone: it is a
+// static alloca of the entry block; every use is reached through constant-offset GEPs / bitcasts and is a simple load,
+// a simple store into it or a lifetime marker (no escaping pointer, call, memcpy, variable index); every store is in
+// the entry block and stores a kernel argument or a load (in the entry block, from the argument pointer itself) of a
+// slots argument; the stored ranges do not overlap. A load that is in the entry block before its covering store, that
+// is not inside one store's range (uninitialised bytes), or whose type is not an integer / floating-point / pointer
+// keeps reading the alloca (the copies stay then). Only byte-array allocas ([N x i8], the lifter's buffers) are
+// considered: the typed per-argument spill slots of CUDA-source kernels (clang -O0) are left to the translator's -O3,
+// so the CI examples keep their code. Runs before every schedule-specific pass, so the 1:1, core-mapping
+// and flat schedules all see the parameters directly; the warp-loop pass then finds nothing to replicate.
+// CUPBOP_UNIFORM_NOREPL=0 (or CUPBOP_PARAM_FORWARD=0): off, the 11770fc code. CUPBOP_PARAM_FORWARD_WHY=1: decisions.
+void forward_param_buffer_copies(Module *M) {
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0; };
+  if (off_env("CUPBOP_UNIFORM_NOREPL") || off_env("CUPBOP_PARAM_FORWARD")) return;
+  const bool why = std::getenv("CUPBOP_PARAM_FORWARD_WHY") != nullptr;
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &C = M->getContext();
+  unsigned n_fwd = 0, n_kept = 0, n_removed = 0, n_partial = 0, n_skipped = 0;
+  for (Function &F : *M) {
+    if (F.isDeclaration() || !isKernelFunction(M, &F)) continue;
+    BasicBlock &Entry = F.getEntryBlock();
+    std::vector<AllocaInst *> allocas;
+    for (Instruction &I : Entry)
+      if (auto *A = dyn_cast<AllocaInst>(&I))
+        if (A->isStaticAlloca() && A->getAllocatedType()->isArrayTy() &&
+            A->getAllocatedType()->getArrayElementType()->isIntegerTy(8))
+          allocas.push_back(A);   // byte buffers only: not clang -O0's per-argument spill slots of CUDA-source kernels
+    for (AllocaInst *AI : allocas) {
+      struct Src { int64_t off, size; StoreInst *S; Argument *slots; Value *scalar; };
+      std::vector<Src> srcs;
+      std::vector<std::pair<LoadInst *, int64_t>> loads;
+      std::vector<Instruction *> markers;
+      std::string bad;
+      std::vector<std::pair<Value *, int64_t>> work{{AI, 0}};
+      while (!work.empty() && bad.empty()) {
+        auto [V, base] = work.back();
+        work.pop_back();
+        for (User *U : V->users()) {
+          if (auto *G = dyn_cast<GEPOperator>(U)) {
+            APInt off(DL.getIndexTypeSizeInBits(G->getType()), 0);
+            if (!isa<Instruction>(G) || !G->accumulateConstantOffset(DL, off)) { bad = "non-constant GEP"; break; }
+            work.push_back({G, base + off.getSExtValue()});
+          } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) {
+            work.push_back({U, base});
+          } else if (auto *L = dyn_cast<LoadInst>(U)) {
+            if (!L->isSimple()) { bad = "volatile/atomic load"; break; }
+            loads.push_back({L, base});
+          } else if (auto *S = dyn_cast<StoreInst>(U)) {
+            if (S->getValueOperand() == V) { bad = "address stored"; break; }
+            if (!S->isSimple()) { bad = "volatile/atomic store"; break; }
+            if (S->getParent() != &Entry) { bad = "store outside the entry block"; break; }
+            Value *X = S->getValueOperand();
+            Src s{base, (int64_t)DL.getTypeStoreSize(X->getType()), S, nullptr, nullptr};
+            if (auto *A = dyn_cast<Argument>(X)) {
+              Type *T = A->getType();
+              if (!(T->isIntegerTy() || T->isFloatingPointTy() || T->isPointerTy()) || s.size > 8) {
+                bad = "stored argument of an unhandled type"; break;
+              }
+              s.scalar = A;
+            } else if (auto *LS = dyn_cast<LoadInst>(X)) {
+              auto *A = dyn_cast<Argument>(LS->getPointerOperand());
+              if (!A || !LS->isSimple() || LS->getParent() != &Entry ||
+                  !F.getAttributes().hasParamAttr(A->getArgNo(), "cupbop-arg-slots")) { bad = "stored value is not a parameter"; break; }
+              s.slots = A;
+            } else { bad = "stored value is not a parameter"; break; }
+            srcs.push_back(s);
+          } else if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+            if (!II->isLifetimeStartOrEnd()) { bad = "intrinsic use"; break; }
+            markers.push_back(II);
+          } else { bad = "other use"; break; }
+          if (base < 0) { bad = "negative offset"; break; }
+        }
+      }
+      if (bad.empty() && srcs.empty()) bad = "no parameter stored";
+      if (bad.empty()) {
+        std::sort(srcs.begin(), srcs.end(), [](const Src &a, const Src &b) { return a.off < b.off; });
+        for (size_t i = 1; i < srcs.size(); ++i)
+          if (srcs[i].off < srcs[i - 1].off + srcs[i - 1].size) { bad = "overlapping stores"; break; }
+      }
+      if (!bad.empty()) {
+        if (!srcs.empty() || why) {   // report buffers that looked like parameter copies
+          n_skipped++;
+          if (why) fprintf(stderr, "[param-fwd] %s: %s kept (%s)\n", F.getName().str().c_str(), AI->getName().str().c_str(), bad.c_str());
+        }
+        continue;
+      }
+      unsigned fwd = 0, kept = 0;
+      for (auto [L, off] : loads) {
+        const int64_t size = (int64_t)DL.getTypeStoreSize(L->getType());
+        const Src *s = nullptr;
+        for (const Src &x : srcs)
+          if (off >= x.off && off + size <= x.off + x.size) { s = &x; break; }
+        Type *LT = L->getType();
+        const bool type_ok = LT->isIntegerTy() || LT->isFloatingPointTy() || LT->isPointerTy();
+        if (!s || !type_ok || (L->getParent() == &Entry && !s->S->comesBefore(L)) ||
+            (s->scalar && DL.getTypeSizeInBits(LT) != (uint64_t)size * 8)) {
+          kept++;
+          if (why) fprintf(stderr, "[param-fwd] %s: %s load at %lld (%lld bytes) kept (%s)\n", F.getName().str().c_str(),
+                           AI->getName().str().c_str(), (long long)off, (long long)size,
+                           !s ? "not inside one parameter" : !type_ok ? "type" : "before its store / size");
+          continue;
+        }
+        IRBuilder<> B(L);
+        const int64_t d = off - s->off;
+        Value *R;
+        if (s->slots) {
+          Value *P = d ? B.CreateConstInBoundsGEP1_64(Type::getInt8Ty(C), s->slots, d) : (Value *)s->slots;
+          LoadInst *NL = B.CreateAlignedLoad(LT, P, commonAlignment(Align(8), d), L->getName() + ".arg");
+          R = NL;
+        } else {
+          Value *X = s->scalar;
+          Type *XT = X->getType();
+          const unsigned xb = DL.getTypeSizeInBits(XT);
+          Type *XI = IntegerType::get(C, xb);
+          if (XT->isPointerTy()) X = B.CreatePtrToInt(X, XI);
+          else if (!XT->isIntegerTy()) X = B.CreateBitCast(X, XI);
+          if (d) X = B.CreateLShr(X, (uint64_t)d * 8);
+          Type *LI = IntegerType::get(C, size * 8);
+          if (size * 8 < (int64_t)xb) X = B.CreateTrunc(X, LI);
+          if (LT->isPointerTy()) X = B.CreateIntToPtr(X, LT);
+          else if (!LT->isIntegerTy()) X = B.CreateBitCast(X, LT);
+          R = X;
+        }
+        L->replaceAllUsesWith(R);
+        L->eraseFromParent();
+        fwd++;
+      }
+      n_fwd += fwd;
+      n_kept += kept;
+      if (kept) {
+        n_partial++;
+        fprintf(stderr, "[param-fwd] %s: %s: %u loads read the parameters directly, %u still read the buffer\n",
+                F.getName().str().c_str(), AI->getName().str().c_str(), fwd, kept);
+        continue;
+      }
+      // no load left: drop the copies, the address arithmetic and the alloca
+      for (const Src &x : srcs) {
+        Value *X = x.S->getValueOperand();
+        x.S->eraseFromParent();
+        if (auto *LS = dyn_cast<LoadInst>(X))
+          if (LS->use_empty()) LS->eraseFromParent();
+      }
+      for (Instruction *I : markers) I->eraseFromParent();
+      std::vector<Instruction *> dead;
+      std::function<void(Value *)> collect = [&](Value *V) {
+        for (User *U : V->users()) collect(U);
+        if (V != AI) dead.push_back(cast<Instruction>(V));
+      };
+      collect(AI);
+      for (Instruction *I : dead) { if (I->use_empty()) I->eraseFromParent(); }
+      if (AI->use_empty()) { AI->eraseFromParent(); n_removed++; }
+      else { n_partial++; fprintf(stderr, "[param-fwd] %s: buffer has uses left after forwarding\n", F.getName().str().c_str()); }
+      if (why || cupbop_debug())
+        fprintf(stderr, "[param-fwd] %s: parameter buffer removed (%u loads read the parameters directly)\n",
+                F.getName().str().c_str(), fwd);
+    }
+  }
+  if (n_fwd || n_skipped || n_partial)
+    fprintf(stderr, "[CuPBoP] parameter buffers: %u removed, %u partly forwarded, %u kept; %u loads read the parameters "
+                    "directly, %u read a buffer\n", n_removed, n_partial, n_skipped, n_fwd, n_kept);
 }
