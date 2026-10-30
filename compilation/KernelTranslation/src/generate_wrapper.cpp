@@ -22,8 +22,11 @@
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <algorithm>
+#include <cstdio>
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 // Software stack (CUPBOP_BIG_STACK=<bytes per hardware thread>, set by examples/stack_fallback.sh when a kernel
@@ -62,10 +65,118 @@ static std::string big_stack_prelude() {
          "    __cupbop_stack_call(fn, arg, base + (h + 1) * " + std::to_string(n) + "ull);\n"
          "}\n\n";
 }
+// Kernel ABI call and per-warp stack-pointer skew (2026-10-30, experiments/stack_native and experiments/kabi).
+// The hardware stack interleave (VX_CFG_LSU_STACK_INTERLEAVE) stores one frame word of a warp's NT stacks as NT
+// consecutive words and XORs the word index with the warp's stack group, so the hot top of every warp's frame lands in
+// the same 64-word window of its 8 KB stack: with 64 warps all those frame tops fall into 1/8 of the L2 sets, and once
+// resident warps x hot words / 64 exceeds the 8 L2 ways the cycles jump (hotspot s2 3.1x, btree s2 7x). What pushes the
+// translated kernels over that threshold is mostly needless stack traffic: kernel_main called them as ordinary
+// functions, so every thread saved and restored up to 13 integer and 12 FP callee-saved registers at the frame top.
+//  * CUPBOP_KABI (1 = on, 0 = off; default KABI_DEFAULT below): the translated kernels and their wrappers get the
+//    Vortex kernel calling convention (annotation "vortex.kernel", Vortex LLVM's RISCVVortexKEntryPass: no callee-saved register is saved;
+//    the backend also emits a __vx_kentry_<name> alias that vxbin.py lists in the .vxbin symbol footer, next to
+//    "main" = kernel_main), and kernel_main calls the kernel through inline asm that clobbers every register except
+//    sp, gp, tp and its operands, so it keeps nothing live in a callee-saved register across the call (the compiler
+//    spills what it needs, e.g. the lane gate's join tokens). The annotated functions are listed in cupbop_kabi.txt;
+//    examples/abi_check.py checks the kernel ELF after every build that has the list (examples/stack_fallback.sh) and
+//    fails the build if a caller of such a function may read a callee-saved register after the call before writing
+//    it (annotation without the asm call: vx_join read s0/s1 after the call and s1 FAILed; an alloca-based skew made
+//    kernel_main's frame pointer s0 live across the call and hung).
+//  * CUPBOP_SP_SKEW (auto = 8, 0 = off, 1/2/4/8 = upper bound; default SP_SKEW_DEFAULT below): kernel_main lowers sp
+//    by (global warp % M) x __CUPBOP_SP_SKEW_STEP bytes (CUPBOP_SP_SKEW_STEP, default 512 = the 64-word XOR window of
+//    64 warps) around the call, so the frame tops of different warps fall into M different windows (L2 set groups).
+//    The skew is computed inside the asm from mhartid / NT before the call and recomputed after it (nothing has to
+//    survive the call); mhartid is the physical (core x NW + warp) x NT + lane, so it stays constant per thread under
+//    the RT_NW / RT_NC / RT_NT caps and the skew is always within (M-1) x STEP. It costs (M-1) x STEP bytes of the 8 KB
+//    stack: examples/stack_fallback.sh rewrites the __CUPBOP_SP_SKEW_M line of kernel_wrapper.cpp to the largest
+//    M in {8,4,2,1} with max frame + (M-1) x STEP <= CUPBOP_FRAME_LIMIT (7168) after the build and rebuilds when it
+//    changed. A software-stack build (CUPBOP_BIG_STACK: no hardware interleave there) gets M = 1.
+//  * CUPBOP_KABI=0 CUPBOP_SP_SKEW=0: the wrapper is exactly the previous one (same machine code). CUPBOP_KABI=0 with the
+//    skew on keeps the ordinary calling convention and only skews (asm call); the kernel ABI with CUPBOP_SP_SKEW=0
+//    calls through the asm without the skew.
+// Defaults when the variable is unset or empty.
+static const char *const KABI_DEFAULT = "0", *const SP_SKEW_DEFAULT = "0";
+static const char *env_or(const char *name, const char *dflt) {
+  const char *e = std::getenv(name);
+  return e && *e ? e : dflt;
+}
+static bool is_off(const char *v) { return !std::strcmp(v, "0") || !std::strcmp(v, "off"); }
+static bool kabi_on() { return !is_off(env_or("CUPBOP_KABI", KABI_DEFAULT)); }
+static bool sp_skew_req() { return !is_off(env_or("CUPBOP_SP_SKEW", SP_SKEW_DEFAULT)); }
+static int sp_skew_m() {
+  if (big_stack_bytes() || !sp_skew_req()) return 1;   // the software stack is not interleaved (own 64-byte stride skew)
+  const char *e = env_or("CUPBOP_SP_SKEW", SP_SKEW_DEFAULT);
+  if (!std::strcmp(e, "auto")) return 8;
+  int v = std::atoi(e), m = 1;
+  while (m * 2 <= v && m < 8) m *= 2;
+  return m;
+}
+static int sp_skew_step() {
+  const char *e = std::getenv("CUPBOP_SP_SKEW_STEP");
+  int v = e ? std::atoi(e) : 512, s = 8;
+  while (s * 2 <= v && s < 2048) s *= 2;
+  return s;
+}
+// the asm call: the kernel ABI, or the skew (kept when the build-time frame check later sets M to 1)
+static bool asm_call_on() { return kabi_on() || (sp_skew_req() && !big_stack_bytes()); }
+static std::string kabi_prelude() {
+  if (!asm_call_on()) return "";
+  const long bs = big_stack_bytes();
+  std::string s =
+      "// Kernel call through inline asm (CUPBOP_KABI / CUPBOP_SP_SKEW; see generate_wrapper.cpp kabi_prelude).\n"
+      "// Kernel ABI " + std::string(kabi_on() ? "on" : "off") + ". __CUPBOP_SP_SKEW_M: the warps' sp skew modulus "
+      "(1 = none); examples/stack_fallback.sh rewrites that line to fit the frame.\n"
+      "#include <VX_config.h>\n"
+      "#define __CUPBOP_SP_SKEW_M " + std::to_string(sp_skew_m()) + "\n"
+      "#define __CUPBOP_SP_SKEW_STEP " + std::to_string(sp_skew_step()) + "\n"
+      "static constexpr int __cupbop_log2(unsigned v) { return v <= 1 ? 0 : 1 + __cupbop_log2(v >> 1); }\n"
+      "static_assert((__CUPBOP_SP_SKEW_M & (__CUPBOP_SP_SKEW_M - 1)) == 0 && __CUPBOP_SP_SKEW_M <= 8, \"skew modulus\");\n"
+      "static_assert((VX_CFG_NUM_THREADS & (VX_CFG_NUM_THREADS - 1)) == 0, \"NT\");\n"
+      "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n"
+      "    register void *__a0 asm(\"a0\") = arg;\n"
+      "    register void *__t2 asm(\"t2\") = (void *)fn;\n";
+  if (bs)
+    s += "    // software stack (CUPBOP_BIG_STACK): the old sp is kept on the new stack, as __cupbop_stack_call does\n"
+         "    char *__base = *(char *volatile *)&__cupbop_big_stack;\n"
+         "    const uint64_t __h = ((uint64_t)vx_core_id() * VX_CFG_NUM_WARPS + (uint64_t)vx_warp_id()) * VX_CFG_NUM_THREADS\n"
+         "                         + (uint64_t)vx_thread_id();\n"
+         "    register char *__t1 asm(\"t1\") = __base ? __base + (__h + 1) * " + std::to_string(bs) + "ull : (char *)0;\n";
+  s += "    __asm__ volatile(\n";
+  if (bs)
+    s += "        \"beqz t1, 1f\\n\\taddi t1, t1, -16\\n\\tsd sp, 0(t1)\\n\\tmv sp, t1\\n\\tjalr ra, 0(t2)\\n\\tld sp, 0(sp)\\n\\tj 2f\\n1:\\n\\t\"\n";
+  s += "#if __CUPBOP_SP_SKEW_M > 1\n"
+       "        // sp -= (mhartid / NT % M) * STEP before the call, += the same after it\n"
+       "        \"csrr t0, mhartid\\n\\tsrli t0, t0, %[nt]\\n\\tandi t0, t0, %[m]\\n\\tslli t0, t0, %[st]\\n\\tsub sp, sp, t0\\n\\t\"\n"
+       "        \"jalr ra, 0(t2)\\n\\t\"\n"
+       "        \"csrr t0, mhartid\\n\\tsrli t0, t0, %[nt]\\n\\tandi t0, t0, %[m]\\n\\tslli t0, t0, %[st]\\n\\tadd sp, sp, t0\"\n"
+       "#else\n"
+       "        \"jalr ra, 0(t2)\"\n"
+       "#endif\n";
+  if (bs) s += "        \"\\n2:\"\n";
+  s += std::string("        : \"+r\"(__a0), \"+r\"(__t2)") + (bs ? ", \"+r\"(__t1)" : "") + "\n"
+       "        : [nt] \"i\"(__cupbop_log2(VX_CFG_NUM_THREADS)), [m] \"i\"(__CUPBOP_SP_SKEW_M - 1),\n"
+       "          [st] \"i\"(__cupbop_log2(__CUPBOP_SP_SKEW_STEP))\n"
+       "        : \"ra\", \"t0\"" + std::string(bs ? "" : ", \"t1\"") + ", \"t3\", \"t4\", \"t5\", \"t6\",\n"
+       "          \"a1\", \"a2\", \"a3\", \"a4\", \"a5\", \"a6\", \"a7\",\n"
+       "          \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\",\n"
+       "          \"ft0\", \"ft1\", \"ft2\", \"ft3\", \"ft4\", \"ft5\", \"ft6\", \"ft7\", \"ft8\", \"ft9\", \"ft10\", \"ft11\",\n"
+       "          \"fa0\", \"fa1\", \"fa2\", \"fa3\", \"fa4\", \"fa5\", \"fa6\", \"fa7\",\n"
+       "          \"fs0\", \"fs1\", \"fs2\", \"fs3\", \"fs4\", \"fs5\", \"fs6\", \"fs7\", \"fs8\", \"fs9\", \"fs10\", \"fs11\", \"memory\");\n"
+       "}\n\n";
+  return s;
+}
+
 static std::string big_stack_call() {
+  if (asm_call_on()) return "    __cupbop_kcall(callbacks[kernel_arg->kernel_idx], (void *)args);\n";
   return big_stack_bytes() ? "    __cupbop_call_kernel(callbacks[kernel_arg->kernel_idx], (void *)args);\n"
                            : "    callbacks[kernel_arg->kernel_idx](args);\n";
 }
+
+// The functions that get the kernel ABI (CUPBOP_KABI): decode_input records every kernel and its <name>_wrapper,
+// create_kernel_wrapper_function the schedule 0/1 cuda_<name>_wrapper (annotated in kernel_wrapper.cpp), and
+// annotate_kernel_abi (end of the translation) annotates the IR ones and writes cupbop_kabi.txt for abi_check.py.
+static std::vector<std::pair<std::string, std::string>> g_kabi_kernels;   // (kernel, wrapper) in the IR
+static std::vector<std::string> g_kabi_cxx_wrappers;                      // cuda_* in kernel_wrapper.cpp
 
 using namespace llvm;
 
@@ -191,6 +302,7 @@ void decode_input(llvm::Module *M) {
 
     FunctionCallee fc =
         M->getOrInsertFunction(func_name + "_wrapper", LauncherFuncT);
+    g_kabi_kernels.emplace_back(F->getName().str(), func_name + "_wrapper");
     Function *WorkGroup = dyn_cast<Function>(fc.getCallee());
 
     BasicBlock *Block = BasicBlock::Create(M->getContext(), "", WorkGroup);
@@ -545,7 +657,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
     if (schedule != 2) {
       // Schedule 0/1: generate cuda_*_wrapper that copies vx_spawn TLS → CuPBoP TLS
       for (auto f : wrapper_name) {
-        ss << "void cuda_" << f << "(void* args) {\n"
+        if (kabi_on()) g_kabi_cxx_wrappers.push_back("cuda_" + f);
+        ss << (kabi_on() ? "extern \"C\" __attribute__((annotate(\"vortex.kernel\"))) " : "") << "void cuda_" << f << "(void* args) {\n"
                   "    // block_index_{x,y,z} were set by the KMU entry (one CUDA block per hardware thread)\n"
            << (schedule == 0 || tls_copies ?
                   "    thread_id_x = 0;\n"
@@ -683,9 +796,9 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    }\n"
           "}\n"
           "\n"
-          << big_stack_prelude() <<
+          << big_stack_prelude() << kabi_prelude() <<
           "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
-          "void kernel_main(kernel_arg_t* kernel_arg) {\n"
+          << (kabi_on() ? "void kernel_main(kernel_arg_t* __UNIFORM__ kernel_arg) {\n" : "void kernel_main(kernel_arg_t* kernel_arg) {\n") <<
           "    auto ctx = &kernel_arg->ctx; \n"
           "    auto num_args = kernel_arg->num_args;\n"
           "    auto args = (uint64_t*)kernel_arg->args;\n"
@@ -787,4 +900,61 @@ void generate_wrapper(llvm::Module *M) {
   remove_useless_var(M);
   // create kernel wraper function  // Hyesoon 6-7-202 
   create_kernel_wrapper_function(M);
+}
+
+// CUPBOP_KABI (see kabi_prelude): at the end of the translation, give every kernel wrapper <name>_wrapper and the
+// kernel it calls the Vortex kernel calling convention (@llvm.global.annotations entry "vortex.kernel", read by Vortex
+// LLVM's RISCVVortexKEntryPass when the cell compiles the kernel), and list them with the schedule 0/1 cuda_* wrappers
+// in cupbop_kabi.txt (examples/abi_check.py checks every caller in the kernel ELF). Off: no annotation, and a stale
+// cupbop_kabi.txt from an earlier translation in the same directory is removed.
+void annotate_kernel_abi(llvm::Module *M) {
+  std::remove("cupbop_kabi.txt");
+  if (!kabi_on() || g_kabi_kernels.empty()) return;
+  LLVMContext &C = M->getContext();
+  auto *PtrTy = PointerType::getUnqual(C);
+  auto *I32 = Type::getInt32Ty(C);
+  auto *ElemTy = StructType::get(C, {PtrTy, PtrTy, PtrTy, I32, PtrTy});
+  auto str = [&](const std::string &v, const char *name) {
+    auto *Init = ConstantDataArray::getString(C, v);
+    auto *G = new GlobalVariable(*M, Init->getType(), true, GlobalValue::PrivateLinkage, Init, name);
+    G->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    G->setSection("llvm.metadata");
+    return G;
+  };
+  std::vector<Constant *> elems;
+  if (GlobalVariable *GA = M->getNamedGlobal("llvm.global.annotations")) {
+    if (auto *CA = dyn_cast<ConstantArray>(GA->getInitializer()))
+      for (auto &op : CA->operands()) elems.push_back(cast<Constant>(op));
+    GA->eraseFromParent();
+  }
+  Constant *Note = str("vortex.kernel", ".cupbop.kabi.note");
+  Constant *File = str("cupbop", ".cupbop.kabi.file");
+  std::vector<std::string> names;
+  auto add = [&](Function *F) {
+    if (!F || F->isDeclaration() || std::find(names.begin(), names.end(), F->getName().str()) != names.end()) return;
+    names.push_back(F->getName().str());
+    elems.push_back(ConstantStruct::get(ElemTy, {F, Note, File, ConstantInt::get(I32, 0), ConstantPointerNull::get(PtrTy)}));
+  };
+  for (auto &kw : g_kabi_kernels) {
+    Function *W = M->getFunction(kw.second);
+    if (!W || W->isDeclaration()) continue;
+    add(W);
+    // the kernel itself when the wrapper still calls it (not inlined)
+    for (auto &BB : *W)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CI->getCalledFunction())
+            if (Callee->getName() == kw.first) add(Callee);
+  }
+  if (!names.empty()) {
+    auto *AT = ArrayType::get(ElemTy, elems.size());
+    auto *GA = new GlobalVariable(*M, AT, false, GlobalValue::AppendingLinkage, ConstantArray::get(AT, elems),
+                                  "llvm.global.annotations");
+    GA->setSection("llvm.metadata");
+  }
+  std::ofstream f("cupbop_kabi.txt");
+  f << "# functions with the Vortex kernel ABI (CUPBOP_KABI, generate_wrapper.cpp annotate_kernel_abi); "
+       "checked by examples/abi_check.py\n";
+  for (auto &n : names) f << n << "\n";
+  for (auto &n : g_kabi_cxx_wrappers) f << n << "\n";
 }
