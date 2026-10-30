@@ -10,4 +10,7 @@ void pass_wide_kernel_args_by_slot(llvm::Module *M);
 
 void set_meta_data(llvm::Module *M);
 
+// CUPBOP_KABI: Vortex kernel calling convention for the kernels and their wrappers, cupbop_kabi.txt (see generate_wrapper.cpp)
+void annotate_kernel_abi(llvm::Module *M);
+
 #endif

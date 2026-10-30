@@ -6,6 +6,7 @@ are skipped. Without --over: '<bytes> <function>' per function. With --over N: t
 exceeds N bytes, comma-separated, on one line (empty if none). Used by common.mk's fixed-trips fallback
 (virt_trips_fallback.sh): the hardware thread's stack is 8 KB (VX_MEM_STACK_LOG2_SIZE=13)."""
 import re, sys
+KENTRY = '__vx_kentry_'
 SKIP = ('kernel_main', 'memcpy', 'memset', 'memmove', '_start', 'vx_', '__', 'exp', 'log', 'sin', 'cos', 'pow', 'fma')
 
 def imm(s):
@@ -16,7 +17,10 @@ def frames(path):
     for line in open(path, errors='replace'):
         m = re.match(r'^[0-9a-f]+ <(.*)>:$', line)
         if m:
-            fn = m.group(1); regs = {}; cur = 0; done = fn.startswith(SKIP)
+            fn = m.group(1)
+            # a function with the Vortex kernel ABI (CUPBOP_KABI) may be printed under its __vx_kentry_<name> alias
+            if fn.startswith(KENTRY): fn = fn[len(KENTRY):]
+            regs = {}; cur = 0; done = fn.startswith(SKIP)
             if not done: out.setdefault(fn, 0)
             continue
         if done: continue

@@ -1,7 +1,16 @@
 #!/bin/bash
 # stack_fallback.sh <kernelTranslator> <device bitcode> <cell dir> <make args for the cell...>
-# Called by common.mk (VORTEX_VER=3, SCHEDULE 1 or 2) in the example directory after kernel.elf/vxbin/dump were built;
-# MAKE = the make program. Nothing happens unless a kernel function's static stack frame exceeds
+# Called by common.mk (VORTEX_VER=3, every schedule) in the example directory after kernel.elf/vxbin/dump were built;
+# MAKE = the make program. Three post-build steps, in this order:
+#  A. frame fallback (schedules 1 and 2; steps 1-2 below)
+#  B. sp skew modulus (CUPBOP_SP_SKEW, generate_wrapper.cpp kabi_prelude): when kernel_wrapper.cpp has a
+#     __CUPBOP_SP_SKEW_M line, M is lowered to the largest of 8, 4, 2, 1 (not above the translated one) with
+#     largest frame + (M-1) x __CUPBOP_SP_SKEW_STEP <= CUPBOP_FRAME_LIMIT, i.e. the same 1 KB of the 8 KB stack stays
+#     for kernel_main and the callees as with the frame limit alone. A change rewrites that line and rebuilds the cell
+#     (the kernel code is the same; only kernel_main's skew mask changes). A software-stack build has M = 1 already.
+#  C. kernel ABI check (CUPBOP_KABI): when the translator wrote cupbop_kabi.txt, examples/abi_check.py checks the final
+#     kernel ELF (abi_check.log); UNSAFE removes kernel.elf/vxbin/dump and fails the build.
+# Frame fallback: nothing happens unless a kernel function's static stack frame exceeds
 # CUPBOP_FRAME_LIMIT (default 7168 bytes) of the 8 KB per-hardware-thread stack (VX_MEM_STACK_LOG2_SIZE=13): a larger
 # frame writes into the next hardware thread's stack (misaligned accesses, IPDOM / range-check crashes, wrong data).
 #  1. Core mapping with fixed trips (CUPBOP_VIRT_TRIPS=k): every warp loop is unrolled k times, so in a large kernel
@@ -32,13 +41,9 @@ fi
 KT=$1; DEV=$2; CELL=$3; shift 3
 LIM=${CUPBOP_FRAME_LIMIT:-7168}
 HERE=$(dirname $0)
-OVER=$(python3 $HERE/stack_frames.py kernel.dump --over $LIM)
-[ -n "$OVER" ] || exit 0
+B=.stack_fallback
+FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt cupbop_kabi.txt kernel.elf kernel.vxbin kernel.dump"
 maxf() { python3 $HERE/stack_frames.py kernel.dump | awk -v l="$1" 'BEGIN{n=split(l,a,",");for(i=1;i<=n;i++)w[a[i]]=1} {if($2 in w && $1>m)m=$1; if($1>all)all=$1} END{print m+0, all+0}'; }
-DYN_ALL=0; [ -f .stack_fallback/dyn_all ] && DYN_ALL=1   # set by --build-failed: every function is dynamic already
-B=.stack_fallback; rm -rf $B; mkdir -p $B
-[ $DYN_ALL = 1 ] && export CUPBOP_VIRT_TRIPS_DYN_FUNCS='*' 
-FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt kernel.elf kernel.vxbin kernel.dump"
 save() { rm -rf $B/keep; mkdir -p $B/keep; for f in $FILES; do [ -f $f ] && cp -p $f $B/keep/; done; }
 restore() { for f in $FILES; do if [ -f $B/keep/$f ]; then cp -p $B/keep/$f .; else rm -f $f; fi; done; }
 rebuild() { # <log tag> <make args...>: translate (env set by the caller) + rebuild the cell + copy back; 1 on failure
@@ -49,6 +54,14 @@ rebuild() { # <log tag> <make args...>: translate (env set by the caller) + rebu
   $MAKE -C $CELL kernel.vxbin kernel.dump "$@" > $B/$tag.rebuild.log 2>&1 || return 1
   cp $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump .
 }
+# --- A. frame fallback (schedules 1 and 2)
+frame_fallback() {
+case "${VORTEX_SCHEDULE_FLAG:-}" in 1|2) ;; *) return 0 ;; esac
+OVER=$(python3 $HERE/stack_frames.py kernel.dump --over $LIM)
+[ -n "$OVER" ] || return 0
+DYN_ALL=0; [ -f .stack_fallback/dyn_all ] && DYN_ALL=1   # set by --build-failed: every function is dynamic already
+rm -rf $B; mkdir -p $B
+[ $DYN_ALL = 1 ] && export CUPBOP_VIRT_TRIPS_DYN_FUNCS='*' 
 # --- 1. fixed trips -> dynamic trip count for the offending functions
 case "${CUPBOP_VIRT_TRIPS:-}" in ''|*[!0-9]*) K=0 ;; *) K=$CUPBOP_VIRT_TRIPS ;; esac
 if [ "$K" -gt 0 ] && [ "$VORTEX_SCHEDULE_FLAG" = 1 ] && [ "${CUPBOP_VIRT_TRIPS_FALLBACK:-1}" != 0 ] && [ -z "${CUPBOP_VIRT_TRIPS_DYN_FUNCS:-}" ]; then
@@ -69,11 +82,11 @@ if [ "$K" -gt 0 ] && [ "$VORTEX_SCHEDULE_FLAG" = 1 ] && [ "${CUPBOP_VIRT_TRIPS_F
     fi
   fi
   OVER=$(python3 $HERE/stack_frames.py kernel.dump --over $LIM)
-  [ -n "$OVER" ] || exit 0
+  [ -n "$OVER" ] || return 0
 fi
 # --- 2. software stack
-[ "${CUPBOP_BIG_STACK_FALLBACK:-1}" = 0 ] && exit 0
-[ -n "${CUPBOP_BIG_STACK:-}" ] && exit 0   # set by hand: honour it as it is
+[ "${CUPBOP_BIG_STACK_FALLBACK:-1}" = 0 ] && return 0
+[ -n "${CUPBOP_BIG_STACK:-}" ] && return 0   # set by hand: honour it as it is
 read OLD OLDALL <<< "$(maxf $OVER)"
 BYTES=$(( (OLDALL + 8192 + 4095) / 4096 * 4096 ))
 # stride between the hardware threads' stacks: one 64-byte line more than a multiple of 4 KB, so that the same frame
@@ -83,12 +96,52 @@ STRIDE=$((BYTES + 64))
 echo "--- [stack] stack frame $OLDALL bytes > $LIM in: $OVER; the kernel runs on a $BYTES-byte software stack per hardware thread"
 save
 if ! CUPBOP_BIG_STACK=$STRIDE rebuild bigstack "$@"; then
-  echo "--- [stack] software-stack rebuild failed ($B/bigstack.*.log): keeping the hardware-stack build"; restore; exit 0
+  echo "--- [stack] software-stack rebuild failed ($B/bigstack.*.log): keeping the hardware-stack build"; restore; return 0
 fi
 read NEW NEWALL <<< "$(maxf $OVER)"
 if [ "$NEWALL" -gt $((BYTES - 4096)) ]; then
-  echo "--- [stack] software-stack build has a $NEWALL-byte frame (> $BYTES - 4 KB): keeping the hardware-stack build"; restore; exit 0
+  echo "--- [stack] software-stack build has a $NEWALL-byte frame (> $BYTES - 4 KB): keeping the hardware-stack build"; restore; return 0
 fi
 echo $STRIDE > cupbop_big_stack.txt
 nm -C --defined-only -g kernel.elf > lookup_global_symbols.txt 2>/dev/null
 echo "--- [stack] software stack: $BYTES bytes per hardware thread, stride $STRIDE (cupbop_big_stack.txt)"
+}
+
+# --- B. sp skew modulus that fits the frame (CUPBOP_SP_SKEW)
+skew_fit() {
+  local M STEP F NEW
+  M=$(sed -n 's/^#define __CUPBOP_SP_SKEW_M \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp 2>/dev/null)
+  [ -n "$M" ] && [ "$M" -gt 1 ] || return 0
+  STEP=$(sed -n 's/^#define __CUPBOP_SP_SKEW_STEP \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp)
+  F=$(python3 $HERE/stack_frames.py kernel.dump | awk 'NR==1{print $1+0}'); F=${F:-0}
+  NEW=$M
+  while [ $NEW -gt 1 ] && [ $((F + (NEW - 1) * STEP)) -gt $LIM ]; do NEW=$((NEW / 2)); done
+  [ $NEW = $M ] && return 0
+  echo "--- [stack] sp skew: largest frame $F bytes + ($M-1) x $STEP > $LIM; rebuilding with skew modulus $NEW"
+  mkdir -p $B
+  sed -i "s/^#define __CUPBOP_SP_SKEW_M .*/#define __CUPBOP_SP_SKEW_M $NEW/" kernel_wrapper.cpp
+  rm -f $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump
+  if ! $MAKE -C $CELL kernel.vxbin kernel.dump "$@" > $B/skew.rebuild.log 2>&1; then
+    echo "--- [stack] sp-skew rebuild failed ($B/skew.rebuild.log)"; rm -f kernel.elf kernel.vxbin kernel.dump; return 1
+  fi
+  cp $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump .
+  skew_fit "$@"   # the frames do not depend on M; this only confirms it
+}
+
+# --- C. kernel ABI check (CUPBOP_KABI)
+abi_gate() {
+  [ -f cupbop_kabi.txt ] || return 0
+  if python3 $HERE/abi_check.py kernel.dump cupbop_kabi.txt > abi_check.log 2>&1; then
+    echo "--- [abi] $(tail -1 abi_check.log)"
+    return 0
+  fi
+  cat abi_check.log
+  echo "--- [abi] the kernel ABI calls are not safe (abi_check.log): build failed; CUPBOP_KABI=0 builds with the ordinary ABI"
+  rm -f kernel.elf kernel.vxbin kernel.dump
+  return 1
+}
+
+frame_fallback "$@"
+skew_fit "$@" || exit 1
+abi_gate || exit 1
+exit 0

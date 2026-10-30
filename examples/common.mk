@@ -186,7 +186,7 @@ clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_kabi.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:
@@ -265,14 +265,14 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 		VORTEX_HOME=$(VORTEX_HOME) CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
-ifneq ($(filter 1 2,$(SCHEDULE)),)
-	@# a kernel function whose stack frame does not fit the 8 KB hardware stack: rebuilt with the dynamic trip count
-	@# (core mapping with fixed trips) or run on a software stack; no-op when every frame fits (see the script)
+	@# post-build stack steps (see the script): schedules 1 and 2, a kernel function whose stack frame does not fit the
+	@# 8 KB hardware stack is rebuilt with the dynamic trip count (core mapping with fixed trips) or run on a software
+	@# stack; every schedule, the sp skew modulus is lowered to fit the frame (CUPBOP_SP_SKEW) and the kernel ABI calls
+	@# are checked (CUPBOP_KABI, examples/abi_check.py; UNSAFE fails the build). No-op when nothing applies.
 	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(CuPBoP_PATH)/build/compilation/kernelTranslator \
 		$(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
-endif
 	@echo "--- Kernel compilation completed!"
 lookup_global_symbols.txt: kernel.elf
 	nm -C --defined-only -g $< > $@
