@@ -257,6 +257,10 @@ int main(int argc, char **argv) {
   DBG_LOG("hoist_block_constant_loads\n");
   hoist_block_constant_loads(program);
 
+  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
+    if (std::stoi(std::string(env)) == 1) virt_ctx_to_scratch(program); // core mapping: context arrays -> scratch
+  }
+
   VerifyModule(program);
 
   // Run LoopSimplify to ensure all loops have preheaders.

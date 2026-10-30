@@ -45,6 +45,8 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <map>
+#include <fstream>
+#include <cstdio>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -2890,6 +2892,401 @@ static bool has_warp_shfl_usage(llvm::Module *M) {
     }
   }
   return false;
+}
+
+// ---- Core mapping (schedule 1): context arrays in a global scratch buffer instead of the stack ------------------
+// A hardware thread of the core mapping runs several CUDA warps one after the other (trips), so every value live
+// across a parallel region gets one copy per trip: a context array of `slots` elements on the hardware thread's stack
+// (GetContextArray, allocas named <value>_intra_warp_). Lifted GEMMs need tens of KB of them (cuBLAS batched_gemm at
+// P = 1, block 256: about 900 arrays x 8 slots), far over the 8 KB Vortex stack, and the array pointers themselves
+// fill the frame with spills. virt_ctx_to_scratch (run by KernelTranslation.cpp after the translator's -O3, so that
+// only the arrays the optimizer kept move) puts them in a scratch buffer in device memory that the host allocates per
+// launch (cudaLaunchKernel_vortex). Element `slot` of array v of hardware thread h is at
+//     __ctx_pool + (slot * B + off_v) * H + h * stride_v
+// B = bytes per slot of all moved arrays, off_v = array v's offset in a slot, stride_v = its element size rounded up
+// to 4 / 8 / 16 bytes, H = __cupbop_ctx_num_harts() (all hardware threads of the device, rounded up to 16; a
+// constant after LTO) and h = __cupbop_ctx_hart(). The lanes of a warp touch consecutive elements: the software
+// counterpart of the hardware stack interleave (an element larger than 16 bytes that is only loaded / stored at
+// constant offsets is interleaved word by word instead: ctx_word_ok). The host reads B, the fixed slot count (CUPBOP_VIRT_TRIPS, else 0:
+// ceil(block / (P*L)) at launch) and L from cupbop_ctx_scratch.txt and sizes the buffer as H * B * slots.
+// CUPBOP_CTX_SCRATCH=auto (default) | on | off. auto moves a kernel's arrays only when its estimated context stack
+// (8 bytes of pointer spill per array + every array at CUPBOP_CTX_DYN_SLOTS slots, default 8, or the fixed trips)
+// exceeds CUPBOP_CTX_STACK_BYTES (default 7168 of the 8192-byte stack); otherwise nothing changes.
+// CUPBOP_CTX_SCRATCH_WHY=1 prints every kernel's numbers and decision. The sub-pass form (nested loops, L < 32 with
+// warp-level ops) keeps its arrays on the stack.
+static std::string ctx_lookup_name(llvm::Function *F) {
+  // the kernel name as generate_wrapper.cpp writes it to lookup.txt
+  std::string n = F->getName().str();
+  if ((triton_cupbop_enabled() && !n.empty() && n[0] == '_') || !triton_cupbop_enabled()) {
+    for (size_t i = 2; i < n.size(); i++) {
+      if (n[i] >= '0' && n[i] <= '9') continue;
+      n = n.substr(i);
+      break;
+    }
+  }
+  return n;
+}
+namespace {
+struct CtxArray {
+  AllocaInst *AI;
+  Type *elem;     // one slot
+  uint64_t size;  // alloc size of one slot
+  uint64_t stride, off;
+  bool words = false; // word-interleaved inside the element (see ctx_word_ok)
+};
+} // namespace
+// Can every use of the array be rewritten slot by slot? (direct load / store / call of slot 0, or a GEP whose leading
+// index selects the slot: `gep elem, A, slot, ...` or, for a fixed-count array [k x elem], `gep [k x elem], A, 0, slot, ...`)
+static bool ctx_uses_ok(const CtxArray &c, std::string &why) {
+  for (Use &U : c.AI->uses()) {
+    Instruction *I = cast<Instruction>(U.getUser());
+    if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+      if (G->getPointerOperand() != c.AI) { why = "array used as a GEP index"; return false; }
+      Type *ST = G->getSourceElementType();
+      const DataLayout &DL = I->getModule()->getDataLayout();
+      const uint64_t t2 = DL.getTypeAllocSize(ST);
+      if (t2 == c.size) continue;
+      if (ST == c.AI->getAllocatedType() && G->getNumIndices() >= 2) {
+        auto *Z = dyn_cast<ConstantInt>(G->getOperand(1));
+        if (Z && Z->isZero()) continue;
+      }
+      // a flattened index over a smaller type (gep i8 A, slot*size + byte; gep i32 A, slot*4 + j): slot = idx / k
+      if (G->getNumIndices() == 1 && t2 && c.size % t2 == 0) continue;
+      why = "GEP over a type of another size";
+      return false;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(I)) { (void)LI; continue; }
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      if (SI->getValueOperand() == c.AI) { why = "array address stored"; return false; }
+      continue;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(I))
+      if (II->isLifetimeStartOrEnd()) continue;
+    if (auto *MI = dyn_cast<MemIntrinsic>(I)) { // must stay within slot 0
+      auto *Len = dyn_cast<ConstantInt>(MI->getLength());
+      if (!Len || Len->getZExtValue() > c.size) { why = "memory intrinsic over several slots"; return false; }
+      continue;
+    }
+    if (isa<CallBase>(I)) continue; // a pointer argument: slot 0 (e.g. a helper's result buffer)
+    why = std::string("user ") + I->getOpcodeName();
+    return false;
+  }
+  return true;
+}
+// Word interleave inside an element. A large element (a lifter's by-value parameter buffer: ~0.5-1 KB, written byte
+// by byte at entry and read at constant offsets) laid out contiguously per hardware thread puts the 32 lanes of a warp
+// ~1 KB apart for the same field: one cache line per lane. When every access is a load / store at a constant byte
+// offset k, byte k of hardware thread h goes instead to word k/4 of a per-word interleave:
+//     (slot * B + off_v + 4 * (k/4)) * H + 4 * h + k % 4
+// so the lanes of a warp touch one 128-byte run, as with the hardware stack interleave. Accesses of 8 bytes or more
+// are split into 4-byte words. CUPBOP_CTX_SCRATCH_WORDS=0 keeps the contiguous element.
+static bool ctx_word_ok_ptr(Value *P, int64_t k, const DataLayout &DL, int depth = 0) {
+  if (depth > 8) return false;
+  for (User *U : P->users()) {
+    if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+      if (G->getPointerOperand() != P) return false;
+      APInt off(64, 0);
+      if (!G->accumulateConstantOffset(DL, off)) return false;
+      if (!ctx_word_ok_ptr(G, k + off.getSExtValue(), DL, depth + 1)) return false;
+      continue;
+    }
+    Type *T = nullptr;
+    if (auto *LI = dyn_cast<LoadInst>(U)) { if (!LI->isSimple()) return false; T = LI->getType(); }
+    else if (auto *SI = dyn_cast<StoreInst>(U)) {
+      if (!SI->isSimple() || SI->getPointerOperand() != P) return false;
+      T = SI->getValueOperand()->getType();
+    } else return false;
+    if (k < 0) return false;
+    const uint64_t n = DL.getTypeStoreSize(T);
+    if (!(T->isIntegerTy() || T->isFloatingPointTy() || T->isPointerTy() || T->isVectorTy())) return false;
+    if (DL.getTypeSizeInBits(T) != n * 8) return false;
+    if (n <= 4) { if ((k % 4) + n > 4) return false; }
+    else if (n % 4 || k % 4) return false;
+  }
+  return true;
+}
+// rewrite the accesses below old pointer P (at byte offset k of the element) for slot base S0 (= base + h*4 +
+// slot*B*H + off_v*H); W = 4*H bytes per interleaved word
+static void ctx_word_rewrite(Value *P, int64_t k, Value *S0, Value *W, const DataLayout &DL) {
+  LLVMContext &C = P->getContext();
+  Type *I8 = Type::getInt8Ty(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  std::vector<User *> users(P->user_begin(), P->user_end());
+  for (User *U : users) {
+    Instruction *I = cast<Instruction>(U);
+    IRBuilder<> B(I);
+    auto word = [&](int64_t kk) { // address of byte kk
+      Value *a = B.CreateGEP(I8, S0, B.CreateMul(ConstantInt::get(I64, kk / 4), W));
+      return kk % 4 ? B.CreateGEP(I8, a, ConstantInt::get(I64, kk % 4)) : a;
+    };
+    if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+      APInt off(64, 0);
+      G->accumulateConstantOffset(DL, off);
+      ctx_word_rewrite(G, k + off.getSExtValue(), S0, W, DL);
+      G->eraseFromParent();
+      continue;
+    }
+    Type *T = isa<LoadInst>(I) ? I->getType() : cast<StoreInst>(I)->getValueOperand()->getType();
+    const uint64_t n = DL.getTypeStoreSize(T);
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      Value *v;
+      if (n <= 4) {
+        v = B.CreateAlignedLoad(T, word(k), Align(k % 4 ? (k % 2 ? 1 : 2) : std::min<uint64_t>(4, n)), LI->isVolatile());
+      } else {
+        Type *IN = IntegerType::get(C, n * 8);
+        Value *acc = ConstantInt::get(IN, 0);
+        for (uint64_t w = 0; w < n / 4; w++) {
+          Value *x = B.CreateAlignedLoad(I32, word(k + 4 * w), Align(4), LI->isVolatile());
+          acc = B.CreateOr(acc, B.CreateShl(B.CreateZExt(x, IN), 32 * w));
+        }
+        v = T->isPointerTy() ? B.CreateIntToPtr(acc, T) : B.CreateBitCast(acc, T);
+      }
+      v->takeName(LI);
+      LI->replaceAllUsesWith(v);
+      LI->eraseFromParent();
+    } else {
+      auto *SI = cast<StoreInst>(I);
+      Value *x = SI->getValueOperand();
+      if (n <= 4) {
+        B.CreateAlignedStore(x, word(k), Align(k % 4 ? (k % 2 ? 1 : 2) : std::min<uint64_t>(4, n)), SI->isVolatile());
+      } else {
+        Type *IN = IntegerType::get(C, n * 8);
+        Value *xi = T->isPointerTy() ? B.CreatePtrToInt(x, IN) : B.CreateBitCast(x, IN);
+        for (uint64_t w = 0; w < n / 4; w++)
+          B.CreateAlignedStore(B.CreateTrunc(B.CreateLShr(xi, 32 * w), I32), word(k + 4 * w), Align(4), SI->isVolatile());
+      }
+      SI->eraseFromParent();
+    }
+  }
+}
+// the slot operand and the constant byte offset of a slot GEP over the array, if it has that shape
+static bool ctx_slot_gep(const CtxArray &c, GetElementPtrInst *G, const DataLayout &DL, Value *&slotV, int64_t &k,
+                         int64_t &slotC) {
+  Type *ST = G->getSourceElementType();
+  const uint64_t t2 = DL.getTypeAllocSize(ST);
+  slotV = nullptr; slotC = -1; k = 0;
+  auto restOff = [&](unsigned first, Type *Ty) -> bool { // constant offset of indices first.. into Ty
+    std::vector<Value *> idx{ConstantInt::get(Type::getInt64Ty(G->getContext()), 0)};
+    for (unsigned i = first; i < G->getNumOperands(); i++) {
+      if (!isa<ConstantInt>(G->getOperand(i))) return false;
+      idx.push_back(G->getOperand(i));
+    }
+    if (idx.size() == 1) return true;
+    k = DL.getIndexedOffsetInType(Ty, idx);
+    return true;
+  };
+  if (t2 == c.size) { slotV = G->getOperand(1); return restOff(2, ST); }
+  if (ST == c.AI->getAllocatedType() && G->getNumIndices() >= 2) { slotV = G->getOperand(2); return restOff(3, c.elem); }
+  if (G->getNumIndices() == 1 && t2 && c.size % t2 == 0) {
+    auto *CI = dyn_cast<ConstantInt>(G->getOperand(1));
+    if (!CI) return false;
+    const uint64_t e = c.size / t2, idx = CI->getZExtValue();
+    slotC = idx / e; k = (idx % e) * t2;
+    return true;
+  }
+  return false;
+}
+static bool ctx_word_ok(const CtxArray &c, const DataLayout &DL) {
+  if (c.size <= 16 || c.size % 4) return false;
+  for (User *U : c.AI->users()) {
+    if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+      Value *sv; int64_t k, sc;
+      if (G->getPointerOperand() != c.AI || !ctx_slot_gep(c, G, DL, sv, k, sc)) return false;
+      if (!ctx_word_ok_ptr(G, k, DL)) return false;
+      continue;
+    }
+    if (isa<LoadInst>(U) || isa<StoreInst>(U)) {
+      if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getPointerOperand() != c.AI) return false;
+      // a direct access of slot 0 at offset 0: check it like a pointer user
+      continue;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) continue;
+    return false;
+  }
+  // the direct loads / stores of slot 0
+  for (User *U : c.AI->users())
+    if (isa<LoadInst>(U) || isa<StoreInst>(U)) {
+      const DataLayout &L2 = DL;
+      Type *T = isa<LoadInst>(U) ? U->getType() : cast<StoreInst>(U)->getValueOperand()->getType();
+      uint64_t n = L2.getTypeStoreSize(T);
+      if (!(n <= 4 || n % 4 == 0)) return false;
+      if (auto *LI = dyn_cast<LoadInst>(U); LI && !LI->isSimple()) return false;
+      if (auto *SI = dyn_cast<StoreInst>(U); SI && !SI->isSimple()) return false;
+    }
+  return true;
+}
+void virt_ctx_to_scratch(llvm::Module *M) {
+  if (need_nested_loop) { std::remove("cupbop_ctx_scratch.txt"); return; }
+  std::string mode = "auto";
+  if (const char *e = std::getenv("CUPBOP_CTX_SCRATCH")) mode = e;
+  const bool why = std::getenv("CUPBOP_CTX_SCRATCH_WHY") != nullptr;
+  long dyn_slots = 8, budget = 7168;
+  if (const char *e = std::getenv("CUPBOP_CTX_DYN_SLOTS")) dyn_slots = std::max(1L, std::atol(e));
+  if (const char *e = std::getenv("CUPBOP_CTX_STACK_BYTES")) budget = std::atol(e);
+  const VirtGeom vg = getVirtGeom();
+  const long fixed = vg.trips; // CUPBOP_VIRT_TRIPS at translation: arrays of exactly that many slots
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &C = M->getContext();
+  Type *I8 = Type::getInt8Ty(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  std::vector<std::string> sidecar;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    std::vector<CtxArray> arrays;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI) continue;
+        StringRef n = AI->getName();
+        size_t p = n.rfind("_intra_warp_");
+        if (p == StringRef::npos || n.substr(p + 12).find_first_not_of("0123456789") != StringRef::npos) continue;
+        if (n.starts_with("local_intra_warp")) continue;
+        CtxArray c{AI, AI->getAllocatedType(), 0, 0, 0};
+        if (!AI->isArrayAllocation()) {
+          // a constant slot count folded into the type ([k x elem]), or one slot
+          auto *AT = dyn_cast<ArrayType>(c.elem);
+          if (fixed > 1 && AT && (long)AT->getNumElements() == fixed) c.elem = AT->getElementType();
+          else if (fixed > 1) continue; // not recognizable as k slots: leave it alone
+        }
+        c.size = DL.getTypeAllocSize(c.elem);
+        if (!c.size) continue;
+        arrays.push_back(c);
+      }
+    if (arrays.empty()) continue;
+    // an array with a use the rewrite does not handle (e.g. a PHI of two arrays' addresses) stays on the stack
+    {
+      std::vector<CtxArray> ok;
+      for (auto &c : arrays) {
+        std::string bad;
+        if (ctx_uses_ok(c, bad)) ok.push_back(c);
+        else if (why)
+          fprintf(stderr, "[ctx-scratch] %s: context array %s stays on the stack: %s\n", F.getName().str().c_str(),
+                  c.AI->getName().str().c_str(), bad.c_str());
+      }
+      arrays.swap(ok);
+    }
+    if (arrays.empty()) continue;
+    {
+      const char *e = std::getenv("CUPBOP_CTX_SCRATCH_WORDS");
+      if (!e || std::atoi(e))
+        for (auto &c : arrays) c.words = ctx_word_ok(c, DL);
+    }
+    const long S = fixed > 0 ? fixed : dyn_slots;
+    uint64_t B = 0, est = 0;
+    for (auto &c : arrays) {
+      uint64_t al = c.size >= 16 ? 16 : c.size >= 8 ? 8 : 4;
+      c.stride = (c.size + al - 1) / al * al;
+      B = (B + al - 1) / al * al;
+      c.off = B;
+      B += c.stride;
+      est += 8 + (c.stride * S + 15) / 16 * 16;
+    }
+    B = (B + 15) / 16 * 16;
+    const bool use = mode == "on" || (mode == "auto" && (long)est > budget);
+    if (why)
+      fprintf(stderr, "[ctx-scratch] %s: %zu context arrays, %lu bytes per slot, %s slots, estimated stack %lu bytes "
+                      "(budget %ld) -> %s\n", F.getName().str().c_str(), arrays.size(), (unsigned long)B,
+              fixed > 0 ? std::to_string(fixed).c_str() : ("dynamic, assumed " + std::to_string(dyn_slots)).c_str(),
+              (unsigned long)est, budget, use ? "scratch" : "stack");
+    if (!use) continue;
+    // per-function values at the top of the entry block
+    IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    GlobalVariable *pool = M->getGlobalVariable("__ctx_pool");
+    if (!pool) pool = new GlobalVariable(*M, PointerType::getUnqual(C), false, GlobalValue::ExternalLinkage, nullptr, "__ctx_pool");
+    LoadInst *base = EB.CreateLoad(PointerType::getUnqual(C), pool, "ctx_scratch_base");
+    base->setVolatile(true); // set by the host per launch (cudaMemcpyToSymbol service launch)
+    Value *H = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_num_harts", FunctionType::get(I32, false)), {}, "ctx_harts"), I64);
+    Value *h = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_hart", FunctionType::get(I32, false)), {}, "ctx_hart"), I64);
+    Value *SS = EB.CreateMul(ConstantInt::get(I64, B), H, "ctx_slot_bytes");
+    // base + h * stride, one per element stride class; an access is (that + slot * SS) + off_v * H, built in this
+    // order so that the per-array constant comes last: the optimizer folds it into the access instead of keeping one
+    // loop-invariant pointer per array live (hundreds of them, all spilled: the frame these arrays should leave)
+    std::map<uint64_t, Value *> hartBase;
+    Value *W4 = EB.CreateMul(ConstantInt::get(I64, 4), H, "ctx_word_bytes");
+    for (auto &c : arrays) {
+      if (c.words) {
+        Value *&hb4 = hartBase[4];
+        if (!hb4) hb4 = EB.CreateGEP(I8, base, EB.CreateMul(h, ConstantInt::get(I64, 4)), "ctx_hart_base");
+        std::vector<User *> users(c.AI->user_begin(), c.AI->user_end());
+        for (User *U : users) {
+          Instruction *I = cast<Instruction>(U);
+          IRBuilder<> B2(I);
+          if (auto *II = dyn_cast<IntrinsicInst>(I); II && II->isLifetimeStartOrEnd()) { II->eraseFromParent(); continue; }
+          Value *slot = nullptr; int64_t k = 0, sc = 0;
+          if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+            ctx_slot_gep(c, G, DL, slot, k, sc);
+            Value *sl = slot ? B2.CreateSExtOrTrunc(slot, I64) : (Value *)ConstantInt::get(I64, sc);
+            Value *S0 = B2.CreateGEP(I8, B2.CreateGEP(I8, hb4, B2.CreateMul(sl, SS)), B2.CreateMul(ConstantInt::get(I64, c.off), H));
+            ctx_word_rewrite(G, k, S0, W4, DL);
+            G->eraseFromParent();
+          } else { // a direct load / store of slot 0, offset 0: rewrite it through a stand-in pointer
+            Value *S0 = B2.CreateGEP(I8, hb4, B2.CreateMul(ConstantInt::get(I64, c.off), H));
+            Instruction *stand = cast<Instruction>(B2.CreateGEP(I8, c.AI, ConstantInt::get(I64, 0), "ctx_word_standin"));
+            I->replaceUsesOfWith(c.AI, stand);
+            ctx_word_rewrite(stand, 0, S0, W4, DL);
+            stand->eraseFromParent();
+          }
+        }
+        c.AI->eraseFromParent();
+        continue;
+      }
+      Value *&hb = hartBase[c.stride];
+      if (!hb) hb = EB.CreateGEP(I8, base, EB.CreateMul(h, ConstantInt::get(I64, c.stride)), "ctx_hart_base");
+      std::vector<Use *> uses;
+      for (Use &U : c.AI->uses()) uses.push_back(&U);
+      for (Use *U : uses) {
+        Instruction *I = cast<Instruction>(U->getUser());
+        if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+          IRBuilder<> B2(G);
+          Type *ST = G->getSourceElementType();
+          const uint64_t t2 = DL.getTypeAllocSize(ST);
+          unsigned slotIdx = 1; // operand index of the slot
+          Type *rest = ST;      // type the indices after the slot walk into
+          Value *within = nullptr; // byte offset inside the element (flattened index)
+          Value *slot;
+          if (t2 == c.size) {
+            slot = B2.CreateSExtOrTrunc(G->getOperand(1), I64);
+          } else if (ST == c.AI->getAllocatedType() && G->getNumIndices() >= 2) { // gep [k x elem], A, 0, slot, ...
+            slotIdx = 2; rest = c.elem;
+            slot = B2.CreateSExtOrTrunc(G->getOperand(2), I64);
+          } else { // gep T2, A, idx with size % sizeof(T2) == 0: slot = idx / k, element offset (idx % k) * sizeof(T2)
+            Value *idx = B2.CreateSExtOrTrunc(G->getOperand(1), I64);
+            Value *k = ConstantInt::get(I64, c.size / t2);
+            slot = B2.CreateUDiv(idx, k);
+            within = B2.CreateMul(B2.CreateURem(idx, k), ConstantInt::get(I64, t2));
+          }
+          Value *p = B2.CreateGEP(I8, B2.CreateGEP(I8, hb, B2.CreateMul(slot, SS)), B2.CreateMul(ConstantInt::get(I64, c.off), H));
+          if (within) p = B2.CreateGEP(I8, p, within);
+          if (!within && G->getNumOperands() > slotIdx + 1) {
+            std::vector<Value *> idx{ConstantInt::get(I64, 0)};
+            for (unsigned k = slotIdx + 1; k < G->getNumOperands(); k++) idx.push_back(G->getOperand(k));
+            p = B2.CreateGEP(rest, p, idx);
+          }
+          p->takeName(G);
+          G->replaceAllUsesWith(p);
+          G->eraseFromParent();
+        } else if (auto *II = dyn_cast<IntrinsicInst>(I); II && II->isLifetimeStartOrEnd()) {
+          II->eraseFromParent();
+        } else {
+          IRBuilder<> B2(I);
+          U->set(B2.CreateGEP(I8, hb, B2.CreateMul(ConstantInt::get(I64, c.off), H), c.AI->getName() + "slot0")); // slot 0
+        }
+      }
+      c.AI->eraseFromParent();
+    }
+    sidecar.push_back(ctx_lookup_name(&F) + " " + std::to_string(B) + " " + std::to_string(fixed > 0 ? fixed : 0) + " " +
+                      std::to_string(vg.lanes));
+    size_t nw = 0;
+    for (auto &c : arrays) nw += c.words;
+    fprintf(stderr, "[ctx-scratch] %s: %zu context arrays in the scratch buffer (%lu bytes per slot, %zu word-interleaved)\n",
+            F.getName().str().c_str(), arrays.size(), (unsigned long)B, nw);
+  }
+  if (sidecar.empty()) {
+    std::remove("cupbop_ctx_scratch.txt");
+  } else {
+    std::ofstream out("cupbop_ctx_scratch.txt");
+    out << "# CuPBoP core-mapping context scratch (translator -> cudaLaunchKernel_vortex): <kernel as in lookup.txt> "
+           "<bytes per slot> <fixed slots, 0 = ceil(block / (P*L))> <L>\n";
+    for (auto &l : sidecar) out << l << "\n";
+  }
 }
 
 void insert_warp_loop(llvm::Module *M) {

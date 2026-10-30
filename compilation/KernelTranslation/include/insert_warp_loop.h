@@ -8,5 +8,7 @@
 using namespace llvm;
 
 void insert_warp_loop(llvm::Module *M);
+// core mapping: move the context arrays to the host-allocated scratch buffer (after the translator's -O3)
+void virt_ctx_to_scratch(llvm::Module *M);
 
 #endif
