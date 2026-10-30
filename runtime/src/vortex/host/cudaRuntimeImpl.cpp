@@ -715,6 +715,65 @@ static void cupbop_virt_geometry(uint64_t block_threads, uint32_t &L, uint32_t &
   if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
   if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
 }
+// Core mapping: kernels the translator found to deadlock with more than one physical warp per CTA (insert_warp_loop.cpp
+// note_p1_only_kernel: a thread-dependent branch between the warp loops guards region-boundary barriers), listed in
+// cupbop_virt_p1_only.txt in the working directory. By default the translator's runtime guard in front of such a
+// branch stops the simulation when the lanes actually disagree there (misaligned access at 0xdead0001);
+// CUPBOP_VIRT_P1_STRICT=1 refuses every launch of a listed kernel with more than one physical warp per CTA instead
+// (also catches physical warps that disagree as a whole, which the per-warp guard cannot see).
+static bool cupbop_virt_p1_only(const std::string &lookup_name) {
+  if (!std::getenv("CUPBOP_VIRT_P1_STRICT")) return false;
+  std::ifstream f("cupbop_virt_p1_only.txt");
+  std::string line;
+  while (std::getline(f, line))
+    if (!line.empty() && line[0] != '#' && line == lookup_name) return true;
+  return false;
+}
+
+// Software stack (translator: generate_wrapper.cpp CUPBOP_BIG_STACK, set by examples/stack_fallback.sh when a kernel
+// function's frame does not fit the 8 KB hardware stack): cupbop_big_stack.txt in the working directory holds the
+// bytes per hardware thread (the stack stride); the kernel ELF then defines __cupbop_big_stack, which gets the base of
+// (device hardware threads rounded up to 16) stacks of that size. Grown, never shrunk. No file or no symbol (every
+// other kernel): nothing to do.
+static void cupbop_big_stack_setup(const std::string &kernel_name) {
+  static uint64_t big_stack_addr = 0, big_stack_size = 0;
+  std::ifstream bf("cupbop_big_stack.txt");
+  uint64_t per = 0;
+  if (!bf.is_open() || !(bf >> per) || !per) return;
+  std::fstream sf("lookup_global_symbols.txt", std::ios::in);
+  std::string sa, st, sn;
+  uint64_t sym = 0;
+  while (sf >> sa >> st) {
+    std::getline(sf, sn);
+    if (!sn.empty() && sn[0] == ' ') sn = sn.substr(1);
+    if (sn == "__cupbop_big_stack") { sym = std::stoull(sa, nullptr, 16); break; }
+  }
+  if (!sym) return;
+  const uint64_t H = ((uint64_t)NUM_CORES_VX * NUM_WARPS_VX * NUM_THREADS_VX + 15) & ~15ull;
+  const uint64_t need = H * per;
+  if (need > big_stack_size) {
+    if (big_stack_addr) cudaFree((void *)big_stack_addr);
+    void *p = nullptr;
+    if (cudaMalloc(&p, need) != cudaSuccess || !p) {
+      fprintf(stderr, "cudaLaunchKernel: cannot allocate the %lu-byte software stack\n", (unsigned long)need);
+      std::abort();
+    }
+    big_stack_addr = (uint64_t)p;
+    big_stack_size = need;
+  }
+  if (std::getenv("CUPBOP_BIG_STACK_VERBOSE"))
+    fprintf(stderr, "[big-stack] %s: %lu bytes x %lu hardware threads at 0x%lx\n", kernel_name.c_str(),
+            (unsigned long)per, (unsigned long)H, (unsigned long)big_stack_addr);
+  MemcpySymbolEntry e;
+  e.dst_addr = sym;
+  e.size = sizeof(uint64_t);
+  e.data.resize(sizeof(uint64_t));
+  memcpy(e.data.data(), &big_stack_addr, sizeof(uint64_t));
+  for (auto &x : memcpy_symbol)
+    if (x.dst_addr == sym) { x = std::move(e); return; }
+  memcpy_symbol.push_back(std::move(e));
+}
+
 // Core-mapping context scratch (translator: insert_warp_loop.cpp virt_ctx_to_scratch, cupbop_ctx_scratch.txt in the
 // working directory, one line per kernel: <name as in lookup.txt> <bytes per slot> <fixed slots or 0> <L>): bytes the
 // launch of kernel `lookup_name` needs = H * B * slots, H = all hardware threads of the device rounded up to 16
@@ -1478,6 +1537,8 @@ cudaError_t cudaLaunchKernel_vortex(
     }
   }
 
+  cupbop_big_stack_setup(kernel_name_tmp);
+
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
   DBG_PRINT("(debug) abuf_size = %ld\n", abuf_size);
@@ -1709,6 +1770,13 @@ cudaError_t cudaLaunchKernel_vortex(
                "mapping runs it only with one logical warp per physical warp of 32 lanes (CUPBOP_VIRT_WARPS = the "
                "block's %u warps, no trips / lane gating), got %u physical warps of %u lanes. Use SCHEDULE=2.\n",
                func_stripped.c_str(), block_warps, P, L);
+        std::abort();
+      }
+      if (P > 1 && cupbop_virt_p1_only(kernel_name_tmp)) {
+        printf("Error: kernel %s deadlocks under the core mapping with more than one physical warp per CTA (a "
+               "thread-dependent branch between its warp loops guards CTA barriers; cupbop_virt_p1_only.txt), got %u "
+               "physical warps. Use CUPBOP_VIRT_WARPS=1 (or SCHEDULE=2).\n", func_stripped.c_str(), P);
+        fflush(stdout);
         std::abort();
       }
       const char *virt_exact_env = std::getenv("CUPBOP_VIRT_TRIPS_EXACT");

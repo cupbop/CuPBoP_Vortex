@@ -23,6 +23,50 @@
 #include <map>
 #include <set>
 
+#include <cstdlib>
+#include <string>
+
+// Software stack (CUPBOP_BIG_STACK=<bytes per hardware thread>, set by examples/stack_fallback.sh when a kernel
+// function's static frame does not fit the 8 KB hardware stack, VX_MEM_STACK_LOG2_SIZE=13): kernel_main calls the
+// translated kernel on a stack of that size in device memory instead. A frame beyond 8 KB writes into the next
+// hardware thread's stack: lifted kernels whose register spills alone are 10-30 KB (CUTLASS/cuDNN tensor-op GEMM
+// and conv mainloops, the 128-accumulator conv2d at s2) crashed with misaligned accesses. The host allocates
+// (device hardware threads, rounded up to 16) x <bytes> (cupbop_big_stack.txt) and stores the base in
+// __cupbop_big_stack; hardware thread h's stack top is base + (h+1) x <bytes> (h = (core x NW + warp) x NT + lane,
+// physical ids, so h stays below that count with the RT_NW/NC/NT caps too; <bytes> is a 4 KB multiple + 64 so that
+// one frame slot of neighbouring lanes falls into different cache sets). The trampoline keeps the old sp and ra
+// on the new stack, so the hardware stack is untouched below kernel_main. Without the variable set by the host
+// (base 0) the kernel runs on the hardware stack as before. Unset: the wrapper is exactly the old one.
+static long big_stack_bytes() {
+  const char *e = std::getenv("CUPBOP_BIG_STACK");
+  long v = e ? std::atol(e) : 0;
+  return v > 0 ? (v + 15) / 16 * 16 : 0;
+}
+static std::string big_stack_prelude() {
+  const long n = big_stack_bytes();
+  if (!n) return "";
+  return "// Software stack, " + std::to_string(n) + " bytes per hardware thread (CUPBOP_BIG_STACK; see generate_wrapper.cpp)\n"
+         "#include <VX_config.h>\n"
+         "extern \"C\" { char *__cupbop_big_stack = 0; }\n"
+         "extern \"C\" void __cupbop_stack_call(vx_kernel_func_cb fn, void *arg, char *top);\n"
+         "asm(\".text\\n.p2align 2\\n.globl __cupbop_stack_call\\n.type __cupbop_stack_call,@function\\n\"\n"
+         "    \"__cupbop_stack_call:\\n\"\n"
+         "    \"  addi a2, a2, -16\\n  sd ra, 8(a2)\\n  sd sp, 0(a2)\\n  mv sp, a2\\n\"\n"
+         "    \"  mv t0, a0\\n  mv a0, a1\\n  jalr t0\\n\"\n"
+         "    \"  ld ra, 8(sp)\\n  ld sp, 0(sp)\\n  ret\\n.size __cupbop_stack_call, .-__cupbop_stack_call\\n\");\n"
+         "static inline __attribute__((always_inline)) void __cupbop_call_kernel(vx_kernel_func_cb fn, void *arg) {\n"
+         "    char *base = *(char *volatile *)&__cupbop_big_stack;\n"
+         "    if (!base) { fn(arg); return; }\n"
+         "    const uint64_t h = ((uint64_t)vx_core_id() * VX_CFG_NUM_WARPS + (uint64_t)vx_warp_id()) * VX_CFG_NUM_THREADS\n"
+         "                       + (uint64_t)vx_thread_id();\n"
+         "    __cupbop_stack_call(fn, arg, base + (h + 1) * " + std::to_string(n) + "ull);\n"
+         "}\n\n";
+}
+static std::string big_stack_call() {
+  return big_stack_bytes() ? "    __cupbop_call_kernel(callbacks[kernel_arg->kernel_idx], (void *)args);\n"
+                           : "    callbacks[kernel_arg->kernel_idx](args);\n";
+}
+
 using namespace llvm;
 
 
@@ -639,6 +683,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    }\n"
           "}\n"
           "\n"
+          << big_stack_prelude() <<
           "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
           "void kernel_main(kernel_arg_t* kernel_arg) {\n"
           "    auto ctx = &kernel_arg->ctx; \n"
@@ -664,7 +709,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    block_index_x = linear % ctx->num_groups[0];\n"
           "    block_index_y = (linear / ctx->num_groups[0]) % ctx->num_groups[1];\n"
           "    block_index_z = linear / (ctx->num_groups[0] * ctx->num_groups[1]);\n"
-          "    callbacks[kernel_arg->kernel_idx](args);\n"
+          << big_stack_call() <<
           "}\n"
 ;
     } else if (schedule == 1) {
@@ -709,11 +754,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // (counted per warp) are unaffected; the host guarantees every warp owns\n"
             "    // at least one logical thread (P <= ceil(block/L)).\n"
             "    if (__lane >= __L || __rank * " << own_stride << "u + __lane >= __bs) return;\n"
-            "    callbacks[kernel_arg->kernel_idx](args);\n"
+            << big_stack_call() <<
             "}\n";
       }
     } else {
-      ss <<           "    callbacks[kernel_arg->kernel_idx](args);\n"
+      ss << big_stack_call() <<
           "}\n"
 ;
     }
