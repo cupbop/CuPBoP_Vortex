@@ -44,6 +44,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <functional>
 #include <map>
 #include <fstream>
 #include <cstdio>
@@ -750,8 +751,78 @@ if (auto *loadInst = dyn_cast<LoadInst>(before)) {
   return createLoad(builder, gep);
 }
 
+// Core mapping (schedule 1): an alloca that gets a context array (one copy per logical-warp slot) is reached through
+// pointers derived from it (GEP / cast chains). AddContextSaveRestore below rewrites the alloca's direct users to the
+// copy of the current slot (GEP on the slot index, inserted before each user), so a derived pointer computed in one
+// block holds the address of THAT block's slot. Used in another block -- another parallel region, i.e. another warp
+// loop, or after it -- it still points at the copy of the slot that computed it last: the divergence analysis sees a
+// GEP of an alloca with constant indices as uniform, so the cross-region value was demoted to one variable and every
+// logical warp read the last warp's copy (ctx_c unit pfwd, _Z4pwbkv: an entry-region GEP of the buffer reused by a
+// load two barriers later; wrong at 11770fc). Every use of a derived pointer outside its block is given a clone of the
+// chain in the user's block (the incoming block for a PHI), so each access computes its slot's address where it is.
+// Index operands stay as they are (ordinary cross-region values). CUPBOP_S1_ALLOCA_ADDR_REMAT=0 or
+// CUPBOP_UNIFORM_NOREPL=0: off (11770fc).
+static unsigned remat_replicated_alloca_addresses(llvm::AllocaInst *AI) {
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0; };
+  if (off_env("CUPBOP_S1_ALLOCA_ADDR_REMAT") || off_env("CUPBOP_UNIFORM_NOREPL")) return 0;
+  auto derived = [](llvm::User *U) {
+    return isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U);
+  };
+  std::vector<Instruction *> chain;   // the derived pointers
+  std::set<Instruction *> in_chain;
+  std::vector<Value *> stack{AI};
+  while (!stack.empty()) {
+    Value *R = stack.back();
+    stack.pop_back();
+    for (User *U : R->users())
+      if (derived(U) && cast<Instruction>(U)->getOperand(0) == R && in_chain.insert(cast<Instruction>(U)).second) {
+        chain.push_back(cast<Instruction>(U));
+        stack.push_back(U);
+      }
+  }
+  std::map<std::pair<Instruction *, BasicBlock *>, Instruction *> clones;
+  std::map<Instruction *, Instruction *> orig_of;   // clone -> derived pointer it copies
+  // the derived pointer V (or a copy of it) as computed in block B
+  std::function<Value *(Value *, BasicBlock *)> at = [&](Value *V, BasicBlock *B) -> Value * {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || I == AI) return V;
+    if (orig_of.count(I)) I = orig_of[I];
+    if (!in_chain.count(I)) return V;
+    if (I->getParent() == B) return I;
+    Instruction *&C = clones[{I, B}];
+    if (!C) {
+      C = I->clone();
+      orig_of[C] = I;
+      C->setName(I->getName() + ".remat");
+      C->insertBefore(&*B->getFirstInsertionPt());
+      C->setOperand(0, at(I->getOperand(0), B));   // inserted before C: B's first insertion point is C now
+    }
+    return C;
+  };
+  unsigned n = 0;
+  for (Instruction *D : std::vector<Instruction *>(chain)) {
+    std::vector<Use *> uses;
+    for (Use &U : D->uses()) uses.push_back(&U);
+    for (Use *U : uses) {
+      auto *UI = dyn_cast<Instruction>(U->getUser());
+      if (!UI) continue;
+      BasicBlock *B = UI->getParent();
+      if (auto *PN = dyn_cast<PHINode>(UI)) B = PN->getIncomingBlock(*U);
+      if (B == D->getParent()) continue;
+      U->set(at(D, B));
+      n++;
+    }
+  }
+  if (n)
+    fprintf(stderr, "[alloca] s1: %u uses of pointers into %s outside their block get the address in their block\n", n,
+            AI->getName().str().c_str());
+  return n;
+}
+
 void AddContextSaveRestore(llvm::Instruction *instruction,
                            bool intra_warp_loop) {
+  if (g_schedule_flag == 1)
+    if (auto *AI = dyn_cast<AllocaInst>(instruction)) remat_replicated_alloca_addresses(AI);
   
                             // print instruction
   // llvm::errs() << "addcontextsaverestore\n";
