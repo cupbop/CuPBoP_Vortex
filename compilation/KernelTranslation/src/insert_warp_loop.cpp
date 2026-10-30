@@ -46,8 +46,10 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <functional>
 #include <map>
+#include <memory>
 #include <fstream>
 #include <cstdio>
+#include <cstring>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -2483,6 +2485,260 @@ static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelReg
   g_virt_p1_only.insert(&F);
 }
 
+// ---- Core mapping, single warp loop: thread-dependent branches between the warp loops (isync, 2026-10-30) ----------
+// Code outside the parallel regions runs once per physical warp, every lane holding its logical thread of slot 0
+// (note_p1_only_kernel above). A thread-dependent branch X there is decided by slot 0: the logical threads of the other
+// slots follow slot 0's arm, and when the lanes of a physical warp disagree they execute the barriers of both arms
+// (cuBLAS sdot/ddot reduce_1Block_kernel s1p2/s1p4: deadlock, stopped by the guard since a076035). Such a branch only
+// sits between the warp loops because insert_sync put region boundaries into its arms (its conditional-barrier rule
+// cascades into thread-dependent ifs and loops on lifted control flow). When the area between X and its immediate
+// post-dominator M (for a thread-dependent loop exit: the whole loop) holds none of the kernel's barriers, nothing in
+// it needs a CTA barrier, and absorb_divergent_areas makes it one piece of a single parallel region, so that every
+// logical thread takes its own way through it inside one warp loop:
+//   - X's leading barrier stays (the area starts after it, in a block of its own); a loop or a block without its own
+//     barrier is entered through a block holding a region marker (cupbop.builtin_barrier "region_split": no
+//     hardware barrier);
+//   - every barrier inside the area that is not the kernel's (insert_sync's boundaries, region_split markers) goes, and
+//     the area's terminators are marked (cupbop.s1_absorbed) so that a block holding only a conditional branch is no
+//     longer a region stop;
+//   - the area's edges into M meet in one block (a region's exit block must be the single predecessor of its barrier
+//     block); when M is also entered from outside the area that join ends in a marker, and M starts with one.
+// The area must be single-entry (no block but its head entered from outside) and hold no exit / switch. The largest
+// area goes first; the analyses and regions are rebuilt after each one, so nested areas go with the outermost.
+// A branch whose area holds a kernel barrier is block-uniform by CUDA's rules and stays; a shape that does not
+// qualify keeps note_p1_only_kernel's runtime guard. split_multi_entry_merges (below) prepares the regions that had
+// two entry barriers. CUPBOP_S1_ABSORB=0: all of it off (virt 4a4fbdb); CUPBOP_S1_ABSORB_WHY=1: decisions;
+// CUPBOP_S1_ABSORB_DRY=1: decisions only, no change.
+static bool s1_absorb_on() {
+  static const bool on = [] { const char *e = std::getenv("CUPBOP_S1_ABSORB"); return !(e && std::atoi(e) == 0); }();
+  return on;
+}
+static bool s1_absorb_why() {
+  static const bool w = std::getenv("CUPBOP_S1_ABSORB_WHY") != nullptr;
+  return w;
+}
+static bool s1_is_cta_barrier(const llvm::Instruction &I) {
+  if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+    if (auto *Callee = CI->getCalledFunction())
+      return Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync";
+  return false;
+}
+// "kernel" | "entry_exit" | "region_split" | "added"
+static const char *s1_barrier_kind(llvm::Instruction &I) {
+  if (g_s1_kernel_barriers.count(&I)) return "kernel";
+  if (auto *MD = I.getMetadata("cupbop.builtin_barrier"))
+    if (MD->getNumOperands())
+      if (auto *S = llvm::dyn_cast<llvm::MDString>(MD->getOperand(0))) {
+        if (S->getString() == "entry_exit") return "entry_exit";
+        return "region_split";
+      }
+  return "added";
+}
+static llvm::CallInst *s1_region_marker(llvm::Instruction *before) {
+  auto *c = CreateInterWarpBarrier(before);
+  auto &mctx = c->getContext();
+  c->setMetadata("cupbop.builtin_barrier", llvm::MDNode::get(mctx, llvm::MDString::get(mctx, "region_split")));
+  return c;
+}
+// A region boundary in front of B on the edges from preds: they meet in a join block J, which branches to a block
+// holding only the marker (a region's exit block must be the single predecessor of its barrier block).
+static llvm::BasicBlock *s1_marker_before(llvm::BasicBlock *B, llvm::ArrayRef<llvm::BasicBlock *> preds, const char *sfx) {
+  llvm::BasicBlock *J = llvm::SplitBlockPredecessors(B, preds, sfx);
+  if (!J) return nullptr;
+  llvm::BasicBlock *MB = J->splitBasicBlock(J->getTerminator(), J->getName() + "_bar");
+  s1_region_marker(MB->getTerminator());
+  return MB;
+}
+struct S1Area {
+  llvm::BasicBlock *X = nullptr;      // the thread-dependent branch
+  llvm::BasicBlock *head = nullptr;   // the area's entry: X, or the header of a loop around X
+  llvm::BasicBlock *M = nullptr;      // where the area ends (immediate post-dominator of head)
+  std::set<llvm::BasicBlock *> A;     // the area (head included)
+  int kernel_bars = 0, added_bars = 0, region_blocks = 0;
+  llvm::BasicBlock *kernel_bar_block = nullptr;   // (diagnostics)
+};
+// The area of the thread-dependent branch X (outside every region); false with `why` when it does not qualify.
+static bool s1_area_of(llvm::BasicBlock *X, llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, llvm::LoopInfo &LI,
+                       const std::set<llvm::BasicBlock *> &wrapped, S1Area &ar, std::string &why) {
+  ar = S1Area();
+  ar.X = X;
+  ar.head = X;
+  if (auto *N = PDT.getNode(X)) if (auto *IN = N->getIDom()) ar.M = IN->getBlock();
+  if (!ar.M) { why = "no post-dominator (paths to different exits)"; return false; }
+  // a loop around X that M leaves and whose body X does not dominate (X is a latch / exiting block): the whole loop
+  for (llvm::Loop *L = LI.getLoopFor(X); L && !L->contains(ar.M); L = L->getParentLoop()) {
+    bool all = true;
+    for (llvm::BasicBlock *B : L->blocks()) all &= DT.dominates(X, B);
+    if (!all) ar.head = L->getHeader();
+  }
+  if (ar.head != X && !PDT.dominates(ar.M, ar.head)) { why = "loop not post-dominated by the merge"; return false; }
+  std::vector<llvm::BasicBlock *> work{ar.head};
+  while (!work.empty()) {
+    llvm::BasicBlock *B = work.back(); work.pop_back();
+    if (B == ar.M || !ar.A.insert(B).second) continue;
+    for (llvm::BasicBlock *S : llvm::successors(B)) work.push_back(S);
+  }
+  for (llvm::BasicBlock *B : ar.A) {
+    if (B != ar.head)
+      for (llvm::BasicBlock *P : llvm::predecessors(B))
+        if (!ar.A.count(P)) { why = "area entered from outside"; return false; }
+    if (!llvm::isa<llvm::BranchInst>(B->getTerminator())) { why = "area holds an exit / switch"; return false; }
+    if (wrapped.count(B)) ar.region_blocks++;
+    for (llvm::Instruction &I : *B)
+      if (s1_is_cta_barrier(I)) {
+        // X's own leading barrier stays outside the area (the area starts after it)
+        if (B == X && ar.head == X && &I == B->getFirstNonPHI()) continue;
+        if (!strcmp(s1_barrier_kind(I), "kernel")) { ar.kernel_bars++; ar.kernel_bar_block = B; }
+        else ar.added_bars++;
+      }
+  }
+  if (ar.kernel_bars) { why = "the area holds a kernel barrier (block-uniform branch)"; return false; }
+  return true;
+}
+static void s1_area_print(llvm::Function &F, const S1Area &ar, const char *what, const std::string &why) {
+  int out_preds = 0;
+  if (ar.M)
+    for (llvm::BasicBlock *P : llvm::predecessors(ar.M)) out_preds += !ar.A.count(P);
+  fprintf(stderr, "[s1-absorb] %s: branch %s (%zu insts%s) head %s, merge %s, %zu blocks (%d in regions), %d added / %d "
+                  "kernel barriers, %d merge preds from outside: %s%s%s\n",
+          F.getName().str().c_str(), ar.X->getName().str().c_str(), ar.X->size(),
+          has_barrier(ar.X) ? ", barrier" : "", ar.head ? ar.head->getName().str().c_str() : "-",
+          ar.M ? ar.M->getName().str().c_str() : "exit", ar.A.size(), ar.region_blocks, ar.added_bars, ar.kernel_bars,
+          out_preds, what, why.empty() ? "" : " -- ", why.c_str());
+  if (ar.kernel_bar_block)
+    fprintf(stderr, "[s1-absorb]   kernel barrier in %s\n", ar.kernel_bar_block->getName().str().c_str());
+}
+// Absorb the largest qualifying area of F (see above); the caller recomputes the analyses and calls again.
+// Returns 1 when an area was changed.
+static int absorb_divergent_areas(llvm::Function &F, const std::vector<ParallelRegion> &PRs, CustomDivergenceAnalysis &DI,
+                                  llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, llvm::LoopInfo &LI) {
+  std::set<llvm::BasicBlock *> wrapped;
+  for (auto &pr : PRs) wrapped.insert(pr.wrapped_block.begin(), pr.wrapped_block.end());
+  const bool dry = std::getenv("CUPBOP_S1_ABSORB_DRY") != nullptr;
+  S1Area best;
+  for (llvm::BasicBlock &X : F) {
+    if (wrapped.count(&X)) continue;
+    auto *BI = llvm::dyn_cast<llvm::BranchInst>(X.getTerminator());
+    if (!BI || !BI->isConditional() || llvm::isa<llvm::Constant>(BI->getCondition())) continue;
+    if (!DI.isDivergent(BI->getCondition()) || BI->getMetadata("cupbop.s1_absorbed")) continue;
+    S1Area ar;
+    std::string why;
+    bool ok = s1_area_of(&X, DT, PDT, LI, wrapped, ar, why);
+    if (ok && !ar.added_bars && !ar.region_blocks) { ok = false; why = "nothing to absorb (no boundary, no region)"; }
+    if (s1_absorb_why()) s1_area_print(F, ar, ok ? (dry ? "dry" : "candidate") : "keep", why);
+    if (ok && ar.A.size() > best.A.size()) best = ar;
+  }
+  if (dry || !best.X) return 0;
+  llvm::LLVMContext &C = F.getContext();
+  llvm::MDNode *mark = llvm::MDNode::get(C, llvm::MDString::get(C, "absorbed"));
+  std::set<llvm::BasicBlock *> A = best.A;
+  // 1. the entry: X's leading barrier stays a region boundary in front of the area
+  llvm::BasicBlock *head = best.head;
+  if (head == best.X && s1_is_cta_barrier(*head->getFirstNonPHI()) && head->size() > 1) {
+    llvm::BasicBlock *H2 = head->splitBasicBlock(head->getFirstNonPHI()->getNextNode(), head->getName() + ".s1in");
+    A.erase(head);
+    A.insert(H2);
+    head = H2;
+  } else {
+    // a loop header / a block without its own barrier: the edges entering the area meet in a block with a marker
+    std::vector<llvm::BasicBlock *> outside;
+    for (llvm::BasicBlock *P : llvm::predecessors(head)) if (!A.count(P)) outside.push_back(P);
+    // (one entry barrier block, or the edges meet in a marker block)
+    const bool one_bar = outside.size() == 1 && has_barrier(outside[0]) && outside[0]->getSingleSuccessor() == head;
+    if (!one_bar && !outside.empty()) s1_marker_before(head, outside, ".s1entry");
+  }
+  // 2. the area's own boundaries go; its branch-only blocks stop being region stops
+  int removed = 0;
+  std::vector<llvm::Instruction *> dead;
+  for (llvm::BasicBlock *B : A)
+    for (llvm::Instruction &I : *B)
+      if (s1_is_cta_barrier(I) && strcmp(s1_barrier_kind(I), "kernel")) dead.push_back(&I);
+  for (llvm::Instruction *I : dead) { I->eraseFromParent(); removed++; }
+  for (llvm::BasicBlock *B : A) B->getTerminator()->setMetadata("cupbop.s1_absorbed", mark);
+  // 3. the exit: M entered from outside the area too -> the area's edges meet in a block with a marker, M starts with one
+  llvm::BasicBlock *M = best.M;
+  std::vector<llvm::BasicBlock *> in, out;
+  for (llvm::BasicBlock *P : llvm::predecessors(M)) (A.count(P) ? in : out).push_back(P);
+  if (out.empty() && in.size() > 1 && s1_is_cta_barrier(*M->getFirstNonPHI())) {
+    // M's barrier ends the area's region, whose exit must be the single predecessor of M
+    llvm::SplitBlockPredecessors(M, in, ".s1merge");
+  } else if (!out.empty() && !in.empty()) {
+    s1_marker_before(M, in, ".s1merge");
+    if (!s1_is_cta_barrier(*M->getFirstNonPHI())) {
+      std::vector<llvm::BasicBlock *> all(llvm::pred_begin(M), llvm::pred_end(M));
+      s1_marker_before(M, all, ".s1join");
+    }
+  }
+  fprintf(stderr, "[s1-absorb] %s: thread-dependent branch %s: %zu blocks to %s run in one warp loop (%d region "
+                  "boundaries removed%s)\n", F.getName().str().c_str(), best.X->getName().str().c_str(), A.size(),
+          M->getName().str().c_str(), removed, out.empty() ? "" : ", merge split");
+  return 1;
+}
+
+// Core mapping, single warp loop: a thread-dependent region with two entry barriers (refused before, e.g. lifted CUTLASS
+// 049 FMHA: early exits from the entry region and the code after the main path's last barrier both reach common.ret
+// in front of the exit barrier). Before the barrier block B, find the merges whose predecessors were entered from
+// different barriers (the reaching-barrier dataflow of insert_sync.cpp separate_multi_entry_regions) and end every such
+// predecessor with a region marker (split before its terminator; the marker has no hardware barrier), and a merge with
+// work starts with one: each incoming path then closes its own region. A branch that this leaves between the warp
+// loops is then handled by absorb_divergent_areas when it can be (else decided by slot 0, as an early `return` in front
+// of __syncthreads in CUDA source). Returns the number of markers placed.
+static int split_multi_entry_merges(llvm::Function &F, const std::vector<llvm::BasicBlock *> &Bs) {
+  auto hasBar = [](llvm::BasicBlock &BB) { for (auto &I : BB) if (s1_is_cta_barrier(I)) return true; return false; };
+  std::map<llvm::BasicBlock *, std::set<llvm::BasicBlock *>> in, out;
+  for (bool ch = true; ch;) {
+    ch = false;
+    for (llvm::BasicBlock &BB : F) {
+      std::set<llvm::BasicBlock *> i;
+      if (&BB == &F.getEntryBlock()) i.insert(&BB);
+      for (auto *P : llvm::predecessors(&BB)) i.insert(out[P].begin(), out[P].end());
+      std::set<llvm::BasicBlock *> o = hasBar(BB) ? std::set<llvm::BasicBlock *>{&BB} : i;
+      if (i != in[&BB] || o != out[&BB]) { in[&BB] = i; out[&BB] = o; ch = true; }
+    }
+  }
+  int n = 0;
+  std::set<llvm::BasicBlock *> done;
+  for (llvm::BasicBlock *B : Bs) {
+    // the blocks of the region before B: backwards from B up to blocks with a barrier
+    std::set<llvm::BasicBlock *> R;
+    std::vector<llvm::BasicBlock *> st(llvm::pred_begin(B), llvm::pred_end(B));
+    while (!st.empty()) {
+      llvm::BasicBlock *X = st.back(); st.pop_back();
+      if (hasBar(*X) || !R.insert(X).second) continue;
+      st.insert(st.end(), llvm::pred_begin(X), llvm::pred_end(X));
+    }
+    for (llvm::BasicBlock *Mg : std::vector<llvm::BasicBlock *>(R.begin(), R.end())) {
+      if (done.count(Mg)) continue;
+      bool differ = false;
+      llvm::BasicBlock *first = nullptr;
+      for (auto *P : llvm::predecessors(Mg)) {
+        if (!first) first = P;
+        else if (out[P] != out[first]) differ = true;
+      }
+      if (!differ) continue;
+      done.insert(Mg);
+      for (auto *P : std::vector<llvm::BasicBlock *>(llvm::pred_begin(Mg), llvm::pred_end(Mg))) {
+        if (s1_is_cta_barrier(*P->getFirstNonPHI())) continue;   // a barrier block already
+        llvm::BasicBlock *P2 = P->getTerminator() == P->getFirstNonPHI()
+                                   ? P : P->splitBasicBlock(P->getTerminator(), P->getName() + ".s1end");
+        s1_region_marker(P2->getTerminator());
+        n++;
+      }
+      bool work = false;
+      for (auto &I : *Mg) work |= !(llvm::isa<llvm::BranchInst>(I) || llvm::isa<llvm::DbgInfoIntrinsic>(I));
+      if (work && !s1_is_cta_barrier(*Mg->getFirstNonPHI())) {
+        Mg->splitBasicBlock(Mg->getFirstNonPHI(), Mg->getName() + ".s1body");
+        s1_region_marker(Mg->getTerminator());
+        n++;
+      }
+    }
+  }
+  if (n)
+    fprintf(stderr, "[s1-absorb] %s: %d region markers at merges of differently-entered paths (thread-dependent regions "
+                    "with two entry barriers)\n", F.getName().str().c_str(), n);
+  return n;
+}
+
 class InsertWarpLoopPass : public llvm::FunctionPass {
 
 public:
@@ -2499,6 +2755,10 @@ public:
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<TargetTransformInfoWrapperPass>();
   }
+
+  // core mapping, absorb on: the barrier blocks before which a thread-dependent region had two entry barriers
+  // (refused otherwise), for split_multi_entry_merges
+  std::vector<llvm::BasicBlock *> *defer_multi_entry = nullptr;
 
   void getParallelRegionBefore(llvm::BasicBlock *B, bool intra_warp_loop,
                                std::vector<ParallelRegion> &parallel_regions,
@@ -2575,7 +2835,8 @@ public:
       // only ran it).
       if (!(g_schedule_flag == 1 && !intra_warp_loop))
       if (auto br = dyn_cast<llvm::BranchInst>(current->getTerminator())) {
-        if (br->isConditional()) {
+        // (a branch of an area absorb_divergent_areas put inside one region is not a region stop)
+        if (br->isConditional() && !br->getMetadata("cupbop.s1_absorbed")) {
           if (current->size() == 1) {
             is_single_conditional_branch_block = 1;
           } else {
@@ -2694,6 +2955,10 @@ public:
       fprintf(stderr, "[PR] WARNING: region before %s has two entry barriers (%s, %s)%s: not looped\n",
               B->getName().str().c_str(), region_entry_barrier->getName().str().c_str(),
               second_entry_barrier->getName().str().c_str(), div ? " and thread-dependent code" : "");
+      if (div && g_schedule_flag == 1 && defer_multi_entry) { // absorb on: split_multi_entry_merges first
+        defer_multi_entry->push_back(B);
+        return;
+      }
       if (div && g_schedule_flag == 1) {
         fprintf(stderr, "[PR] ERROR: unsupported control flow around __syncthreads for the core mapping "
                         "(schedule 1): a thread-dependent parallel region with two entry barriers\n");
@@ -2969,7 +3234,28 @@ public:
     //printf("Function name: %s\n", func_name.c_str());
     // print function
     // F.print(llvm::errs());
+    const bool s1_absorb = g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop && s1_absorb_on();
+    std::vector<llvm::BasicBlock *> multi_entry;
+    if (s1_absorb) defer_multi_entry = &multi_entry;
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+    std::unique_ptr<DominatorTree> absDT;
+    std::unique_ptr<PostDominatorTree> absPDT;
+    std::unique_ptr<LoopInfo> absLI;
+    auto rebuild = [&]() {
+      absDT = std::make_unique<DominatorTree>(F);
+      absPDT = std::make_unique<PostDominatorTree>(F);
+      absLI = std::make_unique<LoopInfo>(*absDT);
+      DI.setAnalyzers(*absDT, *absPDT, *absLI);
+      DI.analyze(F);
+    };
+    for (int round = 0; s1_absorb && !multi_entry.empty(); round++) {
+      std::vector<llvm::BasicBlock *> Bs;
+      Bs.swap(multi_entry);
+      if (round >= 8 || !split_multi_entry_merges(F, Bs)) defer_multi_entry = nullptr; // next pass: refuse as before
+      rebuild();
+      parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+    }
+    defer_multi_entry = nullptr;
     // virt sub-pass form: a region is a lane loop, so a store inside it runs once
     // per lane. An alloca stored there must be per-lane even if the stored value is
     // uniform (a loop counter `off >>= 1` split by a staged shuffle was halved once
@@ -3006,8 +3292,29 @@ public:
       fprintf(stderr, " ]\n");
     }
     print_parallel_region(parallel_regions);
+    // core mapping: thread-dependent branches between the warp loops (absorb_divergent_areas); the analyses are rebuilt
+    // after every changed area
+    if (s1_absorb) {
+      int n = 0;
+      for (int round = 0; round < 256; round++) {
+        if (!absorb_divergent_areas(F, parallel_regions, DI, absDT ? *absDT : *DT, absPDT ? *absPDT : *PDT,
+                                    absLI ? *absLI : LI))
+          break;
+        n++;
+        rebuild();
+        parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+      }
+      if (n) {
+        fprintf(stderr, "[warp_loop] %s: %zu parallel regions after %d absorbed areas\n", func_name.c_str(),
+                parallel_regions.size(), n);
+        if (parallel_regions.empty()) { // cannot happen (the area holds thread-dependent code): be loud
+          fprintf(stderr, "[s1-absorb] ERROR: %s has no parallel region left\n", func_name.c_str());
+          ::exit(3);
+        }
+      }
+    }
     if (g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop)
-      note_p1_only_kernel(F, parallel_regions, DI, *PDT);
+      note_p1_only_kernel(F, parallel_regions, DI, absPDT ? *absPDT : *PDT);
     // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
     //printf("print parallel region done!\n");
     if (parallel_regions.empty()) {
