@@ -20,6 +20,10 @@ void lower_nvvm_rounding(llvm::Module *M);
 // CuLifter's 32 KB `local_mem` alloca -> its accessed extent (constant offsets after integer folding)
 void shrink_lifter_local_mem(llvm::Module *M);
 
+// CuLifter's per-thread parameter buffer (param_local / vx_params, a copy of the kernel parameters at the entry): loads
+// at constant offsets read the parameters instead, the buffer goes when no load of it is left (C plan, 2026-10-29)
+void forward_param_buffer_copies(llvm::Module *M);
+
 // llvm.nvvm.redux.sync.* -> shuffle-based runtime helper
 void lower_redux_sync(llvm::Module *M);
 

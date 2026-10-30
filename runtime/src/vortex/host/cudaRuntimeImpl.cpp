@@ -742,6 +742,27 @@ static uint64_t cupbop_ctx_scratch_bytes(const std::string &lookup_name, uint64_
   }
   return 0;
 }
+// Frame scratch (translator: insert_warp_loop.cpp frame_alloca_to_scratch, cupbop_frame_scratch.txt: <name as in
+// lookup.txt> <bytes per hardware thread>): the launch of `lookup_name` needs H * bytes. 0 when the kernel keeps its
+// allocas on the stack.
+static uint64_t cupbop_frame_scratch_bytes(const std::string &lookup_name) {
+  std::ifstream f("cupbop_frame_scratch.txt");
+  if (!f.is_open()) return 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream is(line);
+    std::string name;
+    uint64_t Fb = 0;
+    if (!(is >> name >> Fb) || name != lookup_name) continue;
+    const uint64_t H = ((uint64_t)NUM_CORES_VX * NUM_WARPS_VX * NUM_THREADS_VX + 15) & ~15ull;
+    if (std::getenv("CUPBOP_CTX_SCRATCH_VERBOSE"))
+      fprintf(stderr, "[frame-scratch] %s: %lu bytes x %lu hardware threads = %lu bytes\n", lookup_name.c_str(),
+              (unsigned long)Fb, (unsigned long)H, (unsigned long)(H * Fb));
+    return H * Fb;
+  }
+  return 0;
+}
 static int cupbop_schedule_flag() {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) return std::stoi(std::string(env));
   return 2;
@@ -1417,6 +1438,44 @@ cudaError_t cudaLaunchKernel_vortex(
       }
     }
     sf.close();
+  }
+
+  // Frame scratch (cupbop_frame_scratch.txt): the large allocas of this kernel, one area per hardware thread, in a
+  // buffer of their own (__frame_pool), grown, never shrunk. Written only when the kernel image has the symbol.
+  {
+    static uint64_t frame_pool_addr = 0, frame_pool_size = 0;
+    const uint64_t need = cupbop_frame_scratch_bytes(kernel_name_tmp);
+    if (need > frame_pool_size) {
+      if (frame_pool_addr) cudaFree((void *)frame_pool_addr);
+      void *p = nullptr;
+      const uint64_t sz = (need + 0xFFFFull) & ~0xFFFFull;
+      if (cudaMalloc(&p, sz) != cudaSuccess || !p) {
+        fprintf(stderr, "cudaLaunchKernel: cannot allocate the %lu-byte frame scratch\n", (unsigned long)sz);
+        std::abort();
+      }
+      frame_pool_addr = (uint64_t)p;
+      frame_pool_size = sz;
+    }
+    if (need) {
+      std::fstream sf("lookup_global_symbols.txt", std::ios::in);
+      std::string sa, st, sn;
+      while (sf >> sa >> st) {
+        std::getline(sf, sn);
+        if (!sn.empty() && sn[0] == ' ') sn = sn.substr(1);
+        if (sn != "__frame_pool") continue;
+        uint64_t sym = std::stoull(sa, nullptr, 16);
+        MemcpySymbolEntry e;
+        e.dst_addr = sym;
+        e.size = sizeof(uint64_t);
+        e.data.resize(sizeof(uint64_t));
+        memcpy(e.data.data(), &frame_pool_addr, sizeof(uint64_t));
+        bool found = false;
+        for (auto &x : memcpy_symbol)
+          if (x.dst_addr == sym) { x = std::move(e); found = true; break; }
+        if (!found) memcpy_symbol.push_back(std::move(e));
+        break;
+      }
+    }
   }
 
   // allocate staging buffer for kernel arguments
