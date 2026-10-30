@@ -196,6 +196,14 @@ public:
       if (auto storeInst = dyn_cast<StoreInst>(Inst)) {
         const Instruction *storeLocation =
             dyn_cast<Instruction>(storeInst->getOperand(1));
+        // core mapping, single warp loop: a divergent store through a pointer derived from an alloca (GEP / cast)
+        // makes the alloca divergent, not only that pointer. Otherwise a load of the same alloca through another
+        // pointer looked uniform: its value was not saved across regions and values computed from it were kept once
+        // per hardware thread (lifted cuDNN conv2d sm86 xmma fprop s1p1 / s1p2 / s1p1t4: 11979 / 7974 / 11979 of
+        // 16384 wrong, only the logical warps of slot 0 right). CUPBOP_DIV_NO_BASE_ALLOCA=1: off (virt 4a4fbdb).
+        if (g_schedule_flag == 1 && !need_nested_loop && !std::getenv("CUPBOP_DIV_NO_BASE_ALLOCA"))
+          if (auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(storeInst->getPointerOperand())))
+            if (AI != storeLocation && DivergentValues.insert(AI).second) Worklist.push(AI);
         if (storeLocation && DivergentValues.insert(storeLocation).second) {
           
           // llvm::errs() << "new divergence source 1\n";
@@ -2422,7 +2430,34 @@ static void guard_p1_branch(llvm::Function &F, llvm::BranchInst *BI) {
                                  "__cupbop_p1_guard");
     G->setAlignment(llvm::Align(4));
   }
+  // The check runs only when the CTA has more than one physical warp: a uniform branch on the CSR value in front of
+  // it (the block is split at the branch; the parallel regions are already formed and do not contain it). With the
+  // ballot / activemask executed unconditionally, the fixed-trips build of lifted cuBLAS ampere_sgemm_128x64_tn (prod
+  // gemm / linear_bias s1p1t4, guard in front of FixIrreducible's irr.guard branch) hung at P = 1 (2026-10-30).
+  // CUPBOP_VIRT_P1_GUARD_ALWAYS=1: the unconditional check of a076035.
   llvm::IRBuilder<> b(BI);
+  if (!std::getenv("CUPBOP_VIRT_P1_GUARD_ALWAYS")) {
+    llvm::BasicBlock *X = BI->getParent();
+    llvm::BasicBlock *Cont = X->splitBasicBlock(BI, X->getName() + ".p1cont");
+    llvm::BasicBlock *Chk = llvm::BasicBlock::Create(C, X->getName() + ".p1check", &F, Cont);
+    X->getTerminator()->eraseFromParent();
+    llvm::IRBuilder<> xb(X);
+    auto *w = xb.CreateCall(getVirtHelper(M, "__cupbop_cta_size", llvm::FunctionType::get(I32, false)), {}, "p1_warps");
+    xb.CreateCondBr(xb.CreateICmpUGT(w, llvm::ConstantInt::get(I32, 1)), Chk, Cont);
+    llvm::IRBuilder<> cb(Chk);
+    auto ballotF = M->getOrInsertFunction("__cupbop_hw_ballot", llvm::FunctionType::get(I32, {I32}, false));
+    if (auto *Fn = llvm::dyn_cast<llvm::Function>(ballotF.getCallee())) Fn->addFnAttr(llvm::Attribute::Convergent);
+    auto activeF = M->getOrInsertFunction("__cupbop_activemask", llvm::FunctionType::get(I32, false));
+    auto *ballot = cb.CreateCall(ballotF, {cb.CreateZExt(BI->getCondition(), I32)}, "p1_ballot");
+    ballot->addFnAttr(llvm::Attribute::Convergent);
+    auto *active = cb.CreateCall(activeF, {}, "p1_active");
+    auto *split = cb.CreateAnd(cb.CreateICmpNE(ballot, llvm::ConstantInt::get(I32, 0)), cb.CreateICmpNE(ballot, active),
+                               "p1_deadlock");
+    auto *addr = cb.CreateSelect(split, llvm::ConstantInt::get(I64, 0xdead0001ull), cb.CreatePtrToInt(G, I64));
+    cb.CreateLoad(I32, cb.CreateIntToPtr(addr, llvm::PointerType::getUnqual(C)), true, "p1_guard");
+    cb.CreateBr(Cont);
+    return;
+  }
   auto ballotF = M->getOrInsertFunction("__cupbop_hw_ballot", llvm::FunctionType::get(I32, {I32}, false));
   if (auto *Fn = llvm::dyn_cast<llvm::Function>(ballotF.getCallee())) Fn->addFnAttr(llvm::Attribute::Convergent);
   auto activeF = M->getOrInsertFunction("__cupbop_activemask", llvm::FunctionType::get(I32, false));
@@ -2448,6 +2483,7 @@ static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelReg
     return false;
   };
   int n = 0;
+  std::vector<llvm::BranchInst *> guarded;
   for (llvm::BasicBlock &X : F) {
     if (wrapped.count(&X)) continue;
     auto *BI = llvm::dyn_cast<llvm::BranchInst>(X.getTerminator());
@@ -2470,7 +2506,7 @@ static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelReg
     }
     if (added && !kernel) {
       n++;
-      guard_p1_branch(F, BI);
+      guarded.push_back(BI);   // (guarded after the walk: guard_p1_branch splits the block)
       if (std::getenv("CUPBOP_VIRT_P1_WHY")) {
         fprintf(stderr, "[virt-p1-why] %s: branch in %s on ", F.getName().str().c_str(), X.getName().str().c_str());
         BI->getCondition()->print(llvm::errs());
@@ -2478,6 +2514,7 @@ static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelReg
       }
     }
   }
+  for (llvm::BranchInst *BI : guarded) guard_p1_branch(F, BI);
   if (!n) return;
   fprintf(stderr, "[virt-p1] %s: %d thread-dependent branches between the warp loops guard added barriers; the host "
                   "runs this kernel with one physical warp per CTA only (cupbop_virt_p1_only.txt)\n",
@@ -2581,7 +2618,10 @@ static bool s1_area_of(llvm::BasicBlock *X, llvm::DominatorTree &DT, llvm::PostD
   for (llvm::BasicBlock *B : ar.A) {
     if (B != ar.head)
       for (llvm::BasicBlock *P : llvm::predecessors(B))
-        if (!ar.A.count(P)) { why = "area entered from outside"; return false; }
+        if (!ar.A.count(P)) {
+          why = "area entered from outside (" + B->getName().str() + " from " + P->getName().str() + ")";
+          return false;
+        }
     if (!llvm::isa<llvm::BranchInst>(B->getTerminator())) { why = "area holds an exit / switch"; return false; }
     if (wrapped.count(B)) ar.region_blocks++;
     for (llvm::Instruction &I : *B)
@@ -3218,6 +3258,17 @@ public:
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
     DI.setAnalyzers(*DT, *PDT, LI);
+    // debug (s1 single loop): allocas as divergence sources, CUPBOP_S1_DBG_REPLICATE_ALL=1 | exphi | noexphi (demoted
+    // PHIs only / all others). Either set made lifted conv2d s1 right before the base-alloca store rule above.
+    if (g_schedule_flag == 1 && !need_nested_loop)
+      if (const char *m = std::getenv("CUPBOP_S1_DBG_REPLICATE_ALL"))
+        for (auto &I : F.getEntryBlock())
+          if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (!AI->getName().contains("_intra_warp_") && !AI->getName().starts_with("shfl_") &&
+                !AI->getName().starts_with("local_")) {
+              const bool ex = AI->getName().contains("ex_phi");
+              if (!strcmp(m, "exphi") ? ex : !strcmp(m, "noexphi") ? !ex : true) DI.addSource(AI);
+            }
 
     DI.analyze(F);
 
