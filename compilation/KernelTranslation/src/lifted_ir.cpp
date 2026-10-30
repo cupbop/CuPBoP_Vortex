@@ -436,15 +436,17 @@ void lower_lanemask(Module *M) {
 // is not inside one store's range (uninitialised bytes), or whose type is not an integer / floating-point / pointer
 // keeps reading the alloca (the copies stay then). Only byte-array allocas ([N x i8], the lifter's buffers) are
 // considered: the typed per-argument spill slots of CUDA-source kernels (clang -O0) are left to the translator's -O3,
-// so the CI examples keep their code. Runs before every schedule-specific pass, so the 1:1, core-mapping
-// and flat schedules all see the parameters directly; the warp-loop pass then finds nothing to replicate.
-// CUPBOP_UNIFORM_NOREPL=0 (or CUPBOP_PARAM_FORWARD=0): off, the 11770fc code; CUPBOP_PARAM_FORWARD=s1: the core
-// mapping only (in the 1:1 schedule a few kernels lose the shrink-wrapped prologue, see ctx_c README).
+// so the CI examples keep their code. Runs before every schedule-specific pass; the warp-loop pass then finds
+// nothing to replicate.
+// By default only the core mapping (schedule 1) is rewritten: in the 1:1 schedule a few kernels lose the
+// shrink-wrapped prologue and get slower (ctx_c README), so the 1:1 and flat schedules keep the 11770fc code.
+// CUPBOP_PARAM_FORWARD=all (or 1): every schedule; CUPBOP_PARAM_FORWARD=0 or CUPBOP_UNIFORM_NOREPL=0: off.
 // CUPBOP_PARAM_FORWARD_WHY=1: decisions.
 void forward_param_buffer_copies(Module *M) {
-  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0 && std::string(e) != "s1"; };
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::string(e) == "0"; };
   if (off_env("CUPBOP_UNIFORM_NOREPL") || off_env("CUPBOP_PARAM_FORWARD")) return;
-  if (const char *e = std::getenv("CUPBOP_PARAM_FORWARD"); e && std::string(e) == "s1") {   // core mapping only
+  const char *mode = std::getenv("CUPBOP_PARAM_FORWARD");
+  if (!mode || std::string(mode) == "s1") {   // default: core mapping only
     const char *sf = std::getenv("VORTEX_SCHEDULE_FLAG");
     if (!sf || std::atoi(sf) != 1) return;
   }
