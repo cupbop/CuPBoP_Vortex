@@ -408,6 +408,37 @@ static llvm::Value *getVirtLanes(llvm::Module *M, llvm::IRBuilder<> &builder) {
   return llvm::ConstantInt::get(llvm::Type::getInt32Ty(M->getContext()), getVirtGeom().lanes);
 }
 
+// Fixed trips (CUPBOP_VIRT_TRIPS=k) of one function, or 0 when it is translated with the dynamic trip count instead.
+// CUPBOP_VIRT_TRIPS_DYN_FUNCS="<name>,<name>,..." (or "*"): these functions keep the dynamic warp loop (runtime slot
+// count ceil(block / (P*32)), no forced unroll) although k is set. examples/common.mk sets it when a fixed-trips build
+// of a function needs a stack frame larger than the 8 KB stack can hold (the k-way unrolled warp loops keep every
+// logical warp's barrier-crossing values live at once and the register allocator spills them: lifted CUTLASS / cuBLAS
+// GEMMs at s1p1t4/t8 had 10-20 KB frames and crashed), and keeps the result only if the frame shrank
+// (examples/stack_fallback.sh). The host launch is unchanged: with P physical warps the dynamic loop runs
+// ceil(block / (P*32)) <= k passes, and the context scratch sized for k slots covers them.
+static int virt_trips_of(const llvm::Function *F) {
+  const int k = getVirtGeom().trips;
+  if (k <= 0 || !F) return k;
+  static const char *dyn = std::getenv("CUPBOP_VIRT_TRIPS_DYN_FUNCS");
+  if (!dyn || !*dyn) return k;
+  static std::set<std::string> names;
+  static bool all = false, parsed = false;
+  if (!parsed) {
+    parsed = true;
+    std::string s(dyn), cur;
+    for (char c : s + ",") {
+      if (c == ',') { if (cur == "*") all = true; else if (!cur.empty()) names.insert(cur); cur.clear(); }
+      else if (c != ' ') cur += c;
+    }
+  }
+  if (!all && !names.count(F->getName().str())) return k;
+  static std::set<const llvm::Function *> told;
+  if (told.insert(F).second)
+    fprintf(stderr, "[virt-trips] %s: dynamic trip count (CUPBOP_VIRT_TRIPS_DYN_FUNCS), fixed trips %d not applied\n",
+            F->getName().str().c_str(), k);
+  return 0;
+}
+
 // adding multiple kenerl in file support
 
 bool ShouldNotBeContextSaved(llvm::Instruction *instr,
@@ -582,7 +613,7 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
     }
     // CUPBOP_VIRT_TRIPS=k: exactly k slots, a fixed-size array (SROA turns it into
     // registers once the k-trip warp loops are unrolled).
-    const int virt_trips = (g_schedule_flag == 1 && !need_nested_loop) ? getVirtGeom().trips : 0;
+    const int virt_trips = (g_schedule_flag == 1 && !need_nested_loop) ? virt_trips_of(FF) : 0;
     // (allocated type stays the element type: other code loads/GEPs with getAllocatedType(); InstCombine
     // canonicalizes a constant-count alloca to [k x T] before SROA)
     if (virt_trips > 0) count = ConstantInt::get(Type::getInt32Ty(C), virt_trips);
@@ -1598,7 +1629,7 @@ BasicBlock *insert_loop_cond(llvm::BasicBlock *InsertCondBefore,
     auto intra_warp_index = M->getGlobalVariable("intra_warp_index");
     cmpResult = builder.CreateICmpULT(createLoad(builder, intra_warp_index),
                                       sche_data.inner_loop_cond);
-    if (g_schedule_flag == 1 && !need_nested_loop && getVirtGeom().trips > 0) {
+    if (g_schedule_flag == 1 && !need_nested_loop && virt_trips_of(InsertCondBefore->getParent()) > 0) {
       // CUPBOP_VIRT_TRIPS=k: a uniform, constant trip count (pass number < k); the
       // per-lane `index < block_size` test moves into a guard in front of the body.
       cmpResult = builder.CreateICmpULT(createLoad(builder, M->getGlobalVariable("intra_warp_slot")),
@@ -2153,7 +2184,7 @@ void add_warp_loop(std::vector<ParallelRegion> parallel_regions,
     }
     auto loop_inc = insert_loop_inc(loop_cond, intra_warp_loop);
     tail_block->getTerminator()->replaceUsesOfWith(next_block, loop_inc);
-    const bool virt_fixed_trips = intra_warp_loop && g_schedule_flag == 1 && !need_nested_loop && getVirtGeom().trips > 0;
+    const bool virt_fixed_trips = intra_warp_loop && g_schedule_flag == 1 && !need_nested_loop && virt_trips_of(F) > 0;
     if (virt_fixed_trips && !getVirtGeom().trips_exact) {
       // index < block_size guard (the loop test is now the uniform pass count)
       auto *Mg = start_block->getParent()->getParent();

@@ -260,6 +260,14 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
+ifneq ($(filter 1 2,$(SCHEDULE)),)
+	@# a kernel function whose stack frame does not fit the 8 KB hardware stack: rebuilt with the dynamic trip count
+	@# (core mapping with fixed trips) or run on a software stack; no-op when every frame fits (see the script)
+	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(CuPBoP_PATH)/build/compilation/kernelTranslator \
+		$(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
+		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
+		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
+endif
 	@echo "--- Kernel compilation completed!"
 lookup_global_symbols.txt: kernel.elf
 	nm -C --defined-only -g $< > $@
