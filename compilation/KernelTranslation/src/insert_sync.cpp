@@ -901,11 +901,24 @@ static void separate_multi_entry_regions(llvm::Module *M) {
   }
 }
 
+// Core mapping (schedule 1, single warp loop): the CTA barriers the kernel itself contains, recorded before the
+// passes below add their region-boundary barriers (insert_warp_loop.cpp note_p1_only_kernel tells them apart).
+std::set<llvm::Instruction *> g_s1_kernel_barriers;
+
 void insert_sync(llvm::Module *M) {
   int schedule = 0;
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     schedule = std::stoi(std::string(env));
   }
+  g_s1_kernel_barriers.clear();
+  if (schedule == 1 && getVirtGeom().subpasses == 1)
+    for (Function &F : *M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Callee = CI->getCalledFunction())
+              if (Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync")
+                g_s1_kernel_barriers.insert(CI);
   if (schedule == 1 && getVirtGeom().subpasses == 1) // sub-pass form keeps them as boundaries
     erase_warp_syncs_for_virt(M);
   else if (schedule == 1 && std::getenv("CUPBOP_VIRT_ERASE_NATIVE_WS")) // experiment: keep only the staged markers

@@ -256,8 +256,13 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
 	printf 'int main(){return 0;}\n' > dummy_host.cpp
 	cp $(CuPBoP_PATH)/examples/v3_cell.mk $(VX3_CELL)/Makefile
+	rm -f .stack_fallback/dyn_all
 	$(MAKE) -C $(VX3_CELL) kernel.vxbin kernel.dump CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
+		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS) \
+	|| MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh --build-failed \
+		$(CuPBoP_PATH)/build/compilation/kernelTranslator $(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" \
+		VORTEX_HOME=$(VORTEX_HOME) CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
 ifneq ($(filter 1 2,$(SCHEDULE)),)

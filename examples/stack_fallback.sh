@@ -14,13 +14,30 @@
 #     generate_wrapper.cpp; the host reads cupbop_big_stack.txt). Bytes = largest frame + 8 KB (callees, dynamic
 #     allocas), rounded up to 4 KB, plus 64 bytes of stride skew. CUPBOP_BIG_STACK_FALLBACK=0 skips this step.
 set -u
+# --build-failed: common.mk's first ELF build failed. With fixed trips the k-way unrolled warp loops can exhaust the
+# register allocator ("ran out of registers": conv2d s1p1t4 with the core-mapping deadlock guard); translate every
+# function with the dynamic trip count and build again (exit status = that build's). Otherwise fail as before.
+if [ "${1:-}" = --build-failed ]; then
+  shift; KT=$1; DEV=$2; CELL=$3; shift 3
+  case "${CUPBOP_VIRT_TRIPS:-}" in ''|*[!0-9]*) exit 1 ;; esac
+  [ "$CUPBOP_VIRT_TRIPS" -gt 0 ] && [ "$VORTEX_SCHEDULE_FLAG" = 1 ] && [ "${CUPBOP_VIRT_TRIPS_FALLBACK:-1}" != 0 ] || exit 1
+  [ -z "${CUPBOP_VIRT_TRIPS_DYN_FUNCS:-}" ] || exit 1
+  mkdir -p .stack_fallback
+  echo "--- [stack] fixed trips $CUPBOP_VIRT_TRIPS: the kernel ELF build failed; building with the dynamic trip count"
+  CUPBOP_VIRT_TRIPS_DYN_FUNCS='*' $KT $DEV kernel.bc > .stack_fallback/buildfail.translate.log 2>&1 || exit 1
+  llvm-dis kernel.bc
+  touch .stack_fallback/dyn_all
+  exec $MAKE -C $CELL kernel.vxbin kernel.dump "$@"
+fi
 KT=$1; DEV=$2; CELL=$3; shift 3
 LIM=${CUPBOP_FRAME_LIMIT:-7168}
 HERE=$(dirname $0)
 OVER=$(python3 $HERE/stack_frames.py kernel.dump --over $LIM)
 [ -n "$OVER" ] || exit 0
 maxf() { python3 $HERE/stack_frames.py kernel.dump | awk -v l="$1" 'BEGIN{n=split(l,a,",");for(i=1;i<=n;i++)w[a[i]]=1} {if($2 in w && $1>m)m=$1; if($1>all)all=$1} END{print m+0, all+0}'; }
+DYN_ALL=0; [ -f .stack_fallback/dyn_all ] && DYN_ALL=1   # set by --build-failed: every function is dynamic already
 B=.stack_fallback; rm -rf $B; mkdir -p $B
+[ $DYN_ALL = 1 ] && export CUPBOP_VIRT_TRIPS_DYN_FUNCS='*' 
 FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt kernel.elf kernel.vxbin kernel.dump"
 save() { rm -rf $B/keep; mkdir -p $B/keep; for f in $FILES; do [ -f $f ] && cp -p $f $B/keep/; done; }
 restore() { for f in $FILES; do if [ -f $B/keep/$f ]; then cp -p $B/keep/$f .; else rm -f $f; fi; done; }

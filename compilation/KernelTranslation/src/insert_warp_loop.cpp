@@ -2387,6 +2387,102 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
   }  
 }
 
+// Core mapping, single warp loop: code between the warp loops runs once per physical warp, every lane holding its
+// logical thread of slot 0. A branch there on a thread-dependent value (DI) splits the lanes of a physical warp, and
+// the physical warps of a CTA, different ways. The kernel's own barriers are never under such a branch (CUDA requires
+// block-uniform control flow around __syncthreads), but insert_sync's region-boundary barriers can be (its
+// conditional-barrier and loop rules cascade into thread-dependent ifs and loops on lifted control flow): a physical
+// warp whose lanes split then executes the barriers of both arms, and with more than one physical warp per CTA the
+// CTA deadlocks (cuBLAS sdot/ddot reduce_1Block_kernel at s1p2 / s1p4: `if (tid <= 3)` got 80 added barriers, the
+// launch hung until the CP poll timeout). With one physical warp every barrier completes alone. Such a branch gets
+// a runtime guard (guard_p1_branch) that stops the run when the lanes disagree there with more than one physical warp
+// per CTA, and the kernel is listed in cupbop_virt_p1_only.txt (the host refuses those launches outright with
+// CUPBOP_VIRT_P1_STRICT=1). Detection: a thread-dependent conditional branch outside every region whose arms (up to
+// its immediate post-dominator) hold an added barrier and none of the kernel's. The analysis is conservative (a
+// parameter-dependent condition counts as thread-dependent), so the static list is much longer than the set of
+// launches that actually deadlock; the guard only fires on a real split. CUPBOP_VIRT_P1_ONLY_OFF=1: neither.
+extern std::set<llvm::Instruction *> g_s1_kernel_barriers;
+std::set<llvm::Function *> g_virt_p1_only;
+// Runtime fail-safe in front of such a branch: when the CTA has more than one physical warp and the lanes of this
+// warp disagree on the condition (ballot neither 0 nor the active mask), the barriers on the arms will not match up
+// and the CTA would hang; a load from a misaligned address (0xdead0001) stops the simulation right there instead
+// ("Error: misaligned memory access: addr=0xdead0001"). Otherwise it loads an aligned dummy global. No new branch:
+// the warp-loop construction that follows sees the same control flow. CUPBOP_VIRT_P1_GUARD_OFF=1: no guard.
+static void guard_p1_branch(llvm::Function &F, llvm::BranchInst *BI) {
+  if (std::getenv("CUPBOP_VIRT_P1_GUARD_OFF")) return;
+  llvm::Module *M = F.getParent();
+  llvm::LLVMContext &C = M->getContext();
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  auto *I64 = llvm::Type::getInt64Ty(C);
+  llvm::GlobalVariable *G = M->getGlobalVariable("__cupbop_p1_guard", true);
+  if (!G) {
+    G = new llvm::GlobalVariable(*M, I32, false, llvm::GlobalValue::InternalLinkage, llvm::ConstantInt::get(I32, 0),
+                                 "__cupbop_p1_guard");
+    G->setAlignment(llvm::Align(4));
+  }
+  llvm::IRBuilder<> b(BI);
+  auto ballotF = M->getOrInsertFunction("__cupbop_hw_ballot", llvm::FunctionType::get(I32, {I32}, false));
+  if (auto *Fn = llvm::dyn_cast<llvm::Function>(ballotF.getCallee())) Fn->addFnAttr(llvm::Attribute::Convergent);
+  auto activeF = M->getOrInsertFunction("__cupbop_activemask", llvm::FunctionType::get(I32, false));
+  auto *ballot = b.CreateCall(ballotF, {b.CreateZExt(BI->getCondition(), I32)}, "p1_ballot");
+  ballot->addFnAttr(llvm::Attribute::Convergent);
+  auto *active = b.CreateCall(activeF, {}, "p1_active");
+  auto *warps = b.CreateCall(getVirtHelper(M, "__cupbop_cta_size", llvm::FunctionType::get(I32, false)), {}, "p1_warps");
+  auto *split = b.CreateAnd(b.CreateICmpNE(ballot, llvm::ConstantInt::get(I32, 0)), b.CreateICmpNE(ballot, active));
+  auto *bad = b.CreateAnd(split, b.CreateICmpUGT(warps, llvm::ConstantInt::get(I32, 1)), "p1_deadlock");
+  auto *ok = b.CreatePtrToInt(G, I64);
+  auto *addr = b.CreateSelect(bad, llvm::ConstantInt::get(I64, 0xdead0001ull), ok);
+  b.CreateLoad(I32, b.CreateIntToPtr(addr, llvm::PointerType::getUnqual(C)), true, "p1_guard");
+}
+static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelRegion> &PRs, CustomDivergenceAnalysis &DI,
+                                llvm::PostDominatorTree &PDT) {
+  if (std::getenv("CUPBOP_VIRT_P1_ONLY_OFF")) return;
+  std::set<llvm::BasicBlock *> wrapped;
+  for (auto &pr : PRs) wrapped.insert(pr.wrapped_block.begin(), pr.wrapped_block.end());
+  auto cta_barrier = [](llvm::Instruction &I) {
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+      if (auto *Callee = CI->getCalledFunction())
+        return Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync";
+    return false;
+  };
+  int n = 0;
+  for (llvm::BasicBlock &X : F) {
+    if (wrapped.count(&X)) continue;
+    auto *BI = llvm::dyn_cast<llvm::BranchInst>(X.getTerminator());
+    if (!BI || !BI->isConditional() || llvm::isa<llvm::Constant>(BI->getCondition())) continue;
+    if (!DI.isDivergent(BI->getCondition())) continue;
+    llvm::BasicBlock *M = nullptr;
+    if (auto *N = PDT.getNode(&X)) if (auto *IN = N->getIDom()) M = IN->getBlock();
+    std::vector<llvm::BasicBlock *> work(llvm::succ_begin(&X), llvm::succ_end(&X));
+    std::set<llvm::BasicBlock *> seen;
+    bool added = false, kernel = false;
+    while (!work.empty()) {
+      llvm::BasicBlock *B = work.back(); work.pop_back();
+      if (B == M || B == &X || !seen.insert(B).second) continue;
+      for (llvm::Instruction &I : *B)
+        if (cta_barrier(I)) {
+          if (g_s1_kernel_barriers.count(&I)) kernel = true;
+          else if (!I.getMetadata("cupbop.builtin_barrier")) added = true;
+        }
+      for (llvm::BasicBlock *S : llvm::successors(B)) work.push_back(S);
+    }
+    if (added && !kernel) {
+      n++;
+      guard_p1_branch(F, BI);
+      if (std::getenv("CUPBOP_VIRT_P1_WHY")) {
+        fprintf(stderr, "[virt-p1-why] %s: branch in %s on ", F.getName().str().c_str(), X.getName().str().c_str());
+        BI->getCondition()->print(llvm::errs());
+        fprintf(stderr, " (%zu blocks to %s)\n", seen.size(), M ? M->getName().str().c_str() : "exit");
+      }
+    }
+  }
+  if (!n) return;
+  fprintf(stderr, "[virt-p1] %s: %d thread-dependent branches between the warp loops guard added barriers; the host "
+                  "runs this kernel with one physical warp per CTA only (cupbop_virt_p1_only.txt)\n",
+          F.getName().str().c_str(), n);
+  g_virt_p1_only.insert(&F);
+}
+
 class InsertWarpLoopPass : public llvm::FunctionPass {
 
 public:
@@ -2910,6 +3006,8 @@ public:
       fprintf(stderr, " ]\n");
     }
     print_parallel_region(parallel_regions);
+    if (g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop)
+      note_p1_only_kernel(F, parallel_regions, DI, *PDT);
     // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
     //printf("print parallel region done!\n");
     if (parallel_regions.empty()) {
@@ -3451,6 +3549,17 @@ void insert_warp_loop(llvm::Module *M) {
     //printf("remove all barriers\n");
     for (auto F = M->begin(); F != M->end(); ++F)
       remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
+  }
+  // core mapping: kernels the host must run with one physical warp per CTA (note_p1_only_kernel)
+  if (schedule == 1) {
+    std::remove("cupbop_virt_p1_only.txt");
+    if (!g_virt_p1_only.empty()) {
+      std::ofstream out("cupbop_virt_p1_only.txt");
+      out << "# CuPBoP core mapping (translator -> cudaLaunchKernel_vortex): kernels (as in lookup.txt) that deadlock "
+             "with more than one physical warp per CTA\n";
+      for (llvm::Function &F : *M)
+        if (g_virt_p1_only.count(&F)) out << ctx_lookup_name(&F) << "\n";
+    }
   }
 }
 

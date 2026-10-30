@@ -715,6 +715,21 @@ static void cupbop_virt_geometry(uint64_t block_threads, uint32_t &L, uint32_t &
   if (char *env = std::getenv("CUPBOP_VIRT_WARPS")) { int v = std::stoi(std::string(env)); if (v > 0 && (uint32_t)v < P) P = (uint32_t)v; }
   if (P > CUPBOP_EFF_NUM_WARPS()) P = CUPBOP_EFF_NUM_WARPS();   // VX_RT_NUM_WARPS cap: fold the block onto the warps the core actually offers
 }
+// Core mapping: kernels the translator found to deadlock with more than one physical warp per CTA (insert_warp_loop.cpp
+// note_p1_only_kernel: a thread-dependent branch between the warp loops guards region-boundary barriers), listed in
+// cupbop_virt_p1_only.txt in the working directory. By default the translator's runtime guard in front of such a
+// branch stops the simulation when the lanes actually disagree there (misaligned access at 0xdead0001);
+// CUPBOP_VIRT_P1_STRICT=1 refuses every launch of a listed kernel with more than one physical warp per CTA instead
+// (also catches physical warps that disagree as a whole, which the per-warp guard cannot see).
+static bool cupbop_virt_p1_only(const std::string &lookup_name) {
+  if (!std::getenv("CUPBOP_VIRT_P1_STRICT")) return false;
+  std::ifstream f("cupbop_virt_p1_only.txt");
+  std::string line;
+  while (std::getline(f, line))
+    if (!line.empty() && line[0] != '#' && line == lookup_name) return true;
+  return false;
+}
+
 // Software stack (translator: generate_wrapper.cpp CUPBOP_BIG_STACK, set by examples/stack_fallback.sh when a kernel
 // function's frame does not fit the 8 KB hardware stack): cupbop_big_stack.txt in the working directory holds the
 // bytes per hardware thread (the stack stride); the kernel ELF then defines __cupbop_big_stack, which gets the base of
@@ -1755,6 +1770,13 @@ cudaError_t cudaLaunchKernel_vortex(
                "mapping runs it only with one logical warp per physical warp of 32 lanes (CUPBOP_VIRT_WARPS = the "
                "block's %u warps, no trips / lane gating), got %u physical warps of %u lanes. Use SCHEDULE=2.\n",
                func_stripped.c_str(), block_warps, P, L);
+        std::abort();
+      }
+      if (P > 1 && cupbop_virt_p1_only(kernel_name_tmp)) {
+        printf("Error: kernel %s deadlocks under the core mapping with more than one physical warp per CTA (a "
+               "thread-dependent branch between its warp loops guards CTA barriers; cupbop_virt_p1_only.txt), got %u "
+               "physical warps. Use CUPBOP_VIRT_WARPS=1 (or SCHEDULE=2).\n", func_stripped.c_str(), P);
+        fflush(stdout);
         std::abort();
       }
       const char *virt_exact_env = std::getenv("CUPBOP_VIRT_TRIPS_EXACT");
