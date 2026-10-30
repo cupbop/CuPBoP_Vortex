@@ -3422,3 +3422,105 @@ void insert_warp_loop(llvm::Module *M) {
       remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
   }
 }
+
+// C plan stage 2 (2026-10-29): large static allocas of a kernel (a lifter's local_mem window that
+// shrink_lifter_local_mem could not bound, a big local array) do not fit the 8 KB per-thread stack in any schedule:
+// the frame silently overruns the neighbouring hardware thread's stack. When a kernel's static allocas exceed
+// CUPBOP_FRAME_STACK_BYTES (default 4096) in total, the largest ones of at least 1 KB move, until the rest fits, to a
+// per-hardware-thread area of a second host-allocated buffer, __frame_pool (not __ctx_pool: no logical-warp slots,
+// one copy per hardware thread, as the stack): array v of hardware thread h starts at
+//     __frame_pool + off_v * H + h * stride_v
+// (H, h as for the context scratch; stride_v = its size rounded up to 16): contiguous per hardware thread for any
+// index; an array only loaded / stored at constant offsets is word-interleaved as in the context scratch
+// (ctx_word_ok_ptr), so the lanes of a warp touch one run. Every defined function is considered (by now the kernel is
+// usually inlined into its launch wrapper; a kernel function without callers is dead and skipped); the offsets are
+// module-wide, so a caller and its callee never share a range. 1:1 and core-mapping schedules (KernelTranslation.cpp;
+// the flat schedule keeps its stack). The host reads `<kernel as in lookup.txt> <bytes per hardware thread>` (the
+// module's total, for each kernel) from cupbop_frame_scratch.txt and sizes the buffer H * bytes. CUPBOP_FRAME_SCRATCH=off or CUPBOP_UNIFORM_NOREPL=0: off; CUPBOP_FRAME_SCRATCH_WHY=1: decisions.
+void frame_alloca_to_scratch(llvm::Module *M) {
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0; };
+  const char *mode = std::getenv("CUPBOP_FRAME_SCRATCH");
+  if ((mode && std::string(mode) == "off") || off_env("CUPBOP_UNIFORM_NOREPL")) { std::remove("cupbop_frame_scratch.txt"); return; }
+  const bool why = std::getenv("CUPBOP_FRAME_SCRATCH_WHY") != nullptr;
+  long budget = 4096, min_bytes = 1024;
+  if (const char *e = std::getenv("CUPBOP_FRAME_STACK_BYTES")) budget = std::atol(e);
+  if (const char *e = std::getenv("CUPBOP_FRAME_MIN_BYTES")) min_bytes = std::atol(e);   // debug
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &C = M->getContext();
+  Type *I8 = Type::getInt8Ty(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  uint64_t off = 0;   // module-wide: every function's arrays get their own range, so a caller and its callee never share
+  for (Function &F : *M) {
+    // every defined function (the kernel is usually inlined into its launch wrapper by then); a kernel function left
+    // without callers is dead code and keeps its allocas
+    if (F.isDeclaration() || (isKernelFunction(M, &F) && F.use_empty())) continue;
+    std::vector<std::pair<AllocaInst *, uint64_t>> all, moved;
+    uint64_t total = 0;
+    for (Instruction &I : F.getEntryBlock())
+      if (auto *AI = dyn_cast<AllocaInst>(&I))
+        if (AI->isStaticAlloca()) {
+          const uint64_t n = DL.getTypeAllocSize(AI->getAllocatedType()) *
+                             cast<ConstantInt>(AI->getArraySize())->getZExtValue();
+          // a lifter window bounded only by ScalarEvolution (shrink_lifter_local_mem): always, see there
+          if (AI->hasMetadata("cupbop.frame_scratch")) moved.push_back({AI, n});
+          else { all.push_back({AI, n}); total += n; }
+        }
+    if ((long)total > budget) {
+      std::stable_sort(all.begin(), all.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+      for (auto &[AI, n] : all) {
+        if ((long)total <= budget || (long)n < min_bytes) break;
+        moved.push_back({AI, n});
+        total -= n;
+      }
+    }
+    if (moved.empty()) continue;
+    IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    GlobalVariable *pool = M->getGlobalVariable("__frame_pool");
+    if (!pool)
+      pool = new GlobalVariable(*M, PointerType::getUnqual(C), false, GlobalValue::ExternalLinkage,
+                                ConstantPointerNull::get(PointerType::getUnqual(C)), "__frame_pool");
+    LoadInst *base = EB.CreateLoad(PointerType::getUnqual(C), pool, "frame_scratch_base");
+    base->setVolatile(true); // set by the host per launch
+    Value *H = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_num_harts", FunctionType::get(I32, false)), {}, "frame_harts"), I64);
+    Value *h = EB.CreateZExt(EB.CreateCall(getVirtHelper(M, "__cupbop_ctx_hart", FunctionType::get(I32, false)), {}, "frame_hart"), I64);
+    Value *W4 = EB.CreateMul(ConstantInt::get(I64, 4), H, "frame_word_bytes");
+    const uint64_t off0 = off;
+    unsigned nwords = 0;
+    for (auto &[AI, n] : moved) {
+      const uint64_t stride = (n + 15) / 16 * 16;
+      const char *e = std::getenv("CUPBOP_CTX_SCRATCH_WORDS");
+      const bool words = (!e || std::atoi(e)) && ctx_word_ok_ptr(AI, 0, DL);
+      if (why)
+        fprintf(stderr, "[frame-scratch] %s: %s (%lu bytes) -> __frame_pool at %lu x H, %s\n", F.getName().str().c_str(),
+                AI->getName().str().c_str(), (unsigned long)n, (unsigned long)off,
+                words ? "word-interleaved" : "contiguous per hardware thread");
+      if (words) {
+        nwords++;
+        Value *S0 = EB.CreateGEP(I8, EB.CreateGEP(I8, base, EB.CreateMul(h, ConstantInt::get(I64, 4))),
+                                 EB.CreateMul(ConstantInt::get(I64, off), H), AI->getName() + ".frame");
+        ctx_word_rewrite(AI, 0, S0, W4, DL);
+        for (User *U : std::vector<User *>(AI->user_begin(), AI->user_end()))   // lifetime markers left
+          if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) II->eraseFromParent();
+      } else {
+        Value *P = EB.CreateGEP(I8, EB.CreateGEP(I8, base, EB.CreateMul(h, ConstantInt::get(I64, stride))),
+                                EB.CreateMul(ConstantInt::get(I64, off), H), AI->getName() + ".frame");
+        for (User *U : std::vector<User *>(AI->user_begin(), AI->user_end()))
+          if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) II->eraseFromParent();
+        AI->replaceAllUsesWith(P);
+      }
+      if (AI->use_empty()) AI->eraseFromParent();
+      else fprintf(stderr, "[frame-scratch] %s: %s still has uses after the rewrite\n", F.getName().str().c_str(), AI->getName().str().c_str());
+      off += stride;
+    }
+    fprintf(stderr, "[frame-scratch] %s: %zu allocas (%lu bytes per hardware thread, %u word-interleaved) in __frame_pool; "
+                    "%lu bytes of static allocas left on the stack\n", F.getName().str().c_str(), moved.size(),
+            (unsigned long)(off - off0), nwords, (unsigned long)total);
+  }
+  if (!off) {
+    std::remove("cupbop_frame_scratch.txt");
+  } else {   // every kernel of the module needs the whole area (H * off bytes)
+    std::ofstream out("cupbop_frame_scratch.txt");
+    out << "# CuPBoP frame scratch (translator -> cudaLaunchKernel_vortex): <kernel as in lookup.txt> <bytes per hardware thread>\n";
+    for (Function &F : *M)
+      if (!F.isDeclaration() && isKernelFunction(M, &F)) out << ctx_lookup_name(&F) << " " << off << "\n";
+  }
+}

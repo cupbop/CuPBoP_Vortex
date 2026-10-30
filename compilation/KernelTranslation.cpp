@@ -263,6 +263,12 @@ int main(int argc, char **argv) {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) {
     if (std::stoi(std::string(env)) == 1) virt_ctx_to_scratch(program); // core mapping: context arrays -> scratch
   }
+  {
+    // large static allocas (a lifter's unbounded local_mem window) -> __frame_pool, 1:1 and core mapping
+    int fs = 2;
+    if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) fs = std::stoi(std::string(env));
+    if (fs == 1 || fs == 2) frame_alloca_to_scratch(program);
+  }
 
   VerifyModule(program);
 

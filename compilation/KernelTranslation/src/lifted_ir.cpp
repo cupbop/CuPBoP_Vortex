@@ -9,9 +9,12 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Passes/PassBuilder.h"
 #include <algorithm>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <regex>
 #include <vector>
 
@@ -223,8 +226,28 @@ void lower_nvvm_rounding(Module *M) {
 // integer arithmetic (the lifted stack pointer is R1 = frame size - frame size + offset), every access is a
 // constant offset; the alloca is shrunk to the largest accessed byte, rounded up to 16. A non-constant offset keeps
 // the 32 KB array and is reported (CUPBOP_KEEP_LOCAL_MEM=1 keeps it always).
+// C plan stage 2 (2026-10-29): a non-constant offset is bounded with ScalarEvolution (on the folded IR, nothing else is
+// changed). CUTLASS reference / fill kernels (BlockForEach, TensorForEach, GemmComplex: 30 modules kept 32 KB) index
+// a small per-thread array with a loop counter, e.g. local_mem[36 + 4 i] for i < 5: SCEV gives the AddRec's range from
+// the loop's exit count. The extent is the largest signed-range maximum + access size; an unbounded range, a possibly
+// negative offset or an extent beyond the array keeps the 32 KB array as before. CUPBOP_LOCAL_MEM_SCEV=0 or
+// CUPBOP_UNIFORM_NOREPL=0: constant offsets only (11770fc).
 void shrink_lifter_local_mem(Module *M) {
   if (std::getenv("CUPBOP_KEEP_LOCAL_MEM")) return;
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0; };
+  const bool use_scev = !off_env("CUPBOP_LOCAL_MEM_SCEV") && !off_env("CUPBOP_UNIFORM_NOREPL");
+  // analysis managers built on the first non-constant offset only: nothing else allocates here, so the translator's
+  // heap layout (which some of its pointer-keyed containers' iteration order follows) is unchanged for other kernels
+  struct Analyses {
+    PassBuilder PB;
+    LoopAnalysisManager LAM; FunctionAnalysisManager FAM; CGSCCAnalysisManager CGAM; ModuleAnalysisManager MAM;
+    Analyses() {
+      PB.registerModuleAnalyses(MAM); PB.registerCGSCCAnalyses(CGAM); PB.registerFunctionAnalyses(FAM);
+      PB.registerLoopAnalyses(LAM); PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+    }
+  };
+  std::unique_ptr<Analyses> AN;
+  unsigned scev_shrunk = 0;
   const DataLayout &DL = M->getDataLayout();
   unsigned shrunk = 0, kept = 0;
   for (auto &F : M->functions()) {
@@ -247,7 +270,7 @@ void shrink_lifter_local_mem(Module *M) {
         }
     }
     uint64_t extent = 0;
-    bool ok = true;
+    bool ok = true, scev_used = false;
     std::vector<std::pair<Value *, int64_t>> work{{AI, 0}};
     std::string why;
     while (!work.empty() && ok) {
@@ -256,7 +279,22 @@ void shrink_lifter_local_mem(Module *M) {
       for (User *U : V->users()) {
         if (auto *G = dyn_cast<GEPOperator>(U)) {
           APInt off(DL.getIndexTypeSizeInBits(G->getType()), 0);
-          if (!G->accumulateConstantOffset(DL, off)) { ok = false; why = "non-constant offset"; break; }
+          if (!G->accumulateConstantOffset(DL, off)) {
+            // the largest offset from the alloca that this GEP can produce (ScalarEvolution)
+            auto *GI = dyn_cast<GetElementPtrInst>(G);
+            if (!use_scev || !GI) { ok = false; why = "non-constant offset"; break; }
+            if (!AN) AN = std::make_unique<Analyses>();
+            ScalarEvolution &SE = AN->FAM.getResult<ScalarEvolutionAnalysis>(F);
+            const SCEV *O = SE.getMinusSCEV(SE.getSCEV(GI), SE.getSCEV(AI));
+            if (isa<SCEVCouldNotCompute>(O) || !O->getType()->isIntegerTy()) { ok = false; why = "non-constant offset (no SCEV)"; break; }
+            ConstantRange R = SE.getSignedRange(O);
+            if (R.isFullSet() || R.getSignedMin().isNegative() || R.getSignedMax().sgt(APInt(R.getBitWidth(), full))) {
+              ok = false; why = "non-constant offset (unbounded)"; break;
+            }
+            work.push_back({G, R.getSignedMax().getSExtValue()});
+            scev_used = true;
+            continue;
+          }
           work.push_back({G, base + off.getSExtValue()});
         } else if (isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
           work.push_back({U, base});
@@ -285,9 +323,22 @@ void shrink_lifter_local_mem(Module *M) {
     const uint64_t n = std::max<uint64_t>(16, (extent + 15) / 16 * 16);
     AI->setAllocatedType(ArrayType::get(Type::getInt8Ty(M->getContext()), n));
     shrunk++;
-    if (cupbop_debug()) fprintf(stderr, "[CuPBoP] %s: local_mem %llu -> %llu bytes\n", F.getName().str().c_str(), (unsigned long long)full, (unsigned long long)n);
+    if (scev_used) {
+      // A window indexed with a variable offset stays memory (SROA cannot split it). The Vortex back end's divergence
+      // analysis takes a load from a stack slot at a thread-uniform address for uniform, although every hardware
+      // thread has its own copy: in the 1:1 schedule the BlockForEach random fills got 126 instead of 280 split/join
+      // and groups of lanes one lane's values (a "divergence" metadata on the loads did not survive). Such an array
+      // goes to the frame scratch (frame_alloca_to_scratch, whatever its size), where its address depends on the
+      // hardware-thread number. (The 32 KB array never got that far: it overflowed the 8 KB stack.)
+      AI->setMetadata("cupbop.frame_scratch", MDNode::get(M->getContext(), {}));
+      scev_shrunk++;
+      fprintf(stderr, "[CuPBoP] %s: local_mem %llu -> %llu bytes (non-constant offsets bounded by SCEV)\n",
+              F.getName().str().c_str(), (unsigned long long)full, (unsigned long long)n);
+    } else if (cupbop_debug())
+      fprintf(stderr, "[CuPBoP] %s: local_mem %llu -> %llu bytes\n", F.getName().str().c_str(), (unsigned long long)full, (unsigned long long)n);
+    if (AN) AN->FAM.clear(F, F.getName());
   }
-  if (shrunk || kept) fprintf(stderr, "[CuPBoP] local_mem frames: %u shrunk to their accessed extent, %u kept\n", shrunk, kept);
+  if (shrunk || kept) fprintf(stderr, "[CuPBoP] local_mem frames: %u shrunk to their accessed extent (%u with SCEV bounds), %u kept\n", shrunk, scev_shrunk, kept);
 }
 
 // llvm.nvvm.redux.sync.{add,umin,umax,min,max,and,or,xor}(i32 v, i32 membermask) (redux.sync.op.b32/.u32/.s32, sm_80+)
@@ -387,10 +438,16 @@ void lower_lanemask(Module *M) {
 // considered: the typed per-argument spill slots of CUDA-source kernels (clang -O0) are left to the translator's -O3,
 // so the CI examples keep their code. Runs before every schedule-specific pass, so the 1:1, core-mapping
 // and flat schedules all see the parameters directly; the warp-loop pass then finds nothing to replicate.
-// CUPBOP_UNIFORM_NOREPL=0 (or CUPBOP_PARAM_FORWARD=0): off, the 11770fc code. CUPBOP_PARAM_FORWARD_WHY=1: decisions.
+// CUPBOP_UNIFORM_NOREPL=0 (or CUPBOP_PARAM_FORWARD=0): off, the 11770fc code; CUPBOP_PARAM_FORWARD=s1: the core
+// mapping only (in the 1:1 schedule a few kernels lose the shrink-wrapped prologue, see ctx_c README).
+// CUPBOP_PARAM_FORWARD_WHY=1: decisions.
 void forward_param_buffer_copies(Module *M) {
-  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0; };
+  auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) == 0 && std::string(e) != "s1"; };
   if (off_env("CUPBOP_UNIFORM_NOREPL") || off_env("CUPBOP_PARAM_FORWARD")) return;
+  if (const char *e = std::getenv("CUPBOP_PARAM_FORWARD"); e && std::string(e) == "s1") {   // core mapping only
+    const char *sf = std::getenv("VORTEX_SCHEDULE_FLAG");
+    if (!sf || std::atoi(sf) != 1) return;
+  }
   const bool why = std::getenv("CUPBOP_PARAM_FORWARD_WHY") != nullptr;
   const DataLayout &DL = M->getDataLayout();
   LLVMContext &C = M->getContext();
