@@ -6,7 +6,8 @@
 #  B. sp skew modulus (CUPBOP_SP_SKEW, generate_wrapper.cpp kabi_prelude): when kernel_wrapper.cpp has a
 #     __CUPBOP_SP_SKEW_M line, M is lowered to the largest of 8, 4, 2, 1 (not above the translated one) with
 #     largest frame + (M-1) x __CUPBOP_SP_SKEW_STEP <= CUPBOP_FRAME_LIMIT, i.e. the same 1 KB of the 8 KB stack stays
-#     for kernel_main and the callees as with the frame limit alone. A change rewrites that line and rebuilds the cell
+#     for kernel_main and the callees as with the frame limit alone. A kernel with run-time sized allocas (core-mapping
+#     context arrays on the stack) gets M = 1. A change rewrites that line and rebuilds the cell
 #     (the kernel code is the same; only kernel_main's skew mask changes). A software-stack build has M = 1 already.
 #  C. kernel ABI check (CUPBOP_KABI): when the translator wrote cupbop_kabi.txt, examples/abi_check.py checks the final
 #     kernel ELF (abi_check.log); UNSAFE removes kernel.elf/vxbin/dump and fails the build.
@@ -109,15 +110,23 @@ echo "--- [stack] software stack: $BYTES bytes per hardware thread, stride $STRI
 
 # --- B. sp skew modulus that fits the frame (CUPBOP_SP_SKEW)
 skew_fit() {
-  local M STEP F NEW
+  local M STEP F NEW WHY
   M=$(sed -n 's/^#define __CUPBOP_SP_SKEW_M \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp 2>/dev/null)
   [ -n "$M" ] && [ "$M" -gt 1 ] || return 0
   STEP=$(sed -n 's/^#define __CUPBOP_SP_SKEW_STEP \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp)
   F=$(python3 $HERE/stack_frames.py kernel.dump | awk 'NR==1{print $1+0}'); F=${F:-0}
-  NEW=$M
+  NEW=$M; WHY="largest frame $F bytes + ($M-1) x $STEP > $LIM"
   while [ $NEW -gt 1 ] && [ $((F + (NEW - 1) * STEP)) -gt $LIM ]; do NEW=$((NEW / 2)); done
+  # Run-time sized allocas (the core-mapping context arrays kept on the stack: alloca <ty>, i64 %n slots) are not in
+  # the static frame and their size is known only at launch, so such a kernel gets no skew: with M = 8 on top of
+  # them CUTLASS basic_gemm s1p1 (816 B frame) and prod curlcurl s1p2 (3568 B) overflowed the 8 KB stack. Without
+  # kernel.ll any variable sp decrement in the dump counts as one.
+  if { [ -f kernel.ll ] && grep -q -E '= alloca [^,]+, i(32|64) %' kernel.ll; } ||
+     { [ ! -f kernel.ll ] && grep -q -P '\tsub\tsp, sp, ' kernel.dump; }; then
+    NEW=1; WHY="run-time sized allocas on the stack (frame $F bytes + launch-time arrays)"
+  fi
   [ $NEW = $M ] && return 0
-  echo "--- [stack] sp skew: largest frame $F bytes + ($M-1) x $STEP > $LIM; rebuilding with skew modulus $NEW"
+  echo "--- [stack] sp skew: $WHY; rebuilding with skew modulus $NEW"
   mkdir -p $B
   sed -i "s/^#define __CUPBOP_SP_SKEW_M .*/#define __CUPBOP_SP_SKEW_M $NEW/" kernel_wrapper.cpp
   rm -f $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump
