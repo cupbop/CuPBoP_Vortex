@@ -47,6 +47,25 @@ static uint32_t cupbop_rt_simd_width() {   // 0 = full width
 #define CUPBOP_EFF_NUM_THREADS() ((cupbop_rt_simd_width() > 0 && cupbop_rt_simd_width() < (uint32_t)NUM_THREADS_VX) ? cupbop_rt_simd_width() : (uint32_t)NUM_THREADS_VX)
 
 
+// CTA local-memory knob (E2 lowering benchmark): CUPBOP_LMEM_SCALE=<k> (1, 2, 4, ...) reserves k times the local
+// memory a CTA needs. The Vortex CTA dispatcher (SimX cta_dispatcher.cpp usable_slots, RTL VX_cta_dispatch) admits
+// min(NUM_WARPS, floor(LMEM capacity / aligned lmem_size)) resident CTAs per core, so a larger reservation lowers
+// the CTA occupancy per core without touching the kernel. Never below what the kernel needs, never above the
+// device capacity; kernels that use no local memory are unaffected. Unset or 1: the launch is unchanged.
+static uint32_t cupbop_lmem_scale() {
+  static const uint32_t v = []() -> uint32_t {
+    if (const char *e = getenv("CUPBOP_LMEM_SCALE")) { int k = atoi(e); if (k > 1) return (uint32_t)k; }
+    return 1;
+  }();
+  return v;
+}
+static uint32_t cupbop_scaled_lmem(uint32_t need, uint64_t cap) {
+  if (cupbop_lmem_scale() <= 1 || need == 0) return need;
+  uint64_t want = (uint64_t)need * cupbop_lmem_scale();
+  if (cap && want > cap) want = cap;
+  return want > need ? (uint32_t)want : need;
+}
+
 // Global variable to support CudaMemcpytoSymbol
 //NOTE: old approach used staging device buffer — replaced with inline args
 //std::vector<std::vector<uint64_t> >  memcpy_symbol;
@@ -1871,6 +1890,14 @@ cudaError_t cudaLaunchKernel_vortex(
     }
     DBG_PRINT("launch2: sched=%d grid=(%u,%u,%u) block=(%u,%u,%u) lmem=%u args=%zu\n",
               schedule, grid[0], grid[1], grid[2], block[0], block[1], block[2], lmem, abuf_total);
+    if (getenv("CUPBOP_LMEM_SCALE")) {   // CUPBOP_LMEM_SCALE: reserve more local memory per CTA (fewer CTAs per core)
+      uint64_t lmem_cap = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) != 0) lmem_cap = 0;
+      const uint32_t need = lmem;
+      lmem = cupbop_scaled_lmem(need, lmem_cap);
+      fprintf(stderr, "cupbop: lmem scale %u: %s %u -> %u bytes per CTA (capacity %lu)\n", cupbop_lmem_scale(),
+              func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
+    }
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
   }
 
