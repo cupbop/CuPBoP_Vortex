@@ -94,12 +94,11 @@ static std::string big_stack_prelude() {
 //  * CUPBOP_KABI=0 CUPBOP_SP_SKEW=0: the wrapper is exactly the previous one (same machine code). CUPBOP_KABI=0 with the
 //    skew on keeps the ordinary calling convention and only skews (asm call); the kernel ABI with CUPBOP_SP_SKEW=0
 //    calls through the asm without the skew.
-// Defaults when the variable is unset or empty: the kernel ABI is on since 2026-10-30 (the user's decision); the skew
-// is off by default since 2026-10-31 (CUPBOP_SP_SKEW=auto turns it on). The frame check of stack_fallback.sh counts
-// neither the run-time sized allocas (core-mapping context arrays) nor, with the kernel ABI, the kernel frame, so
-// M = 8 overflowed the 8 KB stack: CUTLASS basic_gemm s1p1 wrong results, prod curlcurl s1p2 "IPDOM stack is empty".
-// Cycle numbers from before 2026-10-30 are reproduced with CUPBOP_KABI=0 CUPBOP_SP_SKEW=0 at translation time.
-static const char *const KABI_DEFAULT = "1", *const SP_SKEW_DEFAULT = "0";
+// Defaults when the variable is unset or empty: both on since 2026-10-30 (the user's decision). The skew was off for a
+// day (2026-10-31, c22327a): the frame check of stack_fallback.sh did not count the run-time sized allocas (core-mapping
+// context arrays), so M = 8 overflowed the 8 KB stack (CUTLASS basic_gemm s1p1, prod curlcurl s1p2); since f77b52a such
+// kernels get M = 1. Cycle numbers from before 2026-10-30 are reproduced with CUPBOP_KABI=0 CUPBOP_SP_SKEW=0.
+static const char *const KABI_DEFAULT = "1", *const SP_SKEW_DEFAULT = "auto";
 static const char *env_or(const char *name, const char *dflt) {
   const char *e = std::getenv(name);
   return e && *e ? e : dflt;
