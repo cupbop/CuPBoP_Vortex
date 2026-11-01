@@ -284,6 +284,7 @@ int main(int argc, char **argv) {
 
   fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
   annotate_kernel_abi(program); // CUPBOP_KABI (default on): kernel calling convention, cupbop_kabi.txt
+  describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
   DumpModule(program, argv[2]);
 
   fout.close();

@@ -96,8 +96,9 @@ static std::string big_stack_prelude() {
 //    calls through the asm without the skew.
 // Defaults when the variable is unset or empty: both on since 2026-10-30 (the user's decision). The skew was off for a
 // day (2026-10-31, c22327a): the frame check of stack_fallback.sh did not count the run-time sized allocas (core-mapping
-// context arrays), so M = 8 overflowed the 8 KB stack (CUTLASS basic_gemm s1p1, prod curlcurl s1p2); since f77b52a such
-// kernels get M = 1. Cycle numbers from before 2026-10-30 are reproduced with CUPBOP_KABI=0 CUPBOP_SP_SKEW=0.
+// context arrays), so M = 8 overflowed the 8 KB stack (CUTLASS basic_gemm s1p1, prod curlcurl s1p2); f77b52a gave such
+// kernels M = 1, and since branch skewrt their M is bounded with the arrays' launch-time size (see below). Cycle numbers
+// from before 2026-10-30 are reproduced with CUPBOP_KABI=0 CUPBOP_SP_SKEW=0.
 static const char *const KABI_DEFAULT = "1", *const SP_SKEW_DEFAULT = "auto";
 static const char *env_or(const char *name, const char *dflt) {
   const char *e = std::getenv(name);
@@ -122,22 +123,102 @@ static int sp_skew_step() {
 }
 // the asm call: the kernel ABI, or the skew (kept when the build-time frame check later sets M to 1)
 static bool asm_call_on() { return kabi_on() || (sp_skew_req() && !big_stack_bytes()); }
+// Run-time skew modulus for kernels with run-time sized stack arrays (2026-10-31, branch skewrt). The core-mapping
+// context arrays kept on the stack (insert_warp_loop.cpp: alloca <ty>, i64 %ctx_slots, ctx_slots = ceil(block / (P x L))
+// or slots x sub-passes) are sized at launch and are not in the static frame, so the build-time rule above cannot bound
+// them (M = 8 on top of them overflowed the 8 KB stack: CUTLASS basic_gemm s1p1, prod curlcurl s1p2), and f77b52a gave
+// every such kernel M = 1 (s1 cycles +8.9%, btree s1 4x). Now the translator recomputes those arrays' bytes as a function
+// of the launch, dyn(block_size, CTA warps P) (describe_dyn_stack below), and examples/stack_fallback.sh (which knows
+// the static frame F after the build) either keeps the immediate mask, when F + the worst case over every legal launch
+// still allows M, or writes into kernel_wrapper.cpp, for each M' in {8, 4, 2} up to M, the largest C_M' such that
+// every launch with block_size <= C_M' x P has F + dyn + (M'-1) x STEP <= limit (__CUPBOP_SP_SKEW_C8/_C4/_C2, checked
+// by the translator over block_size 1..__CUPBOP_SP_SKEW_MAXBS and P 1..64). kernel_main then calls the kernel through
+// the immediate-mask asm of the largest M' whose test holds (one inlined copy per M', selected by a branch on
+// block_size and the CTA size: no division, no memory but block_size, nothing to recompute after the call, and the
+// callee's frame exactly where the immediate path puts it). Without those defines the preprocessed wrapper is exactly
+// the immediate-mask one. CUPBOP_SP_SKEW_PRINT=1 (translation) prints block_size, P and M' once per launch (logical
+// block 0, rank 0, lane 0).
 static std::string kabi_prelude() {
   if (!asm_call_on()) return "";
   const long bs = big_stack_bytes();
+  const char *pe = std::getenv("CUPBOP_SP_SKEW_PRINT");
+  const bool print = pe && *pe && std::strcmp(pe, "0");
+  const std::string clob_tail =
+      "          \"a1\", \"a2\", \"a3\", \"a4\", \"a5\", \"a6\", \"a7\",\n"
+      "          \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\",\n"
+      "          \"ft0\", \"ft1\", \"ft2\", \"ft3\", \"ft4\", \"ft5\", \"ft6\", \"ft7\", \"ft8\", \"ft9\", \"ft10\", \"ft11\",\n"
+      "          \"fa0\", \"fa1\", \"fa2\", \"fa3\", \"fa4\", \"fa5\", \"fa6\", \"fa7\",\n"
+      "          \"fs0\", \"fs1\", \"fs2\", \"fs3\", \"fs4\", \"fs5\", \"fs6\", \"fs7\", \"fs8\", \"fs9\", \"fs10\", \"fs11\", \"memory\");\n";
   std::string s =
       "// Kernel call through inline asm (CUPBOP_KABI / CUPBOP_SP_SKEW; see generate_wrapper.cpp kabi_prelude).\n"
       "// Kernel ABI " + std::string(kabi_on() ? "on" : "off") + ". __CUPBOP_SP_SKEW_M: the warps' sp skew modulus "
       "(1 = none); examples/stack_fallback.sh rewrites that line to fit the frame.\n"
       "#include <VX_config.h>\n"
       "#define __CUPBOP_SP_SKEW_M " + std::to_string(sp_skew_m()) + "\n"
-      "#define __CUPBOP_SP_SKEW_STEP " + std::to_string(sp_skew_step()) + "\n"
-      "static constexpr int __cupbop_log2(unsigned v) { return v <= 1 ? 0 : 1 + __cupbop_log2(v >> 1); }\n"
-      "static_assert((__CUPBOP_SP_SKEW_M & (__CUPBOP_SP_SKEW_M - 1)) == 0 && __CUPBOP_SP_SKEW_M <= 8, \"skew modulus\");\n"
-      "static_assert((VX_CFG_NUM_THREADS & (VX_CFG_NUM_THREADS - 1)) == 0, \"NT\");\n"
-      "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n"
-      "    register void *__a0 asm(\"a0\") = arg;\n"
-      "    register void *__t2 asm(\"t2\") = (void *)fn;\n";
+      "#define __CUPBOP_SP_SKEW_STEP " + std::to_string(sp_skew_step()) + "\n";
+  if (!bs)
+    s += "// (run-time sized stack arrays: examples/stack_fallback.sh may add __CUPBOP_SP_SKEW_C8/_C4/_C2/_MAXBS after the M line)\n";
+  s += "static constexpr int __cupbop_log2(unsigned v) { return v <= 1 ? 0 : 1 + __cupbop_log2(v >> 1); }\n"
+       "static_assert((__CUPBOP_SP_SKEW_M & (__CUPBOP_SP_SKEW_M - 1)) == 0 && __CUPBOP_SP_SKEW_M <= 8, \"skew modulus\");\n"
+       "static_assert((VX_CFG_NUM_THREADS & (VX_CFG_NUM_THREADS - 1)) == 0, \"NT\");\n";
+  if (!bs) {
+    s += "#if defined(__CUPBOP_SP_SKEW_C2) && __CUPBOP_SP_SKEW_M > 1\n"
+         "// Run-time modulus M' = the largest of M, M/2, ... (> 1) with block_size <= C_M' x CTA warps, else 1: one\n"
+         "// immediate-mask call per M' (mask M' - 1), selected per launch\n"
+         "static_assert(VX_CFG_NUM_WARPS <= 64, \"the thresholds were checked for up to 64 CTA warps\");\n"
+         "extern int block_size;   // the launch's threads per block (kernel_main), which the arrays are sized with\n"
+         "template <unsigned __MASK> static inline __attribute__((always_inline)) void __cupbop_kcall_imm(vx_kernel_func_cb fn, void *arg) {\n"
+         "    register void *__a0 asm(\"a0\") = arg;\n"
+         "    register void *__t2 asm(\"t2\") = (void *)fn;\n"
+         "    if (__MASK)\n"
+         "      __asm__ volatile(\n"
+         "        \"csrr t0, mhartid\\n\\tsrli t0, t0, %[nt]\\n\\tandi t0, t0, %[m]\\n\\tslli t0, t0, %[st]\\n\\tsub sp, sp, t0\\n\\t\"\n"
+         "        \"jalr ra, 0(t2)\\n\\t\"\n"
+         "        \"csrr t0, mhartid\\n\\tsrli t0, t0, %[nt]\\n\\tandi t0, t0, %[m]\\n\\tslli t0, t0, %[st]\\n\\tadd sp, sp, t0\"\n"
+         "        : \"+r\"(__a0), \"+r\"(__t2)\n"
+         "        : [nt] \"i\"(__cupbop_log2(VX_CFG_NUM_THREADS)), [m] \"i\"(__MASK), [st] \"i\"(__cupbop_log2(__CUPBOP_SP_SKEW_STEP))\n"
+         "        : \"ra\", \"t0\", \"t1\", \"t3\", \"t4\", \"t5\", \"t6\",\n" + clob_tail +
+         "    else\n"
+         "      __asm__ volatile(\"jalr ra, 0(t2)\"\n"
+         "        : \"+r\"(__a0), \"+r\"(__t2)\n"
+         "        :\n"
+         "        : \"ra\", \"t0\", \"t1\", \"t3\", \"t4\", \"t5\", \"t6\",\n" + clob_tail +
+         "}\n"
+         "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n"
+         "    // CTA warps as __cupbop_fill_spawn_globals stored them (the CTA-size CSR): a load, which the Vortex backend\n"
+         "    // takes as uniform (a CSR read is divergent to it and the dispatch got split/join tokens spilled to a\n"
+         "    // larger kernel_main frame, moving the callee's frame)\n"
+         "    const uint64_t __bs = (uint32_t)block_size, __p = *(volatile uint32_t *)&__warps_per_group;\n";
+    if (print)
+      s += "    if (vx_thread_id() == 0 && csr_read_nv(VX_CSR_CTA_RANK) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_X) == 0 &&\n"
+           "        csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z) == 0) {\n"
+           "#ifndef __CUPBOP_SP_SKEW_C8\n"
+           "#define __CUPBOP_SP_SKEW_C8 0\n"
+           "#endif\n"
+           "#ifndef __CUPBOP_SP_SKEW_C4\n"
+           "#define __CUPBOP_SP_SKEW_C4 0\n"
+           "#endif\n"
+           "        int __m = __bs > __CUPBOP_SP_SKEW_MAXBS ? 1 : __CUPBOP_SP_SKEW_M > 4 && __bs <= (uint64_t)__CUPBOP_SP_SKEW_C8 * __p ? 8\n"
+           "                : __CUPBOP_SP_SKEW_M > 2 && __bs <= (uint64_t)__CUPBOP_SP_SKEW_C4 * __p ? 4 : __bs <= (uint64_t)__CUPBOP_SP_SKEW_C2 * __p ? 2 : 1;\n"
+           "        vx_printf(\"[cupbop] sp skew: block %d, CTA warps %d: modulus %d of %d (C8/C4/C2 = %d/%d/%d)\\n\", (int)__bs,\n"
+           "                  (int)__p, __m, (int)__CUPBOP_SP_SKEW_M, (int)__CUPBOP_SP_SKEW_C8, (int)__CUPBOP_SP_SKEW_C4,\n"
+           "                  (int)__CUPBOP_SP_SKEW_C2);\n"
+           "    }\n";
+    s += "    if (__bs > (uint64_t)__CUPBOP_SP_SKEW_MAXBS) __cupbop_kcall_imm<0>(fn, arg);\n"
+         "#if __CUPBOP_SP_SKEW_M > 4\n"
+         "    else if (__bs <= (uint64_t)__CUPBOP_SP_SKEW_C8 * __p) __cupbop_kcall_imm<7>(fn, arg);\n"
+         "#endif\n"
+         "#if __CUPBOP_SP_SKEW_M > 2\n"
+         "    else if (__bs <= (uint64_t)__CUPBOP_SP_SKEW_C4 * __p) __cupbop_kcall_imm<3>(fn, arg);\n"
+         "#endif\n"
+         "    else if (__bs <= (uint64_t)__CUPBOP_SP_SKEW_C2 * __p) __cupbop_kcall_imm<1>(fn, arg);\n"
+         "    else __cupbop_kcall_imm<0>(fn, arg);\n"
+         "}\n"
+         "#else\n";
+  }
+  s += "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n"
+       "    register void *__a0 asm(\"a0\") = arg;\n"
+       "    register void *__t2 asm(\"t2\") = (void *)fn;\n";
   if (bs)
     s += "    // software stack (CUPBOP_BIG_STACK): the old sp is kept on the new stack, as __cupbop_stack_call does\n"
          "    char *__base = *(char *volatile *)&__cupbop_big_stack;\n"
@@ -159,13 +240,10 @@ static std::string kabi_prelude() {
   s += std::string("        : \"+r\"(__a0), \"+r\"(__t2)") + (bs ? ", \"+r\"(__t1)" : "") + "\n"
        "        : [nt] \"i\"(__cupbop_log2(VX_CFG_NUM_THREADS)), [m] \"i\"(__CUPBOP_SP_SKEW_M - 1),\n"
        "          [st] \"i\"(__cupbop_log2(__CUPBOP_SP_SKEW_STEP))\n"
-       "        : \"ra\", \"t0\"" + std::string(bs ? "" : ", \"t1\"") + ", \"t3\", \"t4\", \"t5\", \"t6\",\n"
-       "          \"a1\", \"a2\", \"a3\", \"a4\", \"a5\", \"a6\", \"a7\",\n"
-       "          \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\",\n"
-       "          \"ft0\", \"ft1\", \"ft2\", \"ft3\", \"ft4\", \"ft5\", \"ft6\", \"ft7\", \"ft8\", \"ft9\", \"ft10\", \"ft11\",\n"
-       "          \"fa0\", \"fa1\", \"fa2\", \"fa3\", \"fa4\", \"fa5\", \"fa6\", \"fa7\",\n"
-       "          \"fs0\", \"fs1\", \"fs2\", \"fs3\", \"fs4\", \"fs5\", \"fs6\", \"fs7\", \"fs8\", \"fs9\", \"fs10\", \"fs11\", \"memory\");\n"
-       "}\n\n";
+       "        : \"ra\", \"t0\"" + std::string(bs ? "" : ", \"t1\"") + ", \"t3\", \"t4\", \"t5\", \"t6\",\n" + clob_tail +
+       "}\n";
+  if (!bs) s += "#endif\n";
+  s += "\n";
   return s;
 }
 
@@ -960,4 +1038,391 @@ void annotate_kernel_abi(llvm::Module *M) {
        "checked by examples/abi_check.py\n";
   for (auto &n : names) f << n << "\n";
   for (auto &n : g_kabi_cxx_wrappers) f << n << "\n";
+}
+
+// CUPBOP_SP_SKEW with run-time sized stack arrays (see the comment above kabi_prelude). For a module with run-time
+// sized allocas (alloca <ty>, i64 %n: the core-mapping context arrays) this computes dyn(block_size, P) = the stack
+// bytes those allocas take for a launch with that block size and P physical warps per CTA, on the deepest call chain:
+// per function the sum of alignTo(n x sizeof(ty), 16) (+ alignment slack above 16, as the RISC-V backend lowers a
+// dynamic alloca) over its non-static allocas, plus the largest such value of its callees, maximum over the call-graph
+// roots (the kernels' wrappers). A straight-line function (never added to the module) recomputes each count n by
+// cloning its expression tree and is evaluated for every block_size 1..1024 (CUDA's limit; CUPBOP_SP_SKEW_MAX_BLOCK)
+// and P 1..64; the leaves must be constants, loads of block_size (written only by kernel_main, never stored by the
+// translated module) and the CTA-size CSR (__cupbop_cta_size / csrr 0xcd2). cupbop_dyn_stack.txt gets the worst case
+// (static_max) and the threshold function C(B) = the largest C such that every launch with block_size <= C x P has
+// dyn <= B, as the "B:C" points where it steps (examples/stack_fallback.sh looks up B = limit - frame - (M-1) x STEP
+// for M = 8, 4, 2 and kernel_main tests block_size <= C x P). Anything else (another leaf, an argument, a phi, an
+// alloca on a CFG cycle, recursion, an indirect call that could reach such a function) -> "helper none":
+// examples/stack_fallback.sh then gives the kernel M = 1. Nothing is written, and the module is never changed, when it
+// has no run-time sized alloca or the skew is off.
+#include "llvm/ADT/SCCIterator.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Support/raw_ostream.h"
+#include <functional>
+#include <regex>
+#include <unordered_map>
+
+// dyn of the straight-line function H for block_size 1..maxbs and P 1..NP: tab[(P-1) * maxbs + bs-1]; false (why) when
+// an instruction or a leaf other than block_size / the CTA size is not modelled, or a division by zero can occur
+static bool dyn_stack_eval(Function *H, uint64_t maxbs, uint64_t NP, std::vector<uint64_t> &tab, std::string &why) {
+  static const std::regex csr_asm("^\\s*csrr\\s+\\$0\\s*,\\s*(0xcd2|0xCD2|3282)\\s*$");
+  enum K { CONST, BS, P, BIN, ZEXT, SEXT, TRUNC, CMP, SEL, MAXMIN, FREEZE };
+  struct Op { K k; unsigned w, sw; unsigned opc; int a, b, c; uint64_t imm; };
+  std::vector<Op> prog;
+  std::unordered_map<const Value *, int> idx;
+  int ret = -1;
+  auto operand = [&](Value *V, int &r) -> bool {
+    if (auto *CI = dyn_cast<ConstantInt>(V)) {
+      if (CI->getBitWidth() > 64) return false;
+      prog.push_back({CONST, CI->getBitWidth(), 0, 0, -1, -1, -1, CI->getZExtValue()});
+      r = (int)prog.size() - 1;
+      return true;
+    }
+    auto it = idx.find(V);
+    if (it == idx.end()) return false;
+    r = it->second;
+    return true;
+  };
+  for (Instruction &I : H->getEntryBlock()) {
+    if (auto *R = dyn_cast<ReturnInst>(&I)) {
+      if (!operand(R->getReturnValue(), ret)) { why = "return value"; return false; }
+      break;
+    }
+    if (!I.getType()->isIntegerTy() || I.getType()->getIntegerBitWidth() > 64) { why = "non-integer value"; return false; }
+    Op o{CONST, I.getType()->getIntegerBitWidth(), 0, 0, -1, -1, -1, 0};
+    bool ok = true;
+    if (auto *L = dyn_cast<LoadInst>(&I)) {
+      auto *G = dyn_cast<GlobalVariable>(L->getPointerOperand()->stripPointerCasts());
+      if (!G || G->getName() != "block_size") { why = "leaf " + (G ? G->getName().str() : std::string("load")); return false; }
+      o.k = BS;
+    } else if (auto *CI = dyn_cast<CallInst>(&I)) {
+      if (auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand())) {
+        if (!std::regex_match(IA->getAsmString(), csr_asm)) { why = "leaf asm " + IA->getAsmString(); return false; }
+        o.k = P;
+      } else if (auto *T = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts())) {
+        Intrinsic::ID id = T->getIntrinsicID();
+        if (T->getName() == "__cupbop_cta_size") o.k = P;
+        else if (id == Intrinsic::umax || id == Intrinsic::umin || id == Intrinsic::smax || id == Intrinsic::smin) {
+          o.k = MAXMIN; o.opc = id;
+          ok = operand(CI->getArgOperand(0), o.a) && operand(CI->getArgOperand(1), o.b);
+        } else { why = "leaf call " + T->getName().str(); return false; }
+      } else { why = "indirect call"; return false; }
+    } else if (auto *B = dyn_cast<BinaryOperator>(&I)) {
+      o.k = BIN; o.opc = B->getOpcode();
+      ok = operand(B->getOperand(0), o.a) && operand(B->getOperand(1), o.b);
+    } else if (auto *Cs = dyn_cast<CastInst>(&I)) {
+      if (!Cs->getSrcTy()->isIntegerTy()) { why = "cast"; return false; }
+      o.sw = Cs->getSrcTy()->getIntegerBitWidth();
+      o.k = isa<ZExtInst>(Cs) ? ZEXT : isa<SExtInst>(Cs) ? SEXT : isa<TruncInst>(Cs) ? TRUNC : CONST;
+      if (o.k == CONST) { why = "cast"; return false; }
+      ok = operand(Cs->getOperand(0), o.a);
+    } else if (auto *C = dyn_cast<ICmpInst>(&I)) {
+      o.k = CMP; o.opc = C->getPredicate(); o.sw = C->getOperand(0)->getType()->getIntegerBitWidth();
+      ok = operand(C->getOperand(0), o.a) && operand(C->getOperand(1), o.b);
+    } else if (auto *S = dyn_cast<SelectInst>(&I)) {
+      o.k = SEL;
+      ok = operand(S->getCondition(), o.c) && operand(S->getTrueValue(), o.a) && operand(S->getFalseValue(), o.b);
+    } else if (isa<FreezeInst>(&I)) {
+      o.k = FREEZE; ok = operand(I.getOperand(0), o.a);
+    } else { why = std::string("instruction ") + I.getOpcodeName(); return false; }
+    if (!ok) { why = "operand"; return false; }
+    prog.push_back(o);
+    idx[&I] = (int)prog.size() - 1;
+  }
+  if (ret < 0) { why = "no return"; return false; }
+  auto mk = [](uint64_t x, unsigned w) { return w >= 64 ? x : x & ((1ull << w) - 1); };
+  auto sx = [](uint64_t x, unsigned w) { return w >= 64 ? (int64_t)x : (int64_t)(x << (64 - w)) >> (64 - w); };
+  std::vector<uint64_t> v(prog.size());
+  tab.assign(maxbs * NP, 0);
+  for (uint64_t p = 1; p <= NP; ++p)
+    for (uint64_t bs = 1; bs <= maxbs; ++bs) {
+      for (size_t i = 0; i < prog.size(); ++i) {
+        const Op &o = prog[i];
+        uint64_t a = o.a >= 0 ? v[o.a] : 0, b = o.b >= 0 ? v[o.b] : 0, r = 0;
+        switch (o.k) {
+        case CONST: r = o.imm; break;
+        case BS: r = bs; break;
+        case P: r = p; break;
+        case FREEZE: case ZEXT: case TRUNC: r = a; break;
+        case SEXT: r = (uint64_t)sx(a, o.sw); break;
+        case SEL: r = v[o.c] ? a : b; break;
+        case MAXMIN: {
+          int64_t sa = sx(a, o.w), sb = sx(b, o.w);
+          r = o.opc == Intrinsic::umax ? std::max(a, b) : o.opc == Intrinsic::umin ? std::min(a, b)
+            : o.opc == Intrinsic::smax ? (uint64_t)std::max(sa, sb) : (uint64_t)std::min(sa, sb);
+          break;
+        }
+        case CMP: {
+          int64_t sa = sx(a, o.sw), sb = sx(b, o.sw);
+          switch (o.opc) {
+          case CmpInst::ICMP_EQ: r = a == b; break;   case CmpInst::ICMP_NE: r = a != b; break;
+          case CmpInst::ICMP_UGT: r = a > b; break;   case CmpInst::ICMP_UGE: r = a >= b; break;
+          case CmpInst::ICMP_ULT: r = a < b; break;   case CmpInst::ICMP_ULE: r = a <= b; break;
+          case CmpInst::ICMP_SGT: r = sa > sb; break; case CmpInst::ICMP_SGE: r = sa >= sb; break;
+          case CmpInst::ICMP_SLT: r = sa < sb; break; default: r = sa <= sb; break;
+          }
+          break;
+        }
+        case BIN: {
+          int64_t sa = sx(a, o.w), sb = sx(b, o.w);
+          switch (o.opc) {
+          case Instruction::Add: r = a + b; break;
+          case Instruction::Sub: r = a - b; break;
+          case Instruction::Mul: r = a * b; break;
+          case Instruction::And: r = a & b; break;
+          case Instruction::Or: r = a | b; break;
+          case Instruction::Xor: r = a ^ b; break;
+          case Instruction::Shl: if (b >= o.w) { why = "shift"; return false; } r = a << b; break;
+          case Instruction::LShr: if (b >= o.w) { why = "shift"; return false; } r = a >> b; break;
+          case Instruction::AShr: if (b >= o.w) { why = "shift"; return false; } r = (uint64_t)(sa >> b); break;
+          case Instruction::UDiv: if (!b) { why = "division by zero"; return false; } r = a / b; break;
+          case Instruction::URem: if (!b) { why = "division by zero"; return false; } r = a % b; break;
+          case Instruction::SDiv: if (!b || (sb == -1 && sa == INT64_MIN)) { why = "division"; return false; } r = (uint64_t)(sa / sb); break;
+          case Instruction::SRem: if (!b || sb == -1) { why = "division"; return false; } r = (uint64_t)(sa % sb); break;
+          default: why = "binary operator"; return false;
+          }
+          break;
+        }
+        }
+        v[i] = mk(r, o.w);
+      }
+      tab[(p - 1) * maxbs + (bs - 1)] = v[ret];
+    }
+  return true;
+}
+
+void describe_dyn_stack(llvm::Module *M) {
+  std::remove("cupbop_dyn_stack.txt");
+  if (!asm_call_on() || sp_skew_m() <= 1) return;
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &C = M->getContext();
+  auto *I64 = Type::getInt64Ty(C);
+  // run-time sized allocas per function (any non-static alloca once the module has one with a non-constant count)
+  std::map<Function *, std::vector<AllocaInst *>> dyn;
+  bool any_var = false;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+          if (!AI->isStaticAlloca()) {
+            dyn[&F].push_back(AI);
+            any_var |= !isa<ConstantInt>(AI->getArraySize());
+          }
+  }
+  if (!any_var) return;
+  std::string why;
+  // a block on a CFG cycle may run its allocas more than once per call
+  for (auto &kv : dyn) {
+    std::set<const BasicBlock *> cyc;
+    for (scc_iterator<Function *> I = scc_begin(kv.first); !I.isAtEnd(); ++I)
+      if (I.hasCycle()) for (BasicBlock *BB : *I) cyc.insert(BB);
+    for (AllocaInst *AI : kv.second)
+      if (cyc.count(AI->getParent()) && why.empty()) why = "alloca on a CFG cycle in " + kv.first->getName().str();
+  }
+  // direct callees, indirect calls, address-taken functions
+  std::map<Function *, std::set<Function *>> callees;
+  std::set<Function *> has_indirect, has_caller, addr_taken;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->isInlineAsm()) continue;
+          // (a call through a mismatched prototype, e.g. i32 () of a declared i32 (...), is still direct)
+          Function *T = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+          if (!T) has_indirect.insert(&F);
+          else if (!T->isDeclaration()) { callees[&F].insert(T); has_caller.insert(T); }
+        }
+  }
+  std::function<bool(const User *)> meta_only = [&](const User *U) {
+    if (auto *GV = dyn_cast<GlobalVariable>(U))
+      return GV->getName() == "llvm.global.annotations" || GV->getName() == "llvm.used" ||
+             GV->getName() == "llvm.compiler.used";
+    if (!isa<Constant>(U)) return false;
+    for (const User *V : U->users()) if (!meta_only(V)) return false;
+    return true;
+  };
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    for (const Use &U : F.uses()) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      if (CB && CB->isCallee(&U)) continue;
+      if (!meta_only(U.getUser())) { addr_taken.insert(&F); break; }
+    }
+  }
+  // functions that reach a run-time sized alloca through direct calls
+  std::set<Function *> reach;
+  for (auto &kv : dyn) reach.insert(kv.first);
+  for (bool ch = true; ch;) {
+    ch = false;
+    for (auto &kv : callees)
+      if (!reach.count(kv.first))
+        for (Function *T : kv.second) if (reach.count(T)) { reach.insert(kv.first); ch = true; break; }
+  }
+  // an indirect call could stack an address-taken function's arrays on top of its caller's chain
+  if (why.empty() && !has_indirect.empty())
+    for (Function *F : reach)
+      if (addr_taken.count(F)) { why = "indirect call may reach " + F->getName().str(); break; }
+  // the straight-line function that recomputes dyn (built in M, evaluated, removed again)
+  Function *H = Function::Create(FunctionType::get(I64, false), GlobalValue::ExternalLinkage, "__cupbop_dyn_stack_bytes", M);
+  IRBuilder<> B(BasicBlock::Create(C, "entry", H));
+  std::function<bool(const Value *)> read_only = [&](const Value *V) {
+    for (const User *U : V->users()) {
+      if (auto *L = dyn_cast<LoadInst>(U)) { if (L->getPointerOperand() != V) return false; continue; }
+      if (isa<ConstantExpr>(U)) { if (!read_only(U)) return false; continue; }
+      if (meta_only(U)) continue;
+      return false;
+    }
+    return true;
+  };
+  static const std::regex cta_size_asm("^\\s*csrr\\s+\\$0\\s*,\\s*(0xcd2|0xCD2|3282)\\s*$");
+  std::map<Value *, Value *> memo;
+  std::function<Value *(Value *)> clone = [&](Value *V) -> Value * {
+    if (!why.empty()) return nullptr;
+    if (isa<Constant>(V) && !isa<GlobalValue>(V)) return V;
+    auto it = memo.find(V);
+    if (it != memo.end()) return it->second;
+    auto *I = dyn_cast<Instruction>(V);
+    std::string bad;
+    if (!I) bad = "operand " + V->getName().str();
+    else if (auto *L = dyn_cast<LoadInst>(I)) {
+      auto *G = dyn_cast<GlobalVariable>(L->getPointerOperand()->stripPointerCasts());
+      if (!G || G->getName() != "block_size" || G->isThreadLocal() || !read_only(G))
+        bad = "load of " + (G ? G->getName().str() : std::string("a non-global"));
+    } else if (auto *CI = dyn_cast<CallInst>(I)) {
+      // the CTA size (physical warps of this CTA): __cupbop_cta_size() or its inlined csrr
+      Function *T = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
+      bool ok = CI->arg_size() == 0 && T && T->getName() == "__cupbop_cta_size";
+      if (auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand()))
+        ok = CI->arg_size() == 0 && std::regex_match(IA->getAsmString(), cta_size_asm);
+      if (!ok && T && T->isIntrinsic() && CI->doesNotAccessMemory() && !CI->isConvergent()) ok = true;
+      if (!ok) bad = "call to " + (T ? T->getName().str() : std::string("asm / indirect"));
+    } else if (!(isa<BinaryOperator>(I) || isa<CastInst>(I) || isa<CmpInst>(I) || isa<SelectInst>(I) ||
+                 isa<FreezeInst>(I)))
+      bad = std::string("instruction ") + I->getOpcodeName();
+    if (!bad.empty()) { why = bad; return nullptr; }
+    Instruction *N = I->clone();
+    for (unsigned k = 0; k < N->getNumOperands(); ++k) {
+      Value *Op = N->getOperand(k);
+      if (isa<Instruction>(Op) || isa<Argument>(Op)) {
+        Value *R = clone(Op);
+        if (!R) { N->deleteValue(); return nullptr; }
+        N->setOperand(k, R);
+      }
+    }
+    N->setDebugLoc(DebugLoc());
+    SmallVector<std::pair<unsigned, MDNode *>, 4> md;
+    N->getAllMetadata(md);
+    for (auto &p : md) N->setMetadata(p.first, nullptr);
+    B.Insert(N, I->getName());
+    memo[V] = N;
+    return N;
+  };
+  std::map<Function *, Value *> own;
+  for (auto &kv : dyn) {
+    Value *sum = ConstantInt::get(I64, 0);
+    for (AllocaInst *AI : kv.second) {
+      Value *n = clone(AI->getArraySize());
+      if (!n) break;
+      n = B.CreateZExtOrTrunc(n, I64);
+      uint64_t esz = DL.getTypeAllocSize(AI->getAllocatedType()).getFixedValue();
+      uint64_t al = AI->getAlign().value();
+      Value *bytes = B.CreateAnd(B.CreateAdd(B.CreateMul(n, ConstantInt::get(I64, esz)), ConstantInt::get(I64, 15)),
+                                 ConstantInt::get(I64, ~15ull));
+      if (al > 16) bytes = B.CreateAdd(bytes, ConstantInt::get(I64, al - 16));
+      sum = B.CreateAdd(sum, bytes);
+    }
+    own[kv.first] = sum;
+  }
+  // deepest chain: closure(F) = own(F) + max over callees in `reach`; a cycle among them = unknown
+  std::map<Function *, Value *> clo;
+  std::set<Function *> active;
+  std::function<Value *(Function *)> chain = [&](Function *F) -> Value * {
+    auto it = clo.find(F);
+    if (it != clo.end()) return it->second;
+    if (active.count(F)) { if (why.empty()) why = "recursion through " + F->getName().str(); return ConstantInt::get(I64, 0); }
+    active.insert(F);
+    Value *mx = nullptr;
+    for (Function *T : callees[F])
+      if (reach.count(T)) {
+        Value *v = chain(T);
+        mx = mx ? B.CreateBinaryIntrinsic(Intrinsic::umax, mx, v) : v;
+      }
+    active.erase(F);
+    Value *o = own.count(F) ? own[F] : nullptr;
+    Value *r = o && mx ? B.CreateAdd(o, mx) : o ? o : mx ? mx : ConstantInt::get(I64, 0);
+    clo[F] = r;
+    return r;
+  };
+  Value *res = nullptr;
+  std::vector<Function *> roots;
+  for (Function &F : *M)
+    if (reach.count(&F) && (!has_caller.count(&F) || addr_taken.count(&F))) roots.push_back(&F);
+  if (why.empty() && roots.empty()) why = "no root function (recursion?)";
+  for (Function *F : roots) {
+    if (!why.empty()) break;
+    Value *v = chain(F);
+    res = res ? B.CreateBinaryIntrinsic(Intrinsic::umax, res, v) : v;
+  }
+  // evaluate over every legal launch: block_size 1..maxbs (CUDA's 1024 threads per block), P 1..64
+  const char *mb = std::getenv("CUPBOP_SP_SKEW_MAX_BLOCK");
+  const uint64_t maxbs = mb && *mb && std::atol(mb) > 0 ? (uint64_t)std::atol(mb) : 1024;
+  const uint64_t NP = 64;
+  std::vector<uint64_t> tab;
+  if (why.empty()) {
+    B.CreateRet(res);
+    if (verifyFunction(*H, &errs())) why = "verifier";
+    else dyn_stack_eval(H, maxbs, NP, tab, why);
+  }
+  H->eraseFromParent();   // the module stays as it was
+  std::ofstream f("cupbop_dyn_stack.txt");
+  f << "# run-time sized stack allocas (generate_wrapper.cpp describe_dyn_stack; read by examples/stack_fallback.sh)\n";
+  for (auto &kv : dyn) {
+    std::map<std::string, int> types;
+    for (AllocaInst *AI : kv.second) {
+      std::string t;
+      raw_string_ostream os(t);
+      AI->getAllocatedType()->print(os);
+      types[os.str()]++;
+    }
+    f << "function " << kv.first->getName().str() << " allocas " << kv.second.size() << ":";
+    for (auto &t : types) f << " " << t.second << "x" << t.first;
+    f << "\n";
+  }
+  if (!why.empty()) {
+    f << "helper none (" << why << ")\n";
+    if (cupbop_debug()) fprintf(stderr, "[CuPBoP] run-time sized allocas: no launch-time bound (%s)\n", why.c_str());
+    return;
+  }
+  // prefix maximum over block_size per P (a test block_size <= C x P must cover every smaller block too)
+  uint64_t smax = 0;
+  for (uint64_t p = 0; p < NP; ++p)
+    for (uint64_t b = 0; b < maxbs; ++b) {
+      uint64_t &x = tab[p * maxbs + b];
+      if (b) x = std::max(x, tab[p * maxbs + b - 1]);
+      smax = std::max(smax, x);
+    }
+  // C(B) = min over P of floor(bsmax(P, B) / P), bsmax = the largest block_size whose prefix maximum is <= B
+  // (no constraint, C = maxbs, when every block size fits); it steps only at the table's values
+  std::vector<uint64_t> cand;
+  for (uint64_t x : tab) cand.push_back(x);
+  std::sort(cand.begin(), cand.end());
+  cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+  f << "max_block " << maxbs << "\nstatic_max " << smax << "\nthresholds";
+  uint64_t lastC = 0;
+  for (uint64_t Bv : cand) {
+    uint64_t c = maxbs;
+    for (uint64_t p = 1; p <= NP && c; ++p) {
+      const uint64_t *row = &tab[(p - 1) * maxbs];
+      uint64_t n = std::upper_bound(row, row + maxbs, Bv) - row;   // block sizes 1..n fit
+      if (n < maxbs) c = std::min(c, n / p);
+    }
+    if (c != lastC) { f << " " << Bv << ":" << c; lastC = c; }
+  }
+  f << "\nhelper evaluated roots";
+  for (Function *F : roots) f << " " << F->getName().str();
+  f << "\n";
 }

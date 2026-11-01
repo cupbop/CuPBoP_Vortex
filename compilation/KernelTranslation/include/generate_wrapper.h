@@ -13,4 +13,7 @@ void set_meta_data(llvm::Module *M);
 // CUPBOP_KABI: Vortex kernel calling convention for the kernels and their wrappers, cupbop_kabi.txt (see generate_wrapper.cpp)
 void annotate_kernel_abi(llvm::Module *M);
 
+// CUPBOP_SP_SKEW: launch-time bounds of the run-time sized stack allocas -> cupbop_dyn_stack.txt (see generate_wrapper.cpp)
+void describe_dyn_stack(llvm::Module *M);
+
 #endif

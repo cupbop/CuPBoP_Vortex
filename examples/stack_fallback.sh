@@ -7,7 +7,10 @@
 #     __CUPBOP_SP_SKEW_M line, M is lowered to the largest of 8, 4, 2, 1 (not above the translated one) with
 #     largest frame + (M-1) x __CUPBOP_SP_SKEW_STEP <= CUPBOP_FRAME_LIMIT, i.e. the same 1 KB of the 8 KB stack stays
 #     for kernel_main and the callees as with the frame limit alone. A kernel with run-time sized allocas (core-mapping
-#     context arrays on the stack) gets M = 1. A change rewrites that line and rebuilds the cell
+#     context arrays on the stack) keeps that M when their worst case over all launches fits too, else M becomes an
+#     upper bound that kernel_main lowers per launch so that frame + arrays + (M-1) x STEP <= CUPBOP_FRAME_LIMIT (the
+#     translator's cupbop_dyn_stack.txt; see skew_fit). A change rewrites that line (and the threshold defines) and
+#     rebuilds the cell
 #     (the kernel code is the same; only kernel_main's skew mask changes). A software-stack build has M = 1 already.
 #  C. kernel ABI check (CUPBOP_KABI): when the translator wrote cupbop_kabi.txt, examples/abi_check.py checks the final
 #     kernel ELF (abi_check.log); UNSAFE removes kernel.elf/vxbin/dump and fails the build.
@@ -43,7 +46,7 @@ KT=$1; DEV=$2; CELL=$3; shift 3
 LIM=${CUPBOP_FRAME_LIMIT:-7168}
 HERE=$(dirname $0)
 B=.stack_fallback
-FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt cupbop_kabi.txt kernel.elf kernel.vxbin kernel.dump"
+FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt cupbop_kabi.txt cupbop_dyn_stack.txt kernel.elf kernel.vxbin kernel.dump"
 maxf() { python3 $HERE/stack_frames.py kernel.dump | awk -v l="$1" 'BEGIN{n=split(l,a,",");for(i=1;i<=n;i++)w[a[i]]=1} {if($2 in w && $1>m)m=$1; if($1>all)all=$1} END{print m+0, all+0}'; }
 save() { rm -rf $B/keep; mkdir -p $B/keep; for f in $FILES; do [ -f $f ] && cp -p $f $B/keep/; done; }
 restore() { for f in $FILES; do if [ -f $B/keep/$f ]; then cp -p $B/keep/$f .; else rm -f $f; fi; done; }
@@ -109,8 +112,10 @@ echo "--- [stack] software stack: $BYTES bytes per hardware thread, stride $STRI
 }
 
 # --- B. sp skew modulus that fits the frame (CUPBOP_SP_SKEW)
+# C(B) of cupbop_dyn_stack.txt ("thresholds B:C ..."; 0 below the first point and for B < 0)
+skew_c() { awk -v B=$1 '$1 == "thresholds" { c = 0; for (i = 2; i <= NF; i++) { split($i, a, ":"); if (B >= a[1] + 0) c = a[2] } print c + 0 }' cupbop_dyn_stack.txt; }
 skew_fit() {
-  local M STEP F NEW WHY
+  local M STEP F NEW WHY RT OLDC SMAX MAXBS NS C8 C4 C2 DEFS
   M=$(sed -n 's/^#define __CUPBOP_SP_SKEW_M \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp 2>/dev/null)
   [ -n "$M" ] && [ "$M" -gt 1 ] || return 0
   STEP=$(sed -n 's/^#define __CUPBOP_SP_SKEW_STEP \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp)
@@ -118,23 +123,58 @@ skew_fit() {
   NEW=$M; WHY="largest frame $F bytes + ($M-1) x $STEP > $LIM"
   while [ $NEW -gt 1 ] && [ $((F + (NEW - 1) * STEP)) -gt $LIM ]; do NEW=$((NEW / 2)); done
   # Run-time sized allocas (the core-mapping context arrays kept on the stack: alloca <ty>, i64 %n slots) are not in
-  # the static frame and their size is known only at launch, so such a kernel gets no skew: with M = 8 on top of
-  # them CUTLASS basic_gemm s1p1 (816 B frame) and prod curlcurl s1p2 (3568 B) overflowed the 8 KB stack. Without
-  # kernel.ll any variable sp decrement in the dump counts as one.
+  # the static frame and their size is known only at launch: with M = 8 on top of them CUTLASS basic_gemm s1p1
+  # (624 B frame + 4.7 KB of arrays at 256 threads, 1 warp) and prod curlcurl s1p2 (3568 B + 105 arrays) overflowed
+  # the 8 KB stack. The translator (generate_wrapper.cpp describe_dyn_stack) evaluates their bytes for every legal
+  # launch (block_size <= max_block, P CTA warps) into cupbop_dyn_stack.txt:
+  #  * static_max: the worst case. If largest frame + that still allows the modulus above, it stays an immediate mask
+  #    (no run-time code; the same kernel_main as without such allocas).
+  #  * thresholds: C(B), the largest C with dyn <= B for every launch with block_size <= C x P. For each level M' in
+  #    {8, 4, 2} up to the modulus above, B = limit - frame - (M'-1) x STEP; the C values go into kernel_wrapper.cpp
+  #    (__CUPBOP_SP_SKEW_C8/_C4/_C2/_MAXBS after the M line) and kernel_main takes per launch the largest M' whose test
+  #    block_size <= C_M' x P holds, else 1 (the M line stays the static bound).
+  #  * helper none (an array size it could not recompute) or no level ever fits: M = 1.
+  # Without kernel.ll any variable sp decrement in the dump counts as such an alloca (M = 1).
+  RT=0; DEFS=
   if { [ -f kernel.ll ] && grep -q -E '= alloca [^,]+, i(32|64) %' kernel.ll; } ||
      { [ ! -f kernel.ll ] && grep -q -P '\tsub\tsp, sp, ' kernel.dump; }; then
-    NEW=1; WHY="run-time sized allocas on the stack (frame $F bytes + launch-time arrays)"
+    SMAX=$(sed -n 's/^static_max \([0-9][0-9]*\)$/\1/p' cupbop_dyn_stack.txt 2>/dev/null)
+    MAXBS=$(sed -n 's/^max_block \([0-9][0-9]*\)$/\1/p' cupbop_dyn_stack.txt 2>/dev/null)
+    if [ $NEW -gt 1 ] && [ -f kernel.ll ] && [ -n "$SMAX" ] && [ -n "$MAXBS" ] && grep -q '^thresholds' cupbop_dyn_stack.txt; then
+      NS=$NEW; while [ $NS -gt 1 ] && [ $((F + SMAX + (NS - 1) * STEP)) -gt $LIM ]; do NS=$((NS / 2)); done
+      C8=$(skew_c $((LIM - F - 7 * STEP))); C4=$(skew_c $((LIM - F - 3 * STEP))); C2=$(skew_c $((LIM - F - STEP)))
+      if [ $NS = $NEW ]; then
+        WHY="run-time sized allocas on the stack fit every launch (frame $F + at most $SMAX bytes + ($NEW-1) x $STEP <= $LIM)"
+      elif [ "$C2" -gt 0 ]; then
+        RT=1; DEFS="#define __CUPBOP_SP_SKEW_FRAME $F /* + run-time arrays + (M-1) x STEP <= $LIM */"
+        [ $NEW -gt 4 ] && DEFS="$DEFS\n#define __CUPBOP_SP_SKEW_C8 $C8"
+        [ $NEW -gt 2 ] && DEFS="$DEFS\n#define __CUPBOP_SP_SKEW_C4 $C4"
+        DEFS="$DEFS\n#define __CUPBOP_SP_SKEW_C2 $C2\n#define __CUPBOP_SP_SKEW_MAXBS $MAXBS"
+        WHY="run-time sized allocas on the stack (frame $F + up to $SMAX bytes): modulus <= $NEW chosen at launch, block_size <= C x CTA warps with C8/C4/C2 = $C8/$C4/$C2 (max block $MAXBS)"
+      else
+        WHY="run-time sized allocas on the stack (frame $F + at least the arrays of a 1-thread block exceed $LIM - $STEP)"; NEW=1
+      fi
+    elif [ $NEW -gt 1 ]; then
+      WHY="run-time sized allocas on the stack (frame $F bytes + launch-time arrays; $(sed -n 's/^helper //p' cupbop_dyn_stack.txt 2>/dev/null | head -1))"
+      NEW=1
+    fi
   fi
-  [ $NEW = $M ] && return 0
-  echo "--- [stack] sp skew: $WHY; rebuilding with skew modulus $NEW"
+  OLDC=$(grep '^#define __CUPBOP_SP_SKEW_\(FRAME\|C[842]\|MAXBS\) ' kernel_wrapper.cpp)
+  if [ $NEW = $M ] && [ "$OLDC" = "$(printf "$DEFS")" ]; then
+    [ $RT = 0 ] && [ $NEW -gt 1 ] && [ "$WHY" != "${WHY#run-time}" ] && echo "--- [stack] sp skew: $WHY"
+    return 0
+  fi
+  echo "--- [stack] sp skew: $WHY; rebuilding with skew modulus $NEW$([ $RT = 1 ] && echo ' (upper bound)')"
   mkdir -p $B
-  sed -i "s/^#define __CUPBOP_SP_SKEW_M .*/#define __CUPBOP_SP_SKEW_M $NEW/" kernel_wrapper.cpp
+  sed -i -e "s/^#define __CUPBOP_SP_SKEW_M .*/#define __CUPBOP_SP_SKEW_M $NEW/" \
+         -e '/^#define __CUPBOP_SP_SKEW_\(FRAME\|C[842]\|MAXBS\) /d' kernel_wrapper.cpp
+  [ $RT = 1 ] && sed -i "/^#define __CUPBOP_SP_SKEW_M /a $DEFS" kernel_wrapper.cpp
   rm -f $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump
   if ! $MAKE -C $CELL kernel.vxbin kernel.dump "$@" > $B/skew.rebuild.log 2>&1; then
     echo "--- [stack] sp-skew rebuild failed ($B/skew.rebuild.log)"; rm -f kernel.elf kernel.vxbin kernel.dump; return 1
   fi
   cp $CELL/kernel.elf $CELL/kernel.vxbin $CELL/kernel.dump .
-  skew_fit "$@"   # the frames do not depend on M; this only confirms it
+  skew_fit "$@"   # the kernel frames do not depend on M or the defines; this only confirms it
 }
 
 # --- C. kernel ABI check (CUPBOP_KABI)
