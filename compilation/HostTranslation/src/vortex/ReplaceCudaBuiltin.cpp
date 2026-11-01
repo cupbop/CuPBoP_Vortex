@@ -215,6 +215,13 @@ int kernel_idx = 0;
                 functionOperand =
                     dyn_cast<Function>(callOperand->stripPointerCasts());
               }
+              // Only a CUDA launch of a kernel stub (cudaLaunchKernel(stub, grid, block, args, shmem, stream): a
+              // function as operand 0 and the 8 operands of the split dim3s). A direct call of cudaLaunchKernel_vortex
+              // (kernel name string, e.g. a lifted kernel's host) or of any other function whose name starts with
+              // "cudaLaunchKernel" is left alone; it used to be taken for a stub launch and segfault here.
+              if (functionOperand == NULL || callInst_inst == NULL || callInst_inst->arg_size() < 8 ||
+                  calledFunction->getName() == "cudaLaunchKernel_vortex")
+                continue;
 
                 FunctionType *ft = calledFunction->getFunctionType();
                 if (cupbop_debug()) std::cout << " Parent (Caller) Function Name: " << func_name
@@ -258,7 +265,10 @@ int kernel_idx = 0;
                 // to: HistogramPjS_jj
                 newName = std::regex_replace(newName,
                                              std::regex("__device_stub__"), "");
-                // remove _Z24
+                // remove _Z24 (a mangled stub only: an extern "C" kernel's stub __device_stub__<name> keeps its
+                // name, as kernelTranslator's cupbop_kernel_lookup_name does for lookup.txt)
+                if ((newName.size() > 2 && newName[0] == '_' && newName[1] == 'Z') ||
+                    (std::getenv("TRITON_CUPBOP") && std::string(std::getenv("TRITON_CUPBOP")) == "1" && !newName.empty() && newName[0] == '_'))
                 for (int i = 2; i < newName.length(); i++) {
                   if (newName[i] >= '0' && newName[i] <= '9')
                     continue;
