@@ -61,6 +61,8 @@ llvm::Value *createGEP(llvm::IRBuilder<> &B, llvm::Value *ptr,
                        llvm::ArrayRef<llvm::Value *> idxlist);
 void printIR(llvm::Module *module_);
 bool triton_cupbop_enabled();
+// kernel name as lookup.txt / the wrapper symbol carry it ("_Z<len>" of a mangled name dropped; extern "C" kept)
+std::string cupbop_kernel_lookup_name(const std::string &name);
 void replace_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_mma_intrinsics(llvm::Module *M);

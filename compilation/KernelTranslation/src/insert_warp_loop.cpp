@@ -3474,15 +3474,7 @@ static bool has_warp_shfl_usage(llvm::Module *M) {
 // warp-level ops) keeps its arrays on the stack.
 static std::string ctx_lookup_name(llvm::Function *F) {
   // the kernel name as generate_wrapper.cpp writes it to lookup.txt
-  std::string n = F->getName().str();
-  if ((triton_cupbop_enabled() && !n.empty() && n[0] == '_') || !triton_cupbop_enabled()) {
-    for (size_t i = 2; i < n.size(); i++) {
-      if (n[i] >= '0' && n[i] <= '9') continue;
-      n = n.substr(i);
-      break;
-    }
-  }
-  return n;
+  return cupbop_kernel_lookup_name(F->getName().str());
 }
 namespace {
 struct CtxArray {

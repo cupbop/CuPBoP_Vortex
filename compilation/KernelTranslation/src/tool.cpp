@@ -63,6 +63,19 @@ using namespace llvm;
     }                                                                          \
   } while (0)
 
+// The kernel name as lookup.txt, the wrapper symbol (<name>_wrapper) and the translator -> runtime side files carry
+// it: an Itanium-mangled C++ kernel loses its "_Z<length>" prefix; an unmangled (extern "C") name is kept. Before
+// 2026-10-31 the first two characters of every name were cut ("e10_scale" -> "_scale"), so a host launching an
+// extern "C" kernel by its real name (cudaLaunchKernel_vortex) did not find it. Triton kernels: names that start with
+// '_' as before. The host translator applies the same rule to the stub name (ReplaceCudaBuiltin.cpp).
+std::string cupbop_kernel_lookup_name(const std::string &name) {
+  const bool strip = triton_cupbop_enabled() ? (!name.empty() && name[0] == '_')
+                                             : (name.size() > 2 && name[0] == '_' && name[1] == 'Z');
+  if (strip)
+    for (size_t i = 2; i < name.size(); i++)
+      if (name[i] < '0' || name[i] > '9') return name.substr(i);
+  return name;
+}
 bool triton_cupbop_enabled() {
   static bool enabled = [] {
     const char *v = std::getenv("TRITON_CUPBOP");
@@ -1907,7 +1920,8 @@ void replace_built_in_function(llvm::Module *M) {
 //   tf32 -> f32      m16n8k8 (4/2) / m16n8k4 (2/1)                     tag tf32f32
 //   s8/u8 -> s32     m16n8k32 (4/2) / m16n8k16 (2/1), [.satfinite]      tag s8s32, u8s32, s8u8s32, u8s8s32 [+sat]
 //   e4m3/e5m2 -> f32 m16n8k32 (4/2)                                     tag e4m3f32, e5m2f32, e4m3e5m2f32, e5m2e4m3f32
-// Everything else (f16 accumulators, m8n8k4, m8n8k16/m16n8k64 int4, b1, f64, sparse) is refused.
+// m8n8k4 f16 -> f32 (Volta quad pairs, any layout) and the f16-accumulator / f64 forms have their own branches in
+// replace_nvvm_mma_intrinsics. Everything else (m8n8k16/m16n8k64 int4, b1, sparse) is refused.
 namespace {
 struct TensorForm {
   std::string geom, ta, tb; // geometry, A/B element types
@@ -2117,7 +2131,7 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
       if (!o.out && o.code == std::to_string(n)) return Call->getArgOperand(o.pos);
     return nullptr;
   };
-  struct Plan { TensorForm S; std::string sig; std::vector<int> D, A, Bv, C; };
+  struct Plan { TensorForm S; std::string sig; std::vector<int> D, A, Bv, C; std::string lay884; }; // lay884: m8n8k4 "<la>.<lb>"
   std::vector<Plan> plans;
   for (auto &st : stmts) {
     size_t sp = st.find_first_of(" \t\n");
@@ -2132,18 +2146,22 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
     }
     bool sat = tk.size() == 11 && tk[6] == "satfinite";
     size_t ti = sat ? 7 : 6;
-    if (tk.size() != ti + 4 || tk[4] != "row" || tk[5] != "col") {
+    // Volta m8n8k4 f16 -> f32 in any layout: D 8 f32, A 2 / B 2 f16x2, C 8 f32 (replace_nvvm_mma_intrinsics)
+    const bool m884 = tk.size() == 10 && tk[3] == "m8n8k4" && (tk[4] == "row" || tk[4] == "col") &&
+                      (tk[5] == "row" || tk[5] == "col") && tk[6] == "f32" && tk[7] == "f16" && tk[8] == "f16" && tk[9] == "f32";
+    if (!m884 && (tk.size() != ti + 4 || tk[4] != "row" || tk[5] != "col")) {
       fprintf(stderr, "error: inline-asm %s: only .row.col mma.sync is lowered\n", opc.c_str());
       exit(1);
     }
     const std::string geom = tk[3], td = tk[ti], ta = tk[ti + 1], tb = tk[ti + 2], tc = tk[ti + 3];
     Plan P; std::string err;
-    if (td != tc || !classify_mma_form(geom, ta, tb, sat, td, P.S, err)) {
+    if (m884) { P.S.geom = geom; P.S.nA = 2; P.S.nB = 2; P.lay884 = tk[4] + "." + tk[5]; P.sig = ".f32.f32"; }
+    else if (td != tc || !classify_mma_form(geom, ta, tb, sat, td, P.S, err)) {
       if (err.empty()) err = "D type " + td + " differs from C type " + tc;
       fprintf(stderr, "error: inline-asm %s: %s\n", opc.c_str(), err.c_str());
       exit(1);
     }
-    P.sig = tensor_is_f16ish(ta) && ta == "f16" ? ".f32.f32" : ("." + ta + (tb != ta ? "." + tb : std::string("")));
+    if (!m884) P.sig = tensor_is_f16ish(ta) && ta == "f16" ? ".f32.f32" : ("." + ta + (tb != ta ? "." + tb : std::string("")));
     // four brace groups of $N operands
     std::vector<std::vector<int>> groups;
     size_t p = 0;
@@ -2164,7 +2182,8 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
       groups.push_back(g);
       p = q + 1;
     }
-    if (groups.size() != 4 || groups[0].size() != 4 || (int)groups[1].size() != P.S.nA || (int)groups[2].size() != P.S.nB || groups[3].size() != 4) {
+    const size_t nDC = m884 ? 8 : 4;
+    if (groups.size() != 4 || groups[0].size() != nDC || (int)groups[1].size() != P.S.nA || (int)groups[2].size() != P.S.nB || groups[3].size() != nDC) {
       fprintf(stderr, "error: inline-asm %s: operand groups do not match the %s fragment sizes\n", opc.c_str(), geom.c_str());
       exit(1);
     }
@@ -2198,17 +2217,18 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
   }
   for (auto &P : plans) {
     Type *AccT = P.S.intAcc ? I32 : F32;
-    std::string name = "cupbop.mma." + P.S.geom + ".row.col" + (P.S.sat ? ".satfinite" : "") + P.sig;
+    std::string name = "cupbop.mma." + P.S.geom + "." + (P.lay884.empty() ? std::string("row.col") : P.lay884) + (P.S.sat ? ".satfinite" : "") + P.sig;
     SmallVector<Type *, 12> tys;
     SmallVector<Value *, 12> args;
     for (int n : P.A) { Value *v = readOp(n); if (!v || !(v = as32(v, I32))) return false; args.push_back(v); tys.push_back(I32); }
     for (int n : P.Bv) { Value *v = readOp(n); if (!v || !(v = as32(v, I32))) return false; args.push_back(v); tys.push_back(I32); }
     for (int n : P.C) { Value *v = readOp(n); if (!v || !(v = as32(v, AccT))) return false; args.push_back(v); tys.push_back(AccT); }
-    StructType *RT = StructType::get(Ctx, {AccT, AccT, AccT, AccT});
+    SmallVector<Type *, 8> rts(P.D.size(), AccT);
+    StructType *RT = StructType::get(Ctx, rts);
     FunctionCallee FC = M->getOrInsertFunction(name, FunctionType::get(RT, tys, false));
     CallInst *R = B.CreateCall(FC, args, "asm.mma");
     tensor_set_convergent(R);
-    for (int i = 0; i < 4; ++i) cur[ops[P.D[i]].pos] = B.CreateExtractValue(R, i);
+    for (unsigned i = 0; i < P.D.size(); ++i) cur[ops[P.D[i]].pos] = B.CreateExtractValue(R, i);
   }
   // results
   if (Call->getType()->isVoidTy()) return true;
@@ -4202,6 +4222,59 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
 
   for (CallInst *CI : ToReplace) {
     const std::string Name = CI->getCalledFunction()->getName().str();
+    // Volta m8n8k4 f16 -> f32 (HMMA.884.F32.F32; CuLifter: one call per STEP; CUDA source: inline asm), any A/B
+    // layout: {f32 x 8} (<2 x half> a0,a1, b0,b1, f32 c0..c7) -> __cupbop_mma_m8n8k4_f16f32_<la>_<lb>_sw
+    // (cudaKernelImpl_dtypes.inc; quad-pair fragments, software only).
+    {
+      std::string rest884;
+      for (const char *pre : {"llvm.nvvm.mma.m8n8k4.", "cupbop.mma.m8n8k4."})
+        if (Name.rfind(pre, 0) == 0) rest884 = Name.substr(strlen(pre));
+      if (!rest884.empty() && rest884.size() > 8 && rest884.compare(rest884.size() - 8, 8, ".f32.f32") == 0) {
+        const std::string lay = rest884.substr(0, rest884.size() - 8); // "<la>.<lb>"
+        if (lay != "row.col" && lay != "row.row" && lay != "col.row" && lay != "col.col") {
+          fprintf(stderr, "error: mma.sync %s: unknown m8n8k4 layout %s\n", Name.c_str(), lay.c_str());
+          exit(1);
+        }
+        if (CI->arg_size() != 12) {
+          fprintf(stderr, "error: mma.sync intrinsic %s with %u operands (expected 12)\n", Name.c_str(), (unsigned)CI->arg_size());
+          exit(1);
+        }
+        if (tensor_lowering_mode() == "tcu") {
+          fprintf(stderr, "error: %s: CUPBOP_MMA_LOWERING=tcu cannot lower it: the Vortex TCU tile has no m8n8k4 quad-pair form; use sw or auto\n", Name.c_str());
+          exit(1);
+        }
+        std::string rtName = "__cupbop_mma_m8n8k4_f16f32_" + lay + "_sw";
+        rtName[rtName.find('.')] = '_';
+        IRBuilder<> B(CI);
+        SmallVector<Value *, 13> Args;
+        SmallVector<Type *, 13> ArgTys;
+        for (unsigned i = 0; i < 12; i++) {
+          Type *T = i < 4 ? I32 : F32;
+          Value *V = CI->getArgOperand(i);
+          if (V->getType() != T) V = B.CreateBitCast(V, T);
+          Args.push_back(V);
+          ArgTys.push_back(T);
+        }
+        Type *DTy = ArrayType::get(F32, 8);
+        IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
+        Value *D = AB.CreateAlloca(DTy, nullptr, "mma.d");
+        Args.push_back(D);
+        ArgTys.push_back(PtrTy);
+        FunctionCallee FC = M->getOrInsertFunction(rtName.c_str(), FunctionType::get(VoidTy, ArgTys, false));
+        tensor_set_convergent(B.CreateCall(FC, Args));
+        auto *RT = cast<StructType>(CI->getType());
+        Value *Result = UndefValue::get(RT);
+        for (unsigned i = 0; i < 8; i++) {
+          Value *V = B.CreateLoad(F32, B.CreateConstInBoundsGEP2_32(DTy, D, 0, i));
+          if (RT->getElementType(i) != F32) V = B.CreateBitCast(V, RT->getElementType(i));
+          Result = B.CreateInsertValue(Result, V, i);
+        }
+        DBG_PRINT("[nvvm-mma] %s -> %s\n", Name.c_str(), rtName.c_str());
+        CI->replaceAllUsesWith(Result);
+        CI->eraseFromParent();
+        continue;
+      }
+    }
     // f16 accumulators (HMMA.16816.F16 / HMMA.1688.F16) and fp64 m8n8k4 (DMMA.884): two accumulator registers,
     // runtime helpers __cupbop_mma_m16n8k{16,8}_f16f16 / __cupbop_mma_m8n8k4_f64f64 (cudaKernelImpl_dtypes.inc)
     {
@@ -4281,7 +4354,7 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     if (!ok || CI->arg_size() != (unsigned)(S.nA + S.nB + 4)) {
       fprintf(stderr,
               "error: unsupported mma.sync intrinsic %s (%u operands): %s. Lowered: m16n8k16/m16n8k8 .row.col "
-              "f16|bf16 -> f32, m16n8k16/m16n8k8 f16 -> f16, m8n8k4 f64, m16n8k8/m16n8k4 tf32 -> f32, m16n8k32/m16n8k16 s8|u8 -> s32 [.satfinite], "
+              "f16|bf16 -> f32, m16n8k16/m16n8k8 f16 -> f16, m8n8k4 f64, m8n8k4 .row|col.row|col f16 -> f32, m16n8k8/m16n8k4 tf32 -> f32, m16n8k32/m16n8k16 s8|u8 -> s32 [.satfinite], "
               "m16n8k32 e4m3|e5m2 -> f32\n",
               Name.c_str(), (unsigned)CI->arg_size(), err.empty() ? "operand count" : err.c_str());
       exit(1);

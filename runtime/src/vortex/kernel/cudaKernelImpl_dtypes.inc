@@ -696,6 +696,70 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f
   d[0] = d0; d[1] = d1;
 }
 
+// ---- mma.sync m8n8k4 .<la>.<lb>.f32.f16.f16.f32 (Volta HMMA.884.F32.F32, STEP0..3) ----------------------------
+// Four independent 8x8x4 products per warp, one per quad pair q: lanes 4q..4q+3 (low group, hi = 0) and
+// 16+4q..19+4q (high group, hi = 1); r4 = lane % 4. PTX ISA fragments (f16 element e = 0..3 is a0.lo a0.hi a1.lo
+// a1.hi, likewise for b):
+//   A .row: A[r4 + 4hi][e]          A .col: A[e + 4hi][r4]
+//   B .row: B[r4][e + 4hi]          B .col: B[e][r4 + 4hi]
+//   C/D (f32, i = 0..7): row = (lane & 1) + (i & 2) + 4hi, col = (i & 4) + (lane & 2) + (i & 1)
+// (checked bit-exactly against an A100 running the PTX instruction, experiments/bugfix12/mma884). D = A*B + C as
+// k-ordered fp32 FMAs starting from C (f16 products are exact in fp32; the hardware's summation order is not
+// specified). CuLifter lifts each HMMA.884 STEPs to one such call (the other six C inputs zero, two outputs used).
+// Software only, on the 1:1 hardware warp (32 lanes, all active): the Vortex TCU tile has no quad-pair form.
+static inline void __cupbop_mma_m8n8k4_f16f32_impl(const int a_row, const int b_row, uint32_t a0, uint32_t a1,
+    uint32_t b0, uint32_t b1, float c0, float c1, float c2, float c3, float c4, float c5, float c6, float c7, float *d) {
+  const int l = vx_thread_id(), q4 = l & 12, hi16 = l & 16, x = l & 1, y = l & 2;
+  float A[2][4], B[4][4]; // A[j][k]: row x + 2j (+4hi); B[cc][k]: column 4 * (cc >> 1) + y + (cc & 1)
+  if (a_row) {
+    for (int j = 0; j < 2; ++j) {
+      const int src = q4 + x + 2 * j + hi16;
+      const uint32_t u0 = __cupbop_shfl32(a0, src), u1 = __cupbop_shfl32(a1, src);
+      A[j][0] = __cupbop_f16_to_f32(u0); A[j][1] = __cupbop_f16_to_f32(u0 >> 16);
+      A[j][2] = __cupbop_f16_to_f32(u1); A[j][3] = __cupbop_f16_to_f32(u1 >> 16);
+    }
+  } else {
+    for (int k = 0; k < 4; ++k) {
+      const int src = q4 + k + hi16;
+      const uint32_t u0 = __cupbop_shfl32(a0, src), u1 = __cupbop_shfl32(a1, src);
+      A[0][k] = __cupbop_f16_to_f32(x ? u0 >> 16 : u0); A[1][k] = __cupbop_f16_to_f32(x ? u1 >> 16 : u1);
+    }
+  }
+  if (b_row) {
+    for (int k = 0; k < 4; ++k)
+      for (int h = 0; h < 2; ++h) {
+        const int src = q4 + k + 16 * h;
+        const uint32_t u0 = __cupbop_shfl32(b0, src), u1 = __cupbop_shfl32(b1, src), u = y ? u1 : u0;
+        B[2 * h][k] = __cupbop_f16_to_f32(u); B[2 * h + 1][k] = __cupbop_f16_to_f32(u >> 16);
+      }
+  } else {
+    for (int cc = 0; cc < 4; ++cc) {
+      const int src = q4 + y + (cc & 1) + 16 * (cc >> 1);
+      const uint32_t u0 = __cupbop_shfl32(b0, src), u1 = __cupbop_shfl32(b1, src);
+      B[cc][0] = __cupbop_f16_to_f32(u0); B[cc][1] = __cupbop_f16_to_f32(u0 >> 16);
+      B[cc][2] = __cupbop_f16_to_f32(u1); B[cc][3] = __cupbop_f16_to_f32(u1 >> 16);
+    }
+  }
+  const float c[8] = {c0, c1, c2, c3, c4, c5, c6, c7};
+  for (int i = 0; i < 8; ++i) {
+    const int j = (i >> 1) & 1, cc = ((i >> 1) & 2) | (i & 1);
+    float acc = c[i];
+    for (int k = 0; k < 4; ++k) acc = __builtin_fmaf(A[j][k], B[cc][k], acc);
+    d[i] = acc;
+  }
+}
+#define CUPBOP_MMA884_F32(LA, LB, AR, BR)                                                                              \
+  extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f16f32_##LA##_##LB##_sw(            \
+      uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1, float c0, float c1, float c2, float c3, float c4, float c5,   \
+      float c6, float c7, float *d) {                                                                                   \
+    __cupbop_mma_m8n8k4_f16f32_impl(AR, BR, a0, a1, b0, b1, c0, c1, c2, c3, c4, c5, c6, c7, d);                        \
+  }
+CUPBOP_MMA884_F32(row, col, 1, 0)
+CUPBOP_MMA884_F32(row, row, 1, 1)
+CUPBOP_MMA884_F32(col, row, 0, 1)
+CUPBOP_MMA884_F32(col, col, 0, 0)
+#undef CUPBOP_MMA884_F32
+
 
 // ---- ldmatrix / stmatrix .m8n8 .b16 (inline asm of CuLifter-lifted kernels and CUTLASS-style CUDA code) ---------
 // ldmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].shared.b16 {d0..}, [a]: lanes 8j..8j+7 give the row addresses of

@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
   lower_async_ptx(program);
   // wide by-value parameters (CuLifter parameter structs) -> pointer to their consecutive launch slots
   pass_wide_kernel_args_by_slot(program);
+  prepare_byval_args(program);  // by-value struct parameters -> their launch slots (CUPBOP_BYVAL_ARGS=0: off)
   // CuLifter's per-thread copy of the parameters (param_local): loads read the parameters (C plan; before every
   // schedule-specific pass, so the core mapping does not replicate the buffer per logical-warp slot)
   forward_param_buffer_copies(program);
