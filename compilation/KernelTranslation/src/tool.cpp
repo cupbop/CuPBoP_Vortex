@@ -63,6 +63,19 @@ using namespace llvm;
     }                                                                          \
   } while (0)
 
+// The kernel name as lookup.txt, the wrapper symbol (<name>_wrapper) and the translator -> runtime side files carry
+// it: an Itanium-mangled C++ kernel loses its "_Z<length>" prefix; an unmangled (extern "C") name is kept. Before
+// 2026-10-31 the first two characters of every name were cut ("e10_scale" -> "_scale"), so a host launching an
+// extern "C" kernel by its real name (cudaLaunchKernel_vortex) did not find it. Triton kernels: names that start with
+// '_' as before. The host translator applies the same rule to the stub name (ReplaceCudaBuiltin.cpp).
+std::string cupbop_kernel_lookup_name(const std::string &name) {
+  const bool strip = triton_cupbop_enabled() ? (!name.empty() && name[0] == '_')
+                                             : (name.size() > 2 && name[0] == '_' && name[1] == 'Z');
+  if (strip)
+    for (size_t i = 2; i < name.size(); i++)
+      if (name[i] < '0' || name[i] > '9') return name.substr(i);
+  return name;
+}
 bool triton_cupbop_enabled() {
   static bool enabled = [] {
     const char *v = std::getenv("TRITON_CUPBOP");

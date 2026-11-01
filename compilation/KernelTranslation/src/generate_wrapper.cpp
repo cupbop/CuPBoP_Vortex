@@ -362,18 +362,8 @@ void decode_input(llvm::Module *M) {
     auto func_name = F->getName().str();
     if (cupbop_debug()) printf("function name: %s\n", func_name.c_str());
     
-    // remove mangle prefix
-    // remove _Z24
-    // this only applies for nvcc compiled kernel (pass for triton)
-    bool triton_enabled = triton_cupbop_enabled();
-    if ((triton_enabled && func_name[0] == '_') || (!triton_enabled)) {
-      for (int pos = 2; pos < func_name.length(); pos++) {
-      if (func_name[pos] >= '0' && func_name[pos] <= '9')
-        continue;
-      func_name = func_name.substr(pos);
-      break;
-    } 
-    }
+    // remove the mangling prefix _Z<len> (cupbop_kernel_lookup_name: extern "C" names are kept)
+    func_name = cupbop_kernel_lookup_name(func_name);
     llvm::IRBuilder<> Builder(M->getContext());
 
     FunctionCallee fc =
@@ -586,7 +576,6 @@ void create_kernel_wrapper_function(llvm::Module *M){
     */
 
     int kernel_idx = 0;
-    bool triton_enabled = triton_cupbop_enabled();
 
     for (auto F = M->begin(); F != M->end(); ++F) {
       for (auto BB = F->begin(); BB != F->end(); ++BB) {
@@ -604,15 +593,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
             {
               if (cupbop_debug()) std::cout << "Found the kernel name for the kernel_wrapper.cpp, it is " << func_name << "with number of arg "<< func_arg_size << " kernel_idx: " << std::to_string(kernel_idx) << std::endl;
               
-              // remove _Z24, covers triton as well
-              if ((triton_enabled && func_name[0] == '_') || (!triton_enabled)) {
-                for (int i = 2; i < func_name.length(); i++) {
-                  if (func_name[i] >= '0' && func_name[i] <= '9')
-                    continue;
-                  func_name = func_name.substr(i);
-                  break;
-                }
-              }
+              // remove the mangling prefix _Z<len> (cupbop_kernel_lookup_name, covers triton as well)
+              func_name = cupbop_kernel_lookup_name(func_name);
 
               
               wrapper_name.push_back(func_name + "_wrapper");
