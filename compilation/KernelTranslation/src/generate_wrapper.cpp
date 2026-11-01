@@ -1266,7 +1266,10 @@ void describe_dyn_stack(llvm::Module *M) {
   if (why.empty() && !has_indirect.empty())
     for (Function *F : reach)
       if (addr_taken.count(F)) { why = "indirect call may reach " + F->getName().str(); break; }
-  // the straight-line function that recomputes dyn (built in M, evaluated, removed again)
+  // the straight-line function that recomputes dyn (built in M, evaluated, removed again together with the
+  // declarations it added, e.g. llvm.umax.i64: the module stays exactly as it was)
+  std::set<Function *> before;
+  for (Function &F : *M) before.insert(&F);
   Function *H = Function::Create(FunctionType::get(I64, false), GlobalValue::ExternalLinkage, "__cupbop_dyn_stack_bytes", M);
   IRBuilder<> B(BasicBlock::Create(C, "entry", H));
   std::function<bool(const Value *)> read_only = [&](const Value *V) {
@@ -1377,7 +1380,11 @@ void describe_dyn_stack(llvm::Module *M) {
     if (verifyFunction(*H, &errs())) why = "verifier";
     else dyn_stack_eval(H, maxbs, NP, tab, why);
   }
-  H->eraseFromParent();   // the module stays as it was
+  H->eraseFromParent();
+  for (auto it = M->begin(); it != M->end();) {
+    Function &F = *it++;
+    if (!before.count(&F) && F.isDeclaration() && F.use_empty()) F.eraseFromParent();
+  }
   std::ofstream f("cupbop_dyn_stack.txt");
   f << "# run-time sized stack allocas (generate_wrapper.cpp describe_dyn_stack; read by examples/stack_fallback.sh)\n";
   for (auto &kv : dyn) {
