@@ -8,6 +8,7 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -262,6 +263,73 @@ void pass_wide_kernel_args_by_slot(llvm::Module *M) {
   }
 }
 
+// By-value struct parameters of CUDA source kernels (clang: `ptr byval(%struct.T) align A`). The launch passes all
+// bytes of such a parameter in ceil(size/8) consecutive 8-byte slots (cudaLaunchKernel_vortex, cupbop_byval_args.txt
+// written by decode_input), shared by every thread of the launch. Here, before the warp / thread loops are built:
+//  - a parameter the kernel may write (byval_may_write) gets a private copy at entry, so each CUDA thread writes its
+//    own (the flat schedule runs all threads of a block in one hardware thread);
+//  - `byval` is replaced by the marker "cupbop-byval-bytes"="<size>" (+ readonly noalias): the kernel then reads the
+//    slots through a plain pointer, like any pointer argument, and decode_input passes the slot address. Keeping
+//    `byval` makes the wrapper call copy the struct to the stack and blocks inlining (E10 hotspot +36% cycles).
+// A CUtensorMap parameter keeps its old one-slot form (decode_input). CUPBOP_BYVAL_ARGS=0: none of this (before
+// 2026-10-31: the wrapper loaded the first slot as the struct's address and the host copied only 8 bytes).
+// May the kernel write through (or let escape) pointer P? Loads and memcpy/memmove sources are reads; GEPs and casts
+// are followed; anything else counts as a write.
+static bool byval_may_write(Value *P) {
+  SmallVector<Value *, 16> work{P};
+  SmallPtrSet<Value *, 16> seen;
+  while (!work.empty()) {
+    Value *V = work.pop_back_val();
+    if (!seen.insert(V).second) continue;
+    for (User *U : V->users()) {
+      if (isa<LoadInst>(U)) continue;
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) { work.push_back(U); continue; }
+      if (auto *MT = dyn_cast<MemTransferInst>(U))
+        if (MT->getRawSource() == V && MT->getRawDest() != V) continue;
+      if (auto *II = dyn_cast<IntrinsicInst>(U))
+        if (II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+static bool cupbop_byval_on() {
+  const char *e = std::getenv("CUPBOP_BYVAL_ARGS");
+  return !(e && std::string(e) == "0");
+}
+static bool is_tensor_map_type(Type *T) {
+  auto *ST = dyn_cast<StructType>(T);
+  return ST && ST->hasName() && ST->getName().starts_with("struct.CUtensorMap");
+}
+void prepare_byval_args(llvm::Module *M) {
+  if (!cupbop_byval_on()) return;
+  const DataLayout &DL = M->getDataLayout();
+  LLVMContext &ctx = M->getContext();
+  for (auto &F : *M) {
+    if (F.isDeclaration() || !isKernelFunction(M, &F)) continue;
+    for (auto &A : F.args()) {
+      if (!A.hasByValAttr() || is_tensor_map_type(A.getParamByValType())) continue;
+      Type *T = A.getParamByValType();
+      const uint64_t bytes = DL.getTypeAllocSize(T);
+      if (!A.use_empty() && !A.onlyReadsMemory() && byval_may_write(&A)) {
+        IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
+        AllocaInst *Copy = B.CreateAlloca(T, nullptr, A.getName() + ".priv");
+        const Align Al = A.getParamAlign().valueOrOne();
+        Copy->setAlignment(Al);
+        A.replaceAllUsesWith(Copy);
+        B.CreateMemCpy(Copy, Al, &A, Al, bytes);
+        if (cupbop_debug())
+          fprintf(stderr, "[CuPBoP] %s: by-value parameter %u may be written: private copy\n", F.getName().str().c_str(), A.getArgNo());
+      }
+      const unsigned i = A.getArgNo();
+      F.removeParamAttr(i, Attribute::ByVal);
+      F.addParamAttr(i, Attribute::get(ctx, "cupbop-byval-bytes", std::to_string(bytes ? bytes : 1)));
+      F.addParamAttr(i, Attribute::ReadOnly);
+      F.addParamAttr(i, Attribute::NoAlias);
+    }
+  }
+}
+
 // as pthread only accept a single void* for input
 // we have to decode this input inside the kernel
 void decode_input(llvm::Module *M) {
@@ -278,6 +346,11 @@ void decode_input(llvm::Module *M) {
   std::set<GlobalVariable *> dynmaic_memory;
 
   std::map<GlobalVariable *, Value *> corres_dynamic_memory_load_address;
+
+  // by-value struct parameters (prepare_byval_args) -> cupbop_byval_args.txt for cudaLaunchKernel_vortex
+  std::ofstream byval_file("cupbop_byval_args.txt", std::ios::out | std::ios::trunc);
+  byval_file << "# CuPBoP by-value struct kernel parameters (translator -> cudaLaunchKernel_vortex): <kernel as in "
+                "lookup.txt> <parameters> <bytes of each by-value parameter, 0 = not by-value>\n";
 
   // generate Wrapper Function type
   // now we only support a single int32*
@@ -373,9 +446,32 @@ void decode_input(llvm::Module *M) {
     }
 
     size_t idx = 0;
+    std::vector<uint64_t> byval_bytes;
     for (Function::const_arg_iterator ii = F->arg_begin(), ee = F->arg_end();
          ii != ee; ++ii) {
       Type *ArgType = ii->getType();
+      // A by-value struct parameter (prepare_byval_args: marker "cupbop-byval-bytes"): pass the address of its
+      // first slot (an aligned copy when it needs more than the slots' 8-byte alignment). A CUtensorMap
+      // (`const __grid_constant__ CUtensorMap`) keeps the old one-slot form below: the host's 8 first bytes are the
+      // device address of its record (cuTensorMapEncodeTiled shim, cupbop_async.h), which the kernel reads.
+      if (F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-byval-bytes")) {
+        uint64_t bytes = 0;
+        F->getAttributes().getParamAttr(ii->getArgNo(), "cupbop-byval-bytes").getValueAsString().getAsInteger(10, bytes);
+        const uint64_t nslots = (bytes + 7) / 8;
+        Value *SlotP = Builder.CreateGEP(PointerType::get(Int32T, 0), input_arg, ConstantInt::get(Int32T, idx));
+        const MaybeAlign A = ii->getParamAlign();
+        if (A && A->value() > 8) { // slots are 8-byte aligned: give the callee an aligned copy
+          AllocaInst *Copy = Builder.CreateAlloca(ArrayType::get(Int8T, bytes), nullptr, "byval.copy");
+          Copy->setAlignment(*A);
+          Builder.CreateMemCpy(Copy, *A, SlotP, Align(8), bytes);
+          SlotP = Copy;
+        }
+        Arguments.push_back(SlotP);
+        byval_bytes.push_back(bytes);
+        idx += nslots;
+        continue;
+      }
+      byval_bytes.push_back(0);
       // A wide by-value parameter (pass_wide_kernel_args_by_slot) arrives in consecutive 8-byte slots: pass the
       // address of its first slot and skip the rest.
       if (F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-arg-slots")) {
@@ -403,6 +499,16 @@ void decode_input(llvm::Module *M) {
 
     Builder.CreateCall(F, ArrayRef<llvm::Value *>(Arguments));
     Builder.CreateRetVoid();
+    if (std::any_of(byval_bytes.begin(), byval_bytes.end(), [](uint64_t b) { return b != 0; })) {
+      // the struct's slot pointer makes the inliner's cost model keep the kernel out of line (E10 hotspot: +7.5%
+      // cycles, a call per thread); a kernel with scalar parameters is inlined into its wrapper anyway
+      if (!F->hasFnAttribute(Attribute::NoInline)) F->addFnAttr(Attribute::AlwaysInline);
+      byval_file << func_name << " " << byval_bytes.size();
+      for (uint64_t b : byval_bytes) byval_file << " " << b;
+      byval_file << "\n";
+      if (cupbop_debug())
+        fprintf(stderr, "[CuPBoP] %s: by-value struct parameters passed in launch slots (%zu slots)\n", func_name.c_str(), idx);
+    }
   }
 
   for (auto f : need_remove) {

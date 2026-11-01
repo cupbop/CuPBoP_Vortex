@@ -7,6 +7,8 @@ void generate_wrapper(llvm::Module *M);
 
 // wide by-value kernel parameters -> pointer to their consecutive launch slots (see generate_wrapper.cpp)
 void pass_wide_kernel_args_by_slot(llvm::Module *M);
+// by-value struct parameters -> pointer to their launch slots, a private copy where written (generate_wrapper.cpp)
+void prepare_byval_args(llvm::Module *M);
 
 void set_meta_data(llvm::Module *M);
 

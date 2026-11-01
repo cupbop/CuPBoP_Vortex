@@ -822,6 +822,27 @@ static uint64_t cupbop_frame_scratch_bytes(const std::string &lookup_name) {
   }
   return 0;
 }
+// By-value struct parameters (translator: generate_wrapper.cpp decode_input, cupbop_byval_args.txt: <name as in
+// lookup.txt> <parameters> <bytes of each by-value parameter, 0 = not by-value>): such a parameter takes
+// ceil(bytes / 8) consecutive launch slots holding all its bytes (zero-padded), every other one slot as before.
+// Returns false (one 8-byte slot per argument) when the kernel is not listed.
+static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint64_t> &bytes) {
+  std::ifstream f("cupbop_byval_args.txt");
+  if (!f.is_open()) return false;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream is(line);
+    std::string name;
+    size_t n = 0;
+    if (!(is >> name >> n) || name != lookup_name) continue;
+    bytes.assign(n, 0);
+    for (size_t i = 0; i < n; ++i)
+      if (!(is >> bytes[i])) return false;
+    return true;
+  }
+  return false;
+}
 static int cupbop_schedule_flag() {
   if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG")) return std::stoi(std::string(env));
   return 2;
@@ -1539,8 +1560,23 @@ cudaError_t cudaLaunchKernel_vortex(
 
   cupbop_big_stack_setup(kernel_name_tmp);
 
+  // launch slots: one per argument, or ceil(bytes / 8) for a by-value struct parameter (cupbop_byval_layout)
+  std::vector<uint64_t> byval_bytes;
+  const bool byval = cupbop_byval_layout(kernel_name_tmp, byval_bytes);
+  int num_slots = num_args;
+  // host arguments: clang's launch stub passes one pointer per kernel parameter, but its own parameter count
+  // (num_args, from the host translator) counts a struct the x86-64 ABI splits in two (e.g. 16 bytes of floats) twice
+  const int nargs = byval ? (int)byval_bytes.size() : num_args;
+  if (byval) {
+    if ((int)byval_bytes.size() != num_args)
+      DBG_PRINT("cudaLaunchKernel: %s: %zu kernel parameters, %d host arguments: using the kernel's\n",
+                kernel_name_tmp.c_str(), byval_bytes.size(), num_args);
+    num_slots = 0;
+    for (uint64_t b : byval_bytes) num_slots += b ? (int)((b + 7) / 8) : 1;
+  }
+
   // allocate staging buffer for kernel arguments
-  size_t abuf_size = sizeof(kernel_arg_t) + ((num_args > 1) ? (sizeof(uint64_t) * (num_args - 1)) : 0);
+  size_t abuf_size = sizeof(kernel_arg_t) + ((num_slots > 1) ? (sizeof(uint64_t) * (num_slots - 1)) : 0);
   DBG_PRINT("(debug) abuf_size = %ld\n", abuf_size);
 
   //NOTE: old size calculation — 3 uint64_t per symbol (dst_addr, staging_addr, size)
@@ -1578,7 +1614,7 @@ cudaError_t cudaLaunchKernel_vortex(
   
   // write the kerenel index here it retrives
   abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
-  abuf_ptr->num_args = num_args;
+  abuf_ptr->num_args = num_slots;
   
   // Mark Debug Check 
   //printf("test:: kernel_idx %d sizes: %d %d \n", abuf_ptr->kernel_idx, sizeof(kernel_arg_t), sizeof(context_t));
@@ -1589,10 +1625,23 @@ cudaError_t cudaLaunchKernel_vortex(
   DBG_PRINT("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
 
   // write arguments
-  for (int i = 0; i < num_args; ++i) {    
-    memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
-    DBG_PRINT("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
-  }  
+  if (!byval) {
+    for (int i = 0; i < nargs; ++i) {
+      memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
+      DBG_PRINT("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
+    }
+  } else {
+    int s = 0;
+    for (size_t i = 0; i < byval_bytes.size(); ++i) {
+      const uint64_t b = byval_bytes[i];
+      if (!b) { memcpy(&abuf_ptr->args[s++], args[i], sizeof(uint64_t)); continue; }
+      const int k = (int)((b + 7) / 8);
+      memset(&abuf_ptr->args[s], 0, k * sizeof(uint64_t));
+      memcpy(&abuf_ptr->args[s], args[i], b);
+      DBG_PRINT("*** cuda kernel args[%zu]: by-value struct, %lu bytes in slots %d..%d\n", i, (unsigned long)b, s, s + k - 1);
+      s += k;
+    }
+  }
 
   //NOTE: old packing — 3 uint64_t per symbol (dst_addr, staging_dev_addr, size)
   //abuf_ptr->args[num_args] = memcpy_symbol.size();
@@ -1606,8 +1655,8 @@ cudaError_t cudaLaunchKernel_vortex(
   //}
 
   // New packing: [count | dst_addr, size, inline_data... | dst_addr, size, inline_data... | ...]
-  abuf_ptr->args[num_args] = memcpy_symbol.size();
-  int slot = num_args + 1;
+  abuf_ptr->args[num_slots] = memcpy_symbol.size();
+  int slot = num_slots + 1;
   for (auto &entry : memcpy_symbol) {
     abuf_ptr->args[slot++] = entry.dst_addr;
     abuf_ptr->args[slot++] = entry.size;
@@ -1674,17 +1723,17 @@ cudaError_t cudaLaunchKernel_vortex(
     DxaDescEntry d{};
     if (adesc.v2) {
       std::string err;
-      if (!dxa_v2_resolve(adesc, args, num_args, d, err)) {
+      if (!dxa_v2_resolve(adesc, args, nargs, d, err)) {
         fprintf(stderr, "dxa_descriptors.txt: %s\n  in: %s\n", err.c_str(), adesc.line.c_str());
         exit(1);
       }
     } else {
-      if (adesc.ptr_arg_idx < 0 || adesc.ptr_arg_idx >= num_args) continue;
+      if (adesc.ptr_arg_idx < 0 || adesc.ptr_arg_idx >= nargs) continue;
       d.slot = adesc.slot; d.rank = 2; d.elem_bytes = adesc.elem_bytes;
       memcpy(&d.base_addr, args[adesc.ptr_arg_idx], sizeof(uint64_t));
-      if (adesc.dim0_arg_idx >= 0 && adesc.dim0_arg_idx < num_args)
+      if (adesc.dim0_arg_idx >= 0 && adesc.dim0_arg_idx < nargs)
         memcpy(&d.size[0], args[adesc.dim0_arg_idx], sizeof(uint32_t));
-      if (adesc.dim1_arg_idx >= 0 && adesc.dim1_arg_idx < num_args)
+      if (adesc.dim1_arg_idx >= 0 && adesc.dim1_arg_idx < nargs)
         memcpy(&d.size[1], args[adesc.dim1_arg_idx], sizeof(uint32_t));
       d.stride[0] = d.size[0] * adesc.elem_bytes;
       d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
@@ -1703,7 +1752,7 @@ cudaError_t cudaLaunchKernel_vortex(
   {
     uint32_t next_slot = 15;
     std::map<uint64_t, uint32_t> given;
-    for (int i = 0; i < num_args; ++i) {
+    for (int i = 0; i < nargs; ++i) {
       cupbop_tmap r;
       memcpy(&r, args[i], sizeof(r)); // args[i] points at the argument's host value (128 bytes for a CUtensorMap)
       if (r.magic != CUPBOP_TMAP_MAGIC || r.mode != CUPBOP_TMAP_MODE_DXA || !r.self || given.count(r.self)) continue;
