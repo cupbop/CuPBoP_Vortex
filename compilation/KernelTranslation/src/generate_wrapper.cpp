@@ -185,11 +185,17 @@ static std::string kabi_prelude() {
          "        :\n"
          "        : \"ra\", \"t0\", \"t1\", \"t3\", \"t4\", \"t5\", \"t6\",\n" + clob_tail +
          "}\n"
-         "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n"
-         "    // CTA warps as __cupbop_fill_spawn_globals stored them (the CTA-size CSR): a load, which the Vortex backend\n"
-         "    // takes as uniform (a CSR read is divergent to it and the dispatch got split/join tokens spilled to a\n"
-         "    // larger kernel_main frame, moving the callee's frame)\n"
-         "    const uint64_t __bs = (uint32_t)block_size, __p = *(volatile uint32_t *)&__warps_per_group;\n";
+         "static inline __attribute__((always_inline)) void __cupbop_kcall(vx_kernel_func_cb fn, void *arg) {\n";
+    if (fast_entry_on())
+      s += "    // CTA warps: the CTA-size CSR, __UNIFORM__ as in vx_spawn2.h (CUPBOP_FAST_ENTRY: kernel_main no longer\n"
+           "    // stores __warps_per_group; a bare CSR read is divergent to the Vortex backend and would split the dispatch)\n"
+           "    const uint32_t __UNIFORM__ __pw = (uint32_t)csr_read_nv(VX_CSR_CTA_SIZE);\n"
+           "    const uint64_t __bs = (uint32_t)block_size, __p = __pw;\n";
+    else
+      s += "    // CTA warps as __cupbop_fill_spawn_globals stored them (the CTA-size CSR): a load, which the Vortex backend\n"
+           "    // takes as uniform (a CSR read is divergent to it and the dispatch got split/join tokens spilled to a\n"
+           "    // larger kernel_main frame, moving the callee's frame)\n"
+           "    const uint64_t __bs = (uint32_t)block_size, __p = *(volatile uint32_t *)&__warps_per_group;\n";
     if (print)
       s += "    if (vx_thread_id() == 0 && csr_read_nv(VX_CSR_CTA_RANK) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_X) == 0 &&\n"
            "        csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z) == 0) {\n"
@@ -315,11 +321,80 @@ static std::string stack_lmem_prelude() {
       "}\n\n";
 }
 
-static std::string big_stack_call() {
-  if (stack_lmem_on()) return "    __cupbop_kcall_lmem(ctx, callbacks[kernel_arg->kernel_idx], (void *)args);\n";
-  if (asm_call_on()) return "    __cupbop_kcall(callbacks[kernel_arg->kernel_idx], (void *)args);\n";
-  return big_stack_bytes() ? "    __cupbop_call_kernel(callbacks[kernel_arg->kernel_idx], (void *)args);\n"
-                           : "    callbacks[kernel_arg->kernel_idx](args);\n";
+// CUPBOP_FAST_ENTRY, core mapping: kernel_main compares and stores only the grid / block constants the module reads
+// (__CUPBOP_FE_* set by fast_entry_finalize_wrapper; block_size always: the launch-time sp skew test reads it too).
+// With every define 1 this is the switch-off block.
+static std::string fe_s1_grid_block() {
+  static const char *const comp[6][3] = {
+      {"GRID_SIZE_X", "grid_size_x", "__gx"}, {"GRID_SIZE_Y", "grid_size_y", "__gy"}, {"GRID_SIZE_Z", "grid_size_z", "__gz"},
+      {"BLOCK_SIZE_X", "block_size_x", "__lx"}, {"BLOCK_SIZE_Y", "block_size_y", "__ly"}, {"BLOCK_SIZE_Z", "block_size_z", "__lz"}};
+  static const char *const src[6] = {"ctx->num_groups[0]", "ctx->num_groups[1]", "ctx->num_groups[2]",
+                                     "ctx->local_size[0]", "ctx->local_size[1]", "ctx->local_size[2]"};
+  std::string s = "    {\n";
+  for (int i = 0; i < 6; ++i)
+    s += std::string("#if __CUPBOP_FE_") + comp[i][0] + "\n        const int " + comp[i][2] + " = (int)" + src[i] + ";\n#endif\n";
+  s += "        if (";
+  for (int i = 0; i < 6; ++i)
+    s += std::string("\n#if __CUPBOP_FE_") + comp[i][0] + "\n            " + comp[i][1] + " != " + comp[i][2] + " ||\n#endif";
+  s += "\n            block_size != (int)__bs) {\n";
+  for (int i = 0; i < 6; ++i)
+    s += std::string("#if __CUPBOP_FE_") + comp[i][0] + "\n            " + comp[i][1] + " = " + comp[i][2] + ";\n#endif\n";
+  s += "            block_size = (int)__bs;\n"
+       "        }\n"
+       "    }\n";
+  return s;
+}
+
+// CUPBOP_FAST_ENTRY, end of the translation (after every pass, before the module is written): set each
+// __CUPBOP_FE_<name> define of kernel_wrapper.cpp to whether the final module still reads that launch constant.
+// kernel_wrapper.cpp is a separate translation unit; the only other code that runs in the kernel and could read them
+// is the device runtime (runtime/src/vortex/kernel/cudaKernelImpl.cpp, linked or LTO-linked after this): its one
+// reader, __vx_warps_per_group(), became the CTA-size CSR (tool.cpp fast_entry_csr_runtime_calls), and a call left
+// over still counts as a read. A use of any kind (load, store, address taken, initializer) counts as a read.
+void fast_entry_finalize_wrapper(llvm::Module *M) {
+  if (!fast_entry_on()) return;
+  auto used = [&](const char *n) {
+    llvm::GlobalVariable *G = M->getGlobalVariable(n, /*AllowInternal=*/true);
+    if (!G) return false;
+    G->removeDeadConstantUsers();
+    return !G->use_empty();
+  };
+  auto called = [&](const char *n) {
+    llvm::Function *F = M->getFunction(n);
+    if (!F) return false;
+    F->removeDeadConstantUsers();
+    return !F->use_empty();
+  };
+  const std::vector<std::pair<std::string, bool>> defs = {
+      {"BLOCKDIM", used("blockDim")},
+      {"GRIDDIM", used("gridDim")},
+      {"WPG", used("__warps_per_group") || called("_Z20__vx_warps_per_groupv")},
+      {"DYNSMEM", used("dyn_shared_mem_size")},
+      {"GRID_SIZE_X", used("grid_size_x")}, {"GRID_SIZE_Y", used("grid_size_y")}, {"GRID_SIZE_Z", used("grid_size_z")},
+      {"BLOCK_SIZE_X", used("block_size_x")}, {"BLOCK_SIZE_Y", used("block_size_y")}, {"BLOCK_SIZE_Z", used("block_size_z")}};
+  std::ifstream in("kernel_wrapper.cpp");
+  if (!in) { std::cerr << "kernelTranslator: CUPBOP_FAST_ENTRY: no kernel_wrapper.cpp to finalize\n"; std::exit(1); }
+  std::stringstream buf; buf << in.rdbuf(); in.close();
+  std::string s = buf.str(), report;
+  for (auto &[d, v] : defs) {
+    const std::string line = "#define __CUPBOP_FE_" + d + " 1\n";
+    const size_t p = s.find(line);
+    if (p == std::string::npos) continue;   // a define this schedule does not have
+    s.replace(p, line.size(), "#define __CUPBOP_FE_" + d + (v ? " 1\n" : " 0\n"));
+    report += " " + d + "=" + (v ? "1" : "0");
+  }
+  std::ofstream out("kernel_wrapper.cpp", std::ios::trunc);
+  out << s;
+  if (cupbop_debug() || std::getenv("CUPBOP_FAST_ENTRY_REPORT")) std::cout << "[fast-entry] kernel_main stores:" << report << "\n";
+}
+
+// fn: the callee expression (the callbacks[] entry of the launch's kernel_idx, or with CUPBOP_FAST_ENTRY the only
+// kernel wrapper of a one-kernel module)
+static std::string big_stack_call(const std::string &fn = "callbacks[kernel_arg->kernel_idx]") {
+  if (stack_lmem_on()) return "    __cupbop_kcall_lmem(ctx, " + fn + ", (void *)args);\n";
+  if (asm_call_on()) return "    __cupbop_kcall(" + fn + ", (void *)args);\n";
+  return big_stack_bytes() ? "    __cupbop_call_kernel(" + fn + ", (void *)args);\n"
+                           : "    " + fn + "(args);\n";
 }
 
 // The functions that get the kernel ABI (CUPBOP_KABI): decode_input records every kernel and its <name>_wrapper,
@@ -860,6 +935,19 @@ void create_kernel_wrapper_function(llvm::Module *M){
     ss << "char *__ctx_pool = 0;\n"
           "int dyn_shared_mem_size;\n\n";
 
+    // CUPBOP_FAST_ENTRY (tool.cpp fast_entry_on; schedules 1 and 2): which launch constants kernel_main stores. Written
+    // as 1 here; fast_entry_finalize_wrapper (end of the translation) sets each to whether the final module reads it.
+    const bool fe = fast_entry_on();
+    if (fe) {
+      ss << "// CUPBOP_FAST_ENTRY: launch constants the translated module reads (1 = kernel_main stores it). Set at the end\n"
+            "// of the translation from the final module (generate_wrapper.cpp fast_entry_finalize_wrapper).\n";
+      for (const char *d : {"BLOCKDIM", "GRIDDIM", "WPG", "DYNSMEM"}) ss << "#define __CUPBOP_FE_" << d << " 1\n";
+      if (schedule == 1)
+        for (const char *d : {"GRID_SIZE_X", "GRID_SIZE_Y", "GRID_SIZE_Z", "BLOCK_SIZE_X", "BLOCK_SIZE_Y", "BLOCK_SIZE_Z"})
+          ss << "#define __CUPBOP_FE_" << d << " 1\n";
+      ss << "\n";
+    }
+
     // __device__ variables are preserved across kernel launches by the host
     // runtime (cudaRuntimeImpl.cpp) using the cudaMemcpyToSymbol mechanism.
     // No device-side scratch needed.
@@ -1001,13 +1089,17 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    blockIdx.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y);\n"
           "    blockIdx.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z);\n"
           "    __local_group_id = (uint32_t)csr_read_nv(VX_CSR_CTA_ID);\n" : "") <<
+          (fe ? "#if __CUPBOP_FE_BLOCKDIM\n" : "") <<
           "    blockDim.x  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_X);\n"
           "    blockDim.y  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Y);\n"
           "    blockDim.z  = (uint32_t)csr_read_nv(VX_CSR_CTA_BLOCK_DIM_Z);\n"
+          << (fe ? "#endif\n#if __CUPBOP_FE_GRIDDIM\n" : "") <<
           "    gridDim.x   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_X);\n"
           "    gridDim.y   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Y);\n"
           "    gridDim.z   = (uint32_t)csr_read_nv(VX_CSR_CTA_GRID_DIM_Z);\n"
+          << (fe ? "#endif\n#if __CUPBOP_FE_WPG\n" : "") <<
           "    __warps_per_group = (uint32_t)csr_read_nv(VX_CSR_CTA_SIZE);\n"
+          << (fe ? "#endif\n" : "") <<
           "}\n"
           "\n"
           "// Service launches (grid 1, block 1): kernel_idx == -1 applies the cudaMemcpyToSymbol\n"
@@ -1033,16 +1125,35 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    }\n"
           "}\n"
           "\n"
-          << big_stack_prelude() << kabi_prelude() << stack_lmem_prelude() <<
-          "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
-          << (kabi_on() ? "void kernel_main(kernel_arg_t* __UNIFORM__ kernel_arg) {\n" : "void kernel_main(kernel_arg_t* kernel_arg) {\n") <<
+          << big_stack_prelude() << kabi_prelude() << stack_lmem_prelude();
+    // CUPBOP_FAST_ENTRY: the service launches have their own entry (the host takes it from the .vxbin symbol table,
+    // cudaRuntimeImpl.cpp DeviceContext::load_module), so kernel_main has no service test; a one-kernel module's
+    // kernel is called directly.
+    std::string kcallee = "callbacks[kernel_arg->kernel_idx]";
+    if (fe) {
+      ss << "// CUPBOP_FAST_ENTRY: service launches (kernel_idx -1 / -2) enter here, not through kernel_main\n"
+            "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
+            "void cupbop_service_main(kernel_arg_t* kernel_arg) {\n"
+            "    __cupbop_service(kernel_arg->kernel_idx, (uint64_t*)kernel_arg->args + kernel_arg->num_args);\n"
+            "}\n\n";
+      if (wrapper_name.size() == 1)
+        kcallee = schedule == 2 ? "((vx_kernel_func_cb)" + wrapper_name[0] + ")" : "cuda_" + wrapper_name[0];
+    }
+    ss << "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
+       << (kabi_on() ? "void kernel_main(kernel_arg_t* __UNIFORM__ kernel_arg) {\n" : "void kernel_main(kernel_arg_t* kernel_arg) {\n") <<
           "    auto ctx = &kernel_arg->ctx; \n"
           "    auto num_args = kernel_arg->num_args;\n"
-          "    auto args = (uint64_t*)kernel_arg->args;\n"
-          "    if (kernel_arg->kernel_idx < 0) { __cupbop_service(kernel_arg->kernel_idx, args + num_args); return; }\n"
-          "    __cupbop_fill_spawn_globals();\n"
-          "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
-;
+          "    auto args = (uint64_t*)kernel_arg->args;\n";
+    if (fe)
+      ss << "    (void)num_args;\n"
+            "    __cupbop_fill_spawn_globals();\n"
+            "#if __CUPBOP_FE_DYNSMEM\n"
+            "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n"
+            "#endif\n";
+    else
+      ss << "    if (kernel_arg->kernel_idx < 0) { __cupbop_service(kernel_arg->kernel_idx, args + num_args); return; }\n"
+            "    __cupbop_fill_spawn_globals();\n"
+            "    dyn_shared_mem_size = ctx->dyn_shared_mem_size;\n";
     if (schedule == 0) {
       ss <<           "    // Flat schedule: one CUDA block per hardware thread. The host launched\n"
           "    // ceil(num_blocks / NT) CTAs of NT threads; recover the CUDA block index.\n"
@@ -1083,6 +1194,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // (Storing from every thread unconditionally cost small kernels more than their body:\n"
             "    // nn stores 2.4x of 1:1.)\n"
             "    if (getenv_dbg_virt && __lane == 0 && __rank == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_X) == 0 && csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y) == 0) vx_printf(\"[virt] L=%d bs=%d nt=%d\\n\", (int)__L, (int)__bs, (int)vx_num_threads());\n"
+            << (fe ? fe_s1_grid_block() : std::string(
             "    {\n"
             "        const int __gx = (int)ctx->num_groups[0], __gy = (int)ctx->num_groups[1], __gz = (int)ctx->num_groups[2];\n"
             "        const int __lx = (int)ctx->local_size[0], __ly = (int)ctx->local_size[1], __lz = (int)ctx->local_size[2];\n"
@@ -1092,8 +1204,8 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "            block_size_x = __lx; block_size_y = __ly; block_size_z = __lz;\n"
             "            block_size = (int)__bs;\n"
             "        }\n"
-            "    }\n"
-            << (tls_copies ?
+            "    }\n")) <<
+            (tls_copies ?
             "    block_index_x = blockIdx.x;\n"
             "    block_index_y = blockIdx.y;\n"
             "    block_index_z = blockIdx.z;\n" : "") <<
@@ -1104,11 +1216,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "    // (counted per warp) are unaffected; the host guarantees every warp owns\n"
             "    // at least one logical thread (P <= ceil(block/L)).\n"
             "    if (__lane >= __L || __rank * " << own_stride << "u + __lane >= __bs) return;\n"
-            << big_stack_call() <<
+            << big_stack_call(kcallee) <<
             "}\n";
       }
     } else {
-      ss << big_stack_call() <<
+      ss << big_stack_call(kcallee) <<
           "}\n"
 ;
     }

@@ -12,6 +12,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsRISCV.h"
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -1039,6 +1040,70 @@ llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *nam
   return C;
 }
 
+// CUPBOP_FAST_ENTRY=1|0 (default 1; 2026-11-02, experiments/fastentry). The native Vortex kernels
+// (tests/regression, vx_spawn2.h) read blockIdx / blockDim / gridDim from the CTA CSRs that the KMU loads per CTA,
+// marked __UNIFORM__, and their entry is the kernel itself. CuPBoP's kernel_main instead copied blockDim, gridDim,
+// __warps_per_group and dyn_shared_mem_size from the CSRs / kernel arguments into globals on every hardware warp:
+// eight uniform stores to one 64-byte line per warp, which the write-through L1 sends to L2 and the warp's final
+// wsync waits for (experiments/fixcost_s2: relu s2 -53% cycles without them). With the switch on, on the 1:1 schedule
+// (2) and the core mapping (1) only:
+//   P1  kernel_main stores only the launch constants the translated module still reads (generate_wrapper.cpp,
+//       fast_entry_finalize_wrapper: the final module of this translation, plus the device runtime's
+//       __vx_warps_per_group, which P2 removes);
+//   P2  the kernel reads blockDim / gridDim (1:1) and gridDim (core mapping, single-loop form with a run-time trip
+//       count; the CTA's block dims there are the physical warps', not CUDA's) and __vx_warps_per_group() from the CTA
+//       CSRs, as llvm.riscv.vx.uniform values like vx_spawn2.h (a bare CSR asm is divergent to the backend);
+//   P3  kernel_main calls the only kernel of a one-kernel module directly (no callbacks[] load) and has no service
+//       test: the cudaMemcpyToSymbol / read-back service launches (kernel_idx -1 / -2) get their own entry,
+//       cupbop_service_main, which the host takes from the .vxbin symbol table when it is there.
+// 0 (or off): the previous translation, byte for byte. The flat schedule (0) is never changed.
+bool fast_entry_on() {
+  static const bool on = [] {
+    const char *e = std::getenv("CUPBOP_FAST_ENTRY");
+    if (e && *e && (!std::strcmp(e, "0") || !std::strcmp(e, "off"))) return false;
+    const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
+    const int sched = s ? std::atoi(s) : 0;
+    return sched == 1 || sched == 2;
+  }();
+  return on;
+}
+llvm::Value *read_cta_csr_uniform(llvm::IRBuilder<> &B, unsigned csr, const char *name) {
+  llvm::CallInst *C = read_cta_csr(B, csr, name);
+  llvm::Module *M = B.GetInsertBlock()->getModule();
+  llvm::Function *U =
+      llvm::Intrinsic::getDeclaration(M, llvm::Intrinsic::riscv_vx_uniform, {B.getInt32Ty(), B.getInt32Ty()});
+  return B.CreateCall(U, {C}, std::string(name) + ".u");
+}
+extern int need_nested_loop; // insert_warp_loop.cpp: schedule 1 sub-pass form (lanes < 32)
+bool fast_entry_s1_grid_csr() {
+  if (!fast_entry_on()) return false;
+  const VirtGeom g = getVirtGeom();
+  // The sub-pass form and the fixed-trip (unrolled, straight-line) form keep their grid_size_* loads, as the block
+  // constant hoist leaves straight-line functions alone (hoist_block_constant_loads): a value free of memory order
+  // lets the pre-RA scheduler pull every trip's index arithmetic to the top and spill.
+  return g.schedule == 1 && !need_nested_loop && g.subpasses == 1 && g.trips == 0;
+}
+
+// P2 for the device runtime: __vx_warps_per_group() (cudaKernelImpl.cpp, reads the __warps_per_group global) -> the
+// CTA-size CSR. At the end of the translation, after every pass that creates such calls.
+void fast_entry_csr_runtime_calls(llvm::Module *M) {
+  if (!fast_entry_on()) return;
+  llvm::Function *F = M->getFunction("_Z20__vx_warps_per_groupv");
+  if (!F) return;
+  std::vector<llvm::CallInst *> calls;
+  for (llvm::User *U : F->users())
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+      if (CI->getCalledFunction() == F) calls.push_back(CI);
+  for (auto *CI : calls) {
+    llvm::IRBuilder<> B(CI);
+    llvm::Value *V = read_cta_csr_uniform(B, 0xCD2, "cta_warps"); // VX_CSR_CTA_SIZE
+    CI->replaceAllUsesWith(V);
+    CI->eraseFromParent();
+  }
+  if (cupbop_debug() || std::getenv("CUPBOP_FAST_ENTRY_REPORT"))
+    std::cout << "[fast-entry] " << calls.size() << " __vx_warps_per_group() call(s) -> CTA-size CSR\n";
+}
+
 void replace_built_in_function(llvm::Module *M) {
 
   // Remove __vx_* stub function bodies (CUDA device stubs).
@@ -1131,7 +1196,11 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               Value *val;
-              if (schedule == 2) {
+              if (schedule == 2 && fast_entry_on()) {
+                // CUPBOP_FAST_ENTRY: the CTA's block dims (1:1: CTA == CUDA block), uniform as in vx_spawn2.h
+                const int field = (func_name.back() == 'x') ? 0 : (func_name.back() == 'y') ? 1 : 2;
+                val = read_cta_csr_uniform(builder, 0xCD9 + field, "ntid"); // VX_CSR_CTA_BLOCK_DIM_{X,Y,Z}
+              } else if (schedule == 2) {
                 // Load from vx_spawn's blockDim struct field
                 int field = (func_name.back() == 'x')   ? 0
                             : (func_name.back() == 'y') ? 1
@@ -1382,7 +1451,10 @@ void replace_built_in_function(llvm::Module *M) {
               IRBuilder<> builder(context);
               builder.SetInsertPoint(Call);
               Value *grid_size;
-              if (schedule == 2) {
+              if ((schedule == 2 && fast_entry_on()) || (schedule == 1 && fast_entry_s1_grid_csr())) {
+                // CUPBOP_FAST_ENTRY: the launch's grid (1:1 and core mapping launch the CUDA grid), uniform
+                grid_size = read_cta_csr_uniform(builder, 0xCDC + field, "nctaid"); // VX_CSR_CTA_GRID_DIM_{X,Y,Z}
+              } else if (schedule == 2) {
                 // Load from vx_spawn's gridDim struct field
                 auto gridDimGV = M->getGlobalVariable("gridDim");
                 auto field_ptr = builder.CreateStructGEP(
