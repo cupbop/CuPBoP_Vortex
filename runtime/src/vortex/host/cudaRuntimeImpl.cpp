@@ -914,6 +914,7 @@ struct CupbopLmemStackInfo {
   std::string dyn_why;
   std::vector<std::pair<uint64_t, uint64_t>> thr;   // (B, C) points of cupbop_dyn_stack.txt "thresholds", B ascending
   bool has_dyn = false;
+  long align16 = -1;     // allocas aligned to >= 16 bytes in kernel.ll (-1: not recorded)
 };
 static const CupbopLmemStackInfo &cupbop_lmem_stack_info() {
   static CupbopLmemStackInfo info;
@@ -930,6 +931,7 @@ static const CupbopLmemStackInfo &cupbop_lmem_stack_info() {
     std::string k;
     is >> k;
     if (k == "mode") is >> info.mode;
+    else if (k == "align16") is >> info.align16;
     else if (k == "kernel") {
       int idx; uint64_t b; std::string fl;
       if (is >> idx >> b >> fl) info.chain[idx] = {b, fl};
@@ -999,7 +1001,15 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   const char *oe = getenv("CUPBOP_STACK_LMEM_OCC");
   const bool occ = oe && atoi(oe) > 0;
   const char *pe = getenv("CUPBOP_STACK_LMEM_PAD");
-  const uint64_t pad = pe ? (uint64_t)std::max(0, atoi(pe)) : 16;   // stride = pad (mod 2 x pad); 0 = multiple of 16
+  uint64_t pad = pe ? (uint64_t)std::max(0, atoi(pe)) : 16;   // stride = pad (mod 2 x pad); 0 = multiple of 16
+  // pad 8 = an odd number of 8-byte words per stack: the 32 lanes' accesses to one frame slot hit 32 different banks,
+  // but sp is only 8-byte aligned, which the RISC-V ABI does not allow; only for a module without allocas aligned to
+  // 16 bytes or more (examples/stack_fallback.sh align16), else 16
+  std::string padnote;
+  if (pad && pad < 16) {
+    if (pad != 8 || info.align16 != 0) { padnote = " (CUPBOP_STACK_LMEM_PAD=" + std::to_string(pad) + " refused: " +
+        (pad != 8 ? std::string("only 8 or a multiple of 16") : std::to_string(info.align16) + " allocas aligned to 16+ bytes") + "; 16)"; pad = 16; }
+  } else if (pad % 16) pad = (pad + 15) & ~15ull;
   const char *fe = getenv("CUPBOP_STACK_LMEM_FILL");
   const bool fill = fe && atoi(fe) > 0;
   auto down = [&](uint64_t v) -> uint64_t {   // largest stride <= v of the pattern (0 if none)
@@ -1034,11 +1044,11 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   const uint32_t old = lmem;
   lmem = (uint32_t)slot;
   snprintf(buf, sizeof buf, "on: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16), stride %lu x %lu threads, "
-           "shared %u -> slot %lu bytes, CTAs per core %lu -> %lu (slots %lu, warps %lu)",
+           "shared %u -> slot %lu bytes, CTAs per core %lu -> %lu (slots %lu, warps %lu)%s",
            (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)st,
            (unsigned long)n, old, (unsigned long)slot, (unsigned long)R0,
            (unsigned long)std::min<uint64_t>(std::min<uint64_t>(NWhw, cap / slot), effNW / cta_warps),
-           (unsigned long)std::min<uint64_t>(NWhw, cap / slot), (unsigned long)(effNW / cta_warps));
+           (unsigned long)std::min<uint64_t>(NWhw, cap / slot), (unsigned long)(effNW / cta_warps), padnote.c_str());
   log(buf);
 }
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,

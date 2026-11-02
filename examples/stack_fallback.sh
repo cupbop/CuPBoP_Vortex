@@ -200,6 +200,9 @@ lmem_chain() {
   local MODE=$(sed -n 's/^#define __CUPBOP_LMEM_STACK \([0-9]*\).*/\1/p' kernel_wrapper.cpp)
   { echo "# stack in local memory (examples/stack_chain.py): kernel <callbacks index> <chain bytes> <flags> <entry>"
     echo "mode $MODE"
+    # allocas aligned to 16 or more bytes: the backend may address them with ori/andi from a 16-byte aligned sp, so the
+    # host refuses CUPBOP_STACK_LMEM_PAD=8 (8-byte aligned stacks, no LMEM bank conflict) for such a module
+    local N16=$(grep -cE '= alloca .*, align (16|32|64|128|256)\b' kernel.ll 2>/dev/null); echo "align16 ${N16:--1}"
     python3 $HERE/stack_chain.py kernel.dump kernel_wrapper.cpp; } > cupbop_lmem_stack.txt.tmp \
     && mv cupbop_lmem_stack.txt.tmp cupbop_lmem_stack.txt \
     || { rm -f cupbop_lmem_stack.txt.tmp; echo "--- [stack] lmem: stack_chain.py failed, the kernels keep the hardware stack"; return 0; }
