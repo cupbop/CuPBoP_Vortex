@@ -1067,8 +1067,24 @@ bool fast_entry_on() {
   }();
   return on;
 }
+// CUPBOP_FAST_ENTRY_CSR=pure (default) | pinned: pinned reads keep the place of the PTX special-register read (a
+// side-effecting asm without memory access: no CSE, no hoisting, like the loads it replaces), measurement knob.
+static bool fast_entry_csr_pinned() {
+  static const bool p = [] { const char *e = std::getenv("CUPBOP_FAST_ENTRY_CSR"); return e && !std::strcmp(e, "pinned"); }();
+  return p;
+}
 llvm::Value *read_cta_csr_uniform(llvm::IRBuilder<> &B, unsigned csr, const char *name) {
-  llvm::CallInst *C = read_cta_csr(B, csr, name);
+  llvm::CallInst *C;
+  if (fast_entry_csr_pinned()) {
+    auto *FT = llvm::FunctionType::get(B.getInt32Ty(), false);
+    char asm_str[32];
+    snprintf(asm_str, sizeof(asm_str), "csrr $0, 0x%x", csr);
+    C = B.CreateCall(FT, llvm::InlineAsm::get(FT, asm_str, "=r", /*hasSideEffects=*/true), {}, name);
+    C->setDoesNotAccessMemory();
+    C->setDoesNotThrow();
+  } else {
+    C = read_cta_csr(B, csr, name);
+  }
   llvm::Module *M = B.GetInsertBlock()->getModule();
   llvm::Function *U =
       llvm::Intrinsic::getDeclaration(M, llvm::Intrinsic::riscv_vx_uniform, {B.getInt32Ty(), B.getInt32Ty()});

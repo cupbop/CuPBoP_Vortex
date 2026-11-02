@@ -1333,7 +1333,9 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
 //   raw   its value right after the launch,
 //   delta raw minus its value right before the launch (signed; negative = it restarted at this launch),
 //   mode  "r" = seen restarting at a launch of this process (value = raw), "c" = never seen restarting while it was
-//         nonzero before a launch (value = delta), "0" = it was 0 before this launch (raw == delta, either way),
+//         nonzero before a launch (value = delta), "0" = it was 0 before this launch (raw == delta, either way);
+//         decided per class for the non-core counters (a drop of one dcache.* counter marks every dcache.* counter),
+//         per counter for core.*,
 //   val   the launch's own count by that mode.
 // "c" can still be a restarting counter that has not yet been seen to drop; ci/perf_launches.py re-decides the mode
 // over every record of a run (a single drop anywhere marks the counter restarting for the whole run).
@@ -1485,7 +1487,11 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
     const uint64_t r = kv.second, p = prev.count(n) ? prev[n] : 0;
     int64_t d = (int64_t)r - (int64_t)p;
     if (n == "core.cycles") d = cyc_delta;
-    char &m = mode[n];
+    // a cache / memory / LMEM / TCU / DXA counter restarts with its whole class (one Cache::PerfStats, LocalMem, ...
+    // reset in SimX v3.0), so one drop marks the class; core.* counters are decided one by one (v3.0 restarts only
+    // core.stall_opds)
+    const std::string grp = n.compare(0, 5, "core.") == 0 ? n : n.substr(0, n.find('.')) + ".*";
+    char &m = mode[grp];
     if (r < p) m = 'r';
     const char mm = m == 'r' ? 'r' : (p == 0 ? '0' : 'c');
     const int64_t v = mm == 'r' ? (int64_t)r : d;

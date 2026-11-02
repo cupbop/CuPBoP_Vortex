@@ -21,12 +21,14 @@ def load(path):
     modes = {}
     for pid in {r.get("pid") for r in recs}:
         rs = [r for r in recs if r.get("pid") == pid]
-        m = {}
+        g = {}   # restart is decided per class for the non-core counters (SimX v3.0 resets a cache's / the memory's /
+        # LMEM's / TCU's / DXA's statistics together), per counter for core.* (v3.0: only core.stall_opds restarts)
+        grp = lambda k: k if k.startswith("core.") else k.split(".")[0] + ".*"
         for r in rs:
             for k, d in r["delta"].items():
-                if d < 0: m[k] = "r"
-                else: m.setdefault(k, "c")
-        modes[pid] = m
+                if d < 0: g[grp(k)] = "r"
+                else: g.setdefault(grp(k), "c")
+        modes[pid] = {k: g[grp(k)] for r in rs for k in r["delta"]}
     for r in recs:
         m = modes[r.get("pid")]
         r["mode_run"] = m
