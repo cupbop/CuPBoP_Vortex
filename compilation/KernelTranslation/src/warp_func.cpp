@@ -21,6 +21,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstring>
 #include <set>
 #include <vector>
 
@@ -114,6 +115,239 @@ static void foldReconvergenceMasks(Module &m) {
   for (auto *s : syncs_fed) s->eraseFromParent();
   if (folded)
     fprintf(stderr, "[virt] folded %d reconvergence ballot/activemask sites (mask-only results); erased %zu bar.warp.sync fed by them\n", folded, syncs_fed.size());
+}
+
+// The vote/activemask result ci only reaches bar.warp.sync masks and the mask operand of other warp ops (through
+// bit ops, casts, phis, selects and PHI-demoted lifter temporaries): reconvergence bookkeeping, no data use.
+// local_syncs collects the bar.warp.sync calls it feeds. Same test as foldReconvergenceMasks above (kept as its own
+// copy so that the NT32 translation path runs exactly the code it ran before).
+static bool voteFeedsOnlyMasks(CallInst *ci, std::set<CallInst *> &local_syncs) {
+  auto isWarpOp = [](Function *f) {
+    auto n = f->getName();
+    return n.starts_with("llvm.nvvm.vote.") || n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.match.");
+  };
+  {
+    std::set<Value *> seen;
+    std::vector<Value *> work{ci};
+    bool ok = true;
+    while (ok && !work.empty()) {
+      Value *v = work.back(); work.pop_back();
+      if (!seen.insert(v).second) continue;
+      for (Use &u : v->uses()) {
+        auto *I = dyn_cast<Instruction>(u.getUser());
+        if (!I) { ok = false; break; }
+        if (auto *call = dyn_cast<CallInst>(I)) {
+          Function *cf = call->getCalledFunction();
+          if (!cf || call->isInlineAsm()) { ok = false; break; }
+          if (cf->getName() == "llvm.nvvm.bar.warp.sync") { local_syncs.insert(call); continue; }
+          if (isWarpOp(cf) && u.getOperandNo() == 0) continue; // mask operand of another warp op
+          if (cf->getName().starts_with("llvm.dbg")) continue;
+          ok = false; break;
+        }
+        if (auto *bo = dyn_cast<BinaryOperator>(I)) {
+          auto op = bo->getOpcode();
+          if (op == Instruction::And || op == Instruction::Or || op == Instruction::Xor) { work.push_back(I); continue; }
+          ok = false; break;
+        }
+        if (isa<SelectInst>(I)) { if (u.getOperandNo() == 0) { ok = false; break; } work.push_back(I); continue; }
+        if (isa<PHINode>(I) || isa<ZExtInst>(I) || isa<SExtInst>(I) || isa<TruncInst>(I) || isa<BitCastInst>(I) || isa<FreezeInst>(I)) { work.push_back(I); continue; }
+        if (auto *st = dyn_cast<StoreInst>(I)) { // PHI-demoted lifter temporaries: follow the alloca's loads
+          if (u.getOperandNo() != 0) { ok = false; break; }
+          auto *ai = dyn_cast<AllocaInst>(st->getPointerOperand()->stripPointerCasts());
+          if (!ai) { ok = false; break; }
+          bool simple = true;
+          for (User *au : ai->users()) {
+            if (isa<LoadInst>(au) || isa<StoreInst>(au)) continue;
+            if (auto *ii = dyn_cast<IntrinsicInst>(au)) if (ii->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(ii)) continue;
+            if (auto *cc = dyn_cast<CallInst>(au)) if (cc->getCalledFunction() && cc->getCalledFunction()->getName().starts_with("llvm.dbg")) continue;
+            simple = false; break;
+          }
+          if (!simple) { ok = false; break; }
+          for (User *au : ai->users()) if (auto *ld = dyn_cast<LoadInst>(au)) work.push_back(ld);
+          continue;
+        }
+        ok = false; break;
+      }
+    }
+    return ok;
+  }
+}
+// ---------------------------------------------------------------------------
+// Warp-collective operations when a hardware warp is not one CUDA warp (2026-11-02). Build-time refusals that
+// replace silent wrong results; nothing here runs with 32-lane hardware warps on the 1:1 schedule or with the
+// S = 1 core mapping (NT32), so those translations are unchanged.
+//  - 1:1 schedule (SCHEDULE=2) with VORTEX_NUM_THREADS != 32 (a real NT16 bitstream, or rt_simd_width "as-if
+//    NT=16" on NT32): a CUDA warp spans two hardware warps (NT=16) or shares one with another CUDA warp (NT=64),
+//    and every warp-level lowering of this schedule works on the hardware warp: mma/ldmatrix/movmatrix (32-lane
+//    fragments; under as-if NT16 also the NT32 TCU tile with half the lanes masked), wmma/wgmma, redux, match,
+//    %laneid, and shuffles/votes whose lanes cross the 16-lane boundary (E12 stage 1: lifted CUTLASS GEMM NT16 s2
+//    FAIL with no error). Kept: votes/activemask that only feed masks (lifted reconvergence bookkeeping), and at
+//    NT < 32 shuffles that provably stay in one hardware warp (constant segment width <= NT, butterfly lane mask
+//    < NT, constant member mask within lanes [0, NT), or a constant / kernel-argument value).
+//  - core mapping sub-pass form (S > 1): staged are shfl, vote/activemask, mma.sync m16n8k16 and movmatrix only.
+//    ldmatrix/stmatrix, wmma, wgmma, redux, match and the %laneid asm (the hardware lane, not the logical one)
+//    would run once per sub-pass with 32-lane semantics -> refused. The staged mma/movmatrix glue exists only on a
+//    real NT=16 TCU build; with a wider bitstream (as-if NT16, CUPBOP_VIRT_LANES=16) the link used to fail on an
+//    undefined __cupbop_*_glue16 symbol -> refused with a reason (the TCU tile is fixed by the synthesized NT,
+//    2026-10-26_TCU_DATAPATH_KO.md 6.1).
+// CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway (warnings only).
+// ---------------------------------------------------------------------------
+static bool narrowWarpOpsAllowed() {
+  const char *e = std::getenv("CUPBOP_ALLOW_NARROW_WARP_OPS");
+  return e && std::atoi(e) != 0;
+}
+// VX_CFG_NUM_THREADS of the bitstream from VORTEX_CONFIGS (the SimX build flags the examples pass), 0 if unknown
+static int bitstreamThreads() {
+  const char *e = std::getenv("VORTEX_CONFIGS");
+  if (!e) return 0;
+  const std::string s(e), k("-DVX_CFG_NUM_THREADS=");
+  size_t p = s.find(k);
+  return p == std::string::npos ? 0 : std::atoi(s.c_str() + p + k.size());
+}
+static bool bitstreamHasTcu() {
+  const char *e = std::getenv("VORTEX_CONFIGS");
+  return e && std::string(e).find("-DVX_CFG_EXT_TCU_ENABLE") != std::string::npos;
+}
+// The sub-pass mma/movmatrix glue (__cupbop_*_glue16, cudaKernelImpl.cpp) runs on the NT=16 TCU tile and is only
+// built for an NT=16 TCU bitstream. Unknown configuration (no VORTEX_CONFIGS): left to the link, as before.
+static void requireGlue16Bitstream(const char *what, int n) {
+  const int hw = bitstreamThreads();
+  if (hw == 0 || (hw == 16 && bitstreamHasTcu())) return;
+  fprintf(stderr, "error: virt sub-pass form (16 lanes): %d %s site(s) need the NT=16 TCU glue, but the bitstream is "
+                  "VX_CFG_NUM_THREADS=%d%s (as-if NT=16 / CUPBOP_VIRT_LANES on a wider warp): its TCU tile is fixed by the "
+                  "synthesized NT and cannot serve a 16-lane warp; refusing (no __cupbop_*_glue16 for this build)\n",
+          n, what, hw, bitstreamHasTcu() ? "" : " without the TCU");
+  if (!narrowWarpOpsAllowed()) exit(1);
+}
+// What a call does across the CUDA warp, by callee name as the module has it when ReplaceWarpLevelPrimitive runs
+// (after init_block, lower_ldmatrix_asm, lower_redux_sync); nullptr: not a warp-level operation.
+static const char *warpCollectiveKind(const CallInst *CI) {
+  if (CI->isInlineAsm()) {
+    auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand());
+    if (!IA) return nullptr;
+    const std::string &a = IA->getAsmString();
+    for (const char *k : {"mma.", "ldmatrix", "stmatrix", "movmatrix", "redux.sync", "match.", "shfl.sync", "vote.",
+                          "activemask", "%laneid", "%lanemask"})
+      if (a.find(k) != std::string::npos) return "asm";
+    return nullptr;
+  }
+  const Function *F = CI->getCalledFunction();
+  if (!F) return nullptr;
+  StringRef n = F->getName();
+  for (const char *p : {"llvm.nvvm.mma.", "cupbop.mma.", "llvm.nvvm.wmma.", "llvm.nvvm.ldmatrix", "llvm.nvvm.stmatrix",
+                        "__cupbop_mma_", "__cupbop_wmma", "__vx_wmma", "__cupbop_wgmma", "__cupbop_ldmatrix",
+                        "__cupbop_stmatrix", "__cupbop_movmatrix"})
+    if (n.starts_with(p)) return "tensor";
+  if (n.contains("nvcuda4wmma")) return "tensor";
+  if (n == "__cupbop_redux_sync" || n.starts_with("llvm.nvvm.redux.sync.") || n.starts_with("llvm.nvvm.match.")) return "collective";
+  if (n == "llvm.nvvm.read.ptx.sreg.laneid" || n.starts_with("llvm.nvvm.read.ptx.sreg.lanemask.") || n == "__cupbop_laneid") return "laneid";
+  if (n.starts_with("llvm.nvvm.shfl.")) return "shfl";
+  if (n.starts_with("llvm.nvvm.vote.") || n == "__cupbop_activemask" || n == "llvm.nvvm.activemask") return "vote";
+  return nullptr;
+}
+// Functions a launched kernel can reach by direct calls (merged-module source twins __src_* are never launched).
+static std::vector<Function *> launchedClosure(Module &m) {
+  std::vector<Function *> work, out;
+  std::set<Function *> seen;
+  for (auto &F : m)
+    if (!F.isDeclaration() && isKernelFunction(&m, &F) && !F.getName().starts_with("__src_")) work.push_back(&F);
+  while (!work.empty()) {
+    Function *F = work.back(); work.pop_back();
+    if (!seen.insert(F).second) continue;
+    out.push_back(F);
+    for (auto &I : instructions(*F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *G = CB->getCalledFunction())
+          if (!G->isDeclaration()) work.push_back(G);
+  }
+  return out;
+}
+static bool constU64(const Value *V, uint64_t &out) {
+  if (auto *C = dyn_cast<ConstantInt>(V)) { out = C->getZExtValue(); return true; }
+  return false;
+}
+// 1:1 schedule, NT < 32: does this llvm.nvvm.shfl.sync.* give the CUDA result on 16-lane hardware warps?
+static bool shflStaysInHardwareWarp(Module &m, CallInst *CI, int nt) {
+  if (nt >= 32 || CI->arg_size() != 4) return false;
+  const StringRef n = CI->getCalledFunction()->getName();
+  const Value *val = CI->getArgOperand(1);
+  if (isa<Constant>(val)) return true; // every lane gets the same value whatever the source lane
+  if (auto *A = dyn_cast<Argument>(val)) if (isKernelFunction(&m, const_cast<Function *>(A->getParent()))) return true;
+  uint64_t M, b, c;
+  if (constU64(CI->getArgOperand(3), c)) { // PTX c = segmask << 8 | clamp: segments of 32 - segmask lanes
+    const uint64_t seg = (c >> 8) & 31, width = 32 - seg;
+    if (seg && width <= (uint64_t)nt && !(width & (width - 1))) return true;
+  }
+  if (n.contains(".bfly.") && constU64(CI->getArgOperand(2), b) && b < (uint64_t)nt) return true;
+  if (constU64(CI->getArgOperand(0), M) && !((M & 0xffffffffull) >> nt)) return true; // members in lanes [0, nt)
+  return false;
+}
+static void rejectNarrowWarpOps1to1(Module &m, int nt) {
+  if (nt == 32) return;
+  int bad = 0;
+  for (Function *F : launchedClosure(m))
+    for (auto &I : instructions(*F)) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI) continue;
+      const char *kind = warpCollectiveKind(CI);
+      if (!kind) continue;
+      if (!strcmp(kind, "shfl") && shflStaysInHardwareWarp(m, CI, nt)) continue;
+      if (!strcmp(kind, "vote")) {
+        std::set<CallInst *> syncs;
+        if (voteFeedsOnlyMasks(CI, syncs)) continue;
+        uint64_t M;
+        if (nt < 32 && CI->arg_size() >= 1 && CI->getCalledFunction()->getName().starts_with("llvm.nvvm.vote.") &&
+            constU64(CI->getArgOperand(0), M) && !((M & 0xffffffffull) >> nt)) continue;
+      }
+      if (bad++ < 12) {
+        std::string what = CI->isInlineAsm() ? cast<InlineAsm>(CI->getCalledOperand())->getAsmString().substr(0, 60)
+                                             : CI->getCalledFunction()->getName().str();
+        fprintf(stderr, "[narrow-warp] %s: %s %s in %s\n", narrowWarpOpsAllowed() ? "WARNING" : "error", kind,
+                what.c_str(), F->getName().str().substr(0, 80).c_str());
+      }
+    }
+  if (!bad) return;
+  fprintf(stderr, "error: 1:1 schedule (SCHEDULE=2) with %d-lane hardware warps (VORTEX_NUM_THREADS=%d): %d warp-collective "
+                  "operation(s) need a CUDA warp's 32 lanes in one hardware warp and would give wrong results; refusing. "
+                  "Use VORTEX_NUM_THREADS=32 (or the core mapping, SCHEDULE=1, which stages shfl/vote for NT=16); "
+                  "CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway\n", nt, nt, bad);
+  if (!narrowWarpOpsAllowed()) exit(1);
+}
+// Core mapping, S > 1: before staging. Kernel-body mma.sync / movmatrix are staged later; everything else of the
+// tensor / collective / asm kinds, a staged kind outside a kernel body, and the %laneid asm (lowered to the hardware
+// lane, __cupbop_laneid, before the warp loop exists) would run per sub-pass with 32-lane semantics.
+static void rejectUnstagedWarpOpsSubpass(Module &m) {
+  int bad = 0;
+  for (Function *F : launchedClosure(m)) {
+    const bool kernel = isKernelFunction(&m, F);
+    for (auto &I : instructions(*F)) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI) continue;
+      const char *kind = warpCollectiveKind(CI);
+      if (!kind || !strcmp(kind, "shfl") || !strcmp(kind, "vote")) continue; // staged (or left with the old warning)
+      if (!strcmp(kind, "laneid") && !CI->isInlineAsm() && CI->getCalledFunction()->getName() != "__cupbop_laneid") continue;
+      if (kernel && !CI->isInlineAsm()) {
+        StringRef n = CI->getCalledFunction()->getName();
+        if (n.starts_with("llvm.nvvm.mma.") || n.starts_with("cupbop.mma.") || n == "__cupbop_movmatrix_m8n8_trans_b16") continue;
+      }
+      if (kernel && CI->isInlineAsm() &&
+          cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("movmatrix.sync.aligned.m8n8.trans.b16") != std::string::npos)
+        continue;
+      if (bad++ < 12) {
+        std::string what = CI->isInlineAsm() ? cast<InlineAsm>(CI->getCalledOperand())->getAsmString().substr(0, 60)
+                                             : CI->getCalledFunction()->getName().str();
+        fprintf(stderr, "[narrow-warp] %s: %s %s in %s\n", narrowWarpOpsAllowed() ? "WARNING" : "error", kind,
+                what.c_str(), F->getName().str().substr(0, 80).c_str());
+      }
+    }
+  }
+  if (!bad) return;
+  const VirtGeom vg = getVirtGeom();
+  fprintf(stderr, "error: virt sub-pass form (S=%d, %d lanes): %d warp-collective operation(s) have no sub-pass form "
+                  "(only shfl, vote/activemask, mma.sync m16n8k16 and movmatrix are staged) and would run per sub-pass "
+                  "with 32-lane semantics; refusing. Use 32-lane warps (NT32, no CUPBOP_VIRT_LANES); "
+                  "CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway\n", vg.subpasses, vg.lanes, bad);
+  if (!narrowWarpOpsAllowed()) exit(1);
 }
 
 // virt sub-pass form (S > 1): a hardware thread runs the logical lanes l, l+L, ... through ONE copy of the
@@ -247,6 +481,8 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
 static void replaceMmaStaged(Module &m);
 static void replaceMovmatrixStaged(Module &m);
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
+  if (mapping_ == MAPPING_1TO1) rejectNarrowWarpOps1to1(m, getVirtGeom().nt);
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectUnstagedWarpOpsSubpass(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) markPartialMaskWarpOps(m);
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectLaneVariantLoopsAroundWarpOps(m);
@@ -1022,6 +1258,7 @@ static void replaceMmaStaged(Module &m) {
     fprintf(stderr, "error: virt sub-pass form stages mma.sync for 16 lanes only (lanes=%d)\n", vg.lanes);
     exit(1);
   }
+  requireGlue16Bitstream("mma.sync", (int)sites.size());
   if (const char *e = std::getenv("CUPBOP_MMA_LOWERING"))
     if (std::string(e) == "sw") {
       fprintf(stderr, "error: CUPBOP_MMA_LOWERING=sw has no 16-lane sub-pass form (use tcu or auto)\n");
@@ -1094,6 +1331,7 @@ static void replaceMovmatrixStaged(Module &m) {
   }
   if (sites.empty()) return;
   if (getVirtGeom().lanes != 16) { fprintf(stderr, "error: virt sub-pass form stages movmatrix for 16 lanes only\n"); exit(1); }
+  requireGlue16Bitstream("movmatrix", (int)sites.size());
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
