@@ -888,6 +888,159 @@ static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
   auto it = table.find(func_stripped);
   return it == table.end() ? 0u : it->second;
 }
+// Stack in local memory (CUPBOP_STACK_IN_LMEM = 0 | 1 | auto at translation; see generate_wrapper.cpp
+// stack_lmem_prelude). The kernel ELF then calls the kernel through __cupbop_kcall_lmem, and examples/stack_fallback.sh
+// wrote cupbop_lmem_stack.txt (mode, and per callbacks index the static stack bytes of the deepest call chain; flags
+// other than ok = unbounded). Per launch: bytes per hardware thread = chain + run-time sized allocas of this launch
+// (cupbop_dyn_stack.txt: the smallest bound B whose C(B) x CTA warps covers the block) + CUPBOP_STACK_LMEM_MARGIN
+// (default 64) + 16 (the saved sp), rounded to 16. The Vortex CTA dispatcher admits min(NUM_WARPS, LMEM /
+// stride) CTAs per core, stride = lmem_size rounded to 64 (SimX cta_dispatcher.cpp usable_slots, RTL VX_cta_dispatch),
+// and a CTA also needs its warps among the RT_NW-capped ones: R0 = min(those slots, RT_NW warps / CTA warps) CTAs per
+// core now. The stacks fit when a slot of LMEM / R CTAs (R = R0; CUPBOP_STACK_LMEM_OCC=1 also tries R0-1 .. 1) holds
+// the shared memory (lmem_size, after CUPBOP_LMEM_SCALE) plus CTA warps x lanes stacks of `bytes per hardware thread`
+// each, the stride between stacks rounded up to 16 mod 32 bytes (CUPBOP_STACK_LMEM_PAD, default 16: sp stays 16-byte
+// aligned, and the 32 lanes' accesses to one frame slot fall into 16 different LMEM banks of 8 bytes, 2 per bank;
+// 0 = a plain multiple of 16; CUPBOP_STACK_LMEM_FILL=1 spreads the stacks over the whole slot instead of the smallest
+// stride). Then lmem_size = shared + stacks (rounded to 64) and ctx.global_offset = {top of the stacks in the slot,
+// stride, lanes per warp}; else global_offset[1] stays 0 and the kernel runs on the hardware stack as before. auto
+// also keeps the hardware stack for a kernel whose chain and run-time allocas are 0. At run time CUPBOP_STACK_IN_LMEM=0
+// turns it off (another value: the translated mode). One line per kernel and decision on stderr ("cupbop: stack in
+// lmem ...").
+struct CupbopLmemStackInfo {
+  bool loaded = false;   // cupbop_lmem_stack.txt present (the ELF has the local-memory call)
+  int mode = 0;          // 1 on, 2 auto
+  std::map<int, std::pair<uint64_t, std::string>> chain;   // callbacks index -> (bytes, flags)
+  bool dyn_none = false; // cupbop_dyn_stack.txt: run-time sized allocas without a launch-time bound
+  std::string dyn_why;
+  std::vector<std::pair<uint64_t, uint64_t>> thr;   // (B, C) points of cupbop_dyn_stack.txt "thresholds", B ascending
+  bool has_dyn = false;
+};
+static const CupbopLmemStackInfo &cupbop_lmem_stack_info() {
+  static CupbopLmemStackInfo info;
+  static bool done = false;
+  if (done) return info;
+  done = true;
+  std::ifstream f("cupbop_lmem_stack.txt");
+  if (!f.is_open()) return info;
+  info.loaded = true;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream is(line);
+    std::string k;
+    is >> k;
+    if (k == "mode") is >> info.mode;
+    else if (k == "kernel") {
+      int idx; uint64_t b; std::string fl;
+      if (is >> idx >> b >> fl) info.chain[idx] = {b, fl};
+    }
+  }
+  std::ifstream d("cupbop_dyn_stack.txt");
+  while (d.is_open() && std::getline(d, line)) {
+    std::istringstream is(line);
+    std::string k;
+    is >> k;
+    if (k == "helper") {
+      std::string w; is >> w;
+      if (w == "none") { info.dyn_none = true; info.dyn_why = line; }
+    } else if (k == "thresholds") {
+      info.has_dyn = true;
+      std::string pt;
+      while (is >> pt) {
+        size_t c = pt.find(':');
+        if (c != std::string::npos) info.thr.push_back({std::stoull(pt.substr(0, c)), std::stoull(pt.substr(c + 1))});
+      }
+    } else if (k == "function") info.has_dyn = true;
+  }
+  return info;
+}
+static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::string &name, const uint32_t block[3],
+                              uint64_t cuda_block_threads, uint32_t &lmem) {
+  const CupbopLmemStackInfo &info = cupbop_lmem_stack_info();
+  if (!info.loaded) return;
+  int mode = info.mode;
+  if (const char *e = getenv("CUPBOP_STACK_IN_LMEM"))
+    if (!strcmp(e, "0") || !strcmp(e, "off")) mode = 0;
+  static std::map<int, std::string> said;
+  auto log = [&](const std::string &m) {
+    std::string &prev = said[ka->kernel_idx];
+    if (prev == m) return;
+    prev = m;
+    fprintf(stderr, "cupbop: stack in lmem: %s %s\n", name.c_str(), m.c_str());
+  };
+  if (!mode) { log("off (CUPBOP_STACK_IN_LMEM=0 at run time)"); return; }
+  auto it = info.chain.find(ka->kernel_idx);
+  if (it == info.chain.end()) { log("hardware stack: no chain for kernel index " + std::to_string(ka->kernel_idx)); return; }
+  if (it->second.second != "ok") { log("hardware stack: call chain " + it->second.second); return; }
+  const uint64_t chain = it->second.first;
+  uint64_t cap = 0;
+  if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &cap) != 0 || !cap) { log("hardware stack: no local memory"); return; }
+  const uint64_t T = CUPBOP_EFF_NUM_THREADS(), effNW = CUPBOP_EFF_NUM_WARPS(), NWhw = NUM_WARPS_VX;
+  const uint64_t cta_threads = (uint64_t)block[0] * block[1] * block[2];
+  const uint64_t cta_warps = (cta_threads + T - 1) / T, n = cta_warps * T;
+  uint64_t dyn = 0;
+  if (info.dyn_none) { log("hardware stack: run-time sized allocas without a bound (" + info.dyn_why + ")"); return; }
+  if (info.has_dyn) {
+    bool found = false;
+    for (auto &p : info.thr)
+      if (p.second * cta_warps >= cuda_block_threads) { dyn = p.first; found = true; break; }
+    if (!found) { log("hardware stack: run-time sized allocas not bounded for block " + std::to_string(cuda_block_threads)); return; }
+  }
+  const char *me = getenv("CUPBOP_STACK_LMEM_MARGIN");
+  const uint64_t margin = me ? (uint64_t)std::max(0, atoi(me)) : 64;
+  const uint64_t need = (chain + dyn + margin + 16 + 15) & ~15ull;
+  char buf[512];
+  if (mode == 2 && chain == 0 && dyn == 0) { log("hardware stack (auto: the kernel uses no stack)"); return; }
+  const uint64_t A = ((uint64_t)lmem + 63) & ~63ull;
+  if (A > cap) return;
+  const uint64_t slots0 = A ? std::min<uint64_t>(NWhw, cap / A) : NWhw;
+  const uint64_t R0 = std::min<uint64_t>(slots0, effNW / cta_warps);
+  if (!R0) return;
+  const char *oe = getenv("CUPBOP_STACK_LMEM_OCC");
+  const bool occ = oe && atoi(oe) > 0;
+  const char *pe = getenv("CUPBOP_STACK_LMEM_PAD");
+  const uint64_t pad = pe ? (uint64_t)std::max(0, atoi(pe)) : 16;   // stride = pad (mod 2 x pad); 0 = multiple of 16
+  const char *fe = getenv("CUPBOP_STACK_LMEM_FILL");
+  const bool fill = fe && atoi(fe) > 0;
+  auto down = [&](uint64_t v) -> uint64_t {   // largest stride <= v of the pattern (0 if none)
+    if (!pad) return v & ~15ull;
+    return v < pad ? 0 : (v - pad) / (2 * pad) * (2 * pad) + pad;
+  };
+  auto up = [&](uint64_t v) -> uint64_t {     // smallest stride >= v of the pattern
+    if (!pad) return (v + 15) & ~15ull;
+    return v <= pad ? pad : (v - pad + 2 * pad - 1) / (2 * pad) * (2 * pad) + pad;
+  };
+  uint64_t R = 0, st = 0;
+  for (uint64_t r = R0; r >= (occ ? 1 : R0) && r >= 1; --r) {
+    const uint64_t smax = (cap / r) & ~63ull;
+    if (smax <= A) continue;
+    const uint64_t most = down((smax - A) / n), least = up(need);
+    if (most >= least) { R = r; st = fill ? most : least; break; }
+  }
+  if (!R) {
+    const uint64_t smax = (cap / R0) & ~63ull;
+    snprintf(buf, sizeof buf, "hardware stack: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16) x %lu threads "
+             "do not fit next to %lu bytes of shared memory at %lu CTAs per core (%lu bytes per thread there)%s",
+             (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)n,
+             (unsigned long)A, (unsigned long)R0, (unsigned long)(smax > A ? down((smax - A) / n) : 0),
+             occ ? ", nor at fewer CTAs" : " (CUPBOP_STACK_LMEM_OCC=1 tries fewer CTAs)");
+    log(buf);
+    return;
+  }
+  const uint64_t top = A + n * st, slot = (top + 63) & ~63ull;
+  ka->ctx.global_offset[0] = (uint32_t)top;
+  ka->ctx.global_offset[1] = (uint32_t)st;
+  ka->ctx.global_offset[2] = (uint32_t)T;
+  const uint32_t old = lmem;
+  lmem = (uint32_t)slot;
+  snprintf(buf, sizeof buf, "on: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16), stride %lu x %lu threads, "
+           "shared %u -> slot %lu bytes, CTAs per core %lu -> %lu (slots %lu, warps %lu)",
+           (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)st,
+           (unsigned long)n, old, (unsigned long)slot, (unsigned long)R0,
+           (unsigned long)std::min<uint64_t>(std::min<uint64_t>(NWhw, cap / slot), effNW / cta_warps),
+           (unsigned long)std::min<uint64_t>(NWhw, cap / slot), (unsigned long)(effNW / cta_warps));
+  log(buf);
+}
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
                                const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes) {
   vx_launch_info_t li = {};
@@ -1898,7 +2051,18 @@ cudaError_t cudaLaunchKernel_vortex(
       fprintf(stderr, "cupbop: lmem scale %u: %s %u -> %u bytes per CTA (capacity %lu)\n", cupbop_lmem_scale(),
               func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
     }
+    cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
+  }
+
+  // CUPBOP_PERF_KERNEL_FILE=<file> (measurement, experiments/stklmem): the device counters right after the kernel,
+  // appended to <file>. The Perf_counter_* dump at the end of this function comes after the __device__ read-back
+  // service launch below, and SimX resets its memory, L2 and LMEM counters at every launch, so for a program with
+  // __device__ variables that dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
+  if (const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE")) {
+    if (*pk) {
+      if (FILE *pf = fopen(pk, "a")) { vx_dump_perf(DC->device(), pf); fclose(pf); }
+    }
   }
 
   // Read back __device__ variables from device memory after kernel execution.

@@ -248,7 +248,64 @@ static std::string kabi_prelude() {
   return s;
 }
 
+// Stack in local memory (CUPBOP_STACK_IN_LMEM = 0 | 1 | auto, default 0; 2026-11-02, experiments/stklmem). The per-core
+// local memory (LMEM) window starts at VX_MEM_LMEM_BASE_ADDR = VX_MEM_STACK_BASE_ADDR, just above the hardware stacks;
+// the LSU sends an address inside [LMEM base, + 2^LMEM_LOG_SIZE) to the core's LMEM banks (SimX get_addr_type /
+// local_mem_switch, RTL VX_lsu_slice is_addr_local), the stack interleave covers only [stack bottom, LMEM base), and
+// LMEM is never cached, so a stack placed there costs no L1/L2/DRAM traffic. The Vortex CTA dispatcher gives a CTA
+// the LMEM slot base + slot x stride (stride = the launch's lmem_size rounded to 64 bytes; slots = min(NUM_WARPS,
+// LMEM / stride), SimX cta_dispatcher.cpp usable_slots, RTL VX_cta_dispatch usable_slots_r). With the switch on
+// (translation), kernel_main calls the kernel through __cupbop_kcall_lmem: when the host found that the launch's
+// per-thread stacks fit (cudaRuntimeImpl.cpp cupbop_stack_lmem: it enlarges lmem_size so that every CTA slot holds the
+// CTA's shared memory and, below the slot's top, one stack per hardware thread of the CTA), it passes
+// ctx->global_offset = {top offset of the stacks in the slot, bytes per hardware thread, lanes per warp}; hardware
+// thread (CTA warp rank r, lane l) then runs the kernel with sp = CTA LMEM address + top - (r x lanes + l) x bytes - 16
+// (the old sp is kept at the new sp, as for the software stack). global_offset[1] = 0 (no fit, or a host without the
+// switch): the call of the switch-off wrapper. kernel_main's own frame stays on the hardware stack.
+// examples/stack_fallback.sh writes the static stack of each kernel's deepest call chain (examples/stack_chain.py)
+// to cupbop_lmem_stack.txt; the run-time sized allocas come from cupbop_dyn_stack.txt (describe_dyn_stack also runs
+// with this switch). Not with the software stack (CUPBOP_BIG_STACK: such frames never fit). Unset or 0: the wrapper is
+// exactly the old one. 1 and auto translate the same; the host takes the local-memory stack for a launch when it fits
+// without lowering the CTAs per core (auto: and the kernel uses its stack at all); CUPBOP_STACK_LMEM_OCC=1 also lowers
+// the CTAs per core to make it fit.
+static int stack_lmem_mode() {   // 0 off, 1 on, 2 auto
+  const char *e = std::getenv("CUPBOP_STACK_IN_LMEM");
+  if (!e || !*e || is_off(e)) return 0;
+  return std::strcmp(e, "auto") ? 1 : 2;
+}
+static bool stack_lmem_on() { return stack_lmem_mode() && !big_stack_bytes(); }
+static std::string old_kernel_call(const char *fn, const char *arg) {
+  if (asm_call_on()) return std::string("__cupbop_kcall(") + fn + ", " + arg + ")";
+  return std::string(fn) + "(" + arg + ")";
+}
+static std::string stack_lmem_prelude() {
+  if (!stack_lmem_on()) return "";
+  return std::string(
+      "// Stack in local memory (CUPBOP_STACK_IN_LMEM; see generate_wrapper.cpp stack_lmem_prelude): the host sets\n"
+      "// ctx->global_offset = {top offset of the stacks in the CTA's LMEM slot, bytes per hardware thread, lanes per warp}\n"
+      "// when this launch's stacks fit, else global_offset[1] = 0 (the hardware stack).\n"
+      "#define __CUPBOP_LMEM_STACK ") + std::to_string(stack_lmem_mode()) + "\n"
+      "static inline __attribute__((always_inline)) void __cupbop_kcall_lmem(const context_t *ctx, vx_kernel_func_cb fn, void *arg) {\n"
+      "    const uint32_t __st = ctx->global_offset[1];\n"
+      "    if (!__st) { " + old_kernel_call("fn", "arg") + "; return; }\n"
+      "    const uint64_t __h = (uint64_t)csr_read_nv(VX_CSR_CTA_RANK) * ctx->global_offset[2] + (uint64_t)vx_thread_id();\n"
+      "    register char *__t1 asm(\"t1\") = (char *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR) + ctx->global_offset[0] - __h * __st;\n"
+      "    register void *__a0 asm(\"a0\") = arg;\n"
+      "    register void *__t2 asm(\"t2\") = (void *)fn;\n"
+      "    __asm__ volatile(\"addi t1, t1, -16\\n\\tsd sp, 0(t1)\\n\\tmv sp, t1\\n\\tjalr ra, 0(t2)\\n\\tld sp, 0(sp)\"\n"
+      "        : \"+r\"(__a0), \"+r\"(__t2), \"+r\"(__t1)\n"
+      "        :\n"
+      "        : \"ra\", \"t0\", \"t3\", \"t4\", \"t5\", \"t6\",\n"
+      "          \"a1\", \"a2\", \"a3\", \"a4\", \"a5\", \"a6\", \"a7\",\n"
+      "          \"s0\", \"s1\", \"s2\", \"s3\", \"s4\", \"s5\", \"s6\", \"s7\", \"s8\", \"s9\", \"s10\", \"s11\",\n"
+      "          \"ft0\", \"ft1\", \"ft2\", \"ft3\", \"ft4\", \"ft5\", \"ft6\", \"ft7\", \"ft8\", \"ft9\", \"ft10\", \"ft11\",\n"
+      "          \"fa0\", \"fa1\", \"fa2\", \"fa3\", \"fa4\", \"fa5\", \"fa6\", \"fa7\",\n"
+      "          \"fs0\", \"fs1\", \"fs2\", \"fs3\", \"fs4\", \"fs5\", \"fs6\", \"fs7\", \"fs8\", \"fs9\", \"fs10\", \"fs11\", \"memory\");\n"
+      "}\n\n";
+}
+
 static std::string big_stack_call() {
+  if (stack_lmem_on()) return "    __cupbop_kcall_lmem(ctx, callbacks[kernel_arg->kernel_idx], (void *)args);\n";
   if (asm_call_on()) return "    __cupbop_kcall(callbacks[kernel_arg->kernel_idx], (void *)args);\n";
   return big_stack_bytes() ? "    __cupbop_call_kernel(callbacks[kernel_arg->kernel_idx], (void *)args);\n"
                            : "    callbacks[kernel_arg->kernel_idx](args);\n";
@@ -965,7 +1022,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "    }\n"
           "}\n"
           "\n"
-          << big_stack_prelude() << kabi_prelude() <<
+          << big_stack_prelude() << kabi_prelude() << stack_lmem_prelude() <<
           "extern \"C\" __attribute__((annotate(\"vortex.kernel\"), used, retain, noinline))\n"
           << (kabi_on() ? "void kernel_main(kernel_arg_t* __UNIFORM__ kernel_arg) {\n" : "void kernel_main(kernel_arg_t* kernel_arg) {\n") <<
           "    auto ctx = &kernel_arg->ctx; \n"
@@ -1283,7 +1340,7 @@ static bool dyn_stack_eval(Function *H, uint64_t maxbs, uint64_t NP, std::vector
 
 void describe_dyn_stack(llvm::Module *M) {
   std::remove("cupbop_dyn_stack.txt");
-  if (!asm_call_on() || sp_skew_m() <= 1) return;
+  if ((!asm_call_on() || sp_skew_m() <= 1) && !stack_lmem_on()) return;   // also for the stack in local memory
   const DataLayout &DL = M->getDataLayout();
   LLVMContext &C = M->getContext();
   auto *I64 = Type::getInt64Ty(C);
