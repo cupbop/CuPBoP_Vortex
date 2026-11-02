@@ -5,14 +5,15 @@ stack_lmem_prelude; read by the host runtime, cudaRuntimeImpl.cpp cupbop_stack_l
 examples/stack_fallback.sh into cupbop_lmem_stack.txt:
     kernel <callbacks index> <chain bytes> <flags> <entry symbol>
 flags: ok | indirect (an indirect call jalr is reachable: the chain is not bounded) | recursion | noentry (the entry
-is not in the dump). Frame of a function = the largest sum of its sp decrements before the first increment
+is not in the dump) | stackamo (a reachable function does an atomic on an address derived from one of its allocas, per
+kernel.ll next to the dump: an LMEM atomic works in SimX but not in the RTL, VX_lmem_switch asserts). Frame of a function = the largest sum of its sp decrements before the first increment
 (addi sp,sp,-N; sub sp,sp,reg with reg from lui/addiw/li), as examples/stack_frames.py, but for every function
 (runtime helpers, libm, memcpy, ... included). A variable sub sp,sp,reg (run-time sized alloca) is not counted here:
 those bytes come from cupbop_dyn_stack.txt (generate_wrapper.cpp describe_dyn_stack). Calls: jal <f> (call), j <f>
 to another function's first instruction (tail call, counted like a call: conservative), jalr <reg> (indirect).
 The chain of a function = its frame + the largest chain among its callees. kernel_main itself is not counted: it
 stays on the hardware stack (the kernel is called on the new stack)."""
-import re, sys
+import os, re, sys
 
 KENTRY = '__vx_kentry_'
 
@@ -76,6 +77,32 @@ def parse(path):
     return funcs, by_addr
 
 
+def stack_atomics(ll_path):
+    """IR functions of kernel.ll with an atomicrmw / cmpxchg / atomic load-store whose pointer comes (through GEPs,
+    casts, selects, phis) from an alloca of the same function."""
+    out = set()
+    try:
+        txt = open(ll_path, errors='replace').read()
+    except OSError:
+        return out
+    for fm in re.finditer(r'^define [^@]*@("?[^"(]+"?)\((.*?)^}', txt, re.S | re.M):
+        name = fm.group(1).strip('"'); body = fm.group(2)
+        defs = {}
+        for m in re.finditer(r'^\s*(%[\w.$-]+) = (.*)$', body, re.M):
+            defs[m.group(1)] = m.group(2)
+        def from_alloca(v, depth=0):
+            if depth > 32 or v not in defs: return False
+            d = defs[v]
+            if d.startswith('alloca '): return True
+            if re.match(r'(getelementptr|bitcast|addrspacecast|select|phi|freeze)\b', d):
+                return any(from_alloca(x, depth + 1) for x in re.findall(r'%[\w.$-]+', d))
+            return False
+        for m in re.finditer(r'(?:atomicrmw (?:volatile )?\w+ ptr(?: addrspace\(\d+\))? (%[\w.$-]+)|cmpxchg (?:weak )?(?:volatile )?ptr(?: addrspace\(\d+\))? (%[\w.$-]+)|(?:load|store) atomic [^,]*,? ?ptr(?: addrspace\(\d+\))? (%[\w.$-]+))', body):
+            v = next(x for x in m.groups() if x)
+            if from_alloca(v): out.add(name); break
+    return out
+
+
 def callbacks(path):
     src = open(path, errors='replace').read()
     m = re.search(r'vx_kernel_func_cb callbacks\[\] = \{(.*?)\};', src, re.S)
@@ -91,6 +118,7 @@ def callbacks(path):
 
 def main():
     funcs, by_addr = parse(sys.argv[1])
+    amo = stack_atomics(os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), 'kernel.ll'))
     memo = {}
 
     def chain(name, stack):
@@ -98,7 +126,7 @@ def main():
         if name in stack: return (0, 'recursion')
         f = funcs[name]
         stack.add(name)
-        best, flag = 0, ('indirect' if f['indirect'] else 'ok')
+        best, flag = 0, ('indirect' if f['indirect'] else 'stackamo' if name in amo else 'ok')
         for a in sorted(f['calls'] | f['tails']):
             t = by_addr.get(a)
             if t is None or t == name: continue   # a branch to its own entry, or into the middle of a function
