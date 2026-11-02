@@ -36,6 +36,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/ADT/SetVector.h"
 
 #include "cg_sync.h"
 #include "llvm_type_utils.h"
@@ -4185,6 +4186,419 @@ void replace_wmma_intrinsics(llvm::Module *M) {
 }
 
 // =============================================================================
+// CUPBOP_MMA_FUSE=0|n|k|nk: several mma.sync ops -> one NT=32 WMMA (TCU tile m16n16k32)
+//
+// One lifted m16n8k16 op uses a quarter of the tile (m16 n8 k16), m16n8k8 an eighth; the rest is zero padding. Groups of
+// ops of one f16/bf16 form (m16n8k16 | m16n8k8, f32 or f16 accumulators) in one basic block become one call
+//   __cupbop_mmaf_<geom>_<tag>_n<NN>k<L>[_tcu](ptr a[L][nA], ptr b[NN][L][nB], ptr c[NN][nC], ptr d[NN][nC])
+// (cudaKernelImpl_dtypes.inc), with
+//   n: NN = 2 units with the same A operands (same SSA values, bitcasts looked through) -> tile columns 0..7 / 8..15
+//      (each output element depends only on its own A row, B column and C: bit-exact)
+//   k: a unit is a chain D_s = mma(A_s, B_s, D_{s-1}) of L steps (k-blocks KPS*L <= 4): every result of step s-1 is
+//      used only as the accumulator operand of step s. The TCU then adds the k-blocks without the zero padding in
+//      between: bit-exact on the SimX FEDP with f32 accumulators except -0 vs +0 (mmafuse_test: identical bits on random
+//      data), and without the intermediate f16 rounding with f16 accumulators (only with CUPBOP_MMA_FUSE_F16ACC_K=1).
+// Legality (per group): all ops in one basic block; no call other than mma.sync / side-effect-free non-convergent
+// intrinsics (barriers, shuffles, votes, asm, runtime calls), fence or atomic between the first and the last op; the
+// fused call goes at the earliest point after every operand definition and before every use of a result, which must
+// lie inside [first op, last op] (this also rules out any data dependence between the units of an n-pair). Ops under
+// different predicates are in different blocks, so they are never fused. A plain csrr inline asm (lane id) is not a
+// barrier. Operand / result bitcasts are looked through (the fused call bitcasts itself; result bitcasts move with the
+// result). Only for NT=32 TCU lowering (auto or tcu with a TCU build); sw lowering, NT!=32 and other forms are left
+// alone. Default 0 = the unfused lowering, unchanged (same machine code).
+// CUPBOP_MMA_FUSE_ACROSS=ldsm (opt-in): the ldmatrix / movmatrix lowering calls between the ops do not block a group
+// (lifted SASS loads the next k-step's fragments between the HMMAs; see mma_fuse_is_barrier).
+// CUPBOP_MMA_FUSE_MAX=<g>: at most g groups (bisection). CUPBOP_MMA_FUSE_DEBUG=1: every refusal on stderr.
+// =============================================================================
+namespace {
+struct MmaFuseForm { const char *suffix, *geom, *tag; int kps; bool f16acc; };
+const MmaFuseForm kMmaFuseForms[] = {
+    {"m16n8k16.row.col.f32.f32", "m16n8k16", "f16f32", 2, false},
+    {"m16n8k16.row.col.bf16", "m16n8k16", "bf16f32", 2, false},
+    {"m16n8k16.row.col.f16.f16", "m16n8k16", "f16f16", 2, true},
+    {"m16n8k8.row.col.f32.f32", "m16n8k8", "f16f32", 1, false},
+    {"m16n8k8.row.col.bf16", "m16n8k8", "bf16f32", 1, false},
+    {"m16n8k8.row.col.f16.f16", "m16n8k8", "f16f16", 1, true},
+};
+struct MmaFuseUnit { SmallVector<CallInst *, 4> steps; bool paired = false; };
+} // namespace
+
+static int mma_fuse_form_of(const CallInst *CI) {
+  const Function *F = CI->getCalledFunction();
+  if (!F) return -1;
+  StringRef n = F->getName();
+  if (!n.consume_front("llvm.nvvm.mma.") && !n.consume_front("cupbop.mma.")) return -1;
+  for (int i = 0; i < (int)(sizeof(kMmaFuseForms) / sizeof(kMmaFuseForms[0])); i++) {
+    if (n != kMmaFuseForms[i].suffix) continue;
+    const MmaFuseForm &f = kMmaFuseForms[i];
+    const unsigned nA = 2 * f.kps, nB = f.kps, nC = f.f16acc ? 2 : 4;
+    auto *ST = dyn_cast<StructType>(CI->getType());
+    if (CI->arg_size() != nA + nB + nC || !ST || ST->getNumElements() != nC) return -1;
+    return i;
+  }
+  return -1;
+}
+
+static Value *mma_fuse_strip(Value *V) {
+  for (int i = 0; i < 8; i++) {
+    if (auto *BC = dyn_cast<BitCastInst>(V)) V = BC->getOperand(0);
+    else if (auto *CE = dyn_cast<ConstantExpr>(V); CE && CE->getOpcode() == Instruction::BitCast) V = CE->getOperand(0);
+    else break;
+  }
+  return V;
+}
+
+// Instructions that an mma.sync must not be moved across (convergence / region structure under the core mapping).
+static bool mma_fuse_is_barrier(const Instruction &I) {
+  if (isa<FenceInst>(I) || isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) return true;
+  const auto *CB = dyn_cast<CallBase>(&I);
+  if (!CB) return false;
+  if (const auto *CI = dyn_cast<CallInst>(CB); CI && mma_fuse_form_of(CI) >= 0) return false;
+  if (CB->isInlineAsm()) { // a plain CSR read (lane / warp id) is neither a barrier nor a side effect
+    const auto *IA = cast<InlineAsm>(CB->getCalledOperand());
+    return !(StringRef(IA->getAsmString()).starts_with("csrr ") && !IA->hasSideEffects() &&
+             !StringRef(IA->getConstraintString()).contains("memory"));
+  }
+  const Function *F = CB->getCalledFunction();
+  if (!F) return true;
+  // CUPBOP_MMA_FUSE_ACROSS=ldsm (opt-in, off by default): also move the register-only mma.sync across the ldmatrix /
+  // movmatrix lowering (warp-collective lane exchange, shared-memory reads, a private result buffer; lifted SASS
+  // interleaves LDSM/MOVM of the next k-step between the HMMAs). Same block, so the same lanes run both.
+  static const bool acrossLdsm = [] { const char *e = std::getenv("CUPBOP_MMA_FUSE_ACROSS"); return e && std::string(e) == "ldsm"; }();
+  if (acrossLdsm && (F->getName() == "__cupbop_ldmatrix_m8n8_b16" || F->getName() == "__cupbop_movmatrix_m8n8_trans_b16")) return false;
+  if (F->getName().starts_with("llvm.nvvm.mma.") || F->getName().starts_with("cupbop.mma.") ||
+      F->getName().starts_with("__cupbop_mmaf_")) return false; // other mma.sync ops, groups fused before this one
+  if (F->isIntrinsic() && !CB->isConvergent() && !CB->mayHaveSideEffects() && !F->getName().starts_with("llvm.nvvm."))
+    return false; // llvm.fabs, llvm.fma, llvm.umin, ... (pure)
+  return true;
+}
+
+// k-chain link: Y's accumulator operands are exactly extractvalue(X, i) and X's results have no other use.
+static bool mma_fuse_chain_link(CallInst *X, CallInst *Y, const MmaFuseForm &f) {
+  const unsigned nA = 2 * f.kps, nB = f.kps, nC = f.f16acc ? 2 : 4;
+  if (X == Y || X->getParent() != Y->getParent() || X->getCalledFunction() != Y->getCalledFunction()) return false;
+  for (unsigned i = 0; i < nC; i++) {
+    auto *EV = dyn_cast<ExtractValueInst>(Y->getArgOperand(nA + nB + i));
+    if (!EV || EV->getAggregateOperand() != X || EV->getNumIndices() != 1 || EV->getIndices()[0] != i) return false;
+  }
+  for (User *U : X->users()) {
+    auto *EV = dyn_cast<ExtractValueInst>(U);
+    if (!EV || EV->getNumIndices() != 1) return false;
+    for (Use &W : EV->uses())
+      if (W.getUser() != Y || W.getOperandNo() != nA + nB + EV->getIndices()[0]) return false;
+  }
+  return true;
+}
+
+// Group legality and insertion point (see the header). units: n-halves, each a k-chain in step order.
+static Instruction *mma_fuse_place(ArrayRef<const MmaFuseUnit *> units, const DenseMap<const Instruction *, unsigned> &pos,
+                                   BasicBlock &BB, std::string &why) {
+  SmallPtrSet<const Instruction *, 8> members;
+  for (const MmaFuseUnit *u : units) for (CallInst *c : u->steps) members.insert(c);
+  unsigned lo = ~0u, hi = 0;
+  for (const Instruction *m : members) { lo = std::min(lo, pos.lookup(m)); hi = std::max(hi, pos.lookup(m)); }
+  const unsigned INF = ~0u;
+  long earliest = -1;
+  unsigned latest = INF;
+  for (const MmaFuseUnit *u : units)
+    for (unsigned s = 0; s < u->steps.size(); s++) {
+      CallInst *c = u->steps[s];
+      for (unsigned i = 0; i < c->arg_size(); i++) {
+        Value *V = c->getArgOperand(i);
+        if (auto *EV = dyn_cast<ExtractValueInst>(V); EV && s > 0 && EV->getAggregateOperand() == u->steps[s - 1]) continue; // chain link
+        V = mma_fuse_strip(V); // the fused call bitcasts its operands itself
+        if (auto *I = dyn_cast<Instruction>(V); I && I->getParent() == &BB && !isa<PHINode>(I)) {
+          if (members.count(I)) { why = "operand is a group member"; return nullptr; }
+          earliest = std::max(earliest, (long)pos.lookup(I));
+        }
+      }
+      for (User *U : c->users()) {
+        auto check = [&](const Instruction *W) -> bool {
+          if (members.count(W)) return false;
+          if (W->getParent() == &BB && !isa<PHINode>(W)) latest = std::min(latest, pos.lookup(W));
+          return true;
+        };
+        if (auto *EV = dyn_cast<ExtractValueInst>(U)) {
+          for (User *W : EV->users()) {
+            const bool link = s + 1 < u->steps.size() && W == u->steps[s + 1];
+            if (link) continue;
+            // bitcast chains of a final result move with the result (after the fused call): their users count
+            std::function<bool(Instruction *)> chk = [&](Instruction *X) -> bool {
+              if (auto *BC = dyn_cast<BitCastInst>(X); BC && BC->getParent() == &BB && s + 1 == u->steps.size()) {
+                for (User *Y : BC->users()) if (!chk(cast<Instruction>(Y))) return false;
+                return true;
+              }
+              return check(X);
+            };
+            if (!chk(cast<Instruction>(W))) { why = "result used by another group member"; return nullptr; }
+          }
+        } else if (!check(cast<Instruction>(U))) { why = "result used by another group member"; return nullptr; }
+      }
+    }
+  unsigned p = std::max((unsigned)(earliest + 1), lo);
+  if (p > latest) { why = "no point after every operand and before every use"; return nullptr; }
+  Instruction *at = nullptr;
+  for (Instruction &I : BB) {
+    unsigned q = pos.lookup(&I);
+    if (q > lo && q < hi && !members.count(&I) && mma_fuse_is_barrier(I)) {
+      std::string s; raw_string_ostream os(s); I.print(os); why = "barrier-like instruction in between: " + s.substr(0, 160);
+      return nullptr;
+    }
+    if (q == p) at = &I;
+  }
+  return at;
+}
+
+static void fuse_mma_sync_groups(llvm::Module *M) {
+  const char *env = std::getenv("CUPBOP_MMA_FUSE");
+  std::string mode = env ? env : "0";
+  if (mode.empty() || mode == "0") return;
+  bool doN = mode == "n" || mode == "nk" || mode == "kn", doK = mode == "k" || mode == "nk" || mode == "kn";
+  if (!doN && !doK) { fprintf(stderr, "warning: CUPBOP_MMA_FUSE=%s unknown (0|n|k|nk); not fusing\n", mode.c_str()); return; }
+  if (tensor_lowering_mode() == "sw") { fprintf(stderr, "[mma-fuse] CUPBOP_MMA_LOWERING=sw: not fusing\n"); return; }
+  if (const char *sf = std::getenv("VORTEX_SCHEDULE_FLAG"); sf && std::atoi(sf) == 0) {
+    fprintf(stderr, "[mma-fuse] schedule 0 (flat mapping): not fusing\n"); // mma.sync needs hardware lanes (1:1 / core mapping)
+    return;
+  }
+  if (const char *nt = std::getenv("VORTEX_NUM_THREADS"); nt && std::atoi(nt) != 32) {
+    fprintf(stderr, "[mma-fuse] VORTEX_NUM_THREADS=%s: the fused WMMA needs the NT=32 tile; not fusing\n", nt);
+    return;
+  }
+  std::string why_off;
+  if (tensor_lowering_mode() == "auto" && !tensor_build_enables("f16", why_off)) {
+    fprintf(stderr, "[mma-fuse] auto lowering without a TCU build (%s): not fusing\n", why_off.c_str());
+    return;
+  }
+  long maxGroups = -1;
+  if (const char *e = std::getenv("CUPBOP_MMA_FUSE_MAX")) maxGroups = std::atol(e);
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx), *F32 = Type::getFloatTy(Ctx), *PtrTy = PointerType::getUnqual(Ctx);
+  long groups = 0;
+  std::map<std::string, int> shapes; // symbol -> count
+  int ops_total = 0, ops_fused = 0;
+  std::map<std::string, int> refusals;
+
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    // inline-asm mma.sync (lower_inline_mma_sync) repacks each result into the asm's return struct: look through
+    // extractvalue(insertvalue ...) in the operands of the ops so that chains are visible, then drop dead repacks
+    for (BasicBlock &BB : F) {
+      SmallSetVector<Instruction *, 16> dead;
+      for (Instruction &I : BB) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (!CI || mma_fuse_form_of(CI) < 0) continue;
+        for (unsigned i = 0; i < CI->arg_size(); i++) {
+          auto *EV = dyn_cast<ExtractValueInst>(CI->getArgOperand(i));
+          if (!EV || !isa<InsertValueInst>(EV->getAggregateOperand())) continue;
+          Value *v = FindInsertedValue(EV->getAggregateOperand(), EV->getIndices());
+          if (!v || v->getType() != EV->getType()) continue;
+          CI->setArgOperand(i, v);
+          dead.insert(EV);
+        }
+      }
+      for (Instruction *d : dead) {
+        if (!d->use_empty()) continue;
+        Instruction *agg = dyn_cast<Instruction>(cast<ExtractValueInst>(d)->getAggregateOperand());
+        d->eraseFromParent();
+        while (agg && agg->use_empty() && isa<InsertValueInst>(agg)) { // the repack chain, innermost last
+          Instruction *in = dyn_cast<Instruction>(agg->getOperand(0));
+          agg->eraseFromParent();
+          agg = in;
+        }
+      }
+    }
+    for (BasicBlock &BB : F) {
+      DenseMap<const Instruction *, unsigned> pos;
+      SmallVector<CallInst *, 32> ops;
+      unsigned q = 0;
+      for (Instruction &I : BB) {
+        pos[&I] = q++;
+        if (auto *CI = dyn_cast<CallInst>(&I); CI && mma_fuse_form_of(CI) >= 0) ops.push_back(CI);
+      }
+      ops_total += ops.size();
+      if (ops.size() < 2) continue;
+      // 1. units: k-chains (k) or single ops
+      std::vector<MmaFuseUnit> units;
+      {
+        DenseMap<CallInst *, CallInst *> next, prev;
+        // f16 accumulators: a fused k-chain skips the f16 rounding between the steps (not bit-identical, untested on
+        // lifted kernels: none has such a chain in one block), so it needs CUPBOP_MMA_FUSE_F16ACC_K=1 as well
+        static const bool f16accK = [] { const char *e = std::getenv("CUPBOP_MMA_FUSE_F16ACC_K"); return e && std::atoi(e) != 0; }();
+        if (doK)
+          for (CallInst *Y : ops) {
+            const MmaFuseForm &f = kMmaFuseForms[mma_fuse_form_of(Y)];
+            if (f.f16acc && !f16accK) continue;
+            const unsigned nA = 2 * f.kps, nB = f.kps;
+            auto *EV = dyn_cast<ExtractValueInst>(Y->getArgOperand(nA + nB));
+            auto *X = EV ? dyn_cast<CallInst>(EV->getAggregateOperand()) : nullptr;
+            if (X && !next.count(X) && mma_fuse_chain_link(X, Y, f)) { next[X] = Y; prev[Y] = X; }
+          }
+        for (CallInst *c : ops) {
+          if (prev.count(c)) continue; // not a chain head
+          const MmaFuseForm &f = kMmaFuseForms[mma_fuse_form_of(c)];
+          const unsigned maxL = 4 / f.kps;
+          MmaFuseUnit u;
+          for (CallInst *x = c; x; x = next.lookup(x)) {
+            if (u.steps.size() == maxL) { units.push_back(u); u.steps.clear(); }
+            u.steps.push_back(x);
+          }
+          units.push_back(u);
+        }
+        // a chain whose own placement fails is split into single ops
+        std::vector<MmaFuseUnit> checked;
+        for (MmaFuseUnit &u : units) {
+          std::string why;
+          if (u.steps.size() > 1) {
+            const MmaFuseUnit *one[1] = {&u};
+            if (!mma_fuse_place(one, pos, BB, why)) {
+              refusals["k: " + why.substr(0, why.find(':'))]++;
+              if (std::getenv("CUPBOP_MMA_FUSE_DEBUG")) fprintf(stderr, "[mma-fuse] %s: k-chain of %zu refused: %s\n", F.getName().str().substr(0, 40).c_str(), u.steps.size(), why.c_str());
+              for (CallInst *c : u.steps) { MmaFuseUnit s; s.steps.push_back(c); checked.push_back(s); }
+              continue;
+            }
+          }
+          checked.push_back(u);
+        }
+        units.swap(checked);
+        std::sort(units.begin(), units.end(), [&](const MmaFuseUnit &a, const MmaFuseUnit &b) { return pos.lookup(a.steps[0]) < pos.lookup(b.steps[0]); });
+      }
+      // 2. n-pairs: same form, same chain length, same A operands at every step
+      std::vector<std::pair<int, int>> groupsBB; // unit indices (second -1: unit alone)
+      auto akey = [&](const MmaFuseUnit &u) {
+        std::vector<Value *> k;
+        const MmaFuseForm &f = kMmaFuseForms[mma_fuse_form_of(u.steps[0])];
+        k.push_back(u.steps[0]->getCalledFunction());
+        for (CallInst *c : u.steps) for (int i = 0; i < 2 * f.kps; i++) k.push_back(mma_fuse_strip(c->getArgOperand(i)));
+        return k;
+      };
+      for (int i = 0; i < (int)units.size(); i++) {
+        if (units[i].paired) continue;
+        int partner = -1;
+        if (doN) {
+          auto ki = akey(units[i]);
+          for (int j = i + 1; j < (int)units.size() && partner < 0; j++) {
+            if (units[j].paired || units[j].steps.size() != units[i].steps.size() || akey(units[j]) != ki) continue;
+            const MmaFuseUnit *two[2] = {&units[i], &units[j]};
+            std::string why;
+            if (mma_fuse_place(two, pos, BB, why)) partner = j;
+            else {
+              refusals["n: " + why.substr(0, why.find(':'))]++;
+              if (std::getenv("CUPBOP_MMA_FUSE_DEBUG")) fprintf(stderr, "[mma-fuse] %s: n-pair refused: %s\n", F.getName().str().substr(0, 40).c_str(), why.c_str());
+            }
+          }
+        }
+        if (partner >= 0) { units[i].paired = units[partner].paired = true; groupsBB.push_back({i, partner}); }
+        else if (units[i].steps.size() > 1) groupsBB.push_back({i, -1});
+      }
+      // 3. rewrite (insertion points are computed before any change of this block: recompute per group)
+      for (auto &g : groupsBB) {
+        if (maxGroups >= 0 && groups >= maxGroups) break;
+        SmallVector<const MmaFuseUnit *, 2> us;
+        us.push_back(&units[g.first]);
+        if (g.second >= 0) us.push_back(&units[g.second]);
+        DenseMap<const Instruction *, unsigned> pos2;
+        unsigned q2 = 0;
+        for (Instruction &I : BB) pos2[&I] = q2++;
+        std::string why;
+        Instruction *at = mma_fuse_place(us, pos2, BB, why);
+        if (!at) { refusals["late: " + why.substr(0, why.find(':'))]++; continue; }
+        CallInst *c0 = us[0]->steps[0];
+        const MmaFuseForm &f = kMmaFuseForms[mma_fuse_form_of(c0)];
+        const unsigned nA = 2 * f.kps, nB = f.kps, nC = f.f16acc ? 2 : 4, NN = us.size(), L = us[0]->steps.size();
+        Type *AccT = f.f16acc ? I32 : F32;
+        std::string base = std::string("__cupbop_mmaf_") + f.geom + "_" + f.tag + "_n" + std::to_string(NN) + "k" + std::to_string(L);
+        std::string sym = tensor_pick_symbol(std::string("fused ") + f.geom + " " + f.tag, base, base, "f16", "f16", false);
+        IRBuilder<> AB(&F.getEntryBlock().front());
+        Type *ATy = ArrayType::get(I32, L * nA), *BTy = ArrayType::get(I32, NN * L * nB), *CTy = ArrayType::get(AccT, NN * nC);
+        Value *Aa = AB.CreateAlloca(ATy, nullptr, "mmaf.a"), *Ba = AB.CreateAlloca(BTy, nullptr, "mmaf.b");
+        Value *Ca = AB.CreateAlloca(CTy, nullptr, "mmaf.c"), *Da = AB.CreateAlloca(CTy, nullptr, "mmaf.d");
+        IRBuilder<> B(at);
+        auto put = [&](Value *arr, Type *arrTy, unsigned idx, Value *v, Type *T) {
+          if (auto *EV = dyn_cast<ExtractValueInst>(v); !EV) v = mma_fuse_strip(v); // (chain links are never stored)
+          if (v->getType() != T) v = B.CreateBitCast(v, T);
+          B.CreateStore(v, B.CreateConstInBoundsGEP2_32(arrTy, arr, 0, idx));
+        };
+        for (unsigned s = 0; s < L; s++)
+          for (unsigned i = 0; i < nA; i++) put(Aa, ATy, s * nA + i, us[0]->steps[s]->getArgOperand(i), I32);
+        for (unsigned u = 0; u < NN; u++)
+          for (unsigned s = 0; s < L; s++)
+            for (unsigned i = 0; i < nB; i++) put(Ba, BTy, (u * L + s) * nB + i, us[u]->steps[s]->getArgOperand(nA + i), I32);
+        for (unsigned u = 0; u < NN; u++)
+          for (unsigned i = 0; i < nC; i++) put(Ca, CTy, u * nC + i, us[u]->steps[0]->getArgOperand(nA + nB + i), AccT);
+        FunctionCallee FC = M->getOrInsertFunction(sym, FunctionType::get(Type::getVoidTy(Ctx), {PtrTy, PtrTy, PtrTy, PtrTy}, false));
+        tensor_set_convergent(B.CreateCall(FC, {Aa, Ba, Ca, Da}));
+        // create every new value first (the insertion point may be an extractvalue erased below), then rewire
+        std::vector<SmallVector<Value *, 4>> vals(NN);
+        std::vector<Value *> aggs(NN, nullptr);
+        for (unsigned u = 0; u < NN; u++) {
+          auto *RT = cast<StructType>(us[u]->steps.back()->getType());
+          for (unsigned i = 0; i < nC; i++) {
+            Value *v = B.CreateLoad(AccT, B.CreateConstInBoundsGEP2_32(CTy, Da, 0, u * nC + i), "mmaf.r");
+            if (RT->getElementType(i) != AccT) v = B.CreateBitCast(v, RT->getElementType(i));
+            vals[u].push_back(v);
+          }
+          bool other = false;
+          for (User *U : us[u]->steps.back()->users())
+            if (auto *EV = dyn_cast<ExtractValueInst>(U); !EV || EV->getNumIndices() != 1) other = true;
+          if (other) {
+            Value *agg = UndefValue::get(RT);
+            for (unsigned i = 0; i < nC; i++) agg = B.CreateInsertValue(agg, vals[u][i], i);
+            aggs[u] = agg;
+          }
+        }
+        Instruction *tail = &*std::prev(B.GetInsertPoint()); // last new instruction (never erased)
+        for (unsigned u = 0; u < NN; u++) {
+          CallInst *last = us[u]->steps.back();
+          SmallVector<ExtractValueInst *, 8> evs;
+          SmallVector<Use *, 4> others;
+          for (Use &U : last->uses()) {
+            if (auto *EV = dyn_cast<ExtractValueInst>(U.getUser()); EV && EV->getNumIndices() == 1) evs.push_back(EV);
+            else others.push_back(&U);
+          }
+          for (ExtractValueInst *EV : evs) {
+            Value *nv = vals[u][EV->getIndices()[0]];
+            SmallVector<BitCastInst *, 4> bcs; // bitcast chains of the result that sat before the fused call move after it
+            SmallVector<Value *, 4> work{EV};
+            while (!work.empty()) {
+              Value *x = work.pop_back_val();
+              for (User *W : x->users())
+                if (auto *BC = dyn_cast<BitCastInst>(W); BC && BC->getParent() == &BB && BC->comesBefore(tail)) { bcs.push_back(BC); work.push_back(BC); }
+            }
+            std::sort(bcs.begin(), bcs.end(), [](BitCastInst *a, BitCastInst *b) { return a->comesBefore(b); });
+            EV->replaceAllUsesWith(nv);
+            EV->eraseFromParent();
+            for (BitCastInst *BC : bcs) { BC->moveAfter(tail); tail = BC; }
+          }
+          for (Use *U : others) U->set(aggs[u]);
+        }
+        for (unsigned u = 0; u < NN; u++)
+          for (int s = (int)us[u]->steps.size() - 1; s >= 0; s--) {
+            CallInst *c = us[u]->steps[s];
+            SmallVector<Instruction *, 4> dead;
+            for (User *U : c->users()) dead.push_back(cast<Instruction>(U));
+            for (Instruction *d : dead) {
+              if (!d->use_empty()) { fprintf(stderr, "error: [mma-fuse] internal: result of a fused op still used\n"); exit(1); }
+              d->eraseFromParent();
+            }
+            c->eraseFromParent();
+          }
+        groups++;
+        ops_fused += NN * L;
+        shapes[sym]++;
+      }
+    }
+  }
+  std::string sh;
+  for (auto &s : shapes) sh += " " + s.first + "=" + std::to_string(s.second);
+  std::string rf;
+  for (auto &r : refusals) rf += " [" + r.first + "]=" + std::to_string(r.second);
+  const char *across = std::getenv("CUPBOP_MMA_FUSE_ACROSS");
+  if (across && *across) mode += std::string(" ACROSS=") + across;
+  fprintf(stderr, "[mma-fuse] CUPBOP_MMA_FUSE=%s: %d of %d mma.sync ops -> %ld WMMA groups (%d ops left single)%s%s%s\n", mode.c_str(),
+          ops_fused, ops_total, groups, ops_total - ops_fused, sh.c_str(), rf.empty() ? "" : "; not fused:", rf.c_str());
+}
+
+// =============================================================================
 // llvm.nvvm.mma.* (mma.sync) and cupbop.mma.* (inline-asm mma.sync) → runtime helpers
 //
 // CuLifter lifts SASS HMMA/IMMA to the NVPTX mma.sync intrinsics (never to wmma), e.g.
@@ -4200,6 +4614,7 @@ void replace_wmma_intrinsics(llvm::Module *M) {
 // (tensor_pick_symbol). Anything else is reported and aborts the translation.
 // =============================================================================
 void replace_nvvm_mma_intrinsics(llvm::Module *M) {
+  fuse_mma_sync_groups(M); // CUPBOP_MMA_FUSE (default 0: no change)
   LLVMContext &Ctx = M->getContext();
   Type *F32 = Type::getFloatTy(Ctx);
   Type *I32 = Type::getInt32Ty(Ctx);

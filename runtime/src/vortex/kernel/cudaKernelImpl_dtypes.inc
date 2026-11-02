@@ -822,4 +822,215 @@ extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_redux_sy
   return r;
 }
 
+// ---- fused mma.sync groups (kernelTranslator CUPBOP_MMA_FUSE=n|k|nk, fuse_mma_sync_groups in tool.cpp) --------------
+// The NT=32 WMMA tile is m16n16k32 (fp16 elements); one PTX m16n8k16 op fills a quarter of it, m16n8k8 an eighth, and
+// the rest is zero padding. The translator proves a group of mma.sync ops of one form in one basic block legal to
+// run as one WMMA:
+//   NN n-halves (1|2): ops with the same A operands and independent accumulators -> tile columns 0..7 / 8..15
+//   L k-steps (KPS*L <= 4 k-blocks of 8 elements): a chain D_s = mma(A_s, B_s, D_{s-1}) -> tile k-blocks in order
+// Arguments (arrays): a[L][nA] (PTX order a0.. of step s), b[NN][L][nB], c[NN][nC], d[NN][nC]; nA = 2*KPS, nB = KPS,
+// nC = 4 (f32 accumulators) or 2 (packed f16x2 accumulators). Tile k-block j = KPS*s + q of step s: A regs j (rows g:
+// PTX a[2q]) and 4+j (rows g+8: a[2q+1]), B reg 2j+u (n-half u: PTX b[q]), cf. __cupbop_mma_m16n8k16_tcu_impl;
+// accumulator n-half u: Vortex regs 2u, 2u+1 (rows g) and 4+2u, 5+2u (rows g+8), converted with the same shuffles
+// as __cupbop_acc_nv_to_vx / __cupbop_acc_vx_to_nv.
+// Numerics (SimX FEDP, fp32 accumulators): every micro-op adds one k-block's word products to its accumulator and the
+// k-blocks run in order, so n-fusion is bit-exact, and k-fusion differs from the unfused ops only where an all-zero
+// padded k-block would have turned a -0 accumulator into +0. f16 accumulators: k-fusion drops the intermediate f16
+// rounding between the steps (more precise, not bit-identical). _sw runs the unfused software ops in sequence.
+// Inlining: the symbols take arrays (the translator's allocas) and are always_inline, so the arrays become SSA values;
+// they pass the operands as scalars to __cupbop_mmaf_impl_*, which the optimizer inlines or not by its cost model, as
+// it does __cupbop_mma_m16n8k16_tcu_impl for the unfused ops (out of line, the arrays would sit in the kernel frame:
+// per-lane stack traffic, lifted g12 s2 2.2x slower). -DCUPBOP_MMAF_INLINE (CUPBOP_VX_EXTRA_CFLAGS) forces inlining.
+using __cupbop_mma_k16_fn = void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float *);
+using __cupbop_mma_k8_fn = void (*)(uint32_t, uint32_t, uint32_t, float, float, float, float, float *);
+using __cupbop_mma_k16h_fn = void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
+using __cupbop_mma_k8h_fn = void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
+template <int NN, int L, __cupbop_mma_k16_fn F>
+static inline void __cupbop_mmaf_seq_k16(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  for (int u = 0; u < NN; ++u) {
+    float acc[4] = {c[4 * u], c[4 * u + 1], c[4 * u + 2], c[4 * u + 3]};
+    for (int s = 0; s < L; ++s) {
+      const uint32_t *as = a + 4 * s, *bs = b + 2 * (u * L + s);
+      F(as[0], as[1], as[2], as[3], bs[0], bs[1], acc[0], acc[1], acc[2], acc[3], acc);
+    }
+    for (int i = 0; i < 4; ++i) d[4 * u + i] = acc[i];
+  }
+}
+template <int NN, int L, __cupbop_mma_k8_fn F>
+static inline void __cupbop_mmaf_seq_k8(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  for (int u = 0; u < NN; ++u) {
+    float acc[4] = {c[4 * u], c[4 * u + 1], c[4 * u + 2], c[4 * u + 3]};
+    for (int s = 0; s < L; ++s) F(a[2 * s], a[2 * s + 1], b[u * L + s], acc[0], acc[1], acc[2], acc[3], acc);
+    for (int i = 0; i < 4; ++i) d[4 * u + i] = acc[i];
+  }
+}
+template <int NN, int L, __cupbop_mma_k16h_fn F>
+static inline void __cupbop_mmaf_seq_k16h(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  for (int u = 0; u < NN; ++u) {
+    uint32_t acc[2] = {c[2 * u], c[2 * u + 1]};
+    for (int s = 0; s < L; ++s) {
+      const uint32_t *as = a + 4 * s, *bs = b + 2 * (u * L + s);
+      F(as[0], as[1], as[2], as[3], bs[0], bs[1], acc[0], acc[1], acc);
+    }
+    d[2 * u] = acc[0]; d[2 * u + 1] = acc[1];
+  }
+}
+template <int NN, int L, __cupbop_mma_k8h_fn F>
+static inline void __cupbop_mmaf_seq_k8h(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  for (int u = 0; u < NN; ++u) {
+    uint32_t acc[2] = {c[2 * u], c[2 * u + 1]};
+    for (int s = 0; s < L; ++s) F(a[2 * s], a[2 * s + 1], b[u * L + s], acc[0], acc[1], acc);
+    d[2 * u] = acc[0]; d[2 * u + 1] = acc[1];
+  }
+}
+#if defined(CUPBOP_MMA_TCU_AVAILABLE) && VX_CFG_NUM_THREADS == 32
+// PTX accumulator of n-half u -> Vortex regs 2u, 2u+1, 4+2u, 5+2u; the shuffles of __cupbop_acc_nv_to_vx (own always_inline
+// copies, so that the unfused helpers' inlining is unchanged)
+template <class CTX, int U>
+static inline __attribute__((always_inline)) void __cupbop_mmaf_acc_in(const float *c, typename CTX::fragment_acc &fc) {
+#ifdef CUPBOP_MMAF_NOSHFL // measurement only (wrong results): no accumulator layout change, the cost bound of keeping it
+  fc.data[2 * U] = c[0]; fc.data[2 * U + 1] = c[1]; fc.data[4 + 2 * U] = c[2]; fc.data[5 + 2 * U] = c[3]; return;
+#endif
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int s0 = (g << 2) | (t >> 1), s1 = (g << 2) | ((t >> 1) + 2);
+  const bool odd = t & 1;
+  const float x0 = __cupbop_shflf(c[0], s0), x1 = __cupbop_shflf(c[1], s0);
+  const float y0 = __cupbop_shflf(c[0], s1), y1 = __cupbop_shflf(c[1], s1);
+  const float z0 = __cupbop_shflf(c[2], s0), z1 = __cupbop_shflf(c[3], s0);
+  const float w0 = __cupbop_shflf(c[2], s1), w1 = __cupbop_shflf(c[3], s1);
+  fc.data[2 * U] = odd ? x1 : x0; fc.data[2 * U + 1] = odd ? y1 : y0;
+  fc.data[4 + 2 * U] = odd ? z1 : z0; fc.data[5 + 2 * U] = odd ? w1 : w0;
+}
+// Vortex regs of n-half u -> PTX d0..d3 (the shuffles of __cupbop_acc_vx_to_nv)
+template <class CTX, int U>
+static inline __attribute__((always_inline)) void __cupbop_mmaf_acc_out(const typename CTX::fragment_acc &fd, float *d) {
+#ifdef CUPBOP_MMAF_NOSHFL
+  d[0] = fd.data[2 * U]; d[1] = fd.data[2 * U + 1]; d[2] = fd.data[4 + 2 * U]; d[3] = fd.data[5 + 2 * U]; return;
+#endif
+  const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+  const int u0 = (g << 2) | ((2 * t) & 3), u1 = u0 + 1;
+  const bool hi = t >> 1;
+  const float p0 = __cupbop_shflf(fd.data[2 * U], u0), p1 = __cupbop_shflf(fd.data[2 * U + 1], u0);
+  const float q0 = __cupbop_shflf(fd.data[2 * U], u1), q1 = __cupbop_shflf(fd.data[2 * U + 1], u1);
+  const float r0 = __cupbop_shflf(fd.data[4 + 2 * U], u0), r1 = __cupbop_shflf(fd.data[5 + 2 * U], u0);
+  const float v0 = __cupbop_shflf(fd.data[4 + 2 * U], u1), v1 = __cupbop_shflf(fd.data[5 + 2 * U], u1);
+  d[0] = hi ? p1 : p0; d[1] = hi ? q1 : q0; d[2] = hi ? r1 : r0; d[3] = hi ? v1 : v0;
+}
+template <class CTX, int KPS, int NN, int L>
+static inline __attribute__((always_inline)) void __cupbop_mmaf_tcu_f32(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  static_assert((NN == 1 || NN == 2) && L >= 1 && KPS * L <= 4 && NN * L >= 2, "one WMMA tile: 2 n-halves x 4 k-blocks");
+  constexpr int nA = 2 * KPS, nB = KPS;
+  typename CTX::fragment_a fa; typename CTX::fragment_b fb; typename CTX::fragment_acc fc, fd;
+#pragma unroll
+  for (int r = 0; r < 8; ++r) { fa.data[r] = 0.f; fb.data[r] = 0.f; fc.data[r] = 0.f; }
+#pragma unroll
+  for (int s = 0; s < L; ++s)
+#pragma unroll
+    for (int q = 0; q < KPS; ++q) {
+      const int j = KPS * s + q;
+      fa.data[j] = __cupbop_u32_as_f32(a[s * nA + 2 * q]);
+      fa.data[4 + j] = __cupbop_u32_as_f32(a[s * nA + 2 * q + 1]);
+#pragma unroll
+      for (int u = 0; u < NN; ++u) fb.data[2 * j + u] = __cupbop_u32_as_f32(b[(u * L + s) * nB + q]);
+    }
+  __cupbop_mmaf_acc_in<CTX, 0>(c, fc);
+  if constexpr (NN == 2) __cupbop_mmaf_acc_in<CTX, 1>(c + 4, fc);
+  CTX::mma_sync(fd, fa, fb, fc);
+  __cupbop_mmaf_acc_out<CTX, 0>(fd, d);
+  if constexpr (NN == 2) __cupbop_mmaf_acc_out<CTX, 1>(fd, d + 4);
+}
+template <class CTX, int KPS, int NN, int L>
+static inline __attribute__((always_inline)) void __cupbop_mmaf_tcu_f16acc(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  float e[4 * NN], dd[4 * NN];
+#pragma unroll
+  for (int u = 0; u < NN; ++u) {
+    e[4 * u] = __cupbop_f16_to_f32(c[2 * u]); e[4 * u + 1] = __cupbop_f16_to_f32(c[2 * u] >> 16);
+    e[4 * u + 2] = __cupbop_f16_to_f32(c[2 * u + 1]); e[4 * u + 3] = __cupbop_f16_to_f32(c[2 * u + 1] >> 16);
+  }
+  __cupbop_mmaf_tcu_f32<CTX, KPS, NN, L>(a, b, e, dd);
+#pragma unroll
+  for (int u = 0; u < NN; ++u) {
+    d[2 * u] = __cupbop_pack_f16x2_rne(dd[4 * u], dd[4 * u + 1]);
+    d[2 * u + 1] = __cupbop_pack_f16x2_rne(dd[4 * u + 2], dd[4 * u + 3]);
+  }
+}
+#if defined(CUPBOP_MMAF_INLINE)
+#define CUPBOP_MMAF_IMPL_ATTR __attribute__((always_inline, convergent))
+#else
+#define CUPBOP_MMAF_IMPL_ATTR __attribute__((convergent))
+#endif
+static inline __attribute__((always_inline)) uint32_t __cupbop_mmaf_bits(uint32_t x) { return x; }
+static inline __attribute__((always_inline)) uint32_t __cupbop_mmaf_bits(float x) { return __cupbop_f32_bits(x); }
+// scalar boundary: w = A words, B words, C (f32 values or packed f16x2 words)
+template <class CTX, int KPS, int NN, int L, class... W>
+static inline CUPBOP_MMAF_IMPL_ATTR void __cupbop_mmaf_impl_f32(float *d, W... w) {
+  constexpr int nA = L * 2 * KPS, nB = NN * L * KPS;
+  static_assert(sizeof...(W) == nA + nB + 4 * NN, "operand count");
+  const uint32_t u[] = {__cupbop_mmaf_bits(w)...};
+  float c[4 * NN];
+#pragma unroll
+  for (int i = 0; i < 4 * NN; ++i) c[i] = __cupbop_bits_f32(u[nA + nB + i]);
+  __cupbop_mmaf_tcu_f32<CTX, KPS, NN, L>(u, u + nA, c, d);
+}
+template <class CTX, int KPS, int NN, int L, class... W>
+static inline CUPBOP_MMAF_IMPL_ATTR void __cupbop_mmaf_impl_f16acc(uint32_t *d, W... w) {
+  constexpr int nA = L * 2 * KPS, nB = NN * L * KPS;
+  static_assert(sizeof...(W) == nA + nB + 2 * NN, "operand count");
+  const uint32_t u[] = {w...};
+  __cupbop_mmaf_tcu_f16acc<CTX, KPS, NN, L>(u, u + nA, u + nA + nB, d);
+}
+template <class CTX, int KPS, int NN, int L, class ACCT, size_t... IA, size_t... IB, size_t... IC>
+static inline __attribute__((always_inline)) void __cupbop_mmaf_unpack(const uint32_t *a, const uint32_t *b, const ACCT *c, ACCT *d,
+                                                                      std::index_sequence<IA...>, std::index_sequence<IB...>, std::index_sequence<IC...>) {
+  if constexpr (std::is_same<ACCT, float>::value) __cupbop_mmaf_impl_f32<CTX, KPS, NN, L>(d, a[IA]..., b[IB]..., c[IC]...);
+  else __cupbop_mmaf_impl_f16acc<CTX, KPS, NN, L>(d, a[IA]..., b[IB]..., c[IC]...);
+}
+#if defined(CUPBOP_MMA_SW)
+#define CUPBOP_MMAF_PICK(NAME) NAME##_sw
+#else
+#define CUPBOP_MMAF_PICK(NAME) NAME##_tcu
+#endif
+#define CUPBOP_MMAF_TCU(NAME, ACCT, IMPL, CTX, KPS, NN, L)                                                             \
+  extern "C" __attribute__((always_inline, convergent)) void NAME##_tcu(const uint32_t *a, const uint32_t *b, const ACCT *c, ACCT *d) { \
+    __cupbop_mmaf_unpack<CTX, KPS, NN, L, ACCT>(a, b, c, d, std::make_index_sequence<L * 2 * KPS>{},                   \
+                                                std::make_index_sequence<NN * L * KPS>{},                             \
+                                                std::make_index_sequence<NN * (std::is_same<ACCT, float>::value ? 4 : 2)>{}); \
+  }
+#else
+#define CUPBOP_MMAF_PICK(NAME) NAME##_sw
+#define CUPBOP_MMAF_TCU(NAME, ACCT, IMPL, CTX, KPS, NN, L)
+#endif
+// one symbol triple per group shape: NAME = __cupbop_mmaf_<geom>_<tag>_n<NN>k<L> {_sw, _tcu, dispatch}
+#define CUPBOP_MMAF_DEF(NAME, ACCT, SEQ, SWFN, IMPL, CTX, KPS, NN, L)                                                   \
+  extern "C" __attribute__((always_inline, convergent)) void NAME##_sw(const uint32_t *a, const uint32_t *b, const ACCT *c, ACCT *d) { \
+    SEQ<NN, L, SWFN>(a, b, c, d);                                                                                     \
+  }                                                                                                                   \
+  CUPBOP_MMAF_TCU(NAME, ACCT, IMPL, CTX, KPS, NN, L)                                                                  \
+  extern "C" __attribute__((always_inline, convergent)) void NAME(const uint32_t *a, const uint32_t *b, const ACCT *c, ACCT *d) { \
+    CUPBOP_MMAF_PICK(NAME)(a, b, c, d);                                                                               \
+  }
+#define CUPBOP_MMAF_K16(TAG, ACCT, SEQ, IMPL, CTX)                                                                     \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k16_##TAG##_n2k1, ACCT, SEQ, __cupbop_mma_m16n8k16_##TAG##_sw, IMPL, CTX, 2, 2, 1) \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k16_##TAG##_n1k2, ACCT, SEQ, __cupbop_mma_m16n8k16_##TAG##_sw, IMPL, CTX, 2, 1, 2) \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k16_##TAG##_n2k2, ACCT, SEQ, __cupbop_mma_m16n8k16_##TAG##_sw, IMPL, CTX, 2, 2, 2)
+#define CUPBOP_MMAF_K8(TAG, ACCT, SEQ, IMPL, CTX)                                                                      \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n2k1, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 2, 1)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n1k2, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 1, 2)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n1k3, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 1, 3)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n1k4, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 1, 4)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n2k2, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 2, 2)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n2k3, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 2, 3)  \
+  CUPBOP_MMAF_DEF(__cupbop_mmaf_m16n8k8_##TAG##_n2k4, ACCT, SEQ, __cupbop_mma_m16n8k8_##TAG##_sw, IMPL, CTX, 1, 2, 4)
+CUPBOP_MMAF_K16(f16f32, float, __cupbop_mmaf_seq_k16, __cupbop_mmaf_tcu_f32, tcu_ctx)
+CUPBOP_MMAF_K16(bf16f32, float, __cupbop_mmaf_seq_k16, __cupbop_mmaf_tcu_f32, tcu_ctx_bf16)
+CUPBOP_MMAF_K16(f16f16, uint32_t, __cupbop_mmaf_seq_k16h, __cupbop_mmaf_tcu_f16acc, tcu_ctx)
+CUPBOP_MMAF_K8(f16f32, float, __cupbop_mmaf_seq_k8, __cupbop_mmaf_tcu_f32, tcu_ctx)
+CUPBOP_MMAF_K8(bf16f32, float, __cupbop_mmaf_seq_k8, __cupbop_mmaf_tcu_f32, tcu_ctx_bf16)
+CUPBOP_MMAF_K8(f16f16, uint32_t, __cupbop_mmaf_seq_k8h, __cupbop_mmaf_tcu_f16acc, tcu_ctx)
+#undef CUPBOP_MMAF_K16
+#undef CUPBOP_MMAF_K8
+#undef CUPBOP_MMAF_DEF
+#undef CUPBOP_MMAF_TCU
+#undef CUPBOP_MMAF_PICK
+
 #endif // VX_CFG_NUM_THREADS (Vortex 3.0)
