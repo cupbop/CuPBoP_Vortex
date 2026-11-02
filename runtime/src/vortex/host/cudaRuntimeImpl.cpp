@@ -896,7 +896,9 @@ static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
 // (default 64) + 16 (the saved sp), rounded to 16. The Vortex CTA dispatcher admits min(NUM_WARPS, LMEM /
 // stride) CTAs per core, stride = lmem_size rounded to 64 (SimX cta_dispatcher.cpp usable_slots, RTL VX_cta_dispatch),
 // and a CTA also needs its warps among the RT_NW-capped ones: R0 = min(those slots, RT_NW warps / CTA warps) CTAs per
-// core now. The stacks fit when a slot of LMEM / R CTAs (R = R0; CUPBOP_STACK_LMEM_OCC=1 also tries R0-1 .. 1) holds
+// core now. Core-wide form (tried first, CUPBOP_STACK_LMEM_FORM=core|cta restricts): every hardware thread of the core
+// (RT_NW warps x lanes) gets a stack between the last CTA slot (min(NUM_WARPS, LMEM / A) x A, A = lmem_size rounded to
+// 64) and the end of LMEM; lmem_size and the slots stay unchanged. CTA-slot form: the stacks fit when a slot of LMEM / R CTAs (R = R0; CUPBOP_STACK_LMEM_OCC=1 also tries R0-1 .. 1) holds
 // the shared memory (lmem_size, after CUPBOP_LMEM_SCALE) plus CTA warps x lanes stacks of `bytes per hardware thread`
 // each, the stride between stacks rounded up to 16 mod 32 bytes (CUPBOP_STACK_LMEM_PAD, default 16: sp stays 16-byte
 // aligned, and the 32 lanes' accesses to one frame slot fall into 16 different LMEM banks of 8 bytes, 2 per bank;
@@ -1020,8 +1022,30 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
     if (!pad) return (v + 15) & ~15ull;
     return v <= pad ? pad : (v - pad + 2 * pad - 1) / (2 * pad) * (2 * pad) + pad;
   };
+  // Core-wide form first: the CTA slots keep their layout (lmem_size unchanged, slots0 x A bytes) and every hardware
+  // thread of the core (RT_NW-capped warps x lanes) gets a stack between the last slot and the end of LMEM. Fewer CTA
+  // slots cost cycles even at the same CTAs per core (the dispatcher's round-robin waits for the next slot in order).
+  // CUPBOP_STACK_LMEM_FORM = core | cta (only that form) | unset (core, else cta).
+  const char *fm = getenv("CUPBOP_STACK_LMEM_FORM");
+  const bool try_core = !fm || strcmp(fm, "cta"), try_cta = !fm || strcmp(fm, "core");
+  if (try_core) {
+    const uint64_t region = A ? slots0 * A : 0, nc = effNW * T;
+    const uint64_t most = cap > region ? down((cap - region) / nc) : 0, least = up(need);
+    if (most >= least) {
+      const uint64_t stc = fill ? most : least;
+      ka->ctx.global_offset[0] = (uint32_t)cap;
+      ka->ctx.global_offset[1] = (uint32_t)stc;
+      ka->ctx.global_offset[2] = (uint32_t)T | (1u << 16);
+      snprintf(buf, sizeof buf, "on (core-wide): %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16), stride %lu x "
+               "%lu threads per core above %lu CTA slots x %lu bytes (lmem_size unchanged, CTAs per core %lu)%s",
+               (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)stc,
+               (unsigned long)nc, (unsigned long)slots0, (unsigned long)A, (unsigned long)R0, padnote.c_str());
+      log(buf);
+      return;
+    }
+  }
   uint64_t R = 0, st = 0;
-  for (uint64_t r = R0; r >= (occ ? 1 : R0) && r >= 1; --r) {
+  for (uint64_t r = R0; try_cta && r >= (occ ? 1 : R0) && r >= 1; --r) {
     const uint64_t smax = (cap / r) & ~63ull;
     if (smax <= A) continue;
     const uint64_t most = down((smax - A) / n), least = up(need);
@@ -1029,10 +1053,11 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   }
   if (!R) {
     const uint64_t smax = (cap / R0) & ~63ull;
+    const uint64_t corefree = cap > (A ? slots0 * A : 0) ? down((cap - (A ? slots0 * A : 0)) / (effNW * T)) : 0;
     snprintf(buf, sizeof buf, "hardware stack: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16) x %lu threads "
-             "do not fit next to %lu bytes of shared memory at %lu CTAs per core (%lu bytes per thread there)%s",
+             "do not fit next to %lu bytes of shared memory at %lu CTAs per core (%lu bytes per thread there, %lu core-wide)%s",
              (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)n,
-             (unsigned long)A, (unsigned long)R0, (unsigned long)(smax > A ? down((smax - A) / n) : 0),
+             (unsigned long)A, (unsigned long)R0, (unsigned long)(smax > A ? down((smax - A) / n) : 0), (unsigned long)corefree,
              occ ? ", nor at fewer CTAs" : " (CUPBOP_STACK_LMEM_OCC=1 tries fewer CTAs)");
     log(buf);
     return;
@@ -1043,7 +1068,7 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   ka->ctx.global_offset[2] = (uint32_t)T;
   const uint32_t old = lmem;
   lmem = (uint32_t)slot;
-  snprintf(buf, sizeof buf, "on: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16), stride %lu x %lu threads, "
+  snprintf(buf, sizeof buf, "on (CTA slot): %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16), stride %lu x %lu threads, "
            "shared %u -> slot %lu bytes, CTAs per core %lu -> %lu (slots %lu, warps %lu)%s",
            (unsigned long)need, (unsigned long)chain, (unsigned long)dyn, (unsigned long)margin, (unsigned long)st,
            (unsigned long)n, old, (unsigned long)slot, (unsigned long)R0,

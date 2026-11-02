@@ -261,7 +261,11 @@ static std::string kabi_prelude() {
 // ctx->global_offset = {top offset of the stacks in the slot, bytes per hardware thread, lanes per warp}; hardware
 // thread (CTA warp rank r, lane l) then runs the kernel with sp = CTA LMEM address + top - (r x lanes + l) x bytes - 16
 // (the old sp is kept at the new sp, as for the software stack). global_offset[1] = 0 (no fit, or a host without the
-// switch): the call of the switch-off wrapper. kernel_main's own frame stays on the hardware stack.
+// switch): the call of the switch-off wrapper. kernel_main's own frame stays on the hardware stack. Core-wide form
+// (global_offset[2] bit 16, preferred by the host when it fits): the stacks of all hardware threads of the core
+// (warp id x lanes + lane) lie above every CTA slot the dispatcher can use, base VX_MEM_LMEM_BASE_ADDR, so lmem_size
+// and the CTA slots stay as without the switch (fewer slots cost cycles: the dispatcher's round-robin waits for the
+// next slot in order, sgemm sm100 s2 NC16 +4% with 4 slots, +11% with 2, against 16).
 // examples/stack_fallback.sh writes the static stack of each kernel's deepest call chain (examples/stack_chain.py)
 // to cupbop_lmem_stack.txt; the run-time sized allocas come from cupbop_dyn_stack.txt (describe_dyn_stack also runs
 // with this switch). Not with the software stack (CUPBOP_BIG_STACK: such frames never fit). Unset or 0: the wrapper is
@@ -285,11 +289,18 @@ static std::string stack_lmem_prelude() {
       "// ctx->global_offset = {top offset of the stacks in the CTA's LMEM slot, bytes per hardware thread, lanes per warp}\n"
       "// when this launch's stacks fit, else global_offset[1] = 0 (the hardware stack).\n"
       "#define __CUPBOP_LMEM_STACK ") + std::to_string(stack_lmem_mode()) + "\n"
+      "#include <VX_types.h>\n"
       "static inline __attribute__((always_inline)) void __cupbop_kcall_lmem(const context_t *ctx, vx_kernel_func_cb fn, void *arg) {\n"
       "    const uint32_t __st = ctx->global_offset[1];\n"
       "    if (!__st) { " + old_kernel_call("fn", "arg") + "; return; }\n"
-      "    const uint64_t __h = (uint64_t)csr_read_nv(VX_CSR_CTA_RANK) * ctx->global_offset[2] + (uint64_t)vx_thread_id();\n"
-      "    register char *__t1 asm(\"t1\") = (char *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR) + ctx->global_offset[0] - __h * __st;\n"
+      "    // global_offset[2] = lanes per warp | core-wide << 16: stacks of the CTA's hardware threads (CTA warp rank) in\n"
+      "    // its LMEM slot, or core-wide: of every hardware thread of the core (warp id) above all CTA slots\n"
+      "    const uint32_t __g2 = ctx->global_offset[2];\n"
+      "    const bool __core = (__g2 >> 16) != 0;\n"
+      "    const uint64_t __w = __core ? (uint64_t)vx_warp_id() : (uint64_t)csr_read_nv(VX_CSR_CTA_RANK);\n"
+      "    char *const __b = __core ? (char *)(uintptr_t)VX_MEM_LMEM_BASE_ADDR : (char *)csr_read_nv(VX_CSR_CTA_LMEM_ADDR);\n"
+      "    const uint64_t __h = __w * (__g2 & 0xffffu) + (uint64_t)vx_thread_id();\n"
+      "    register char *__t1 asm(\"t1\") = __b + ctx->global_offset[0] - __h * __st;\n"
       "    register void *__a0 asm(\"a0\") = arg;\n"
       "    register void *__t2 asm(\"t2\") = (void *)fn;\n"
       "    __asm__ volatile(\"addi t1, t1, -16\\n\\tsd sp, 0(t1)\\n\\tmv sp, t1\\n\\tjalr ra, 0(t2)\\n\\tld sp, 0(sp)\"\n"
