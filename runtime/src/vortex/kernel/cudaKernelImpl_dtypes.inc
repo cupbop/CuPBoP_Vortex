@@ -888,6 +888,9 @@ static inline void __cupbop_mmaf_seq_k8h(const uint32_t *a, const uint32_t *b, c
 // copies, so that the unfused helpers' inlining is unchanged)
 template <class CTX, int U>
 static inline __attribute__((always_inline)) void __cupbop_mmaf_acc_in(const float *c, typename CTX::fragment_acc &fc) {
+#ifdef CUPBOP_MMAF_NOSHFL // measurement only (wrong results): no accumulator layout change, the cost bound of keeping it
+  fc.data[2 * U] = c[0]; fc.data[2 * U + 1] = c[1]; fc.data[4 + 2 * U] = c[2]; fc.data[5 + 2 * U] = c[3]; return;
+#endif
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int s0 = (g << 2) | (t >> 1), s1 = (g << 2) | ((t >> 1) + 2);
   const bool odd = t & 1;
@@ -901,6 +904,9 @@ static inline __attribute__((always_inline)) void __cupbop_mmaf_acc_in(const flo
 // Vortex regs of n-half u -> PTX d0..d3 (the shuffles of __cupbop_acc_vx_to_nv)
 template <class CTX, int U>
 static inline __attribute__((always_inline)) void __cupbop_mmaf_acc_out(const typename CTX::fragment_acc &fd, float *d) {
+#ifdef CUPBOP_MMAF_NOSHFL
+  d[0] = fd.data[2 * U]; d[1] = fd.data[2 * U + 1]; d[2] = fd.data[4 + 2 * U]; d[3] = fd.data[5 + 2 * U]; return;
+#endif
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const int u0 = (g << 2) | ((2 * t) & 3), u1 = u0 + 1;
   const bool hi = t >> 1;

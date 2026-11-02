@@ -4196,8 +4196,8 @@ void replace_wmma_intrinsics(llvm::Module *M) {
 //      (each output element depends only on its own A row, B column and C: bit-exact)
 //   k: a unit is a chain D_s = mma(A_s, B_s, D_{s-1}) of L steps (k-blocks KPS*L <= 4): every result of step s-1 is
 //      used only as the accumulator operand of step s. The TCU then adds the k-blocks without the zero padding in
-//      between: bit-exact on the SimX FEDP with f32 accumulators except -0 vs +0, and without the intermediate f16
-//      rounding with f16 accumulators. Separate switch for that reason.
+//      between: bit-exact on the SimX FEDP with f32 accumulators except -0 vs +0 (mmafuse_test: identical bits on random
+//      data), and without the intermediate f16 rounding with f16 accumulators (only with CUPBOP_MMA_FUSE_F16ACC_K=1).
 // Legality (per group): all ops in one basic block; no call other than mma.sync / side-effect-free non-convergent
 // intrinsics (barriers, shuffles, votes, asm, runtime calls), fence or atomic between the first and the last op; the
 // fused call goes at the earliest point after every operand definition and before every use of a result, which must
@@ -4356,6 +4356,10 @@ static void fuse_mma_sync_groups(llvm::Module *M) {
   bool doN = mode == "n" || mode == "nk" || mode == "kn", doK = mode == "k" || mode == "nk" || mode == "kn";
   if (!doN && !doK) { fprintf(stderr, "warning: CUPBOP_MMA_FUSE=%s unknown (0|n|k|nk); not fusing\n", mode.c_str()); return; }
   if (tensor_lowering_mode() == "sw") { fprintf(stderr, "[mma-fuse] CUPBOP_MMA_LOWERING=sw: not fusing\n"); return; }
+  if (const char *sf = std::getenv("VORTEX_SCHEDULE_FLAG"); sf && std::atoi(sf) == 0) {
+    fprintf(stderr, "[mma-fuse] schedule 0 (flat mapping): not fusing\n"); // mma.sync needs hardware lanes (1:1 / core mapping)
+    return;
+  }
   if (const char *nt = std::getenv("VORTEX_NUM_THREADS"); nt && std::atoi(nt) != 32) {
     fprintf(stderr, "[mma-fuse] VORTEX_NUM_THREADS=%s: the fused WMMA needs the NT=32 tile; not fusing\n", nt);
     return;
@@ -4417,9 +4421,13 @@ static void fuse_mma_sync_groups(llvm::Module *M) {
       std::vector<MmaFuseUnit> units;
       {
         DenseMap<CallInst *, CallInst *> next, prev;
+        // f16 accumulators: a fused k-chain skips the f16 rounding between the steps (not bit-identical, untested on
+        // lifted kernels: none has such a chain in one block), so it needs CUPBOP_MMA_FUSE_F16ACC_K=1 as well
+        static const bool f16accK = [] { const char *e = std::getenv("CUPBOP_MMA_FUSE_F16ACC_K"); return e && std::atoi(e) != 0; }();
         if (doK)
           for (CallInst *Y : ops) {
             const MmaFuseForm &f = kMmaFuseForms[mma_fuse_form_of(Y)];
+            if (f.f16acc && !f16accK) continue;
             const unsigned nA = 2 * f.kps, nB = f.kps;
             auto *EV = dyn_cast<ExtractValueInst>(Y->getArgOperand(nA + nB));
             auto *X = EV ? dyn_cast<CallInst>(EV->getAggregateOperand()) : nullptr;
