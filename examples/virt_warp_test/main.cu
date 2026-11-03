@@ -72,7 +72,34 @@ __global__ void warp_test2(int *out) {
   for (int a = 0; a < 3; a++) { k1 = wsum(k1) & 1023; if (lane < 8) k1 += a; }
   for (int a = 0; a < (lane & 1) + 1; a++) k2 = wsum(k2) & 1023; // divergent trip count around staged ops
   out[o + 10] = k1; out[o + 11] = k2;
-  for (int f = 12; f < NF; f++) out[o + f] = t;
+  // 16-lane sub-pass shapes (nt16s1, 11/3): branches whose arm differs between the two halves of a CUDA warp
+  int q = t * 3 + __shfl_xor_sync(full, t, 16);       // after a staged shuffle, store only in the lower half
+  int f12 = -5;
+  if (lane < 16) f12 = q;                             // (lifted backprop: `if (tid.y == 0) store`)
+  int f13;                                            // both arms hold a warp op, each with its own half
+  if (lane < 16) f13 = __ballot_sync(0x0000ffffu, t & 1);
+  else f13 = __ballot_sync(0xffff0000u, (t % 3) == 0);
+  int f14 = -3;                                       // only the upper half runs a shuffle loop (sub-pass 0 is idle)
+  if (lane >= 16) {
+    f14 = t;
+    for (int off = 8; off > 0; off >>= 1) f14 += __shfl_xor_sync(0xffff0000u, f14, off, 16);
+  }
+  int f15 = -4;                                       // nested arms inside the upper half
+  if (lane >= 16) { if (lane & 1) f15 = __ballot_sync(0xaaaa0000u, (t % 5) == 0); else f15 = lane; }
+  out[o + 12] = f12; out[o + 13] = f13; out[o + 14] = f14; out[o + 15] = f15;
+}
+
+// Third kernel: lifted backprop's shape in a 2-D block (16 x 4): the guard around the shuffle and the store behind it test
+// threadIdx.y, which differs between the two 16-lane halves of a CUDA warp. Rows t + 2000: fields 0 and 1, the rest 0.
+__global__ void warp_test3(int *out) {
+  int tx = threadIdx.x, ty = threadIdx.y, t = ty * 16 + tx;
+  if (ty >= 2) return;                                // (both early exits: one merge in front of the return, as lifted)
+  int v = tx + 100 * ty + 1;
+  int x = __shfl_xor_sync(0xffffffffu, v, 16);
+  int s = v + (ty == 0 ? x : 0);
+  out[t * NF + 0] = s;
+  if (ty != 0) return;
+  out[(32 + tx) * NF + 1] = s;
 }
 int main() {
   int *d = NULL; size_t sz = NTHREADS * NF * sizeof(int);
@@ -93,6 +120,15 @@ int main() {
   cudaMemcpy(h, d, sz, cudaMemcpyDeviceToHost);
   for (int t = 0; t < NTHREADS; t++) {
     printf("%d:", 1000 + t);
+    for (int f = 0; f < NF; f++) printf(" %d", h[t * NF + f]);
+    printf("\n");
+  }
+  for (int i = 0; i < NTHREADS * NF; i++) h[i] = 0;
+  cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice);
+  warp_test3<<<1, dim3(16, 4)>>>(d);
+  cudaMemcpy(h, d, sz, cudaMemcpyDeviceToHost);
+  for (int t = 0; t < NTHREADS; t++) {
+    printf("%d:", 2000 + t);
     for (int f = 0; f < NF; f++) printf(" %d", h[t * NF + f]);
     printf("\n");
   }

@@ -919,7 +919,9 @@ void insert_sync(llvm::Module *M) {
         for (Instruction &I : BB)
           if (auto *CI = dyn_cast<CallInst>(&I))
             if (Function *Callee = CI->getCalledFunction())
-              if (Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync")
+              if (Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync" ||
+                  // sub-pass form: staged warp-op markers, glue_end, native warp syncs are boundaries of the kernel too
+                  (getVirtGeom().subpasses > 1 && (isWarpSync(Callee->getName().str()) || isCGSync(Callee->getName().str()))))
                 g_s1_kernel_barriers.insert(CI);
   if (schedule == 1 && getVirtGeom().subpasses == 1) // sub-pass form keeps them as boundaries
     erase_warp_syncs_for_virt(M);

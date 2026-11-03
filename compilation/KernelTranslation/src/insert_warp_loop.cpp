@@ -2556,8 +2556,11 @@ static bool s1_absorb_why() {
 }
 static bool s1_is_cta_barrier(const llvm::Instruction &I) {
   if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-    if (auto *Callee = CI->getCalledFunction())
-      return Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync";
+    if (auto *Callee = CI->getCalledFunction()) {
+      if (Callee->getName() == "llvm.nvvm.barrier0" || Callee->getName() == "llvm.nvvm.barrier.sync") return true;
+      // sub-pass form: a warp sync bounds a lane loop the same way (a CTA barrier for this logic)
+      return need_nested_loop && (isWarpSync(Callee->getName().str()) || isCGSync(Callee->getName().str()));
+    }
   return false;
 }
 // "kernel" | "entry_exit" | "region_split" | "added"
@@ -2572,7 +2575,7 @@ static const char *s1_barrier_kind(llvm::Instruction &I) {
   return "added";
 }
 static llvm::CallInst *s1_region_marker(llvm::Instruction *before) {
-  auto *c = CreateInterWarpBarrier(before);
+  auto *c = need_nested_loop ? CreateIntraWarpBarrier(before) : CreateInterWarpBarrier(before);
   auto &mctx = c->getContext();
   c->setMetadata("cupbop.builtin_barrier", llvm::MDNode::get(mctx, llvm::MDString::get(mctx, "region_split")));
   return c;
@@ -2777,6 +2780,279 @@ static int split_multi_entry_merges(llvm::Function &F, const std::vector<llvm::B
     fprintf(stderr, "[s1-absorb] %s: %d region markers at merges of differently-entered paths (thread-dependent regions "
                     "with two entry barriers)\n", F.getName().str().c_str(), n);
   return n;
+}
+
+// ---- Core mapping, sub-pass form (S > 1): thread-dependent branches between the lane loops (nt16s1, 2026-11-03) ----------
+// Code outside a lane loop runs once per logical warp and reads slot 0 of every per-lane value. A thread-dependent branch
+// left there (insert_sync put region boundaries into its arms, or the arm holds a staged warp op) was decided by sub-pass
+// 0 for the whole CUDA warp: lifted backprop's `if (tid.y == 0) store` also ran for tid.y = 1, silently. Now:
+//   1. an area with no boundary of the kernel (no staged warp op, __syncwarp, CTA barrier) is absorbed into one lane loop
+//      (absorb_divergent_areas, as at S = 1), so each sub-pass takes its own way through it;
+//   2. other forward branches get a gate: the lane loop in front of the branch stores (cond ? 2 : 1) in a per-hardware-
+//      thread slot per sub-pass (0 = did not run); the branch itself becomes warp-uniform: an arm runs when any lane of
+//      any sub-pass takes it (hardware ballot over the OR of the slots, slots cleared), both arms one after the other
+//      when both are wanted; every lane loop inside an arm starts with a test of the condition in that sub-pass. Glue
+//      runs for all lanes (a staged vote counts only lanes that stored; a shuffle from a lane that did not run is
+//      undefined in CUDA as well);
+//   3. branches between the lane loops inside a gated arm follow the same scheme (a loop branch, whose lanes must agree
+//      under the 2A rule of warp_func.cpp, without the tests: it must not read slot 0, which may not have run);
+//   4. what cannot be gated is refused: unstructured arms, thread-dependent loops without a boundary of the kernel that
+//      could not be absorbed. An area with a CTA barrier stays as it was (block-uniform by CUDA's rules).
+// CUPBOP_VIRT_NO_GATE=1: off (slot 0 decides, as before).
+static bool virt_gate_on() { return !std::getenv("CUPBOP_VIRT_NO_GATE"); }
+struct VirtGate {
+  llvm::BasicBlock *X = nullptr, *A = nullptr, *B = nullptr, *M = nullptr;  // block with the branch, its arms, its merge
+  llvm::Value *cond = nullptr;
+  std::set<llvm::BasicBlock *> T, E;   // blocks of the arms
+  bool loop_branch = false;
+  llvm::AllocaInst *stage = nullptr;   // [S + 1 x i32] per hardware thread; [S] = "the else arm runs"
+};
+static void virt_reach(llvm::BasicBlock *from, llvm::BasicBlock *M, std::set<llvm::BasicBlock *> &out) {
+  std::vector<llvm::BasicBlock *> work{from};
+  while (!work.empty()) {
+    llvm::BasicBlock *B = work.back(); work.pop_back();
+    if (B == M || !out.insert(B).second) continue;
+    for (llvm::BasicBlock *S : llvm::successors(B)) work.push_back(S);
+  }
+}
+// 0: forward branch, 1: loop branch, -1: unstructured (why)
+static int virt_classify(llvm::BasicBlock *X, llvm::BranchInst *BI, llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT,
+                         llvm::LoopInfo &LI, VirtGate &g, std::string &why) {
+  g = VirtGate();
+  g.X = X; g.cond = BI->getCondition(); g.A = BI->getSuccessor(0); g.B = BI->getSuccessor(1);
+  if (auto *N = PDT.getNode(X)) if (auto *IN = N->getIDom()) g.M = IN->getBlock();
+  if (llvm::Loop *L = LI.getLoopFor(X))
+    if (!L->contains(g.A) || !L->contains(g.B) || g.A == L->getHeader() || g.B == L->getHeader()) {
+      g.loop_branch = true;
+      for (llvm::BasicBlock *B : L->blocks()) g.T.insert(B);
+      return 1;
+    }
+  if (!g.M) { why = "no post-dominator (paths to different exits)"; virt_reach(g.A, nullptr, g.T); virt_reach(g.B, nullptr, g.E); return -1; }
+  if (g.A != g.M) virt_reach(g.A, g.M, g.T);
+  if (g.B != g.M) virt_reach(g.B, g.M, g.E);
+  if (g.T.count(X) || g.E.count(X)) { why = "the arms reach the branch again"; return -1; }
+  for (llvm::BasicBlock *B : g.T) if (g.E.count(B)) { why = "the arms share " + B->getName().str(); return -1; }
+  for (auto *S : {&g.T, &g.E})
+    for (llvm::BasicBlock *B : *S)
+      for (llvm::BasicBlock *P : llvm::predecessors(B))
+        if (!S->count(P) && !(P == X && (B == g.A || B == g.B))) { why = "arm entered from outside (" + B->getName().str() + ")"; return -1; }
+  return 0;
+}
+static bool virt_area_holds(const std::set<llvm::BasicBlock *> &S, bool cta, bool real) {
+  for (llvm::BasicBlock *B : S)
+    for (llvm::Instruction &I : *B) {
+      if (!s1_is_cta_barrier(I) || strcmp(s1_barrier_kind(I), "kernel")) continue;
+      auto *CI = llvm::cast<llvm::CallInst>(&I);
+      const llvm::StringRef n = CI->getCalledFunction()->getName();
+      const bool is_cta = n == "llvm.nvvm.barrier0" || n == "llvm.nvvm.barrier.sync" || isCGSync(n.str());
+      if ((cta && is_cta) || (real && !is_cta)) return true;
+    }
+  return false;
+}
+static bool virt_area_holds_region(const std::set<llvm::BasicBlock *> &S, const std::set<llvm::BasicBlock *> &wrapped) {
+  for (llvm::BasicBlock *B : S) if (wrapped.count(B)) return true;
+  return false;
+}
+// Stage the condition of g in the lane loop in front of the branch (g.X becomes the block that ends in the branch).
+static void virt_gate_stage(VirtGate &g, llvm::Function &F, const std::set<llvm::BasicBlock *> &wrapped) {
+  llvm::Module *Mod = F.getParent();
+  llvm::LLVMContext &C = F.getContext();
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  const VirtGeom vg = getVirtGeom();
+  auto *ArrTy = llvm::ArrayType::get(I32, vg.subpasses + 1);
+  {
+    llvm::Instruction *at = F.getEntryBlock().getTerminator();
+    for (llvm::Instruction &I : F.getEntryBlock()) if (!llvm::isa<llvm::AllocaInst>(&I)) { at = &I; break; }
+    llvm::IRBuilder<> eb(at);
+    g.stage = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_gate");
+    for (int j = 0; j <= vg.subpasses; j++)
+      eb.CreateStore(llvm::ConstantInt::get(I32, 0), eb.CreateConstInBoundsGEP2_32(ArrTy, g.stage, 0, j))->setVolatile(true);
+  }
+  llvm::BasicBlock *X = g.X;
+  llvm::Instruction *lead = X->getFirstNonPHI();
+  auto *CI = llvm::dyn_cast<llvm::CallInst>(lead);
+  const bool boundary = s1_is_cta_barrier(*lead);
+  const bool warp_lead = boundary && CI->getCalledFunction() && isWarpSync(CI->getCalledFunction()->getName().str());
+  auto *CondI = llvm::dyn_cast<llvm::Instruction>(g.cond);
+  llvm::BasicBlock *P = X->getSinglePredecessor();
+  llvm::BasicBlock *Xs;
+  if (warp_lead && P && wrapped.count(P) && !(CondI && CondI->getParent() == X)) {
+    // the lane loop that ends in front of X stores the condition (a CTA barrier would end the logical warp's turn: a
+    // slot is only good within one logical warp)
+    Xs = llvm::SplitBlockPredecessors(X, {P}, ".vgate");
+  } else {
+    // a lane loop of its own: X = [boundary], Xs = [store], X2 = [warp boundary, branch]
+    llvm::Instruction *term = X->getTerminator();
+    llvm::BasicBlock *X2;
+    if (boundary && term != lead) {
+      Xs = X->splitBasicBlock(lead->getNextNode(), X->getName() + ".vgate");
+      X2 = Xs->splitBasicBlock(term, X->getName() + ".vgbr");
+    } else if (boundary) {
+      fprintf(stderr, "[virt-gate] internal: a boundary block without a terminator\n");
+      ::exit(3);
+    } else {
+      Xs = X;
+      X2 = X->splitBasicBlock(term, X->getName() + ".vgbr");
+    }
+    CreateIntraWarpBarrier(X2->getTerminator());
+    g.X = X2;
+  }
+  llvm::IRBuilder<> b(Xs->getTerminator());
+  auto *l = createLoad(b, Mod->getGlobalVariable("intra_warp_index"));
+  auto *j = b.CreateLShr(l, llvm::ConstantInt::get(I32, vg.lg_lanes), "gsub");
+  auto *v = b.CreateSelect(g.cond, llvm::ConstantInt::get(I32, 2), llvm::ConstantInt::get(I32, 1), "gate_v");
+  b.CreateStore(v, b.CreateInBoundsGEP(ArrTy, g.stage, {llvm::ConstantInt::get(I32, 0), j}))->setVolatile(true);
+}
+// The branch of g, warp-uniform now (see above).
+static void virt_gate_branch(VirtGate &g, llvm::Function &F) {
+  llvm::Module *Mod = F.getParent();
+  llvm::LLVMContext &C = F.getContext();
+  auto *I32 = llvm::Type::getInt32Ty(C);
+  const VirtGeom vg = getVirtGeom();
+  auto *ArrTy = llvm::ArrayType::get(I32, vg.subpasses + 1);
+  auto *BI = llvm::cast<llvm::BranchInst>(g.X->getTerminator());
+  llvm::IRBuilder<> b(BI);
+  llvm::FunctionCallee ballotF = Mod->getOrInsertFunction("__cupbop_hw_ballot", llvm::FunctionType::get(I32, {I32}, false));
+  if (auto *Fn = llvm::dyn_cast<llvm::Function>(ballotF.getCallee())) Fn->addFnAttr(llvm::Attribute::Convergent);
+  llvm::Value *v = llvm::ConstantInt::get(I32, 0);
+  for (int j = 0; j < vg.subpasses; j++) {
+    auto *gep = b.CreateConstInBoundsGEP2_32(ArrTy, g.stage, 0, j);
+    auto *ld = b.CreateLoad(I32, gep, "gate_s"); ld->setVolatile(true);
+    v = b.CreateOr(v, ld);
+    b.CreateStore(llvm::ConstantInt::get(I32, 0), gep)->setVolatile(true);
+  }
+  auto any = [&](llvm::Value *bit) {
+    auto *hb = b.CreateCall(ballotF, {bit}, "gate_ballot");
+    hb->addFnAttr(llvm::Attribute::Convergent);
+    return b.CreateICmpNE(hb, llvm::ConstantInt::get(I32, 0), "gate_any");
+  };
+  llvm::Value *t = b.CreateAnd(b.CreateLShr(v, llvm::ConstantInt::get(I32, 1)), llvm::ConstantInt::get(I32, 1));
+  llvm::Value *f = b.CreateAnd(v, llvm::ConstantInt::get(I32, 1));
+  llvm::MDNode *mark = llvm::MDNode::get(C, llvm::MDString::get(C, "gated"));
+  BI->setMetadata("cupbop.virt_gated", mark);
+  if (g.loop_branch || g.B == g.M) {      // (the arm of the true side; a loop: stay / leave as the active lanes say)
+    BI->setCondition(any(t));
+  } else if (g.A == g.M) {                 // only the false side has an arm
+    BI->setCondition(any(f));
+    BI->setSuccessor(0, g.B);
+    BI->setSuccessor(1, g.M);
+  } else {                                 // both: then-arm, Y, else-arm
+    llvm::Value *anyT = any(t), *anyF = any(f);
+    auto *gep = b.CreateConstInBoundsGEP2_32(ArrTy, g.stage, 0, vg.subpasses);
+    b.CreateStore(b.CreateZExt(anyF, I32), gep)->setVolatile(true);
+    llvm::BasicBlock *Y = llvm::BasicBlock::Create(C, g.X->getName() + ".velse", &F, g.B);
+    std::vector<llvm::BasicBlock *> preds;
+    for (llvm::BasicBlock *P : llvm::predecessors(g.M)) if (g.T.count(P)) preds.push_back(P);
+    for (llvm::BasicBlock *P : preds) P->getTerminator()->replaceSuccessorWith(g.M, Y);
+    BI->setCondition(anyT);
+    BI->setSuccessor(1, Y);
+    llvm::IRBuilder<> yb(Y);
+    auto *ybr = yb.CreateCondBr(llvm::ConstantInt::getFalse(C), g.B, g.M);
+    CreateIntraWarpBarrier(ybr);
+    yb.SetInsertPoint(ybr);
+    auto *ygep = yb.CreateConstInBoundsGEP2_32(ArrTy, g.stage, 0, vg.subpasses);
+    auto *yl = yb.CreateLoad(I32, ygep, "gate_else"); yl->setVolatile(true);
+    ybr->setCondition(yb.CreateICmpNE(yl, llvm::ConstantInt::get(I32, 0)));
+    ybr->setMetadata("cupbop.virt_gated", mark);
+  }
+}
+// Every lane loop inside a gated arm starts with the tests of the gates around it, outermost first.
+static void virt_gate_guards(llvm::Function &F, std::vector<VirtGate> &gates, std::vector<ParallelRegion> &PRs) {
+  llvm::LLVMContext &C = F.getContext();
+  llvm::MDNode *mark = llvm::MDNode::get(C, llvm::MDString::get(C, "absorbed"));
+  std::vector<const VirtGate *> order;
+  for (auto &g : gates) if (!g.loop_branch) order.push_back(&g);
+  std::stable_sort(order.begin(), order.end(), [](const VirtGate *a, const VirtGate *b) {
+    return a->T.size() + a->E.size() > b->T.size() + b->E.size(); });
+  for (auto &pr : PRs) {
+    llvm::BasicBlock *S = pr.start_block, *E = pr.end_block, *N = pr.successor_block;
+    std::vector<std::pair<const VirtGate *, bool>> chain;
+    for (const VirtGate *g : order) {
+      const bool inT = g->T.count(S), inE = g->E.count(S);
+      if (!inT && !inE) continue;
+      for (llvm::BasicBlock *B : pr.wrapped_block)
+        if (!(inT ? g->T : g->E).count(B) && !B->getName().contains(".vg")) {
+          fprintf(stderr, "error: virt sub-pass form: a lane loop leaves the arm of a thread-dependent branch in %s (block %s); "
+                          "refusing (CUPBOP_VIRT_NO_GATE=1 translates anyway)\n", g->X->getName().str().c_str(), B->getName().str().c_str());
+          ::exit(1);
+        }
+      chain.push_back({g, inT});
+    }
+    if (chain.empty()) continue;
+    if (!S->phis().empty()) { fprintf(stderr, "error: virt sub-pass form: gate in front of a block with PHIs (%s)\n", S->getName().str().c_str()); ::exit(1); }
+    std::vector<llvm::BasicBlock *> outside;
+    for (llvm::BasicBlock *P : llvm::predecessors(S)) if (!pr.wrapped_block.count(P)) outside.push_back(P);
+    llvm::BasicBlock *J = llvm::BasicBlock::Create(C, "vgate_join", &F, N);
+    llvm::BranchInst::Create(N, J);
+    E->getTerminator()->replaceSuccessorWith(N, J);
+    N->replacePhiUsesWith(E, J);
+    llvm::BasicBlock *next = S;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      llvm::BasicBlock *G = llvm::BasicBlock::Create(C, "vgate_test", &F, S);
+      auto *br = it->second ? llvm::BranchInst::Create(next, J, it->first->cond, G)
+                            : llvm::BranchInst::Create(J, next, it->first->cond, G);
+      br->setMetadata("cupbop.s1_absorbed", mark);   // (not a region stop)
+      next = G;
+    }
+    for (llvm::BasicBlock *P : outside) P->getTerminator()->replaceSuccessorWith(S, next);
+  }
+}
+// Picks the branches to gate. Refuses what cannot be gated. Returns the gates (arms computed on the current CFG).
+static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vector<ParallelRegion> &PRs, CustomDivergenceAnalysis &DI,
+                                               llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, llvm::LoopInfo &LI) {
+  std::set<llvm::BasicBlock *> wrapped;
+  for (auto &pr : PRs) wrapped.insert(pr.wrapped_block.begin(), pr.wrapped_block.end());
+  struct Cand { VirtGate g; int kind; std::string why; bool div; };
+  std::vector<Cand> cands;
+  for (llvm::BasicBlock &X : F) {
+    if (wrapped.count(&X)) continue;
+    auto *BI = llvm::dyn_cast<llvm::BranchInst>(X.getTerminator());
+    if (!BI || !BI->isConditional() || llvm::isa<llvm::Constant>(BI->getCondition())) continue;
+    if (BI->getMetadata("cupbop.virt_gated")) continue;
+    Cand c; c.div = DI.isDivergent(BI->getCondition());
+    c.kind = virt_classify(&X, BI, DT, PDT, LI, c.g, c.why);
+    cands.push_back(c);
+  }
+  std::vector<VirtGate> gates;
+  std::set<const Cand *> taken;
+  std::set<llvm::BasicBlock *> gated;   // the blocks of the gated arms
+  int bad = 0;
+  for (bool ch = true; ch;) {
+    ch = false;
+    for (Cand &c : cands) {
+      if (taken.count(&c)) continue;
+      const bool inside = gated.count(c.g.X);
+      if (!c.div && !inside) continue;
+      if (c.kind == 1 && !inside) continue;    // loops: below
+      if (c.kind == 0 && virt_area_holds(c.g.T, true, false)) continue;
+      if (c.kind == 0 && virt_area_holds(c.g.E, true, false)) continue;
+      if (c.kind == 1 && virt_area_holds(c.g.T, true, false)) continue;
+      if (c.kind < 0) continue;                // below
+      taken.insert(&c);
+      gates.push_back(c.g);
+      if (c.kind == 0) { gated.insert(c.g.T.begin(), c.g.T.end()); gated.insert(c.g.E.begin(), c.g.E.end()); }
+      ch = true;
+    }
+  }
+  for (Cand &c : cands) {
+    if (taken.count(&c) || !c.div) continue;
+    const bool cta = virt_area_holds(c.g.T, true, false) || virt_area_holds(c.g.E, true, false);
+    if (cta) continue;                         // block-uniform by CUDA's rules: slot 0 is as good as any
+    if (c.kind == 1) {
+      if (virt_area_holds(c.g.T, false, true)) continue;   // warp ops in the loop: the 2A rule in warp_func.cpp
+      if (!virt_area_holds_region(c.g.T, wrapped)) continue;
+      c.why = "thread-dependent loop that could not be absorbed";
+    } else if (!virt_area_holds_region(c.g.T, wrapped) && !virt_area_holds_region(c.g.E, wrapped)) continue;
+    fprintf(stderr, "error: virt sub-pass form (%d lanes): thread-dependent branch in %s of %s cannot be gated: %s\n",
+            getVirtGeom().lanes, c.g.X->getName().str().c_str(), F.getName().str().c_str(), c.why.c_str());
+    bad++;
+  }
+  if (bad) {
+    fprintf(stderr, "error: virt sub-pass form: %d branch(es) would be decided by sub-pass 0 for the whole CUDA warp; refusing. "
+                    "Use 32 lanes (NT32, no CUPBOP_VIRT_LANES); CUPBOP_VIRT_NO_GATE=1 translates anyway\n", bad);
+    ::exit(1);
+  }
+  return gates;
 }
 
 class InsertWarpLoopPass : public llvm::FunctionPass {
@@ -3313,7 +3589,7 @@ public:
     // per sub-pass). Force such allocas divergent and recompute: their other
     // accesses then also land in lane loops (consistent copies), and the
     // expansion below gives them a context array.
-    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop) {
+    auto force_lane_allocas = [&]() {
       for (int iter = 0; iter < 8; iter++) {
         std::set<const AllocaInst *> add;
         for (auto &pr : parallel_regions)
@@ -3331,6 +3607,55 @@ public:
         for (auto *AI : add) DI.addSource(AI);
         DI.analyze(F);
         parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+      }
+    };
+    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop) {
+      force_lane_allocas();
+      if (virt_gate_on()) {
+        // thread-dependent branches between the lane loops (see virt_gate_collect): absorb what has no boundary of the
+        // kernel, gate the rest
+        int n = 0;
+        for (int round = 0; round < 256; round++) {
+          if (!absorb_divergent_areas(F, parallel_regions, DI, absDT ? *absDT : *DT, absPDT ? *absPDT : *PDT,
+                                      absLI ? *absLI : LI))
+            break;
+          n++;
+          rebuild();
+          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          force_lane_allocas();
+        }
+        if (n) fprintf(stderr, "[virt-gate] %s: %d areas absorbed into lane loops\n", func_name.c_str(), n);
+        auto gates = virt_gate_collect(F, parallel_regions, DI, absDT ? *absDT : *DT, absPDT ? *absPDT : *PDT,
+                                       absLI ? *absLI : LI);
+        if (!gates.empty()) {
+          std::set<llvm::BasicBlock *> wrapped;
+          for (auto &pr : parallel_regions) wrapped.insert(pr.wrapped_block.begin(), pr.wrapped_block.end());
+          for (auto &g : gates) virt_gate_stage(g, F, wrapped);
+          rebuild();
+          // the arms again, with the new blocks
+          for (auto &g : gates) {
+            auto *BI = llvm::cast<llvm::BranchInst>(g.X->getTerminator());
+            VirtGate r; std::string why;
+            const int k = virt_classify(g.X, BI, *absDT, *absPDT, *absLI, r, why);
+            if (k < 0 || (k == 1) != g.loop_branch) {
+              fprintf(stderr, "error: virt sub-pass form: branch in %s changed its shape while gated: %s\n", g.X->getName().str().c_str(), why.c_str());
+              ::exit(1);
+            }
+            r.stage = g.stage;
+            g = r;
+          }
+          for (auto &g : gates) virt_gate_branch(g, F);
+          rebuild();
+          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          virt_gate_guards(F, gates, parallel_regions);
+          rebuild();
+          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          force_lane_allocas();
+          int fw = 0;
+          for (auto &g : gates) fw += !g.loop_branch;
+          fprintf(stderr, "[virt-gate] %s: %d thread-dependent branches gated, %zu loop branches read all sub-passes\n",
+                  func_name.c_str(), fw, gates.size() - fw);
+        }
       }
     }
     fprintf(stderr, "[warp_loop] %s: %zu parallel regions, intra_warp=%d\n",
