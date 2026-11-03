@@ -34,6 +34,9 @@ run s1_nt16_p1    1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUP
 ( cd examples/virt_warp_test && make clean > /dev/null 2>&1
   env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
 echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops are unsupported at S>1' $OUT/reject_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)'); $(grep -c 'trip count depends on the lane' $OUT/reject_nt16.log) sites"
+( cd examples/virt_gate_refuse && make clean > /dev/null 2>&1
+  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/refuse_gate_nt16.log 2>&1 )
+echo "== refuse_gate_nt16 (arms that cannot be gated): $(grep -q 'would be decided by sub-pass 0 for the whole CUDA warp; refusing' $OUT/refuse_gate_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)')"
 # 16 lanes without warp ops (single warp loop, S = 2): __syncthreads in a thread-dependent loop (nt16s1, 11/3)
 ( cd examples/dotproduct && make clean > /dev/null 2>&1; rm -f ci_output.txt
   env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 CI_RUN_ARGS="-n 16384" RUN_ARGS="-n 16384" > $OUT/dotproduct_nt16.log 2>&1; cp -f ci_output.txt $OUT/dotproduct_nt16.out 2>/dev/null )
