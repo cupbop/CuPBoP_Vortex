@@ -40,6 +40,92 @@ unsigned int num_threads = 0;
 unsigned int num_blocks = 0;
 
 ////////////////////////////////////////////////////////////////////////////////
+// SELFCHECK: what each kernel wrote vs a double-precision CPU reference
+////////////////////////////////////////////////////////////////////////////////
+// The printed result (the updated input weights at %f) cannot show an error in either kernel: the host uploads
+// the original weights again before bpnn_adjust_weights_cuda (layerforward's weight writes are dropped), and with
+// this input (weights and inputs in [0,1], 64 inputs) the hidden units saturate, so the weight changes are ~1e-11
+// and vanish in float. These checks read what the kernels wrote (hidden_partial_sum, and input_prev_weights_cuda =
+// the weight change new_dw) and compare it with a reference computed here from the same uploaded inputs. One line
+// per kernel, "SELFCHECK <kernel> PASS|FAIL", without digits (ci/compare_golden.py matches it exactly, so a FAIL
+// fails the golden check); the max relative errors go to stderr ("SELFCHECK-INFO ..."). Host work only, plus one
+// device-to-host copy after the last launch: the kernels, the launches and the cycles are unchanged.
+// Coverage: at 64 inputs 14 of the 16 hidden units keep a nonzero delta (910 of 1040 new_dw are nonzero); from 128
+// inputs on every hidden unit is exactly 1.0f, all new_dw are 0 and a no-op adjust kernel cannot be told from a
+// correct one (stderr says so; garbage writes are still caught).
+// Tolerances (u = 2^-24, float unit roundoff; the error of a float sum of m terms in any order, any tree, with or
+// without FMA, is below (m-1)*u*sum|terms|, plus u per product; x2 margin):
+//   partial sum (16 products per block)            2*16*u      relative to sum|terms| of the block
+//   hidden sum  (+ num_blocks-1 partials + bias)   2*(16+nb)*u relative to sum|terms| of the column
+//   new_dw, updated weight                         8*u         relative to the reference value: the CUDA source
+//     computes them in double and rounds once to float (the CPU reference does the same); a float evaluation
+//     rounds at most 4 times.
+#define SELFCHECK_U 5.9604644775390625e-08
+#define SELFCHECK_FLT_MIN 1.17549435e-38
+
+static double selfcheck_rel(double got, double ref, double scale) {   // NaN-safe: a NaN gives +inf
+  double e = fabs(got - ref) / (scale > SELFCHECK_FLT_MIN ? scale : SELFCHECK_FLT_MIN);
+  return e == e ? e : 1e300;
+}
+
+// partial_sum[b*hid + j-1] = sum_{r<16} w[16b+r+1][j] * x[16b+r+1]; hidden_sum[j] = w[0][j] + sum_b partial_sum
+static int selfcheck_layerforward(BPNN *net, const float *x, const float *partial_sum, const float *hidden_sum,
+                                  int hid, int nb) {
+  const double tol_p = 2.0 * HEIGHT * SELFCHECK_U, tol_h = 2.0 * (HEIGHT + nb) * SELFCHECK_U;
+  double mp = 0, mh = 0;
+  int bad_p = 0, bad_h = 0;
+  for (int j = 1; j <= hid; j++) {
+    double tot = net->input_weights[0][j], tot_abs = fabs(tot);
+    for (int b = 0; b < nb; b++) {
+      double s = 0, a = 0;
+      for (int r = 0; r < HEIGHT; r++) {
+        int k = HEIGHT * b + r + 1;
+        double t = (double)net->input_weights[k][j] * (double)x[k];
+        s += t; a += fabs(t);
+      }
+      double e = selfcheck_rel(partial_sum[b * hid + j - 1], s, a);
+      if (e > mp) mp = e;
+      if (!(e <= tol_p)) bad_p++;
+      tot += s; tot_abs += a;
+    }
+    double e = selfcheck_rel(hidden_sum[j], tot, tot_abs);
+    if (e > mh) mh = e;
+    if (!(e <= tol_h)) bad_h++;
+  }
+  fprintf(stderr, "SELFCHECK-INFO layerforward: partial_sum max_rel_err %.3e tol %.3e bad %d/%d; "
+          "hidden_sum max_rel_err %.3e tol %.3e bad %d/%d\n", mp, tol_p, bad_p, nb * hid, mh, tol_h, bad_h, hid);
+  return bad_p == 0 && bad_h == 0;
+}
+
+// rows 1..in, columns 1..hid: new_dw = ETA*delta[j]*x[k] + MOMENTUM*oldw[k][j]; row 0 (bias): ETA*delta[j] +
+// MOMENTUM*oldw[0][j]; w += new_dw, oldw = new_dw. Column 0 is not touched. w_out/oldw_out: (in+1) x (hid+1), row major.
+static int selfcheck_adjust(BPNN *net, const float *x, const float *w_out, const float *oldw_out, int in, int hid) {
+  const double tol = 8.0 * SELFCHECK_U;
+  double mo = 0, mw = 0;
+  int bad = 0, nonzero = 0, n = 0;
+  for (int k = 0; k <= in; k++) {
+    for (int j = 0; j <= hid; j++, n++) {
+      float ref_o = net->input_prev_weights[k][j], ref_w = net->input_weights[k][j];
+      if (j >= 1) {
+        double dw = (k >= 1 ? ETA * net->hidden_delta[j] * x[k] : ETA * net->hidden_delta[j]) +
+                    MOMENTUM * net->input_prev_weights[k][j];
+        ref_o = (float)dw;
+        ref_w = (float)(net->input_weights[k][j] + dw);
+        if (ref_o != 0.0f) nonzero++;
+      }
+      double eo = selfcheck_rel(oldw_out[n], ref_o, fabs(ref_o)), ew = selfcheck_rel(w_out[n], ref_w, fabs(ref_w));
+      if (eo > mo) mo = eo;
+      if (ew > mw) mw = ew;
+      if (!(eo <= tol) || !(ew <= tol)) bad++;
+    }
+  }
+  fprintf(stderr, "SELFCHECK-INFO adjust_weights: prev_weights max_rel_err %.3e, weights max_rel_err %.3e, "
+          "tol %.3e, bad %d/%d; nonzero weight changes %d/%d%s\n", mo, mw, tol, bad, n, nonzero, in * hid + hid,
+          nonzero ? "" : " (none: this input cannot tell a no-op kernel from a correct one)");
+  return bad == 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
 int main(int argc, char **argv) {
@@ -91,6 +177,14 @@ extern "C" void bpnn_train_cuda(BPNN *net, float *eo, float *eh) {
   cudaMalloc((void **)&input_hidden_cuda, (in + 1) * (hid + 1) * sizeof(float));
   cudaMalloc((void **)&hidden_partial_sum, num_blocks * WIDTH * sizeof(float));
 
+  // SELFCHECK inputs: the uploaded input units (the program later overwrites net->input_units from the device)
+  // and the hidden sums before squash
+  float *selfcheck_x = (float *)malloc((in + 1) * sizeof(float));
+  float *selfcheck_hsum = (float *)malloc((hid + 1) * sizeof(float));
+  float *selfcheck_oldw = (float *)malloc((in + 1) * (hid + 1) * sizeof(float));
+  memcpy(selfcheck_x, net->input_units, (in + 1) * sizeof(float));
+  int selfcheck_lf = 0, selfcheck_aw = 0;
+
 #endif
 
 #ifdef CPU
@@ -133,8 +227,10 @@ extern "C" void bpnn_train_cuda(BPNN *net, float *eo, float *eh) {
       sum += partial_sum[k * hid + j - 1];
     }
     sum += net->input_weights[0][j];
+    selfcheck_hsum[j] = sum;
     net->hidden_units[j] = float(1.0 / (1.0 + exp(-sum)));
   }
+  selfcheck_lf = selfcheck_layerforward(net, selfcheck_x, partial_sum, selfcheck_hsum, hid, num_blocks);
 #endif
 
   bpnn_layerforward(net->hidden_units, net->output_units, net->hidden_weights,
@@ -179,6 +275,15 @@ extern "C" void bpnn_train_cuda(BPNN *net, float *eo, float *eh) {
     printf("%f ", input_weights_one_dim[i]);
   }
   printf("\n");
+
+  cudaMemcpy(selfcheck_oldw, input_prev_weights_cuda, (in + 1) * (hid + 1) * sizeof(float),
+             cudaMemcpyDeviceToHost);
+  selfcheck_aw = selfcheck_adjust(net, selfcheck_x, input_weights_one_dim, selfcheck_oldw, in, hid);
+  printf("SELFCHECK layerforward %s\n", selfcheck_lf ? "PASS" : "FAIL");
+  printf("SELFCHECK adjust_weights %s\n", selfcheck_aw ? "PASS" : "FAIL");
+  free(selfcheck_x);
+  free(selfcheck_hsum);
+  free(selfcheck_oldw);
 
   cudaFree(input_cuda);
   cudaFree(output_hidden_cuda);
