@@ -10,6 +10,7 @@
 #include "tool.h"
 #include "warp_func.h"
 #include "lifted_ir.h"
+#include "smem_reserve.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -159,6 +160,10 @@ int main(int argc, char **argv) {
     }
     VerifyModule(program);
   }
+
+  // CUPBOP_SMEM_RESERVE_DROP (default 0): the lowest shared-memory byte each kernel can touch, for mem_share2local
+  // (smem_reserve.cpp; nothing runs when the switch is off)
+  analyze_smem_reserve(program);
 
   DBG_LOG("init_block\n");
   init_block(program, fout);

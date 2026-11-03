@@ -10,6 +10,7 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <assert.h>
 #include "tool.h"
+#include "smem_reserve.h"
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -528,6 +529,18 @@ static void breakConstantExprUses(llvm::Value *V, llvm::Function *F) {
   }
 }
 
+// CUPBOP_SMEM_RESERVE_DROP: smem_reserve_drop_for over mem_share2local's static layout (Item = {GV, off})
+template <class Items>
+static uint32_t smem_reserve_drop_bytes(llvm::Function &F, const Items &layout,
+                                        const llvm::SmallVectorImpl<llvm::GlobalVariable *> &usedDynamic,
+                                        uint32_t staticAligned) {
+  if (!smem_reserve_drop_enabled()) return 0;
+  std::vector<std::pair<llvm::GlobalVariable *, uint32_t>> st;
+  for (auto &it : layout) st.push_back({it.GV, it.off});
+  std::vector<llvm::GlobalVariable *> dy(usedDynamic.begin(), usedDynamic.end());
+  return smem_reserve_drop_for(F, st, dy, staticAligned);
+}
+
 void mem_share2local(llvm::Module *M) {
   using namespace llvm;
 
@@ -646,6 +659,8 @@ void mem_share2local(llvm::Module *M) {
         dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
       }
       uint32_t staticAligned = alignTo(staticBytes, dynAlign);
+      // CUPBOP_SMEM_RESERVE_DROP (smem_reserve.cpp): the proven-untouched prefix of the area (0 when off)
+      const uint32_t drop = smem_reserve_drop_bytes(F, layout, usedDynamic, staticAligned);
 
       // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
       // lmem size so generate_wrapper.cpp can emit a kernel_lmem_sizes[] table
@@ -657,7 +672,7 @@ void mem_share2local(llvm::Module *M) {
         // re-invocations of the compiler, the static is reinitialized and the
         // file is truncated fresh.
         static std::ofstream lmem_log("kernel_lmem.log");
-        lmem_log << F.getName().str() << " " << staticAligned << "\n";
+        lmem_log << F.getName().str() << " " << staticAligned - drop << "\n";
         lmem_log.flush();
       }
 
@@ -665,7 +680,7 @@ void mem_share2local(llvm::Module *M) {
       if (!usedDynamic.empty() && DynSizeGV)
         dynBytes = B.CreateLoad(I32, DynSizeGV, "dyn_bytes");
 
-      Value *stride = B.CreateAdd(ConstantInt::get(I32, staticAligned), dynBytes, "total_stride");
+      Value *stride = B.CreateAdd(ConstantInt::get(I32, staticAligned - drop), dynBytes, "total_stride");
 
       // base_group = vx_local_alloc(stride)  // ★ internally already applies gid*stride
       Value *bgrp = B.CreateCall(vxAlloc, {stride}, "__local_group_i8");
@@ -674,14 +689,14 @@ void mem_share2local(llvm::Module *M) {
       DenseMap<GlobalVariable*, Value*> repl;
       for (auto &it : layout) {
         auto *GV = it.GV;
-        Value *p = B.CreateGEP(I8, bgrp, ConstantInt::get(I32, it.off), GV->getName()+".i8");
+        Value *p = B.CreateGEP(I8, bgrp, ConstantInt::getSigned(I32, (int64_t)it.off - (int64_t)drop), GV->getName()+".i8");
         Value *t = B.CreatePointerCast(p, PointerType::get(GV->getValueType(), GV->getType()->getAddressSpace()),
                                        GV->getName()+".ptr");
         repl[GV] = t;
       }
       // replace dynamics
       if (!usedDynamic.empty()) {
-        Value *dynBase = B.CreateGEP(I8, bgrp, ConstantInt::get(I32, staticAligned), "dyn_base_i8");
+        Value *dynBase = B.CreateGEP(I8, bgrp, ConstantInt::get(I32, staticAligned - drop), "dyn_base_i8");
         for (auto *GV : usedDynamic) {
           Value *t = B.CreatePointerCast(dynBase, GV->getType(), GV->getName()+".dynptr");
           repl[GV] = t;
@@ -763,12 +778,14 @@ void mem_share2local(llvm::Module *M) {
       dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
     }
     uint32_t staticAligned = alignTo(staticBytes, dynAlign);
+    // CUPBOP_SMEM_RESERVE_DROP (smem_reserve.cpp): the proven-untouched prefix of the area (0 when off)
+    const uint32_t drop = smem_reserve_drop_bytes(F, layout, usedDynamic, staticAligned);
 
     // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
     // lmem size. See no-barrier branch above for context.
     {
       static std::ofstream lmem_log("kernel_lmem.log", std::ios::app);
-      lmem_log << F.getName().str() << " " << staticAligned << "\n";
+      lmem_log << F.getName().str() << " " << staticAligned - drop << "\n";
       lmem_log.flush();
     }
 
@@ -776,7 +793,7 @@ void mem_share2local(llvm::Module *M) {
     if (!usedDynamic.empty() && DynSizeGV)
       dynBytes = IB_Alloc.CreateLoad(I32, DynSizeGV, "dyn_bytes");
 
-    Value *stride = IB_Alloc.CreateAdd(ConstantInt::get(I32, staticAligned), dynBytes, "total_stride");
+    Value *stride = IB_Alloc.CreateAdd(ConstantInt::get(I32, staticAligned - drop), dynBytes, "total_stride");
 
     // base_group = vx_local_alloc(stride)  // ★ internally already applies gid*stride
     Value *bgrp = IB_Alloc.CreateCall(vxAlloc, {stride}, "__local_group_i8");
@@ -798,7 +815,7 @@ void mem_share2local(llvm::Module *M) {
     // create replacement pointers for statics
     for (auto &it : layout) {
       auto *GV = it.GV;
-      Value *pi8 = IB_After.CreateGEP(I8, bgrp_all, ConstantInt::get(I32, it.off), GV->getName()+".i8");
+      Value *pi8 = IB_After.CreateGEP(I8, bgrp_all, ConstantInt::getSigned(I32, (int64_t)it.off - (int64_t)drop), GV->getName()+".i8");
       Value *tp  = IB_After.CreatePointerCast(
                       pi8,
                       PointerType::get(GV->getValueType(), GV->getType()->getAddressSpace()),
@@ -807,7 +824,7 @@ void mem_share2local(llvm::Module *M) {
     }
     // create replacement pointer(s) for dynamic region (base + staticAligned → [0 x T]*)
     if (!usedDynamic.empty()) {
-      Value *dynBase = IB_After.CreateGEP(I8, bgrp_all, ConstantInt::get(I32, staticAligned), "dyn_base_i8");
+      Value *dynBase = IB_After.CreateGEP(I8, bgrp_all, ConstantInt::get(I32, staticAligned - drop), "dyn_base_i8");
       for (auto *GV : usedDynamic) {
         Value *tp = IB_After.CreatePointerCast(dynBase, GV->getType(), GV->getName()+".dynptr");
         repl[GV] = tp;
