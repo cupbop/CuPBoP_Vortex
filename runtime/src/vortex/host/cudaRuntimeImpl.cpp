@@ -8,6 +8,7 @@
 #include <bits/stdint-uintn.h>
 #include <cstddef>
 #include <algorithm>
+#include <iterator>
 #include <iostream>
 #include <stdint.h>
 #include <stdio.h>
@@ -219,6 +220,34 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 #if __has_include(<VX_types.h>)
 #include <VX_types.h>
 #endif
+#ifndef VX_DCR_KMU_STARTUP_ADDR0
+#define VX_DCR_KMU_STARTUP_ADDR0 0x010
+#endif
+#ifndef VX_DCR_KMU_STARTUP_ADDR1
+#define VX_DCR_KMU_STARTUP_ADDR1 0x011
+#endif
+#ifndef VX_DCR_KMU_KERNEL_ENTRY0
+#define VX_DCR_KMU_KERNEL_ENTRY0 0x012
+#endif
+#ifndef VX_DCR_KMU_KERNEL_ENTRY1
+#define VX_DCR_KMU_KERNEL_ENTRY1 0x013
+#endif
+// CUPBOP_SYMBOL_DIRECT=1|0 (default 0; 2026-11-02, experiments/fastentry): symbol copies without service launches.
+// The KMU module path (vx_module_load_file) keeps the kernel image in a device buffer the public API does not hand
+// out, and a vx_mem_reserve over that range fails (overlap), so the host could not write a symbol directly and
+// cudaMemcpyToSymbol, the __device__ variable restore and read-back and cudaMemcpyFromSymbol went through
+// single-thread service launches (kernel_idx -1 / -2). With the switch on, the host uploads the .vxbin itself as
+// the legacy vx_upload_kernel_bytes does (vx_mem_reserve of [min_vma, max_vma), payload without the VXSYMTAB footer,
+// BSS zeroed once at load), launches with vx_launch_info_t.kernel = NULL after programming the KMU STARTUP_ADDR /
+// KERNEL_ENTRY DCRs itself (the documented escape hatch; the entry PCs come from the footer, as vx_module does), and
+// every symbol copy is a vx_copy_to_dev / vx_copy_from_dev at (symbol address - min_vma). Nothing re-initializes the
+// image between launches (vx_start.S has no BSS loop; Module/vx_upload_kernel_bytes zero it only at load), so the
+// device values persist; the restore list is still written before every kernel, as the service launch did.
+// cudaMemcpyToSymbol honors its offset with the switch on (the service path writes at the symbol start).
+static bool cupbop_symbol_direct() {
+  static const bool on = [] { const char *e = getenv("CUPBOP_SYMBOL_DIRECT"); return e && *e && strcmp(e, "0") && strcmp(e, "off"); }();
+  return on;
+}
 #ifndef VX_CSR_MCYCLE
 #define VX_CSR_MCYCLE 0xB00
 #endif
@@ -746,6 +775,7 @@ private:
     , module_(nullptr)
     , kernel_(nullptr)
     , service_kernel_(nullptr)
+    , image_(nullptr)
     , queue_(nullptr)
   {
     RT_CHECK(vx_dev_open(&device_));
@@ -785,18 +815,86 @@ public:
     if (service_kernel_) { vx_kernel_release(service_kernel_); service_kernel_ = nullptr; }
     if (kernel_) { vx_kernel_release(kernel_); kernel_ = nullptr; }
     if (module_) { vx_module_release(module_); module_ = nullptr; }
+    if (image_) { vx_mem_free(image_); image_ = nullptr; }
     last_krnl_path_.clear();
   }
 
   // CUPBOP_LAUNCH2: load kernel.vxbin as a module and resolve the single CuPBoP
   // entry (generated kernel_main, exposed by the vxbin symbol footer as "main").
   void load_module(const std::string& path) {
+    if (cupbop_symbol_direct()) { load_image_direct(path); return; }
     RT_CHECK((int)vx_module_load_file(device_, path.c_str(), &module_));
     RT_CHECK((int)vx_module_get_kernel(module_, "main", &kernel_));
     // CUPBOP_FAST_ENTRY (translator, generate_wrapper.cpp): the service launches (kernel_idx -1 / -2) have their own
     // entry, cupbop_service_main, and kernel_main no longer tests kernel_idx < 0. A module without it (translated with
     // CUPBOP_FAST_ENTRY=0, or the flat schedule) takes them through kernel_main as before.
     if (vx_module_get_kernel(module_, "cupbop_service_main", &service_kernel_) != VX_SUCCESS) service_kernel_ = nullptr;
+  }
+  // CUPBOP_SYMBOL_DIRECT: the .vxbin uploaded by the host (vx_upload_kernel_bytes without the symbol footer) and its
+  // entry PCs read from the footer like Module::load_bytes ("main" = kernel_main; no footer: main at min_vma)
+  void load_image_direct(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { fprintf(stderr, "CUPBOP_SYMBOL_DIRECT: cannot read %s\n", path.c_str()); std::abort(); }
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (b.size() < 16) { fprintf(stderr, "CUPBOP_SYMBOL_DIRECT: %s too short\n", path.c_str()); std::abort(); }
+    uint64_t min_vma, max_vma; memcpy(&min_vma, b.data(), 8); memcpy(&max_vma, b.data() + 8, 8);
+    const uint64_t rt_sz = max_vma - min_vma;
+    size_t footer = 0; uint32_t n = 0;
+    std::vector<std::pair<std::string, uint64_t>> syms;
+    if (b.size() >= 28 && !memcmp(b.data() + b.size() - 8, "VXSYMTAB", 8)) {
+      memcpy(&n, b.data() + b.size() - 12, 4);
+      const size_t esz = (size_t)n * 16;
+      if (b.size() >= 28 + esz) {
+        const uint8_t *e0 = b.data() + b.size() - 12 - esz;
+        size_t blob = 0;
+        for (uint32_t i = 0; i < n; ++i) { uint32_t o; uint16_t l; memcpy(&o, e0 + 16 * i, 4); memcpy(&l, e0 + 16 * i + 4, 2); blob = std::max(blob, (size_t)o + l); }
+        if (12 + esz + blob <= b.size() - 16) {
+          footer = 12 + esz + blob;
+          const uint8_t *str = b.data() + 16 + (b.size() - 16 - footer);
+          for (uint32_t i = 0; i < n; ++i) {
+            uint32_t o; uint16_t l; uint64_t pc;
+            memcpy(&o, e0 + 16 * i, 4); memcpy(&l, e0 + 16 * i + 4, 2); memcpy(&pc, e0 + 16 * i + 8, 8);
+            syms.push_back({std::string((const char *)str + o, l), pc});
+          }
+        }
+      }
+    }
+    const uint64_t bin_sz = b.size() - 16 - footer;
+    if (max_vma <= min_vma || bin_sz > rt_sz) { fprintf(stderr, "CUPBOP_SYMBOL_DIRECT: bad image %s\n", path.c_str()); std::abort(); }
+    RT_CHECK(vx_mem_reserve(device_, min_vma, rt_sz, 0, &image_));
+    RT_CHECK(vx_copy_to_dev(image_, b.data() + 16, 0, bin_sz));
+    if (rt_sz > bin_sz) { std::vector<uint8_t> z(rt_sz - bin_sz, 0); RT_CHECK(vx_copy_to_dev(image_, z.data(), bin_sz, rt_sz - bin_sz)); }
+    image_base_ = min_vma; image_size_ = rt_sz;
+    pc_main_ = min_vma; pc_service_ = 0;
+    for (auto &kv : syms) { if (kv.first == "main") pc_main_ = kv.second; if (kv.first == "cupbop_service_main") pc_service_ = kv.second; }
+    if (!pc_service_) pc_service_ = pc_main_;
+    programmed_pc_ = 0;
+    if (getenv("CUPBOP_SYMBOL_DIRECT_VERBOSE"))
+      fprintf(stderr, "[symbol-direct] image 0x%lx..0x%lx (payload %lu), main 0x%lx, service 0x%lx\n", (unsigned long)min_vma,
+              (unsigned long)max_vma, (unsigned long)bin_sz, (unsigned long)pc_main_, (unsigned long)pc_service_);
+  }
+  bool loaded() const { return module_ != nullptr || image_ != nullptr; }
+  bool direct() const { return image_ != nullptr; }
+  // KMU program base / entry for the next launch (direct image only; the DCRs persist, so only on a change)
+  void program_entry(bool service) {
+    const uint64_t pc = service ? pc_service_ : pc_main_;
+    if (pc == programmed_pc_) return;
+    RT_CHECK(vx_dcr_write(device_, VX_DCR_KMU_STARTUP_ADDR0, (uint32_t)(image_base_ & 0xffffffffu)));
+    RT_CHECK(vx_dcr_write(device_, VX_DCR_KMU_STARTUP_ADDR1, (uint32_t)(image_base_ >> 32)));
+    RT_CHECK(vx_dcr_write(device_, VX_DCR_KMU_KERNEL_ENTRY0, (uint32_t)(pc & 0xffffffffu)));
+    RT_CHECK(vx_dcr_write(device_, VX_DCR_KMU_KERNEL_ENTRY1, (uint32_t)(pc >> 32)));
+    programmed_pc_ = pc;
+  }
+  // a symbol range inside the direct image: host copies at (address - min_vma)
+  void symbol_write(uint64_t addr, const void *src, size_t n) {
+    if (addr < image_base_ || addr + n > image_base_ + image_size_) {
+      fprintf(stderr, "CUPBOP_SYMBOL_DIRECT: 0x%lx+%lu is outside the kernel image\n", (unsigned long)addr, (unsigned long)n); std::abort(); }
+    RT_CHECK(vx_copy_to_dev(image_, src, addr - image_base_, n));
+  }
+  void symbol_read(uint64_t addr, void *dst, size_t n) {
+    if (addr < image_base_ || addr + n > image_base_ + image_size_) {
+      fprintf(stderr, "CUPBOP_SYMBOL_DIRECT: 0x%lx+%lu is outside the kernel image\n", (unsigned long)addr, (unsigned long)n); std::abort(); }
+    RT_CHECK(vx_copy_from_dev(dst, image_, addr - image_base_, n));
   }
   vx_module_h module() const { return module_; }
   vx_kernel_h kernel() const { return kernel_; }
@@ -818,6 +916,8 @@ private:
   vx_module_h module_;
   vx_kernel_h kernel_;
   vx_kernel_h service_kernel_;
+  vx_buffer_h image_;                       // CUPBOP_SYMBOL_DIRECT: the kernel image (vx_mem_reserve)
+  uint64_t image_base_ = 0, image_size_ = 0, pc_main_ = 0, pc_service_ = 0, programmed_pc_ = 0;
   vx_queue_h  queue_;
 
   // Pointer manager
@@ -1531,6 +1631,7 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   vx_launch_info_t li = {};
   li.struct_size = sizeof(li);
   li.kernel      = service ? DC->service_kernel() : DC->kernel();
+  if (DC->direct()) { DC->program_entry(service); li.kernel = nullptr; }   // CUPBOP_SYMBOL_DIRECT: PC DCRs set by the host
   if (service) ++g_cupbop_service_launches;
   li.args_host   = blob;
   li.args_size   = size;
@@ -1557,6 +1658,10 @@ static void cupbop_service_launch(DeviceContext *DC, int kind, const std::vector
 static void cupbop_read_device_ranges(DeviceContext *DC, const std::vector<std::pair<uint64_t, size_t>> &ranges,
                                       const std::vector<void *> &dsts) {
   if (ranges.empty()) return;
+  if (DC->direct()) {   // CUPBOP_SYMBOL_DIRECT: host reads of the image, no service launch
+    for (size_t i = 0; i < ranges.size(); ++i) DC->symbol_read(ranges[i].first, dsts[i], ranges[i].second);
+    return;
+  }
   size_t total = 0;
   for (auto &r : ranges) total += (r.second + 7) & ~size_t(7);
   static uint64_t staging_addr = 0; static size_t staging_cap = 0;
@@ -1781,7 +1886,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
                                     cudaMemcpyKind kind,
                                     void *symbol) {
                                       
-  assert(offset == 0 && "DO not support offset !=0\n");
+  assert((offset == 0 || cupbop_symbol_direct()) && "DO not support offset !=0 (CUPBOP_SYMBOL_DIRECT=1 does)\n");
 
   //symbol is a pointer to a string 
   //print the string that symbol points to
@@ -1839,6 +1944,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
   int vx_err;
   //cast string(in hex) to uint64_t
   uint64_t symbol_addr = std::stoull(symbol_addr_tmp, nullptr, 16);
+  if (cupbop_symbol_direct()) symbol_addr += offset;   // CUPBOP_SYMBOL_DIRECT: the copy starts at symbol + offset
 
   // print symbol_addr_tmp, and compare it with dst
   DBG_PRINT("symbol_addr_tmp: %p, dst: %p\n", symbol_addr, dst);
@@ -2126,7 +2232,7 @@ cudaError_t cudaLaunchKernel_vortex(
   {
     // Use func as path if it looks like a file path (absolute or relative with /), else fallback
     std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
-    if (DC->module() == nullptr || krnl_path != DC->last_krnl_path()) {
+    if (!DC->loaded() || krnl_path != DC->last_krnl_path()) {
       DC->cleanup_krnl();
       DC->load_module(krnl_path);
       DC->set_last_krnl_path(krnl_path);
@@ -2438,7 +2544,9 @@ cudaError_t cudaLaunchKernel_vortex(
     const int schedule = cupbop_schedule_flag();
     const int kernel_idx = abuf_ptr->kernel_idx;
     // 1) restore cudaMemcpyToSymbol / __device__ variables (single-thread service launch)
-    if (!memcpy_symbol.empty()) {
+    if (!memcpy_symbol.empty() && DC->direct()) {   // CUPBOP_SYMBOL_DIRECT: the same list, written by the host
+      for (auto &e : memcpy_symbol) DC->symbol_write(e.dst_addr, e.data.data(), e.size);
+    } else if (!memcpy_symbol.empty()) {
       abuf_ptr->kernel_idx = -1;
       uint32_t one[3] = {1, 1, 1};
       cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0, true);
