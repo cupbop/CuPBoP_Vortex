@@ -1065,6 +1065,49 @@ static uint64_t cupbop_ctx_scratch_bytes(const std::string &lookup_name, uint64_
   }
   return 0;
 }
+// Idle-RF-row context storage (vortex vx-rfctx SimX prototype, RT_NW reroute 2.1; DCRs VX_DCR_RFCTX_*, broadcast to
+// the cores). CUPBOP_RFCTX unset or 0 = nothing is written (stock behaviour). Otherwise a mode list:
+//   pool  = the core-mapping context scratch [__ctx_pool, + H*B*slots) (needs CUPBOP_CTX_SCRATCH=on or a kernel that
+//           auto moves) is served by an ideal RF-class port (fixed latency, no L1/L2/DRAM): upper bound
+//   stack = the hardware stack window the same way (upper bound for stack + context arrays left on the stack)
+//   e.g. CUPBOP_RFCTX=pool, =stack, =pool+stack. CUPBOP_RFCTX_LAT=<cycles> sets the port latency (default 1).
+// Every launch rewrites base, size and mode; it prints one line per kernel with the bytes per hardware thread and the
+// RF capacity of the idle rows under the runtime warp cap (64 registers x 8 B per lane and row).
+static uint64_t g_rfctx_pool_addr = 0;
+static void cupbop_rfctx_setup(const std::string &lookup_name, uint64_t block_threads) {
+  const char *e = std::getenv("CUPBOP_RFCTX");
+  if (!e || !*e || std::string(e) == "0") return;
+  const std::string m(e);
+  uint32_t mode = 0;
+  if (m.find("pool") != std::string::npos) mode |= 1;
+  if (m.find("stack") != std::string::npos) mode |= 2;
+  if (!mode) { fprintf(stderr, "cupbop: CUPBOP_RFCTX=%s: unknown mode\n", e); std::abort(); }
+  uint32_t lat = 0;
+  if (const char *l = std::getenv("CUPBOP_RFCTX_LAT")) lat = (uint32_t)std::atoi(l) & 0xff;
+  const uint64_t H = ((uint64_t)NUM_CORES_VX * NUM_WARPS_VX * NUM_THREADS_VX + 15) & ~15ull;
+  const uint64_t sc = (mode & 1) ? cupbop_ctx_scratch_bytes(lookup_name, block_threads) : 0;
+  const uint64_t base = (mode & 1) ? g_rfctx_pool_addr : 0;
+  auto DC = DeviceContext::instance();
+  vx_device_h dev = DC->device();
+#ifndef VX_DCR_RFCTX_MODE
+#define VX_DCR_RFCTX_BASE_LO 0x030
+#define VX_DCR_RFCTX_BASE_HI 0x031
+#define VX_DCR_RFCTX_SIZE    0x032
+#define VX_DCR_RFCTX_MODE    0x033
+#endif
+  vx_dcr_write(dev, VX_DCR_RFCTX_BASE_LO, (uint32_t)(base & 0xFFFFFFFFull));
+  vx_dcr_write(dev, VX_DCR_RFCTX_BASE_HI, (uint32_t)(base >> 32));
+  vx_dcr_write(dev, VX_DCR_RFCTX_SIZE, (uint32_t)std::min<uint64_t>(sc, 0xFFFFFFFFull));
+  vx_dcr_write(dev, VX_DCR_RFCTX_MODE, mode | (lat << 8));
+  static std::set<std::string> said;
+  if (said.insert(lookup_name).second) {
+    const uint32_t k = CUPBOP_EFF_NUM_WARPS();
+    const uint64_t idle_rows = (k < (uint32_t)NUM_WARPS_VX) ? ((uint64_t)NUM_WARPS_VX - k) / k : 0;
+    fprintf(stderr, "cupbop: rfctx %s mode=%u lat=%u pool=0x%lx size=%lu bytes/hart=%lu rt_warps=%u idle_rows/warp=%lu "
+            "rf_bytes/hart=%lu\n", lookup_name.c_str(), mode, lat ? lat : 1, (unsigned long)base, (unsigned long)sc,
+            (unsigned long)(sc / H), k, (unsigned long)idle_rows, (unsigned long)(idle_rows * 64 * 8));
+  }
+}
 // Frame scratch (translator: insert_warp_loop.cpp frame_alloca_to_scratch, cupbop_frame_scratch.txt: <name as in
 // lookup.txt> <bytes per hardware thread>): the launch of `lookup_name` needs H * bytes. 0 when the kernel keeps its
 // allocas on the stack.
@@ -2154,6 +2197,7 @@ cudaError_t cudaLaunchKernel_vortex(
       ctx_pool_size = need;
       DBG_PRINT("ctx_pool: 0x%lx (%lu bytes)\n", ctx_pool_addr, (unsigned long)ctx_pool_size);
     }
+    g_rfctx_pool_addr = ctx_pool_addr;
     // Find __ctx_pool symbol address in ELF
     std::fstream sf("lookup_global_symbols.txt", std::ios::in);
     std::string sa, st, sn;
@@ -2217,6 +2261,8 @@ cudaError_t cudaLaunchKernel_vortex(
   }
 
   cupbop_big_stack_setup(kernel_name_tmp);
+
+  cupbop_rfctx_setup(kernel_name_tmp, (uint64_t)blockDim.x * blockDim.y * blockDim.z);
 
   // launch slots: one per argument, or ceil(bytes / 8) for a by-value struct parameter (cupbop_byval_layout)
   std::vector<uint64_t> byval_bytes;
