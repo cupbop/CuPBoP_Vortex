@@ -38,6 +38,18 @@ echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops 
 ( cd examples/dotproduct && make clean > /dev/null 2>&1; rm -f ci_output.txt
   env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 CI_RUN_ARGS="-n 16384" RUN_ARGS="-n 16384" > $OUT/dotproduct_nt16.log 2>&1; cp -f ci_output.txt $OUT/dotproduct_nt16.out 2>/dev/null )
 echo "== dotproduct_nt16: $(grep -c 'FAILED!' $OUT/dotproduct_nt16.out) failed, $(grep -m1 'GPU result' $OUT/dotproduct_nt16.out), $(grep -m1 'CPU result' $OUT/dotproduct_nt16.out)"
+# ldmatrix / stmatrix forms, checked on the host against the PTX layout: 9 lines PASS each
+ldsm() { # tag sched vortex_path configs nt [env...]
+  local tag=$1 sched=$2 vp=$3 cfg=$4 nt=$5; shift 5
+  ( cd examples/virt_ldsm_test && make clean > /dev/null 2>&1; rm -f ci_output.txt
+    env VORTEX_PATH=$vp VORTEX_CONFIGS="$cfg" VORTEX_NUM_THREADS=$nt "$@" make ci SCHEDULE=$sched > $OUT/ldsm_$tag.log 2>&1; cp -f ci_output.txt $OUT/ldsm_$tag.out 2>/dev/null )
+  echo "== ldsm_$tag: $(grep -c ' PASS$' $OUT/ldsm_$tag.out 2>/dev/null)/9 PASS"
+}
+ldsm s2_nt32 2 $VORTEX_PATH "$CFG32" 32
+ldsm s1_nt32 1 $VORTEX_PATH "$CFG32" 32
+ldsm s1_nt32_l16 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16
+ldsm s1_nt16 1 $VXH/build64_cupbop_nt16 "$CFG16" 16
+ldsm s1_nt16_p1 1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1
 cp -f $OUT/golden_s2_nt32.out examples/virt_warp_test/golden_output.txt
 python3 - $OUT <<'PY'
 import sys,glob,os
