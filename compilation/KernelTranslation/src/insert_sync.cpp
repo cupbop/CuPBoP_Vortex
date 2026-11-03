@@ -911,7 +911,9 @@ void insert_sync(llvm::Module *M) {
     schedule = std::stoi(std::string(env));
   }
   g_s1_kernel_barriers.clear();
-  if (schedule == 1 && getVirtGeom().subpasses == 1)
+  // (every core-mapping form: a 16-lane kernel without warp ops takes the single warp loop too, need_nested_loop = 0,
+  // S = 2, and absorb_divergent_areas removed its __syncthreads as "added" barriers: dotproduct s1 16 lanes, 11/3)
+  if (schedule == 1)
     for (Function &F : *M)
       for (BasicBlock &BB : F)
         for (Instruction &I : BB)
