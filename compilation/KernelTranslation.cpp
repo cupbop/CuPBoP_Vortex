@@ -271,6 +271,8 @@ int main(int argc, char **argv) {
     if (fs == 1 || fs == 2) frame_alloca_to_scratch(program);
   }
 
+  fast_entry_csr_runtime_calls(program); // CUPBOP_FAST_ENTRY: __vx_warps_per_group() -> CTA-size CSR (tool.cpp)
+
   VerifyModule(program);
 
   // Run LoopSimplify to ensure all loops have preheaders.
@@ -285,6 +287,7 @@ int main(int argc, char **argv) {
 
   fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
   annotate_kernel_abi(program); // CUPBOP_KABI (default on): kernel calling convention, cupbop_kabi.txt
+  fast_entry_finalize_wrapper(program); // CUPBOP_FAST_ENTRY: kernel_main stores only what the module reads
   describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
   DumpModule(program, argv[2]);
 

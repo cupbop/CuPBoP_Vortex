@@ -38,6 +38,17 @@ void lower_named_barriers(llvm::Module *M);
 // KMU CTA CSR reads instead of the legacy vx_spawn TLS copies (tool.cpp; CUPBOP_SREG_TLS=1 turns them off)
 bool sreg_from_csr();
 llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *name);
+// CUPBOP_FAST_ENTRY (tool.cpp, default 1; 0 = the previous entry path, same machine code): native-style kernel entry
+// on the 1:1 schedule and the core mapping. fast_entry_on() is false on the flat schedule (0) whatever the variable says.
+bool fast_entry_on();
+// A CTA CSR read the Vortex backend takes as uniform (llvm.riscv.vx.uniform, what __UNIFORM__ in vx_spawn2.h becomes)
+llvm::Value *read_cta_csr_uniform(llvm::IRBuilder<> &B, unsigned csr, const char *name);
+// fast entry, core mapping: the kernel may read gridDim from the CTA CSRs (single-loop form, run-time trip count)
+bool fast_entry_s1_grid_csr();
+// fast entry, end of the translation: replace __vx_warps_per_group() calls by the CTA-size CSR, then find which
+// launch constants the final module still reads and write that into kernel_wrapper.cpp (generate_wrapper.cpp)
+void fast_entry_csr_runtime_calls(llvm::Module *M);
+void fast_entry_finalize_wrapper(llvm::Module *M);
 
 void hoist_block_constant_loads(llvm::Module *M);
 void replace_warp_shfl_early(llvm::Module *M);

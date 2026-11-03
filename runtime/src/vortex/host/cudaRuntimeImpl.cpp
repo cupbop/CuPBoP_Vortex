@@ -214,6 +214,242 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 // CUDA_ERROR_INVALID_VALUE = 1 and a message), never encoded approximately: swizzle, interleave, element
 // strides other than 1, misaligned addresses or strides. Signature as in cuda.h (enums are int-sized).
 #include "cupbop_async.h"
+// MPM counter ids for the per-launch record (CUPBOP_PERF_KERNEL_FILE): from the build's VX_types.h when the include
+// path has it ($VORTEX_PATH/sw), else these values (the same in Vortex v3.0 and upstream master 50cb17454).
+#if __has_include(<VX_types.h>)
+#include <VX_types.h>
+#endif
+#ifndef VX_CSR_MCYCLE
+#define VX_CSR_MCYCLE 0xB00
+#endif
+#ifndef VX_CSR_MINSTRET
+#define VX_CSR_MINSTRET 0xB02
+#endif
+#ifndef VX_CSR_MPM_ACTIVE_WARPS
+#define VX_CSR_MPM_ACTIVE_WARPS 0xB04
+#endif
+#ifndef VX_CSR_MPM_BRANCHES
+#define VX_CSR_MPM_BRANCHES 0xB11
+#endif
+#ifndef VX_CSR_MPM_COALESCER_MISS
+#define VX_CSR_MPM_COALESCER_MISS 0xB0A
+#endif
+#ifndef VX_CSR_MPM_DCACHE_BANK_ST
+#define VX_CSR_MPM_DCACHE_BANK_ST 0xB08
+#endif
+#ifndef VX_CSR_MPM_DCACHE_EVICTS
+#define VX_CSR_MPM_DCACHE_EVICTS 0xB07
+#endif
+#ifndef VX_CSR_MPM_DCACHE_MISS_R
+#define VX_CSR_MPM_DCACHE_MISS_R 0xB05
+#endif
+#ifndef VX_CSR_MPM_DCACHE_MISS_W
+#define VX_CSR_MPM_DCACHE_MISS_W 0xB06
+#endif
+#ifndef VX_CSR_MPM_DCACHE_MSHR_ST
+#define VX_CSR_MPM_DCACHE_MSHR_ST 0xB09
+#endif
+#ifndef VX_CSR_MPM_DCACHE_READS
+#define VX_CSR_MPM_DCACHE_READS 0xB03
+#endif
+#ifndef VX_CSR_MPM_DCACHE_WRITES
+#define VX_CSR_MPM_DCACHE_WRITES 0xB04
+#endif
+#ifndef VX_CSR_MPM_DIVERGENCE
+#define VX_CSR_MPM_DIVERGENCE 0xB12
+#endif
+#ifndef VX_CSR_MPM_DXA_GMEM_DEDUP
+#define VX_CSR_MPM_DXA_GMEM_DEDUP 0xB05
+#endif
+#ifndef VX_CSR_MPM_DXA_GMEM_LT
+#define VX_CSR_MPM_DXA_GMEM_LT 0xB07
+#endif
+#ifndef VX_CSR_MPM_DXA_GMEM_READS
+#define VX_CSR_MPM_DXA_GMEM_READS 0xB04
+#endif
+#ifndef VX_CSR_MPM_DXA_LMEM_WRITES
+#define VX_CSR_MPM_DXA_LMEM_WRITES 0xB06
+#endif
+#ifndef VX_CSR_MPM_DXA_NOSLOT_STALLS
+#define VX_CSR_MPM_DXA_NOSLOT_STALLS 0xB08
+#endif
+#ifndef VX_CSR_MPM_DXA_TRANSFERS
+#define VX_CSR_MPM_DXA_TRANSFERS 0xB03
+#endif
+#ifndef VX_CSR_MPM_ICACHE_MISS_R
+#define VX_CSR_MPM_ICACHE_MISS_R 0xB04
+#endif
+#ifndef VX_CSR_MPM_ICACHE_MSHR_ST
+#define VX_CSR_MPM_ICACHE_MSHR_ST 0xB05
+#endif
+#ifndef VX_CSR_MPM_ICACHE_READS
+#define VX_CSR_MPM_ICACHE_READS 0xB03
+#endif
+#ifndef VX_CSR_MPM_IFETCHES
+#define VX_CSR_MPM_IFETCHES 0xB1A
+#endif
+#ifndef VX_CSR_MPM_IFETCH_LT
+#define VX_CSR_MPM_IFETCH_LT 0xB1B
+#endif
+#ifndef VX_CSR_MPM_INSTR_ALU
+#define VX_CSR_MPM_INSTR_ALU 0xB13
+#endif
+#ifndef VX_CSR_MPM_INSTR_FPU
+#define VX_CSR_MPM_INSTR_FPU 0xB14
+#endif
+#ifndef VX_CSR_MPM_INSTR_LSU
+#define VX_CSR_MPM_INSTR_LSU 0xB15
+#endif
+#ifndef VX_CSR_MPM_INSTR_SFU
+#define VX_CSR_MPM_INSTR_SFU 0xB16
+#endif
+#ifndef VX_CSR_MPM_INSTR_TCU
+#define VX_CSR_MPM_INSTR_TCU 0xB17
+#endif
+#ifndef VX_CSR_MPM_ISSUED_THREADS
+#define VX_CSR_MPM_ISSUED_THREADS 0xB07
+#endif
+#ifndef VX_CSR_MPM_ISSUED_WARPS
+#define VX_CSR_MPM_ISSUED_WARPS 0xB06
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_BANK_ST
+#define VX_CSR_MPM_L2CACHE_BANK_ST 0xB08
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_EVICTS
+#define VX_CSR_MPM_L2CACHE_EVICTS 0xB07
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_MISS_R
+#define VX_CSR_MPM_L2CACHE_MISS_R 0xB05
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_MISS_W
+#define VX_CSR_MPM_L2CACHE_MISS_W 0xB06
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_MSHR_ST
+#define VX_CSR_MPM_L2CACHE_MSHR_ST 0xB09
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_READS
+#define VX_CSR_MPM_L2CACHE_READS 0xB03
+#endif
+#ifndef VX_CSR_MPM_L2CACHE_WRITES
+#define VX_CSR_MPM_L2CACHE_WRITES 0xB04
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_BANK_ST
+#define VX_CSR_MPM_L3CACHE_BANK_ST 0xB08
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_EVICTS
+#define VX_CSR_MPM_L3CACHE_EVICTS 0xB07
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_MISS_R
+#define VX_CSR_MPM_L3CACHE_MISS_R 0xB05
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_MISS_W
+#define VX_CSR_MPM_L3CACHE_MISS_W 0xB06
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_MSHR_ST
+#define VX_CSR_MPM_L3CACHE_MSHR_ST 0xB09
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_READS
+#define VX_CSR_MPM_L3CACHE_READS 0xB03
+#endif
+#ifndef VX_CSR_MPM_L3CACHE_WRITES
+#define VX_CSR_MPM_L3CACHE_WRITES 0xB04
+#endif
+#ifndef VX_CSR_MPM_LMEM_BANK_ST
+#define VX_CSR_MPM_LMEM_BANK_ST 0xB09
+#endif
+#ifndef VX_CSR_MPM_LMEM_READS
+#define VX_CSR_MPM_LMEM_READS 0xB07
+#endif
+#ifndef VX_CSR_MPM_LMEM_WRITES
+#define VX_CSR_MPM_LMEM_WRITES 0xB08
+#endif
+#ifndef VX_CSR_MPM_LOADS
+#define VX_CSR_MPM_LOADS 0xB1C
+#endif
+#ifndef VX_CSR_MPM_LOAD_LT
+#define VX_CSR_MPM_LOAD_LT 0xB1D
+#endif
+#ifndef VX_CSR_MPM_MEM_BANK_ST
+#define VX_CSR_MPM_MEM_BANK_ST 0xB06
+#endif
+#ifndef VX_CSR_MPM_MEM_LT
+#define VX_CSR_MPM_MEM_LT 0xB05
+#endif
+#ifndef VX_CSR_MPM_MEM_READS
+#define VX_CSR_MPM_MEM_READS 0xB03
+#endif
+#ifndef VX_CSR_MPM_MEM_WRITES
+#define VX_CSR_MPM_MEM_WRITES 0xB04
+#endif
+#ifndef VX_CSR_MPM_SCHED_IDLE
+#define VX_CSR_MPM_SCHED_IDLE 0xB03
+#endif
+#ifndef VX_CSR_MPM_STALLED_WARPS
+#define VX_CSR_MPM_STALLED_WARPS 0xB05
+#endif
+#ifndef VX_CSR_MPM_STALL_ALU
+#define VX_CSR_MPM_STALL_ALU 0xB0C
+#endif
+#ifndef VX_CSR_MPM_STALL_FETCH
+#define VX_CSR_MPM_STALL_FETCH 0xB08
+#endif
+#ifndef VX_CSR_MPM_STALL_FPU
+#define VX_CSR_MPM_STALL_FPU 0xB0D
+#endif
+#ifndef VX_CSR_MPM_STALL_IBUF
+#define VX_CSR_MPM_STALL_IBUF 0xB09
+#endif
+#ifndef VX_CSR_MPM_STALL_LSU
+#define VX_CSR_MPM_STALL_LSU 0xB0E
+#endif
+#ifndef VX_CSR_MPM_STALL_OPDS
+#define VX_CSR_MPM_STALL_OPDS 0xB0B
+#endif
+#ifndef VX_CSR_MPM_STALL_SCRB
+#define VX_CSR_MPM_STALL_SCRB 0xB0A
+#endif
+#ifndef VX_CSR_MPM_STALL_SFU
+#define VX_CSR_MPM_STALL_SFU 0xB0F
+#endif
+#ifndef VX_CSR_MPM_STALL_TCU
+#define VX_CSR_MPM_STALL_TCU 0xB10
+#endif
+#ifndef VX_CSR_MPM_STORES
+#define VX_CSR_MPM_STORES 0xB1E
+#endif
+#ifndef VX_CSR_MPM_TCU_LMEM_READS
+#define VX_CSR_MPM_TCU_LMEM_READS 0xB05
+#endif
+#ifndef VX_CSR_MPM_TCU_TBUF_CACHE_HITS
+#define VX_CSR_MPM_TCU_TBUF_CACHE_HITS 0xB04
+#endif
+#ifndef VX_CSR_MPM_TCU_TBUF_STALLS
+#define VX_CSR_MPM_TCU_TBUF_STALLS 0xB03
+#endif
+#ifndef VX_DCR_MPM_CLASS_CORE
+#define VX_DCR_MPM_CLASS_CORE 1
+#endif
+#ifndef VX_DCR_MPM_CLASS_DCACHE
+#define VX_DCR_MPM_CLASS_DCACHE 4
+#endif
+#ifndef VX_DCR_MPM_CLASS_DXA
+#define VX_DCR_MPM_CLASS_DXA 16
+#endif
+#ifndef VX_DCR_MPM_CLASS_ICACHE
+#define VX_DCR_MPM_CLASS_ICACHE 3
+#endif
+#ifndef VX_DCR_MPM_CLASS_L2CACHE
+#define VX_DCR_MPM_CLASS_L2CACHE 5
+#endif
+#ifndef VX_DCR_MPM_CLASS_L3CACHE
+#define VX_DCR_MPM_CLASS_L3CACHE 6
+#endif
+#ifndef VX_DCR_MPM_CLASS_MEM
+#define VX_DCR_MPM_CLASS_MEM 7
+#endif
+#ifndef VX_DCR_MPM_CLASS_TCU
+#define VX_DCR_MPM_CLASS_TCU 11
+#endif
 static_assert(sizeof(cupbop_tmap) <= 128, "cupbop_tmap must fit in a CUtensorMap");
 extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint32_t tensorRank, void *globalAddress,
                                       const uint64_t *globalDim, const uint64_t *globalStrides,
@@ -509,6 +745,7 @@ private:
     , args_buffer_(nullptr)
     , module_(nullptr)
     , kernel_(nullptr)
+    , service_kernel_(nullptr)
     , queue_(nullptr)
   {
     RT_CHECK(vx_dev_open(&device_));
@@ -524,6 +761,7 @@ private:
 	vx_mem_free(krnl_buffer_);
       if (args_buffer_ != nullptr)
 	vx_mem_free(args_buffer_);
+      if (service_kernel_) vx_kernel_release(service_kernel_);
       if (kernel_) vx_kernel_release(kernel_);
       if (module_) vx_module_release(module_);
       if (queue_)  vx_queue_release(queue_);
@@ -544,6 +782,7 @@ public:
       vx_mem_free(krnl_buffer_);
       krnl_buffer_ = nullptr;
     }
+    if (service_kernel_) { vx_kernel_release(service_kernel_); service_kernel_ = nullptr; }
     if (kernel_) { vx_kernel_release(kernel_); kernel_ = nullptr; }
     if (module_) { vx_module_release(module_); module_ = nullptr; }
     last_krnl_path_.clear();
@@ -554,9 +793,14 @@ public:
   void load_module(const std::string& path) {
     RT_CHECK((int)vx_module_load_file(device_, path.c_str(), &module_));
     RT_CHECK((int)vx_module_get_kernel(module_, "main", &kernel_));
+    // CUPBOP_FAST_ENTRY (translator, generate_wrapper.cpp): the service launches (kernel_idx -1 / -2) have their own
+    // entry, cupbop_service_main, and kernel_main no longer tests kernel_idx < 0. A module without it (translated with
+    // CUPBOP_FAST_ENTRY=0, or the flat schedule) takes them through kernel_main as before.
+    if (vx_module_get_kernel(module_, "cupbop_service_main", &service_kernel_) != VX_SUCCESS) service_kernel_ = nullptr;
   }
   vx_module_h module() const { return module_; }
   vx_kernel_h kernel() const { return kernel_; }
+  vx_kernel_h service_kernel() const { return service_kernel_ ? service_kernel_ : kernel_; }
   vx_queue_h  queue()  const { return queue_; }
 
   const std::string& last_krnl_path() const { return last_krnl_path_; }
@@ -573,6 +817,7 @@ private:
   std::string last_krnl_path_;
   vx_module_h module_;
   vx_kernel_h kernel_;
+  vx_kernel_h service_kernel_;
   vx_queue_h  queue_;
 
   // Pointer manager
@@ -1076,11 +1321,217 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
            (unsigned long)std::min<uint64_t>(NWhw, cap / slot), (unsigned long)(effNW / cta_warps), padnote.c_str());
   log(buf);
 }
+
+// ─── CUPBOP_PERF_KERNEL_FILE: per-launch performance record ───────────────────
+// CUPBOP_PERF_KERNEL_FILE=<file> (measurement; unset = nothing is read or written): one JSON line per kernel launch,
+// appended to <file>, with every MPM counter the device has (vx_mpm_query, the public runtime API, so SimX, rtlsim and
+// the FPGA give the same record). The counters are read right before the kernel launch (after any service launch) and
+// right after it (before the __device__ read-back launch). Whether a counter restarts at a launch depends on the
+// Vortex version and the backend (v3.0 SimX: the core counters run free from device reset except the operand-stall
+// count; caches, memory, LMEM, TCU and DXA restart at every launch; newer upstream keeps the memory counters running),
+// so each counter is recorded as
+//   raw   its value right after the launch,
+//   delta raw minus its value right before the launch (signed; negative = it restarted at this launch),
+//   mode  "r" = seen restarting at a launch of this process (value = raw), "c" = never seen restarting while it was
+//         nonzero before a launch (value = delta), "0" = it was 0 before this launch (raw == delta, either way);
+//         decided per class for the non-core counters (a drop of one dcache.* counter marks every dcache.* counter),
+//         per counter for core.*,
+//   val   the launch's own count by that mode.
+// "c" can still be a restarting counter that has not yet been seen to drop; ci/perf_launches.py re-decides the mode
+// over every record of a run (a single drop anywhere marks the counter restarting for the whole run).
+// Names: core.* summed over cores (core.cycles: maximum over cores, its delta the maximum of the per-core deltas, as
+// vx_dump_perf's cycles), icache/dcache per socket, l2 per cluster, mem.* (DRAM) once, lmem/coalescer per core,
+// tcu per core, dxa per cluster; "per_core" holds each core's cycles and instrs. CUPBOP_PERF_KERNEL_FORMAT=text keeps
+// the previous record (vx_dump_perf's text after each launch, for the stklmem tools).
+struct CupbopPerfSnap {
+  std::vector<std::pair<std::string, uint64_t>> v;   // name, value
+  std::vector<uint64_t> cyc, ins;                      // per core
+};
+static uint64_t g_cupbop_service_launches = 0;
+static bool cupbop_perf_json_on() {
+  const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE");
+  if (!pk || !*pk) return false;
+  const char *f = getenv("CUPBOP_PERF_KERNEL_FORMAT");
+  return !(f && !strcmp(f, "text"));
+}
+static void cupbop_perf_snap(vx_device_h dev, CupbopPerfSnap &S) {
+  S.v.clear(); S.cyc.clear(); S.ins.clear();
+  uint64_t nc = 0, ncl = 1, ss = 1, isa = 0;
+  vx_dev_caps(dev, VX_CAPS_NUM_CORES, &nc);
+  if (vx_dev_caps(dev, VX_CAPS_NUM_CLUSTERS, &ncl) != 0 || !ncl) ncl = 1;
+  if (vx_dev_caps(dev, VX_CAPS_SOCKET_SIZE, &ss) != 0 || !ss) ss = 1;
+  vx_dev_caps(dev, VX_CAPS_ISA_FLAGS, &isa);
+  auto q = [&](uint32_t cls, uint32_t addr, uint32_t core) {
+    uint64_t x = 0;
+    if (vx_mpm_query(dev, cls, addr, core, &x) != 0) x = 0;
+    return x;
+  };
+  uint64_t cmax = 0, isum = 0;
+  for (uint32_t c = 0; c < nc; ++c) {
+    const uint64_t cy = q(VX_DCR_MPM_CLASS_CORE, VX_CSR_MCYCLE, c), in = q(VX_DCR_MPM_CLASS_CORE, VX_CSR_MINSTRET, c);
+    S.cyc.push_back(cy); S.ins.push_back(in); cmax = std::max(cmax, cy); isum += in;
+  }
+  S.v.push_back({"core.cycles", cmax});
+  S.v.push_back({"core.instrs", isum});
+  auto sum_cores = [&](uint32_t cls, const char *name, uint32_t addr) {
+    uint64_t t = 0;
+    for (uint32_t c = 0; c < nc; ++c) t += q(cls, addr, c);
+    S.v.push_back({name, t});
+  };
+  auto sum_reps = [&](uint32_t cls, const char *name, uint32_t addr, uint64_t group) {   // one core per socket / cluster
+    uint64_t t = 0;
+    for (uint64_t c = 0; c < nc; c += group) t += q(cls, addr, (uint32_t)c);
+    S.v.push_back({name, t});
+  };
+  const uint32_t C = VX_DCR_MPM_CLASS_CORE;
+  sum_cores(C, "core.sched_idle", VX_CSR_MPM_SCHED_IDLE);       sum_cores(C, "core.active_warps", VX_CSR_MPM_ACTIVE_WARPS);
+  sum_cores(C, "core.stalled_warps", VX_CSR_MPM_STALLED_WARPS); sum_cores(C, "core.issued_warps", VX_CSR_MPM_ISSUED_WARPS);
+  sum_cores(C, "core.issued_threads", VX_CSR_MPM_ISSUED_THREADS);
+  sum_cores(C, "core.stall_fetch", VX_CSR_MPM_STALL_FETCH);     sum_cores(C, "core.stall_ibuf", VX_CSR_MPM_STALL_IBUF);
+  sum_cores(C, "core.stall_scrb", VX_CSR_MPM_STALL_SCRB);       sum_cores(C, "core.stall_opds", VX_CSR_MPM_STALL_OPDS);
+  sum_cores(C, "core.stall_alu", VX_CSR_MPM_STALL_ALU);         sum_cores(C, "core.stall_fpu", VX_CSR_MPM_STALL_FPU);
+  sum_cores(C, "core.stall_lsu", VX_CSR_MPM_STALL_LSU);         sum_cores(C, "core.stall_sfu", VX_CSR_MPM_STALL_SFU);
+  if (isa & VX_ISA_EXT_TCU) sum_cores(C, "core.stall_tcu", VX_CSR_MPM_STALL_TCU);
+  sum_cores(C, "core.instr_alu", VX_CSR_MPM_INSTR_ALU);         sum_cores(C, "core.instr_fpu", VX_CSR_MPM_INSTR_FPU);
+  sum_cores(C, "core.instr_lsu", VX_CSR_MPM_INSTR_LSU);         sum_cores(C, "core.instr_sfu", VX_CSR_MPM_INSTR_SFU);
+  if (isa & VX_ISA_EXT_TCU) sum_cores(C, "core.instr_tcu", VX_CSR_MPM_INSTR_TCU);
+  sum_cores(C, "core.branches", VX_CSR_MPM_BRANCHES);           sum_cores(C, "core.divergence", VX_CSR_MPM_DIVERGENCE);
+  sum_cores(C, "core.ifetches", VX_CSR_MPM_IFETCHES);           sum_cores(C, "core.ifetch_lt", VX_CSR_MPM_IFETCH_LT);
+  sum_cores(C, "core.loads", VX_CSR_MPM_LOADS);                 sum_cores(C, "core.load_lt", VX_CSR_MPM_LOAD_LT);
+  sum_cores(C, "core.stores", VX_CSR_MPM_STORES);
+  if (isa & VX_ISA_EXT_ICACHE) {
+    const uint32_t K = VX_DCR_MPM_CLASS_ICACHE;
+    sum_reps(K, "icache.reads", VX_CSR_MPM_ICACHE_READS, ss); sum_reps(K, "icache.miss_r", VX_CSR_MPM_ICACHE_MISS_R, ss);
+    sum_reps(K, "icache.mshr_st", VX_CSR_MPM_ICACHE_MSHR_ST, ss);
+  }
+  if (isa & VX_ISA_EXT_DCACHE) {
+    const uint32_t K = VX_DCR_MPM_CLASS_DCACHE;
+    sum_reps(K, "dcache.reads", VX_CSR_MPM_DCACHE_READS, ss);   sum_reps(K, "dcache.writes", VX_CSR_MPM_DCACHE_WRITES, ss);
+    sum_reps(K, "dcache.miss_r", VX_CSR_MPM_DCACHE_MISS_R, ss); sum_reps(K, "dcache.miss_w", VX_CSR_MPM_DCACHE_MISS_W, ss);
+    sum_reps(K, "dcache.evicts", VX_CSR_MPM_DCACHE_EVICTS, ss); sum_reps(K, "dcache.bank_st", VX_CSR_MPM_DCACHE_BANK_ST, ss);
+    sum_reps(K, "dcache.mshr_st", VX_CSR_MPM_DCACHE_MSHR_ST, ss);
+  }
+  const uint64_t cpc = (nc + ncl - 1) / ncl;   // cores per cluster
+  if (isa & VX_ISA_EXT_L2CACHE) {
+    const uint32_t K = VX_DCR_MPM_CLASS_L2CACHE;
+    sum_reps(K, "l2.reads", VX_CSR_MPM_L2CACHE_READS, cpc);   sum_reps(K, "l2.writes", VX_CSR_MPM_L2CACHE_WRITES, cpc);
+    sum_reps(K, "l2.miss_r", VX_CSR_MPM_L2CACHE_MISS_R, cpc); sum_reps(K, "l2.miss_w", VX_CSR_MPM_L2CACHE_MISS_W, cpc);
+    sum_reps(K, "l2.evicts", VX_CSR_MPM_L2CACHE_EVICTS, cpc); sum_reps(K, "l2.bank_st", VX_CSR_MPM_L2CACHE_BANK_ST, cpc);
+    sum_reps(K, "l2.mshr_st", VX_CSR_MPM_L2CACHE_MSHR_ST, cpc);
+  }
+  if (isa & VX_ISA_EXT_L3CACHE) {
+    const uint32_t K = VX_DCR_MPM_CLASS_L3CACHE;
+    sum_reps(K, "l3.reads", VX_CSR_MPM_L3CACHE_READS, nc);   sum_reps(K, "l3.writes", VX_CSR_MPM_L3CACHE_WRITES, nc);
+    sum_reps(K, "l3.miss_r", VX_CSR_MPM_L3CACHE_MISS_R, nc); sum_reps(K, "l3.miss_w", VX_CSR_MPM_L3CACHE_MISS_W, nc);
+    sum_reps(K, "l3.evicts", VX_CSR_MPM_L3CACHE_EVICTS, nc); sum_reps(K, "l3.bank_st", VX_CSR_MPM_L3CACHE_BANK_ST, nc);
+    sum_reps(K, "l3.mshr_st", VX_CSR_MPM_L3CACHE_MSHR_ST, nc);
+  }
+  {
+    const uint32_t K = VX_DCR_MPM_CLASS_MEM;
+    if (isa & VX_ISA_EXT_LMEM) {
+      sum_cores(K, "lmem.reads", VX_CSR_MPM_LMEM_READS); sum_cores(K, "lmem.writes", VX_CSR_MPM_LMEM_WRITES);
+      sum_cores(K, "lmem.bank_st", VX_CSR_MPM_LMEM_BANK_ST);
+    }
+    sum_cores(K, "coalescer.misses", VX_CSR_MPM_COALESCER_MISS);
+    sum_reps(K, "mem.reads", VX_CSR_MPM_MEM_READS, nc);   sum_reps(K, "mem.writes", VX_CSR_MPM_MEM_WRITES, nc);
+    sum_reps(K, "mem.lat", VX_CSR_MPM_MEM_LT, nc);        sum_reps(K, "mem.bank_st", VX_CSR_MPM_MEM_BANK_ST, nc);
+  }
+  if (isa & VX_ISA_EXT_TCU) {
+    const uint32_t K = VX_DCR_MPM_CLASS_TCU;
+    sum_cores(K, "tcu.tbuf_stalls", VX_CSR_MPM_TCU_TBUF_STALLS); sum_cores(K, "tcu.tbuf_cache_hits", VX_CSR_MPM_TCU_TBUF_CACHE_HITS);
+    sum_cores(K, "tcu.lmem_reads", VX_CSR_MPM_TCU_LMEM_READS);
+  }
+  if (isa & VX_ISA_EXT_DXA) {
+    const uint32_t K = VX_DCR_MPM_CLASS_DXA;
+    sum_reps(K, "dxa.transfers", VX_CSR_MPM_DXA_TRANSFERS, cpc);     sum_reps(K, "dxa.gmem_reads", VX_CSR_MPM_DXA_GMEM_READS, cpc);
+    sum_reps(K, "dxa.gmem_dedup", VX_CSR_MPM_DXA_GMEM_DEDUP, cpc);   sum_reps(K, "dxa.lmem_writes", VX_CSR_MPM_DXA_LMEM_WRITES, cpc);
+    sum_reps(K, "dxa.gmem_lt", VX_CSR_MPM_DXA_GMEM_LT, cpc);         sum_reps(K, "dxa.noslot_stalls", VX_CSR_MPM_DXA_NOSLOT_STALLS, cpc);
+  }
+}
+static CupbopPerfSnap g_cupbop_perf_pre;
+static void cupbop_perf_pre(DeviceContext *DC) {
+  if (cupbop_perf_json_on()) cupbop_perf_snap(DC->device(), g_cupbop_perf_pre);
+}
+static std::string cupbop_json_str(const std::string &x) {
+  std::string o = "\"";
+  for (char ch : x) {
+    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+    else if ((unsigned char)ch < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", ch); o += b; }
+    else o += ch;
+  }
+  return o + "\"";
+}
+static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int kernel_idx, int schedule,
+                             const uint32_t grid[3], const uint32_t block[3], uint32_t ndim, uint32_t lmem,
+                             const dim3 &cgrid, const dim3 &cblock, size_t dyn_smem) {
+  const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE");
+  if (!pk || !*pk) return;
+  FILE *pf = fopen(pk, "a");
+  if (!pf) { perror("CUPBOP_PERF_KERNEL_FILE"); return; }
+  if (!cupbop_perf_json_on()) { vx_dump_perf(DC->device(), pf); fclose(pf); return; }   // CUPBOP_PERF_KERNEL_FORMAT=text
+  static uint64_t launch_no = 0, last_service = 0;
+  static std::map<std::string, char> mode;   // sticky per counter: 'r' once seen restarting
+  CupbopPerfSnap post;
+  cupbop_perf_snap(DC->device(), post);
+  const CupbopPerfSnap &pre = g_cupbop_perf_pre;
+  std::map<std::string, uint64_t> prev;
+  for (auto &kv : pre.v) prev[kv.first] = kv.second;
+  // core.cycles: the maximum of the per-core deltas (the cores run the whole launch; vx_dump_perf's max)
+  int64_t cyc_delta = 0;
+  for (size_t c = 0; c < post.cyc.size(); ++c)
+    cyc_delta = std::max<int64_t>(cyc_delta, (int64_t)post.cyc[c] - (int64_t)(c < pre.cyc.size() ? pre.cyc[c] : 0));
+  std::string raw = "{", dl = "{", md = "{", val = "{";
+  bool first = true;
+  for (auto &kv : post.v) {
+    const std::string &n = kv.first;
+    const uint64_t r = kv.second, p = prev.count(n) ? prev[n] : 0;
+    int64_t d = (int64_t)r - (int64_t)p;
+    if (n == "core.cycles") d = cyc_delta;
+    // a cache / memory / LMEM / TCU / DXA counter restarts with its whole class (one Cache::PerfStats, LocalMem, ...
+    // reset in SimX v3.0), so one drop marks the class; core.* counters are decided one by one (v3.0 restarts only
+    // core.stall_opds)
+    const std::string grp = n.compare(0, 5, "core.") == 0 ? n : n.substr(0, n.find('.')) + ".*";
+    char &m = mode[grp];
+    if (r < p) m = 'r';
+    const char mm = m == 'r' ? 'r' : (p == 0 ? '0' : 'c');
+    const int64_t v = mm == 'r' ? (int64_t)r : d;
+    const std::string sep = first ? "" : ",", key = cupbop_json_str(n) + ":";
+    raw += sep + key + std::to_string(r); dl += sep + key + std::to_string(d);
+    md += sep + key + "\"" + std::string(1, mm) + "\""; val += sep + key + std::to_string(v);
+    first = false;
+  }
+  raw += "}"; dl += "}"; md += "}"; val += "}";
+  auto arr = [](const std::vector<uint64_t> &a, const std::vector<uint64_t> *b) {
+    std::string o = "[";
+    for (size_t i = 0; i < a.size(); ++i)
+      o += (i ? "," : "") + std::to_string(b ? (int64_t)a[i] - (int64_t)(i < b->size() ? (*b)[i] : 0) : (int64_t)a[i]);
+    return o + "]";
+  };
+  auto d3 = [](const uint32_t *x) { return "[" + std::to_string(x[0]) + "," + std::to_string(x[1]) + "," + std::to_string(x[2]) + "]"; };
+  const uint32_t cg[3] = {cgrid.x, cgrid.y, cgrid.z}, cb[3] = {cblock.x, cblock.y, cblock.z};
+  std::string line = "{\"v\":1,\"pid\":" + std::to_string((long)getpid()) + ",\"launch\":" + std::to_string(launch_no) +
+      ",\"kernel\":" + cupbop_json_str(kernel) + ",\"kernel_idx\":" + std::to_string(kernel_idx) +
+      ",\"sched\":" + std::to_string(schedule) + ",\"ndim\":" + std::to_string(ndim) + ",\"grid\":" + d3(grid) +
+      ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) +
+      ",\"lmem\":" + std::to_string(lmem) + ",\"dyn_smem\":" + std::to_string(dyn_smem) +
+      ",\"service_launches\":" + std::to_string(g_cupbop_service_launches - last_service) +
+      ",\"cycles\":" + std::to_string(cyc_delta) +
+      ",\"per_core\":{\"cycles\":" + arr(post.cyc, nullptr) + ",\"instrs\":" + arr(post.ins, nullptr) +
+      ",\"cycles_delta\":" + arr(post.cyc, &pre.cyc) + ",\"instrs_delta\":" + arr(post.ins, &pre.ins) + "}" +
+      ",\"raw\":" + raw + ",\"delta\":" + dl + ",\"mode\":" + md + ",\"val\":" + val + "}\n";
+  fputs(line.c_str(), pf);
+  fclose(pf);
+  ++launch_no;
+  last_service = g_cupbop_service_launches;
+}
+// service: a service launch (kernel_idx -1 / -2), which goes to cupbop_service_main when the module has it
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
-                               const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes) {
+                               const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes,
+                               bool service = false) {
   vx_launch_info_t li = {};
   li.struct_size = sizeof(li);
-  li.kernel      = DC->kernel();
+  li.kernel      = service ? DC->service_kernel() : DC->kernel();
+  if (service) ++g_cupbop_service_launches;
   li.args_host   = blob;
   li.args_size   = size;
   li.ndim        = ndim;
@@ -1099,7 +1550,7 @@ static void cupbop_service_launch(DeviceContext *DC, int kind, const std::vector
   ka->num_args = 0;
   memcpy(ka->args, list.data(), list.size() * sizeof(uint64_t));
   uint32_t one[3] = {1, 1, 1};
-  cupbop_launch_blob(DC, blob.data(), blob.size(), 1, one, one, 0);
+  cupbop_launch_blob(DC, blob.data(), blob.size(), 1, one, one, 0, true);
 }
 // Read device memory that lives inside the module image (BSS / __device__ vars):
 // the service kernel copies each range into a host-visible staging buffer.
@@ -1990,7 +2441,7 @@ cudaError_t cudaLaunchKernel_vortex(
     if (!memcpy_symbol.empty()) {
       abuf_ptr->kernel_idx = -1;
       uint32_t one[3] = {1, 1, 1};
-      cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0);
+      cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0, true);
       abuf_ptr->kernel_idx = kernel_idx;
     }
     // 2) the kernel itself
@@ -2087,17 +2538,14 @@ cudaError_t cudaLaunchKernel_vortex(
               func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
     }
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
+    cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
-  }
-
-  // CUPBOP_PERF_KERNEL_FILE=<file> (measurement, experiments/stklmem): the device counters right after the kernel,
-  // appended to <file>. The Perf_counter_* dump at the end of this function comes after the __device__ read-back
-  // service launch below, and SimX resets its memory, L2 and LMEM counters at every launch, so for a program with
-  // __device__ variables that dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
-  if (const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE")) {
-    if (*pk) {
-      if (FILE *pf = fopen(pk, "a")) { vx_dump_perf(DC->device(), pf); fclose(pf); }
-    }
+    // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
+    // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
+    // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
+    // SimX v3.0 resets its memory, L2 and LMEM counters at every launch, so for a program with __device__ variables that
+    // dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
+    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem);
   }
 
   // Read back __device__ variables from device memory after kernel execution.
