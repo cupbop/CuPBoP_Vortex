@@ -299,7 +299,29 @@ public:
       return syncRightBefore(at);
     };
     auto insIntra = [&](llvm::Instruction *at) { if (alreadySynced(at)) return; CreateIntraWarpBarrier(at); inserted++; };
-    auto insInter = [&](llvm::Instruction *at) { if (alreadySynced(at)) return; CreateInterWarpBarrier(at); inserted++; };
+    // a warp sync already there does not do: a branch with a CTA barrier in its arms must end the inter region too. Left
+    // with the warp sync of an earlier round, both arms' CTA barriers closed an inter region over the same start, and the
+    // inner warp loop restarted the outer one forever at P < CTA warps (lifted tg2 NT16 s1p1, s1p2).
+    auto ctaSynced = [&](llvm::Instruction *at) {
+      if (!virt_subpass) return false;
+      auto cta = [](llvm::Instruction *I) {
+        auto *CI = llvm::dyn_cast_or_null<llvm::CallInst>(I);
+        return CI && CI->getCalledFunction() && (CI->getCalledFunction()->getName() == "llvm.nvvm.barrier0" ||
+                                                 CI->getCalledFunction()->getName() == "llvm.nvvm.barrier.sync");
+      };
+      for (auto *P = at->getPrevNode(); P; P = P->getPrevNode()) {
+        if (llvm::isa<llvm::DbgInfoIntrinsic>(P)) continue;
+        if (!isSyncCallInst(P)) break;
+        if (cta(P)) return true;
+      }
+      for (auto *N = at; N; N = N->getNextNode()) {
+        if (llvm::isa<llvm::DbgInfoIntrinsic>(N)) continue;
+        if (!isSyncCallInst(N)) break;
+        if (cta(N)) return true;
+      }
+      return false;
+    };
+    auto insInter = [&](llvm::Instruction *at) { if (virt_subpass ? ctaSynced(at) : alreadySynced(at)) return; CreateInterWarpBarrier(at); inserted++; };
     bool changed = false;
     for (int round = 0; round < (virt_subpass ? 8 : 1); round++) {
     inserted = 0;
