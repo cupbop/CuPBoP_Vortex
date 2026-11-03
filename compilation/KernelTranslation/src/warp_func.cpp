@@ -1282,10 +1282,11 @@ static void replaceMmaStaged(Module &m) {
   for (auto *ci : sites) {
     StringRef Name = ci->getCalledFunction()->getName();
     const bool bf16 = Name.ends_with(".bf16");
+    const bool f16acc = Name.ends_with(".row.col.f16.f16");   // C/D: two f16x2 registers per lane
     // the NT=16 glue is the f16/bf16 m16n8k16 TCU tile only: tf32 / int8 / fp8 forms have no sub-pass form yet
-    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != 10 ||
-        !(Name.ends_with(".row.col.f32.f32") || Name.ends_with(".row.col.bf16"))) {
-      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col f16/bf16 -> f32 only)\n", Name.str().c_str());
+    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != (f16acc ? 8u : 10u) ||
+        !(f16acc || Name.ends_with(".row.col.f32.f32") || Name.ends_with(".row.col.bf16"))) {
+      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col f16/bf16 -> f32, f16 -> f16 only)\n", Name.str().c_str());
       exit(1);
     }
     Function *F = ci->getFunction();
@@ -1307,14 +1308,25 @@ static void replaceMmaStaged(Module &m) {
     };
     for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(i);     if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stA, ATy, 4, i)); }
     for (int i = 0; i < 2; i++) { Value *v = ci->getArgOperand(4 + i); if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stB, BTy, 2, i)); }
+    if (f16acc) {
+      for (int i = 0; i < 2; i++) { Value *v = ci->getArgOperand(6 + i); if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stC, CTy, 2, i)); }
+    } else
     for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(6 + i); if (!v->getType()->isFloatTy())     v = b.CreateBitCast(v, F32); vstore(b, v, slot(stC, CTy, 4, i)); }
     CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
-    std::string gname = std::string("__cupbop_mma_m16n8k16_") + (bf16 ? "bf16f32" : "f16f32") + "_glue16";
+    std::string gname = std::string("__cupbop_mma_m16n8k16_") + (bf16 ? "bf16f32" : f16acc ? "f16f16" : "f16f32") + "_glue16";
     FunctionCallee glue = m.getOrInsertFunction(gname, FunctionType::get(VoidT, {PtrTy, PtrTy, PtrTy, PtrTy}, false));
     if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
     b.CreateCall(glue, {stA, stB, stC, stD})->addFnAttr(Attribute::Convergent);
     b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
     Value *res = UndefValue::get(ci->getType());
+    if (f16acc) {
+      auto *ST = cast<StructType>(ci->getType());
+      for (int i = 0; i < 2; i++) {
+        Value *v = vload(b, I32, slot(stD, CTy, 2, i));
+        if (ST->getElementType(i) != I32) v = b.CreateBitCast(v, ST->getElementType(i));
+        res = b.CreateInsertValue(res, v, i);
+      }
+    } else
     for (int i = 0; i < 4; i++) res = b.CreateInsertValue(res, vload(b, F32, slot(stD, CTy, 4, i)), i);
     ci->replaceAllUsesWith(res);
     ci->eraseFromParent();

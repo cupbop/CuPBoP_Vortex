@@ -644,6 +644,22 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_
   __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, e0, e1, e2, e3, dd);
   CUPBOP_F16ACC_PACK;
 }
+#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE) && VX_CFG_NUM_THREADS == 16
+// NT=16 sub-pass form: f16 accumulators through the f32 glue, same model as the f32 helper above. Slots per pass:
+// c / d[2 * pass + i] = the two f16x2 registers of logical lane L = h + 16 pass.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  float fc[8], fd[8];
+  for (int p = 0; p < 2; p++) {
+    fc[4 * p + 0] = __cupbop_f16_to_f32(c[2 * p]);     fc[4 * p + 1] = __cupbop_f16_to_f32(c[2 * p] >> 16);
+    fc[4 * p + 2] = __cupbop_f16_to_f32(c[2 * p + 1]); fc[4 * p + 3] = __cupbop_f16_to_f32(c[2 * p + 1] >> 16);
+  }
+  __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx>(a, b, fc, fd);
+  for (int p = 0; p < 2; p++) {
+    d[2 * p] = __cupbop_pack_f16x2_rne(fd[4 * p], fd[4 * p + 1]);
+    d[2 * p + 1] = __cupbop_pack_f16x2_rne(fd[4 * p + 2], fd[4 * p + 3]);
+  }
+}
+#endif
 #if defined(CUPBOP_MMA_TCU_AVAILABLE)
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1, uint32_t c0, uint32_t c1, uint32_t *d) {
