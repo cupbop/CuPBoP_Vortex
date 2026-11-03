@@ -2574,8 +2574,9 @@ static const char *s1_barrier_kind(llvm::Instruction &I) {
       }
   return "added";
 }
+static bool s1_marker_is_warp_sync = false;   // sub-pass form, intra pass: region markers bound lane loops
 static llvm::CallInst *s1_region_marker(llvm::Instruction *before) {
-  auto *c = need_nested_loop ? CreateIntraWarpBarrier(before) : CreateInterWarpBarrier(before);
+  auto *c = s1_marker_is_warp_sync ? CreateIntraWarpBarrier(before) : CreateInterWarpBarrier(before);
   auto &mctx = c->getContext();
   c->setMetadata("cupbop.builtin_barrier", llvm::MDNode::get(mctx, llvm::MDString::get(mctx, "region_split")));
   return c;
@@ -2771,6 +2772,10 @@ static int split_multi_entry_merges(llvm::Function &F, const std::vector<llvm::B
       for (auto &I : *Mg) work |= !(llvm::isa<llvm::BranchInst>(I) || llvm::isa<llvm::DbgInfoIntrinsic>(I));
       if (work && !s1_is_cta_barrier(*Mg->getFirstNonPHI())) {
         Mg->splitBasicBlock(Mg->getFirstNonPHI(), Mg->getName() + ".s1body");
+        s1_region_marker(Mg->getTerminator());
+        n++;
+      } else if (need_nested_loop && !work && !s1_is_cta_barrier(*Mg->getFirstNonPHI())) {
+        // sub-pass form, inter pass: an empty join (its warp sync is gone by now) of two barrier blocks
         s1_region_marker(Mg->getTerminator());
         n++;
       }
@@ -3562,8 +3567,12 @@ public:
     // print function
     // F.print(llvm::errs());
     const bool s1_absorb = g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop && s1_absorb_on();
+    // sub-pass form, inter pass: the same split for the regions between CTA barriers (lifted GEMM: `if (k > 0) main loop`
+    // joins the epilogue from the entry's barrier and from the loop's last barrier)
+    const bool s1_split_merges = s1_absorb || (g_schedule_flag == 1 && need_nested_loop && !intra_warp_loop && virt_gate_on());
+    s1_marker_is_warp_sync = g_schedule_flag == 1 && need_nested_loop && intra_warp_loop;
     std::vector<llvm::BasicBlock *> multi_entry;
-    if (s1_absorb) defer_multi_entry = &multi_entry;
+    if (s1_split_merges) defer_multi_entry = &multi_entry;
     auto parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
     std::unique_ptr<DominatorTree> absDT;
     std::unique_ptr<PostDominatorTree> absPDT;
@@ -3575,7 +3584,7 @@ public:
       DI.setAnalyzers(*absDT, *absPDT, *absLI);
       DI.analyze(F);
     };
-    for (int round = 0; s1_absorb && !multi_entry.empty(); round++) {
+    for (int round = 0; s1_split_merges && !multi_entry.empty(); round++) {
       std::vector<llvm::BasicBlock *> Bs;
       Bs.swap(multi_entry);
       if (round >= 8 || !split_multi_entry_merges(F, Bs)) defer_multi_entry = nullptr; // next pass: refuse as before
@@ -3796,7 +3805,8 @@ static bool has_warp_shfl_usage(llvm::Module *M) {
 // (8 bytes of pointer spill per array + every array at CUPBOP_CTX_DYN_SLOTS slots, default 8, or the fixed trips)
 // exceeds CUPBOP_CTX_STACK_BYTES (default 7168 of the 8192-byte stack); otherwise nothing changes.
 // CUPBOP_CTX_SCRATCH_WHY=1 prints every kernel's numbers and decision. The sub-pass form (nested loops, L < 32 with
-// warp-level ops) keeps its arrays on the stack.
+// warp-level ops) has ceil(CUDA warps / P) x S slots (sidecar field `nested`), assumes 8 x S of them, and leaves the
+// stack sooner (budget 2048): its frame also holds the staging slots, and a stack overrun is silent.
 static std::string ctx_lookup_name(llvm::Function *F) {
   // the kernel name as generate_wrapper.cpp writes it to lookup.txt
   return cupbop_kernel_lookup_name(F->getName().str());
@@ -3990,11 +4000,10 @@ static bool ctx_word_ok(const CtxArray &c, const DataLayout &DL) {
   return true;
 }
 void virt_ctx_to_scratch(llvm::Module *M) {
-  if (need_nested_loop) { std::remove("cupbop_ctx_scratch.txt"); return; }
   std::string mode = "auto";
   if (const char *e = std::getenv("CUPBOP_CTX_SCRATCH")) mode = e;
   const bool why = std::getenv("CUPBOP_CTX_SCRATCH_WHY") != nullptr;
-  long dyn_slots = 8, budget = 7168;
+  long dyn_slots = need_nested_loop ? 8 * getVirtGeom().subpasses : 8, budget = need_nested_loop ? 2048 : 7168;
   if (const char *e = std::getenv("CUPBOP_CTX_DYN_SLOTS")) dyn_slots = std::max(1L, std::atol(e));
   if (const char *e = std::getenv("CUPBOP_CTX_STACK_BYTES")) budget = std::atol(e);
   const VirtGeom vg = getVirtGeom();
@@ -4148,7 +4157,7 @@ void virt_ctx_to_scratch(llvm::Module *M) {
       c.AI->eraseFromParent();
     }
     sidecar.push_back(ctx_lookup_name(&F) + " " + std::to_string(B) + " " + std::to_string(fixed > 0 ? fixed : 0) + " " +
-                      std::to_string(vg.lanes));
+                      std::to_string(vg.lanes) + (need_nested_loop ? " 1" : ""));
     size_t nw = 0;
     for (auto &c : arrays) nw += c.words;
     fprintf(stderr, "[ctx-scratch] %s: %zu context arrays in the scratch buffer (%lu bytes per slot, %zu word-interleaved)\n",

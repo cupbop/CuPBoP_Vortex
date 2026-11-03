@@ -799,6 +799,49 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n
     }
   }
 }
+// 16-lane sub-pass form (S = 2): st[pass] holds each lane's address, out / v[4 * pass + j] the registers of logical lane
+// L = h + 16 pass (replaceLdStMatrixStaged). Matrix j's row r comes from logical lane 8j + r: hardware lane 8(j&1) + r of
+// slot j>>1. Runs once per CUDA warp on all 16 hardware lanes, num and trans are constants after inlining.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, uint32_t *out) {
+  const int h = vx_thread_id(), t = h & 3;
+  for (int j = 0; j < num; ++j) {
+    const uint32_t as = st[j >> 1];
+    const int base = 8 * (j & 1);
+    if (!trans) {
+      for (int p = 0; p < 2; ++p) {
+        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
+        out[4 * p + j] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t);
+      }
+    } else {
+      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
+      for (int p = 0; p < 2; ++p) {
+        const int g = (h >> 2) + 4 * p;
+        const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g), hi = *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g);
+        out[4 * p + j] = lo | (hi << 16);
+      }
+    }
+  }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, const uint32_t *v) {
+  const int h = vx_thread_id(), t = h & 3;
+  for (int j = 0; j < num; ++j) {
+    const uint32_t as = st[j >> 1];
+    const int base = 8 * (j & 1);
+    if (!trans) {
+      for (int p = 0; p < 2; ++p) {
+        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
+        *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t) = v[4 * p + j];
+      }
+    } else {
+      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
+      for (int p = 0; p < 2; ++p) {
+        const int g = (h >> 2) + 4 * p;
+        *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[4 * p + j];
+        *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[4 * p + j] >> 16);
+      }
+    }
+  }
+}
 
 
 // ---- redux.sync.<op>.b32 v, membermask (sm_80+): reduction over the mask's lanes (index shuffles, any mask) ----------
