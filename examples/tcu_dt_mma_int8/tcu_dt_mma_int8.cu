@@ -207,16 +207,23 @@ int main(int argc, char **argv) {
       for (int c = 0; c < N; c++) {
         double ref, tol = 0; bool ok;
 #if defined(FAM_int8)
-        int64_t acc = hC[r * N + c];
+        // .satfinite: acc clamps once per mma (the 32-lane _sw helper), acc4 after every 4 words of K as an A100 does at k32 (the 16-lane
+        // glue, experiments/nt16cov/cases/mma_forms): the two differ only when a partial sum overflows, either is accepted
+        auto clamp = [](int64_t v) { return v > 2147483647LL ? 2147483647LL : (v < -2147483648LL ? -2147483648LL : v); };
+        int64_t acc = hC[r * N + c], acc4 = acc;
         for (int kw0 = 0; kw0 < KW; kw0 += step) { // one mma per step: D = sat?(A_step B_step + C)
           int64_t s = 0;
-          for (int w = kw0; w < kw0 + step; w++)
-            for (int i = 0; i < 4; i++) s += (int64_t)elem(hA[r * KW + w], i, fa) * (int64_t)elem(hBt[c * KW + w], i, fb);
+          for (int w = kw0; w < kw0 + step; w++) {
+            int64_t s4 = 0;
+            for (int i = 0; i < 4; i++) s4 += (int64_t)elem(hA[r * KW + w], i, fa) * (int64_t)elem(hBt[c * KW + w], i, fb);
+            s += s4; acc4 += s4;
+            if (sat && ((w - kw0) & 3) == 3) acc4 = clamp(acc4);
+          }
           acc += s;
-          if (sat) acc = acc > 2147483647LL ? 2147483647LL : (acc < -2147483648LL ? -2147483648LL : acc);
+          if (sat) acc = clamp(acc);
           else acc = (int64_t)(int32_t)(uint32_t)(uint64_t)acc;
         }
-        ref = (double)acc; ok = hD[r * N + c] == (acc_t)acc;
+        ref = (double)acc; ok = hD[r * N + c] == (acc_t)acc || (sat && hD[r * N + c] == (acc_t)acc4);
 #else
         double s = hC[r * N + c], mag = fabs(s);
         for (int w = 0; w < KW; w++)
