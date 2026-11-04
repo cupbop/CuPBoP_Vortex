@@ -34,6 +34,25 @@ run s1_nt16_p1    1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUP
 ( cd examples/virt_warp_test && make clean > /dev/null 2>&1
   env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
 echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops are unsupported at S>1' $OUT/reject_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)'); $(grep -c 'trip count depends on the lane' $OUT/reject_nt16.log) sites"
+( cd examples/virt_gate_refuse && make clean > /dev/null 2>&1
+  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/refuse_gate_nt16.log 2>&1 )
+echo "== refuse_gate_nt16 (arms that cannot be gated): $(grep -q 'would be decided by sub-pass 0 for the whole CUDA warp; refusing' $OUT/refuse_gate_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)')"
+# 16 lanes without warp ops (single warp loop, S = 2): __syncthreads in a thread-dependent loop (nt16s1, 11/3)
+( cd examples/dotproduct && make clean > /dev/null 2>&1; rm -f ci_output.txt
+  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 CI_RUN_ARGS="-n 16384" RUN_ARGS="-n 16384" > $OUT/dotproduct_nt16.log 2>&1; cp -f ci_output.txt $OUT/dotproduct_nt16.out 2>/dev/null )
+echo "== dotproduct_nt16: $(grep -c 'FAILED!' $OUT/dotproduct_nt16.out) failed, $(grep -m1 'GPU result' $OUT/dotproduct_nt16.out), $(grep -m1 'CPU result' $OUT/dotproduct_nt16.out)"
+# ldmatrix / stmatrix forms, checked on the host against the PTX layout: 9 lines PASS each
+ldsm() { # tag sched vortex_path configs nt [env...]
+  local tag=$1 sched=$2 vp=$3 cfg=$4 nt=$5; shift 5
+  ( cd examples/virt_ldsm_test && make clean > /dev/null 2>&1; rm -f ci_output.txt
+    env VORTEX_PATH=$vp VORTEX_CONFIGS="$cfg" VORTEX_NUM_THREADS=$nt "$@" make ci SCHEDULE=$sched > $OUT/ldsm_$tag.log 2>&1; cp -f ci_output.txt $OUT/ldsm_$tag.out 2>/dev/null )
+  echo "== ldsm_$tag: $(grep -c ' PASS$' $OUT/ldsm_$tag.out 2>/dev/null)/9 PASS"
+}
+ldsm s2_nt32 2 $VORTEX_PATH "$CFG32" 32
+ldsm s1_nt32 1 $VORTEX_PATH "$CFG32" 32
+ldsm s1_nt32_l16 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16
+ldsm s1_nt16 1 $VXH/build64_cupbop_nt16 "$CFG16" 16
+ldsm s1_nt16_p1 1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1
 cp -f $OUT/golden_s2_nt32.out examples/virt_warp_test/golden_output.txt
 python3 - $OUT <<'PY'
 import sys,glob,os
@@ -46,14 +65,14 @@ def load(p):
     return rows
 g=load(d+'/golden_s2_nt32.out')
 names=["ballot","any","all","shfl5","down1","up3","xor16","fdown2","redsum","actmask","ballot_am","idx_w16","up1_w8","down8_v","popc_hi","t"]
-names2=["uniform_if_shfl","warpuni_if_shfl","welford","halfwarp_shfl","ballot_in_if_mask","nested_if_ballot","nested_if_ballot2","div_loop_ballot","syncwarp_smem","t0_store","loop_glue_if","divtrip_loop_glue","t","t","t","t"]
+names2=["uniform_if_shfl","warpuni_if_shfl","welford","halfwarp_shfl","ballot_in_if_mask","nested_if_ballot","nested_if_ballot2","div_loop_ballot","syncwarp_smem","t0_store","loop_glue_if","divtrip_loop_glue","sp_store_half","sp_both_arms","sp_upper_loop","sp_nested_upper"]
 for f in sorted(glob.glob(d+'/s1_*.out')):
     r=load(f); bad={}
     for t,gv in g.items():
         rv=r.get(t)
         if rv is None: bad.setdefault('missing',[]).append(t); continue
         for i,(a,b) in enumerate(zip(gv,rv)):
-            if a!=b: bad.setdefault((names2[i] if t>=1000 else names[i]),[]).append((t,a,b))
+            if a!=b: bad.setdefault(("k3_field%d"%i if t>=2000 else names2[i] if t>=1000 else names[i]),[]).append((t,a,b))
     print(f"== {os.path.basename(f)}: {'PASS' if not bad else 'FAIL'}")
     for k,v in bad.items():
         print(f"   {k}: {len(v)} mismatches, e.g. {v[:4]}")

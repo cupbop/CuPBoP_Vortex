@@ -644,6 +644,22 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_
   __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, e0, e1, e2, e3, dd);
   CUPBOP_F16ACC_PACK;
 }
+#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE) && VX_CFG_NUM_THREADS == 16
+// NT=16 sub-pass form: f16 accumulators through the f32 glue, same model as the f32 helper above. Slots per pass:
+// c / d[2 * pass + i] = the two f16x2 registers of logical lane L = h + 16 pass.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  float fc[8], fd[8];
+  for (int p = 0; p < 2; p++) {
+    fc[4 * p + 0] = __cupbop_f16_to_f32(c[2 * p]);     fc[4 * p + 1] = __cupbop_f16_to_f32(c[2 * p] >> 16);
+    fc[4 * p + 2] = __cupbop_f16_to_f32(c[2 * p + 1]); fc[4 * p + 3] = __cupbop_f16_to_f32(c[2 * p + 1] >> 16);
+  }
+  __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx>(a, b, fc, fd);
+  for (int p = 0; p < 2; p++) {
+    d[2 * p] = __cupbop_pack_f16x2_rne(fd[4 * p], fd[4 * p + 1]);
+    d[2 * p + 1] = __cupbop_pack_f16x2_rne(fd[4 * p + 2], fd[4 * p + 3]);
+  }
+}
+#endif
 #if defined(CUPBOP_MMA_TCU_AVAILABLE)
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1, uint32_t c0, uint32_t c1, uint32_t *d) {
@@ -796,6 +812,49 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n
       const uint32_t r0 = __cupbop_shfl32(a, 8 * j + 2 * t), r1 = __cupbop_shfl32(a, 8 * j + 2 * t + 1);
       *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[j];
       *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[j] >> 16);
+    }
+  }
+}
+// 16-lane sub-pass form (S = 2): st[pass] holds each lane's address, out / v[4 * pass + j] the registers of logical lane
+// L = h + 16 pass (replaceLdStMatrixStaged). Matrix j's row r comes from logical lane 8j + r: hardware lane 8(j&1) + r of
+// slot j>>1. Runs once per CUDA warp on all 16 hardware lanes, num and trans are constants after inlining.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, uint32_t *out) {
+  const int h = vx_thread_id(), t = h & 3;
+  for (int j = 0; j < num; ++j) {
+    const uint32_t as = st[j >> 1];
+    const int base = 8 * (j & 1);
+    if (!trans) {
+      for (int p = 0; p < 2; ++p) {
+        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
+        out[4 * p + j] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t);
+      }
+    } else {
+      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
+      for (int p = 0; p < 2; ++p) {
+        const int g = (h >> 2) + 4 * p;
+        const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g), hi = *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g);
+        out[4 * p + j] = lo | (hi << 16);
+      }
+    }
+  }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, const uint32_t *v) {
+  const int h = vx_thread_id(), t = h & 3;
+  for (int j = 0; j < num; ++j) {
+    const uint32_t as = st[j >> 1];
+    const int base = 8 * (j & 1);
+    if (!trans) {
+      for (int p = 0; p < 2; ++p) {
+        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
+        *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t) = v[4 * p + j];
+      }
+    } else {
+      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
+      for (int p = 0; p < 2; ++p) {
+        const int g = (h >> 2) + 4 * p;
+        *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[4 * p + j];
+        *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[4 * p + j] >> 16);
+      }
     }
   }
 }

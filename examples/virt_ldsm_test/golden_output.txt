@@ -1,0 +1,10 @@
+ldmatrix x4 PASS
+ldmatrix x4.trans PASS
+ldmatrix x2 PASS
+ldmatrix x2.trans PASS
+ldmatrix x1 PASS
+ldmatrix x1.trans PASS
+stmatrix x4 PASS
+stmatrix x2.trans PASS
+stmatrix x1 PASS
+done

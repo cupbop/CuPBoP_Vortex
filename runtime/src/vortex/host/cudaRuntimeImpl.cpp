@@ -1041,7 +1041,8 @@ static void cupbop_big_stack_setup(const std::string &kernel_name) {
 // Core-mapping context scratch (translator: insert_warp_loop.cpp virt_ctx_to_scratch, cupbop_ctx_scratch.txt in the
 // working directory, one line per kernel: <name as in lookup.txt> <bytes per slot> <fixed slots or 0> <L>): bytes the
 // launch of kernel `lookup_name` needs = H * B * slots, H = all hardware threads of the device rounded up to 16
-// (the device's __cupbop_ctx_num_harts), slots = the fixed count or ceil(block / (P * L)). 0 when the kernel keeps
+// (the device's __cupbop_ctx_num_harts), slots = the fixed count or ceil(block / (P * L)); a fifth field 1 = sub-pass
+// form, ceil(CUDA warps / P) * (32 / L) slots. 0 when the kernel keeps
 // its context arrays on the stack.
 static uint64_t cupbop_ctx_scratch_bytes(const std::string &lookup_name, uint64_t block_threads) {
   std::ifstream f("cupbop_ctx_scratch.txt");
@@ -1055,7 +1056,10 @@ static uint64_t cupbop_ctx_scratch_bytes(const std::string &lookup_name, uint64_
     if (!(is >> name >> B >> fixed >> Lt) || name != lookup_name) continue;
     uint32_t L, P, trips, bw;
     cupbop_virt_geometry(block_threads, L, P, trips, bw);
-    const uint64_t slots = fixed ? fixed : (block_threads + (uint64_t)P * Lt - 1) / ((uint64_t)P * Lt);
+    uint64_t nested = 0;   // sub-pass form: slots per CUDA warp (a partial last warp keeps all its sub-pass slots)
+    is >> nested;
+    const uint64_t slots = fixed ? fixed : nested ? ((block_threads + 31) / 32 + P - 1) / P * (32 / Lt)
+                                                  : (block_threads + (uint64_t)P * Lt - 1) / ((uint64_t)P * Lt);
     const uint64_t H = ((uint64_t)NUM_CORES_VX * NUM_WARPS_VX * NUM_THREADS_VX + 15) & ~15ull;
     const uint64_t bytes = H * B * slots;
     if (std::getenv("CUPBOP_CTX_SCRATCH_VERBOSE"))
