@@ -137,6 +137,7 @@ public:
 
     //printf("analyze divergence\n");
     // Identify divergence sources
+    unsigned nSources = 0;
     for (Instruction &I : instructions(F)) {
       // print instruction
       // I.print(llvm::errs());
@@ -145,9 +146,12 @@ public:
       if (isDivergenceSource(&I)) {
         DivergentValues.insert(&I);
         Worklist.push(&I);
-        fprintf(stderr, "[div] source: ");
-        I.print(llvm::errs());
-        fprintf(stderr, "\n");
+        // printing an instruction numbers the whole function: unbounded, a staged kernel with thousands of sources took hours (CUTLASS 07_volta, 3585 shfl sites)
+        if (nSources++ < 64) {
+          fprintf(stderr, "[div] source: ");
+          I.print(llvm::errs());
+          fprintf(stderr, "\n");
+        }
       }
       // virt (schedule 1): results the analysis cannot see through. It follows SSA values and stores only, but
       // the core mapping keeps an alloca whose stores all look uniform as ONE copy per hardware thread, shared by
