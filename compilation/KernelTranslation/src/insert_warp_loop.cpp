@@ -3002,12 +3002,37 @@ static void virt_gate_guards(llvm::Function &F, std::vector<VirtGate> &gates, st
     for (llvm::BasicBlock *P : outside) P->getTerminator()->replaceSuccessorWith(S, next);
   }
 }
+// A condition that only depends on the kernel's arguments is the same for every thread: the divergence analysis counts it
+// as thread-dependent (a parameter stored to a local inside a lane loop, tcu_dt_mma's switch (mode)), but it needs no gate.
+static bool virt_launch_uniform(llvm::Value *V, llvm::DominatorTree &DT, std::set<llvm::Value *> &seen) {
+  using namespace llvm;
+  if (isa<Constant>(V) || isa<Argument>(V)) return true;
+  if (!seen.insert(V).second) return false;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I) return false;
+  if (auto *Ld = dyn_cast<LoadInst>(I)) {
+    auto *AI = dyn_cast<AllocaInst>(Ld->getPointerOperand());
+    if (!AI) return false;
+    StoreInst *only = nullptr;
+    for (User *U : AI->users()) {
+      if (isa<LoadInst>(U)) continue;
+      auto *St = dyn_cast<StoreInst>(U);
+      if (!St || St->getPointerOperand() != AI || only) return false;
+      only = St;
+    }
+    return only && DT.dominates(only, Ld) && virt_launch_uniform(only->getValueOperand(), DT, seen);
+  }
+  if (!isa<CmpInst>(I) && !isa<BinaryOperator>(I) && !isa<CastInst>(I) && !isa<SelectInst>(I)) return false;
+  for (Value *O : I->operands())
+    if (!virt_launch_uniform(O, DT, seen)) return false;
+  return true;
+}
 // Picks the branches to gate. Refuses what cannot be gated. Returns the gates (arms computed on the current CFG).
 static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vector<ParallelRegion> &PRs, CustomDivergenceAnalysis &DI,
                                                llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, llvm::LoopInfo &LI) {
   std::set<llvm::BasicBlock *> wrapped;
   for (auto &pr : PRs) wrapped.insert(pr.wrapped_block.begin(), pr.wrapped_block.end());
-  struct Cand { VirtGate g; int kind; std::string why; bool div; };
+  struct Cand { VirtGate g; int kind; std::string why; bool div, uni; };
   std::vector<Cand> cands;
   for (llvm::BasicBlock &X : F) {
     if (wrapped.count(&X)) continue;
@@ -3016,6 +3041,8 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
     if (BI->getMetadata("cupbop.virt_gated")) continue;
     Cand c; c.div = DI.isDivergent(BI->getCondition());
     c.kind = virt_classify(&X, BI, DT, PDT, LI, c.g, c.why);
+    std::set<llvm::Value *> seen;
+    c.uni = c.div && virt_launch_uniform(BI->getCondition(), DT, seen);
     cands.push_back(c);
   }
   std::vector<VirtGate> gates;
@@ -3027,7 +3054,7 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
     for (Cand &c : cands) {
       if (taken.count(&c)) continue;
       const bool inside = gated.count(c.g.X);
-      if (!c.div && !inside) continue;
+      if ((!c.div || c.uni) && !inside) continue;
       if (c.kind == 1 && !inside) continue;    // loops: below
       if (c.kind == 0 && virt_area_holds(c.g.T, true, false)) continue;
       if (c.kind == 0 && virt_area_holds(c.g.E, true, false)) continue;
@@ -3040,7 +3067,7 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
     }
   }
   for (Cand &c : cands) {
-    if (taken.count(&c) || !c.div) continue;
+    if (taken.count(&c) || !c.div || (c.uni && !gated.count(c.g.X))) continue;
     const bool cta = virt_area_holds(c.g.T, true, false) || virt_area_holds(c.g.E, true, false);
     if (cta) continue;                         // block-uniform by CUDA's rules: slot 0 is as good as any
     if (c.kind == 1) {
@@ -3822,6 +3849,35 @@ struct CtxArray {
 } // namespace
 // Can every use of the array be rewritten slot by slot? (direct load / store / call of slot 0, or a GEP whose leading
 // index selects the slot: `gep elem, A, slot, ...` or, for a fixed-count array [k x elem], `gep [k x elem], A, 0, slot, ...`)
+// -O3 (loop idiom, LICM) hoists the constant part of a flattened index out of a lane loop: gep i8 (gep i8 A, 32), slot * 352
+// (mmafuse_test at 16 lanes: memcpy d0 -> o[8..11] of every slot). The rewrite below finds the slot in the GEP on the array, so
+// the outer GEP would keep stepping by the old element size, silently into other arrays: fold such a chain into one flat index.
+static void ctx_fold_flat_chains(const CtxArray &c, const DataLayout &DL) {
+  Type *I8 = Type::getInt8Ty(c.AI->getContext()), *I64 = Type::getInt64Ty(c.AI->getContext());
+  std::vector<GetElementPtrInst *> work;
+  for (User *U : c.AI->users())
+    if (auto *G = dyn_cast<GetElementPtrInst>(U))
+      if (G->getPointerOperand() == c.AI && G->getNumIndices() == 1 && DL.getTypeAllocSize(G->getSourceElementType()) != c.size)
+        work.push_back(G);
+  while (!work.empty()) {
+    GetElementPtrInst *G1 = work.back(); work.pop_back();
+    std::vector<GetElementPtrInst *> outer;
+    for (User *U : G1->users())
+      if (auto *G2 = dyn_cast<GetElementPtrInst>(U))
+        if (G2->getPointerOperand() == G1 && G2->getNumIndices() == 1 && !isa<ConstantInt>(G2->getOperand(1))) outer.push_back(G2);
+    for (GetElementPtrInst *G2 : outer) {
+      IRBuilder<> B(G2);
+      Value *a = B.CreateMul(B.CreateSExtOrTrunc(G1->getOperand(1), I64), ConstantInt::get(I64, DL.getTypeAllocSize(G1->getSourceElementType())));
+      Value *b = B.CreateMul(B.CreateSExtOrTrunc(G2->getOperand(1), I64), ConstantInt::get(I64, DL.getTypeAllocSize(G2->getSourceElementType())));
+      auto *F = cast<GetElementPtrInst>(B.CreateGEP(I8, c.AI, B.CreateAdd(a, b)));
+      F->takeName(G2);
+      G2->replaceAllUsesWith(F);
+      G2->eraseFromParent();
+      work.push_back(F);
+    }
+    if (G1->use_empty()) G1->eraseFromParent();
+  }
+}
 static bool ctx_uses_ok(const CtxArray &c, std::string &why) {
   for (Use &U : c.AI->uses()) {
     Instruction *I = cast<Instruction>(U.getUser());
@@ -4040,6 +4096,7 @@ void virt_ctx_to_scratch(llvm::Module *M) {
       std::vector<CtxArray> ok;
       for (auto &c : arrays) {
         std::string bad;
+        ctx_fold_flat_chains(c, DL);
         if (ctx_uses_ok(c, bad)) ok.push_back(c);
         else if (why)
           fprintf(stderr, "[ctx-scratch] %s: context array %s stays on the stack: %s\n", F.getName().str().c_str(),
