@@ -77,6 +77,16 @@ std::string cupbop_kernel_lookup_name(const std::string &name);
 void replace_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_wmma_intrinsics(llvm::Module *M);
 void replace_nvvm_mma_intrinsics(llvm::Module *M);
+// virt sub-pass form (S = 2, 16 lanes): one mma.sync call as replaceMmaStaged stages it. The glue symbols take the
+// slots (a, b, c, d): <sw>_sw_glue16 is the software glue (every form), <tcu>_glue16 the NT=16 TCU glue (f16/bf16 only,
+// empty otherwise). Half shapes run on the m16n8k16 TCU tile with the missing registers zero (pad).
+struct MmaSubpassForm {
+  std::string sw, tcu;
+  int nA = 0, nB = 0, nC = 0; // operand registers of the call
+  bool f64 = false;           // operands and accumulators are doubles: two 32-bit words per register
+  bool pad = false;
+};
+bool mma_subpass_form(const std::string &name, unsigned nargs, MmaSubpassForm &f, std::string &err);
 void replace_cp_async_with_dxa(llvm::Module *M);
 void mark_virt_lane_divergence(llvm::Module *M); // schedule 1 (virt): lane-index loads are divergent
 #endif

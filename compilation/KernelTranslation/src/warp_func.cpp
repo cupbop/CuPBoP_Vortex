@@ -21,6 +21,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <vector>
@@ -185,12 +186,12 @@ static bool voteFeedsOnlyMasks(CallInst *ci, std::set<CallInst *> &local_syncs) 
 //    FAIL with no error). Kept: votes/activemask that only feed masks (lifted reconvergence bookkeeping), and at
 //    NT < 32 shuffles that provably stay in one hardware warp (constant segment width <= NT, butterfly lane mask
 //    < NT, constant member mask within lanes [0, NT), or a constant / kernel-argument value).
-//  - core mapping sub-pass form (S > 1): staged are shfl, vote/activemask, mma.sync m16n8k16, movmatrix and (16 lanes)
-//    ldmatrix/stmatrix only. wmma, wgmma, redux, match and the %laneid asm (the hardware lane, not the logical one)
-//    would run once per sub-pass with 32-lane semantics -> refused. The staged mma/movmatrix glue exists only on a
-//    real NT=16 TCU build; with a wider bitstream (as-if NT16, CUPBOP_VIRT_LANES=16) the link used to fail on an
-//    undefined __cupbop_*_glue16 symbol -> refused with a reason (the TCU tile is fixed by the synthesized NT,
-//    2026-10-26_TCU_DATAPATH_KO.md 6.1).
+//  - core mapping sub-pass form (S > 1): staged are shfl, vote/activemask, every mma.sync form replace_nvvm_mma_intrinsics
+//    lowers, movmatrix and (16 lanes) ldmatrix/stmatrix and redux.sync; the %laneid asm reads the logical lane. wmma, wgmma,
+//    match and anything else would run once per sub-pass with 32-lane semantics -> refused. The staged mma/movmatrix glue
+//    exists only on a real NT=16 build (TCU glue for f16/bf16: NT=16 TCU build); with a wider bitstream (as-if NT16,
+//    CUPBOP_VIRT_LANES=16) the link used to fail on an undefined __cupbop_*_glue16 symbol -> refused with a reason (the
+//    TCU tile is fixed by the synthesized NT, 2026-10-26_TCU_DATAPATH_KO.md 6.1).
 // CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway (warnings only).
 // ---------------------------------------------------------------------------
 static bool narrowWarpOpsAllowed() {
@@ -209,12 +210,13 @@ static bool bitstreamHasTcu() {
   const char *e = std::getenv("VORTEX_CONFIGS");
   return e && std::string(e).find("-DVX_CFG_EXT_TCU_ENABLE") != std::string::npos;
 }
-// The sub-pass mma/movmatrix glue (__cupbop_*_glue16, cudaKernelImpl.cpp) runs on the NT=16 TCU tile and is only
-// built for an NT=16 TCU bitstream. Unknown configuration (no VORTEX_CONFIGS): left to the link, as before.
-static void requireGlue16Bitstream(const char *what, int n) {
+// The sub-pass glue (__cupbop_*_glue16, cudaKernelImpl.cpp, cudaKernelImpl_dtypes.inc) is only built for an NT=16
+// bitstream; the TCU glue runs on the NT=16 TCU tile (needTcu), the software glue needs no TCU. Unknown configuration
+// (no VORTEX_CONFIGS): left to the link, as before.
+static void requireGlue16Bitstream(const char *what, int n, bool needTcu = true) {
   const int hw = bitstreamThreads();
-  if (hw == 0 || (hw == 16 && bitstreamHasTcu())) return;
-  fprintf(stderr, "error: virt sub-pass form (16 lanes): %d %s site(s) need the NT=16 TCU glue, but the bitstream is "
+  if (hw == 0 || (hw == 16 && (!needTcu || bitstreamHasTcu()))) return;
+  fprintf(stderr, "error: virt sub-pass form (16 lanes): %d %s site(s) need the NT=16 glue, but the bitstream is "
                   "VX_CFG_NUM_THREADS=%d%s (as-if NT=16 / CUPBOP_VIRT_LANES on a wider warp): its TCU tile is fixed by the "
                   "synthesized NT and cannot serve a 16-lane warp; refusing (no __cupbop_*_glue16 for this build)\n",
           n, what, hw, bitstreamHasTcu() ? "" : " without the TCU");
@@ -330,7 +332,7 @@ static void rejectUnstagedWarpOpsSubpass(Module &m) {
       if (kernel && !CI->isInlineAsm()) {
         StringRef n = CI->getCalledFunction()->getName();
         if (n.starts_with("llvm.nvvm.mma.") || n.starts_with("cupbop.mma.") || n == "__cupbop_movmatrix_m8n8_trans_b16") continue;
-        if ((n == "__cupbop_ldmatrix_m8n8_b16" || n == "__cupbop_stmatrix_m8n8_b16") && getVirtGeom().lanes == 16) continue;
+        if ((n == "__cupbop_ldmatrix_m8n8_b16" || n == "__cupbop_stmatrix_m8n8_b16" || n == "__cupbop_redux_sync") && getVirtGeom().lanes == 16) continue;
       }
       if (kernel && CI->isInlineAsm() &&
           cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("movmatrix.sync.aligned.m8n8.trans.b16") != std::string::npos)
@@ -346,7 +348,7 @@ static void rejectUnstagedWarpOpsSubpass(Module &m) {
   if (!bad) return;
   const VirtGeom vg = getVirtGeom();
   fprintf(stderr, "error: virt sub-pass form (S=%d, %d lanes): %d warp-collective operation(s) have no sub-pass form "
-                  "(only shfl, vote/activemask, mma.sync m16n8k16, movmatrix and ldmatrix/stmatrix are staged) and would run per sub-pass "
+                  "(only shfl, vote/activemask, mma.sync, movmatrix, ldmatrix/stmatrix and redux.sync are staged) and would run per sub-pass "
                   "with 32-lane semantics; refusing. Use 32-lane warps (NT32, no CUPBOP_VIRT_LANES); "
                   "CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway\n", vg.subpasses, vg.lanes, bad);
   if (!narrowWarpOpsAllowed()) exit(1);
@@ -379,7 +381,8 @@ static bool isStagedWarpOp(const CallInst *CI) {
   if (CI->isInlineAsm() || !CI->getCalledFunction()) return false;
   StringRef n = CI->getCalledFunction()->getName();
   return n.starts_with("llvm.nvvm.vote.") || n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.match.") ||
-         n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix") || n == "__cupbop_activemask";
+         n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix") || n == "__cupbop_activemask" ||
+         n == "__cupbop_redux_sync";
 }
 // The mask of an inlined CUDA wrapper (__shfl_sync, __ballot_sync, ...) reaches the intrinsic through the
 // wrapper's parameter slot (an alloca the earlier mem2reg never saw): follow stores into that slot.
@@ -402,6 +405,7 @@ static bool mayRunPartialWarp(const CallInst *CI) {
   StringRef n = CI->getCalledFunction()->getName();
   if (n == "__cupbop_activemask") return true;
   if (n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix")) return false;
+  if (n == "__cupbop_redux_sync") return !isFullMask(CI->getArgOperand(1));
   return !isFullMask(CI->getArgOperand(0));
 }
 // Runs before foldReconvergenceMasks, which turns a mask-only __activemask() into -1: the masks are judged
@@ -483,6 +487,7 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
 static void replaceMmaStaged(Module &m);
 static void replaceMovmatrixStaged(Module &m);
 static void replaceLdStMatrixStaged(Module &m);
+static void replaceReduxStaged(Module &m);
 PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManager&) {
   if (mapping_ == MAPPING_1TO1) rejectNarrowWarpOps1to1(m, getVirtGeom().nt);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectUnstagedWarpOpsSubpass(m);
@@ -492,6 +497,7 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m); // virt sub-pass form: mma.sync -> NT=16 TCU glue
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceLdStMatrixStaged(m);
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceReduxStaged(m);
   // In FLAT mode, skip shfl replacement here — it's handled by
   // replace_warp_shfl_early() after init_block (barrier insertion order matters).
   if (mapping_ != MAPPING_FLAT)
@@ -1241,10 +1247,11 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
   fprintf(stderr, "[virt-stage] %d shfl sites staged over %d sub-passes of %d lanes\n", n, S, L);
 }
 
-// virt sub-pass form: CuLifter's mma.sync m16n8k16 staged over the S=2 passes and executed
-// once per CUDA warp by the NT=16 glue in the device runtime (__cupbop_mma_m16n8k16_*_glue16,
-// which owns the PTX<->Vortex fragment mapping). Store phase: this pass's a0..a3, b0,b1, c0..c3
-// into the thread's slots [pass][reg]; marker; glue (uniform); glue_end; load phase: d0..d3.
+// virt sub-pass form: mma.sync (llvm.nvvm.mma.*, cupbop.mma.*) staged over the S=2 passes and executed once per CUDA warp
+// by the glue in the device runtime, which owns the PTX fragment layouts: __cupbop_mma_m16n8k16_{f16f32,bf16f32,f16f16}_glue16
+// on the NT=16 TCU tile (half shapes with the missing registers zero), <helper>_sw_glue16 in software for every form
+// (cudaKernelImpl_dtypes.inc). Store phase: this pass's A, B, C registers into the thread's slots [pass][word]; marker; glue
+// (uniform); glue_end; load phase: D. A stride 4 words, B 2, C/D nC registers (a double is two words).
 static void replaceMmaStaged(Module &m) {
   const VirtGeom vg = getVirtGeom();
   if (std::getenv("CUPBOP_VIRT_NO_MMA_STAGE")) { fprintf(stderr, "[virt-stage] mma/movmatrix staging disabled (bisection)\n"); return; }
@@ -1262,33 +1269,43 @@ static void replaceMmaStaged(Module &m) {
     fprintf(stderr, "error: virt sub-pass form stages mma.sync for 16 lanes only (lanes=%d)\n", vg.lanes);
     exit(1);
   }
-  requireGlue16Bitstream("mma.sync", (int)sites.size());
-  if (const char *e = std::getenv("CUPBOP_MMA_LOWERING"))
-    if (std::string(e) == "sw") {
-      fprintf(stderr, "error: CUPBOP_MMA_LOWERING=sw has no 16-lane sub-pass form (use tcu or auto)\n");
+  const char *lowEnv = std::getenv("CUPBOP_MMA_LOWERING");
+  const std::string lowering = lowEnv && *lowEnv ? lowEnv : "auto";
+  // auto: the TCU glue where one exists and the bitstream has the TCU (unknown configuration: as before, TCU)
+  const bool mayTcu = lowering == "tcu" || (lowering != "sw" && (bitstreamThreads() == 0 || bitstreamHasTcu()));
+  std::vector<MmaSubpassForm> forms(sites.size());
+  int nTcu = 0, nSw = 0, maxC = 0;
+  for (size_t k = 0; k < sites.size(); k++) {
+    const std::string Name = sites[k]->getCalledFunction()->getName().str();
+    std::string err;
+    if (!mma_subpass_form(Name, sites[k]->arg_size(), forms[k], err)) {
+      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s: %s\n", Name.c_str(), err.c_str());
       exit(1);
     }
+    if (forms[k].tcu.empty() && lowering == "tcu") {
+      fprintf(stderr, "error: virt sub-pass form: %s has no NT=16 TCU glue (CUPBOP_MMA_LOWERING=tcu); use auto or sw\n", Name.c_str());
+      exit(1);
+    }
+    if (mayTcu && !forms[k].tcu.empty()) nTcu++; else nSw++;
+    maxC = std::max(maxC, forms[k].f64 ? 2 * forms[k].nC : forms[k].nC);
+  }
+  if (nTcu) requireGlue16Bitstream("mma.sync", nTcu);
+  if (nSw) requireGlue16Bitstream("mma.sync (software glue)", nSw, false);
   auto &ctx = m.getContext();
-  Type *I32 = Type::getInt32Ty(ctx), *F32 = Type::getFloatTy(ctx), *VoidT = Type::getVoidTy(ctx);
+  Type *I32 = Type::getInt32Ty(ctx), *I64 = Type::getInt64Ty(ctx), *F32 = Type::getFloatTy(ctx), *F64 = Type::getDoubleTy(ctx), *VoidT = Type::getVoidTy(ctx);
   Type *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
   if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
-  auto *ATy = ArrayType::get(I32, 8); auto *BTy = ArrayType::get(I32, 4); auto *CTy = ArrayType::get(F32, 8);
+  auto *ATy = ArrayType::get(I32, 8); auto *BTy = ArrayType::get(I32, 4); auto *CTy = ArrayType::get(F32, maxC > 4 ? 16 : 8);
   // one set of slots per function: a slot is written and read back within one staged op, and 112 bytes per site filled the
   // frame of the lifted GEMMs (tg2: 33 sites)
   struct Slots { AllocaInst *a = nullptr, *b = nullptr, *c = nullptr, *d = nullptr; };
   std::map<Function *, Slots> slots;
   int n = 0;
-  for (auto *ci : sites) {
-    StringRef Name = ci->getCalledFunction()->getName();
-    const bool bf16 = Name.ends_with(".bf16");
-    const bool f16acc = Name.ends_with(".row.col.f16.f16");   // C/D: two f16x2 registers per lane
-    // the NT=16 glue is the f16/bf16 m16n8k16 TCU tile only: tf32 / int8 / fp8 forms have no sub-pass form yet
-    if (!Name.contains(".m16n8k16.") || !Name.contains(".row.col.") || ci->arg_size() != (f16acc ? 8u : 10u) ||
-        !(f16acc || Name.ends_with(".row.col.f32.f32") || Name.ends_with(".row.col.bf16"))) {
-      fprintf(stderr, "error: virt sub-pass form: unsupported mma.sync %s (m16n8k16 .row.col f16/bf16 -> f32, f16 -> f16 only)\n", Name.str().c_str());
-      exit(1);
-    }
+  for (size_t k = 0; k < sites.size(); k++) {
+    CallInst *ci = sites[k];
+    const MmaSubpassForm &fm = forms[k];
+    const bool useTcu = mayTcu && !fm.tcu.empty();
     Function *F = ci->getFunction();
     Slots &sl = slots[F];
     if (!sl.a) {
@@ -1306,33 +1323,48 @@ static void replaceMmaStaged(Module &m) {
       Value *idx = b.CreateAdd(b.CreateMul(j, ConstantInt::get(I32, stride)), ConstantInt::get(I32, i));
       return b.CreateInBoundsGEP(ArrT, base, {ConstantInt::get(I32, 0), idx});
     };
-    for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(i);     if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stA, ATy, 4, i)); }
-    for (int i = 0; i < 2; i++) { Value *v = ci->getArgOperand(4 + i); if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stB, BTy, 2, i)); }
-    if (f16acc) {
-      for (int i = 0; i < 2; i++) { Value *v = ci->getArgOperand(6 + i); if (!v->getType()->isIntegerTy(32)) v = b.CreateBitCast(v, I32); vstore(b, v, slot(stC, CTy, 2, i)); }
-    } else
-    for (int i = 0; i < 4; i++) { Value *v = ci->getArgOperand(6 + i); if (!v->getType()->isFloatTy())     v = b.CreateBitCast(v, F32); vstore(b, v, slot(stC, CTy, 4, i)); }
+    auto put = [&](Value *v, Value *base, Type *ArrT, int stride, int w) { // one register at word w: 1 word, a double 2
+      if (v->getType()->isDoubleTy()) {
+        Value *u = b.CreateBitCast(v, I64);
+        vstore(b, b.CreateTrunc(u, I32), slot(base, ArrT, stride, w));
+        vstore(b, b.CreateTrunc(b.CreateLShr(u, ConstantInt::get(I64, 32)), I32), slot(base, ArrT, stride, w + 1));
+        return;
+      }
+      if (!v->getType()->isIntegerTy(32) && !v->getType()->isFloatTy()) v = b.CreateBitCast(v, I32);
+      vstore(b, v, slot(base, ArrT, stride, w));
+    };
+    const int rw = fm.f64 ? 2 : 1, cs = fm.nC * rw; // words per register, words of C/D per pass
+    for (int i = 0; i < fm.nA; i++) put(ci->getArgOperand(i), stA, ATy, 4, i * rw);
+    for (int i = 0; i < fm.nB; i++) put(ci->getArgOperand(fm.nA + i), stB, BTy, 2, i * rw);
+    for (int i = 0; i < fm.nC; i++) put(ci->getArgOperand(fm.nA + fm.nB + i), stC, CTy, cs, i * rw);
+    if (useTcu && fm.pad && !std::getenv("CUPBOP_VIRT_MMA_NO_PAD")) { // half shape on the full tile (the switch: negative control of the tests)
+      for (int i = fm.nA; i < 4; i++) vstore(b, ConstantInt::get(I32, 0), slot(stA, ATy, 4, i));
+      for (int i = fm.nB; i < 2; i++) vstore(b, ConstantInt::get(I32, 0), slot(stB, BTy, 2, i));
+    }
     CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
-    std::string gname = std::string("__cupbop_mma_m16n8k16_") + (bf16 ? "bf16f32" : f16acc ? "f16f16" : "f16f32") + "_glue16";
+    std::string gname = useTcu ? fm.tcu + "_glue16" : fm.sw + "_sw_glue16";
     FunctionCallee glue = m.getOrInsertFunction(gname, FunctionType::get(VoidT, {PtrTy, PtrTy, PtrTy, PtrTy}, false));
     if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
     b.CreateCall(glue, {stA, stB, stC, stD})->addFnAttr(Attribute::Convergent);
     b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
-    Value *res = UndefValue::get(ci->getType());
-    if (f16acc) {
-      auto *ST = cast<StructType>(ci->getType());
-      for (int i = 0; i < 2; i++) {
-        Value *v = vload(b, I32, slot(stD, CTy, 2, i));
-        if (ST->getElementType(i) != I32) v = b.CreateBitCast(v, ST->getElementType(i));
-        res = b.CreateInsertValue(res, v, i);
-      }
-    } else
-    for (int i = 0; i < 4; i++) res = b.CreateInsertValue(res, vload(b, F32, slot(stD, CTy, 4, i)), i);
+    auto *ST = cast<StructType>(ci->getType());
+    Value *res = UndefValue::get(ST);
+    for (int i = 0; i < fm.nC; i++) {
+      Type *ET = ST->getElementType(i);
+      Value *v;
+      if (fm.f64) {
+        Value *lo = b.CreateZExt(vload(b, I32, slot(stD, CTy, cs, 2 * i)), I64), *hi = b.CreateZExt(vload(b, I32, slot(stD, CTy, cs, 2 * i + 1)), I64);
+        v = b.CreateBitCast(b.CreateOr(lo, b.CreateShl(hi, ConstantInt::get(I64, 32))), F64);
+      } else
+        v = vload(b, ET->isFloatTy() ? F32 : I32, slot(stD, CTy, cs, i));
+      if (v->getType() != ET) v = b.CreateBitCast(v, ET);
+      res = b.CreateInsertValue(res, v, i);
+    }
     ci->replaceAllUsesWith(res);
     ci->eraseFromParent();
     n++;
   }
-  fprintf(stderr, "[virt-stage] %d mma.sync m16n8k16 sites staged over 2 sub-passes of 16 lanes (TCU glue)\n", n);
+  fprintf(stderr, "[virt-stage] %d mma.sync sites staged over 2 sub-passes of 16 lanes (%d TCU glue, %d software glue)\n", n, nTcu, nSw);
 }
 
 // virt sub-pass form: CuLifter's `movmatrix.sync.aligned.m8n8.trans.b16` (inline asm, i32 -> i32)
@@ -1460,6 +1492,54 @@ static void replaceLdStMatrixStaged(Module &m) {
     ci->eraseFromParent();
   }
   fprintf(stderr, "[virt-stage] %d ldmatrix / %d stmatrix sites staged over 2 sub-passes of 16 lanes\n", nld, nst);
+}
+
+// virt sub-pass form: __cupbop_redux_sync (lower_redux_sync) staged at 16 lanes. Store phase: this pass's value and member
+// mask; marker; glue (uniform, __cupbop_redux_sync_glue16: index shuffles of both slots, one result per pass); glue_end; load
+// phase. A lane outside the mask has not stored its slots: no mask contains it, and its own result is not used.
+static void replaceReduxStaged(Module &m) {
+  std::vector<CallInst *> sites;
+  for (auto &f : m) {
+    if (!isKernelFunction(&m, &f)) continue;
+    for (auto &bb : f)
+      for (auto &i : bb)
+        if (auto *ci = dyn_cast<CallInst>(&i))
+          if (Function *cf = ci->getCalledFunction())
+            if (cf->getName() == "__cupbop_redux_sync") sites.push_back(ci);
+  }
+  if (sites.empty()) return;
+  requireGlue16Bitstream("redux.sync", (int)sites.size(), false);
+  auto &ctx = m.getContext();
+  Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
+  FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
+  if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  FunctionCallee glue = m.getOrInsertFunction("__cupbop_redux_sync_glue16", FunctionType::get(VoidT, {PtrTy, PtrTy, I32, PtrTy}, false));
+  if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  auto *ArrTy = ArrayType::get(I32, 2);
+  struct Slots { AllocaInst *v = nullptr, *m = nullptr, *r = nullptr; };
+  std::map<Function *, Slots> slots;
+  Value *zero = ConstantInt::get(I32, 0);
+  for (auto *ci : sites) {
+    Function *F = ci->getFunction();
+    Slots &sl = slots[F];
+    if (!sl.v) {
+      IRBuilder<> eb(virtEntryInsertPt(F));
+      sl.v = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_redux_v");
+      sl.m = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_redux_m");
+      sl.r = eb.CreateAlloca(ArrTy, nullptr, "shfl_virt_redux_r");
+    }
+    IRBuilder<> b(ci);
+    Value *j = b.CreateLShr(virtLogicalLane(b, m), ConstantInt::get(I32, 4), "rsub");
+    vstore(b, ci->getArgOperand(0), b.CreateInBoundsGEP(ArrTy, sl.v, {zero, j}));
+    vstore(b, ci->getArgOperand(1), b.CreateInBoundsGEP(ArrTy, sl.m, {zero, j}));
+    CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
+    b.CreateCall(glue, {sl.v, sl.m, ci->getArgOperand(2), sl.r})->addFnAttr(Attribute::Convergent);
+    b.CreateCall(glueEnd)->addFnAttr(Attribute::Convergent);
+    Value *j2 = b.CreateLShr(virtLogicalLane(b, m), ConstantInt::get(I32, 4), "rsub2");
+    ci->replaceAllUsesWith(vload(b, I32, b.CreateInBoundsGEP(ArrTy, sl.r, {zero, j2}), "redux_r"));
+    ci->eraseFromParent();
+  }
+  fprintf(stderr, "[virt-stage] %zu redux.sync sites staged over 2 sub-passes of 16 lanes\n", sites.size());
 }
 
 } // namespace cupbop
