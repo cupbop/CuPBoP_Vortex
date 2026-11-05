@@ -4,7 +4,7 @@
 // uses NVVM intrinsics newer than this translator's LLVM. Both are lowered here, first thing, so that every later pass
 // sees plain loads, stores and the intrinsics it already handles:
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
-//               load), [@p] atom.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               load), [@p] atom.global.*, [@p] red.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
 //               {rcp,ex2,lg2,rsqrt,sqrt,sin,cos}.approx[.ftz].f32 (libdevice)
 //               mma.sync m16n8k16 f16 -> llvm.nvvm.mma.m16n8k16.row.col.f32.f32, the form of a lifted module
 //   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
@@ -168,6 +168,16 @@ public:
     die("store operand of another width", text);
   }
 
+  // The old value, as an integer of op.bits.
+  Value *atomic_rmw(const AtomOp &op, Value *A, Value *V, IRBuilder<> &G) {
+    if (!op.fp) return G.CreateAtomicRMW(op.rmw, A, as_bits(V, op.bits, G), MaybeAlign(op.bits / 8), AtomicOrdering::AcquireRelease);
+    if (op.bits != 32 || op.rmw != AtomicRMWInst::FAdd) die("atomic of this float type", text);
+    Type *F32 = G.getFloatTy(), *PT = PointerType::get(CI->getContext(), 0);
+    auto *FT = FunctionType::get(F32, {PT, F32}, false);
+    return G.CreateBitCast(G.CreateCall(CI->getModule()->getOrInsertFunction("__cuda_atomic_fadd_f32", FT),
+                                        {G.CreateAddrSpaceCast(A, PT), G.CreateBitCast(as_bits(V, op.bits, G), F32)}), G.getIntNTy(op.bits));
+  }
+
   // Masked access: the access runs in its own block under the predicate, as PTX does (a masked-off lane must not touch
   // its address). A constant predicate needs no block.
   template <class Body> void guarded(Value *P, IRBuilder<> &B, Body body) {
@@ -189,13 +199,15 @@ public:
     static const std::regex st(R"(^(?:@(!?)\$(\d+)\s+)?st((?:\.[A-Za-z0-9_:]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*(\{[^}]*\}|\$\d+)(?:\s*,\s*\$\d+)?$)");
     static const std::regex policy(R"(^createpolicy\.[A-Za-z0-9_:.]+\s+\$\d+\s*,.*$)");
     static const std::regex atom(R"(^(?:@(!?)\$(\d+)\s+)?atom\.global((?:\.[a-z0-9_]+)+)\s+\$(\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*\$(\d+)(?:\s*,\s*\$(\d+))?$)");
+    // an atomic whose result nobody reads
+    static const std::regex red(R"(^(?:@(!?)\$(\d+)\s+)?red\.global((?:\.[a-z0-9_]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*\$(\d+)$)");
     const auto stmts = split_statements(text);
     // parse everything first: a form with one unknown statement stays untouched
     for (const auto &s : stmts) {
       std::smatch m;
       if (std::regex_match(s, m, mov)) { if (m[2].matched) return false; continue; }
       if (std::regex_match(s, policy)) continue;
-      if (std::regex_match(s, m, atom)) { if (!parse_atomic(m[3].str()).ok) return false; continue; }
+      if (std::regex_match(s, m, atom) || std::regex_match(s, m, red)) { if (!parse_atomic(m[3].str()).ok) return false; continue; }
       if (std::regex_match(s, m, ld) || std::regex_match(s, m, st)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
       return false;
     }
@@ -224,15 +236,8 @@ public:
           if (op.cas) {
             R = G.CreateExtractValue(G.CreateAtomicCmpXchg(A, as_bits(V, op.bits, G), as_bits(Cmp, op.bits, G), MaybeAlign(op.bits / 8),
                                                            AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire), 0);
-          } else if (op.fp) {
-            if (op.bits != 32 || op.rmw != AtomicRMWInst::FAdd) die("atomic of this float type", text);
-            Module *M = CI->getModule();
-            Type *F32 = G.getFloatTy(), *PT = PointerType::get(CI->getContext(), 0);
-            auto *FT = FunctionType::get(F32, {PT, F32}, false);
-            R = G.CreateBitCast(G.CreateCall(M->getOrInsertFunction("__cuda_atomic_fadd_f32", FT),
-                                             {G.CreateAddrSpaceCast(A, PT), G.CreateBitCast(as_bits(V, op.bits, G), F32)}), IT);
           } else {
-            R = G.CreateAtomicRMW(op.rmw, A, as_bits(V, op.bits, G), MaybeAlign(op.bits / 8), AtomicOrdering::AcquireRelease);
+            R = atomic_rmw(op, A, V, G);
           }
           if (R->getType() != outTy[d]) R = G.CreateBitCast(R, outTy[d]);
           if (!T) { regs[d] = R; return; }
@@ -242,6 +247,13 @@ public:
           Phi->addIncoming(old, Then->getSinglePredecessor());
           regs[d] = Phi;
         });
+      } else if (std::regex_match(s, m, red)) {
+        const AtomOp op = parse_atomic(m[3].str());
+        if (op.cas) die("red.cas", text);
+        Value *P = pred(m[1].str(), m[2].str(), B);
+        Value *A = address(m[4].str(), m[5].str(), 1, B);
+        Value *V = reg(std::stoi(m[6].str()));
+        guarded(P, B, [&](IRBuilder<> &G, Instruction *) { atomic_rmw(op, A, V, G); });
       } else if (std::regex_match(s, m, ld)) {
         const MemOp op = parse_modifiers(m[3].str());
         const std::vector<int> dst = operand_list(m[4].str());
