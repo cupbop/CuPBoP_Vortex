@@ -78,6 +78,42 @@ struct MemcpySymbolEntry {
 std::vector<MemcpySymbolEntry> memcpy_symbol;
 //create string vector
 std::vector<std::string> symbol_name_vector;
+// The __device__ variables of the module on the device (see the read-back at the end of cudaLaunchKernel_vortex)
+static bool device_vars_registered = false;
+static size_t device_var_start_idx = 0;
+
+// A process can launch several modules (a path as `func`: Triton, one module per kernel). Every kernel image links at the
+// same addresses and a load replaces the image on the device, so an address in memcpy_symbol means something only for its own
+// module: in another image it is other data or code, which the service launch would overwrite. The list of a module that
+// left the device waits here, and when the module comes back it restores the module's values, as it does across a BSS reset.
+struct ModuleSymbols {
+  std::vector<MemcpySymbolEntry> entries;
+  bool device_vars_registered;
+  size_t device_var_start_idx;
+};
+// Counts the modules that went on the device. A table read from a side file in the working directory holds for one module.
+static uint64_t g_cupbop_module_gen = 1;
+// `seen` is a table's generation: true when the table has to be read (again).
+static bool cupbop_module_changed(uint64_t &seen) {
+  if (seen == g_cupbop_module_gen) return false;
+  seen = g_cupbop_module_gen;
+  return true;
+}
+static void cupbop_switch_module(const std::string &from, const std::string &to) {
+  static std::map<std::string, ModuleSymbols> parked;
+  if (from.empty()) return;   // the first module: what cudaMemcpyToSymbol queued before the first launch is its own
+  ++g_cupbop_module_gen;
+  parked[from] = {std::move(memcpy_symbol), device_vars_registered, device_var_start_idx};
+  memcpy_symbol.clear();
+  device_vars_registered = false;
+  device_var_start_idx = 0;
+  auto it = parked.find(to);
+  if (it == parked.end()) return;
+  memcpy_symbol = std::move(it->second.entries);
+  device_vars_registered = it->second.device_vars_registered;
+  device_var_start_idx = it->second.device_var_start_idx;
+  parked.erase(it);
+}
 
 // ── DXA descriptors (programmed into the DXA DCRs before each kernel launch) ─────────────────────────
 // Field layout: vortex sw/runtime/include/dxa.h (VX_DCR_DXA_DESC_* offsets, META = rank | log2(elem)<<3 |
@@ -526,19 +562,20 @@ extern "C" int cuTensorMapEncodeIm2col(void *, int, uint32_t, void *, const uint
 // translator in cupbop_async_kernels.txt. The core mapping (schedule 1) runs them only as a de facto 1:1
 // mapping, one logical warp per physical warp (P == the CTA's warps); anything else is refused at launch.
 static bool cupbop_async_kernel(const std::string &kname) {
-  static const std::vector<std::string> names = []() {
-    std::vector<std::string> v;
+  static std::vector<std::string> names;
+  static uint64_t seen = 0;
+  if (cupbop_module_changed(seen)) {
+    names.clear();
     std::ifstream f("cupbop_async_kernels.txt");
     std::string s;
-    while (f >> s) v.push_back(s);
-    return v;
-  }();
+    while (f >> s) names.push_back(s);
+  }
   for (auto &n : names)
     if (!kname.empty() && (kname.find(n) != std::string::npos || n.find(kname) != std::string::npos)) return true;
   return false;
 }
 
-// ── dxa_descriptors.txt sidecar (read from the working directory at the first launch) ──
+// ── dxa_descriptors.txt sidecar (read from the working directory at the first launch of a module) ──
 // Legacy line (the automatic cp.async conversion): kernel slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes
 //   -> rank 2, sizes from the integer arguments, dense row stride.
 // v2 line (kernelTranslator from !vx.dxa.desc, or by hand):
@@ -558,11 +595,11 @@ struct DxaAutoDescEntry {
   std::string line;
 };
 static std::vector<DxaAutoDescEntry> dxa_auto_descriptors;
-static bool dxa_auto_loaded = false;
+static uint64_t dxa_auto_seen = 0;
 
 static void load_dxa_auto_descriptors() {
-  if (dxa_auto_loaded) return;
-  dxa_auto_loaded = true;
+  if (!cupbop_module_changed(dxa_auto_seen)) return;
+  dxa_auto_descriptors.clear();
   std::ifstream ifs("dxa_descriptors.txt");
   if (!ifs.is_open()) return;
   std::string line;
@@ -1128,9 +1165,9 @@ static std::string cupbop_strip_prefix(const std::string &s) {
 // launched without its rewrite runs wrongly.
 static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem) {
   static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
-  static bool loaded = false;
-  if (!loaded) {
-    loaded = true;
+  static uint64_t seen = 0;
+  if (cupbop_module_changed(seen)) {
+    table.clear();
     const char *rt = std::getenv("CUPBOP_LAUNCH_FIX");
     if (!rt || std::atoi(rt) != 0) {
       std::ifstream f("cupbop_launch_fix.txt");
@@ -1164,9 +1201,9 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
 // Per-kernel static __shared__ bytes, written by mem_share2local into kernel_lmem.log.
 static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
   static std::map<std::string, uint32_t> table;
-  static bool loaded = false;
-  if (!loaded) {
-    loaded = true;
+  static uint64_t seen = 0;
+  if (cupbop_module_changed(seen)) {
+    table.clear();
     std::ifstream f("kernel_lmem.log");
     std::string name; uint32_t bytes;
     while (f >> name >> bytes) {
@@ -1183,9 +1220,9 @@ static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
 static uint32_t cupbop_lmem_touched(const std::string &func_stripped, uint32_t usual, const dim3 &b) {
   struct E { uint32_t x, y, z, bytes; };
   static std::map<std::string, std::vector<E>> table;
-  static bool loaded = false;
-  if (!loaded) {
-    loaded = true;
+  static uint64_t seen = 0;
+  if (cupbop_module_changed(seen)) {
+    table.clear();
     const char *rt = std::getenv("CUPBOP_SMEM_SHRINK_RT");
     if (!rt || std::atoi(rt) != 0) {
       std::ifstream f("kernel_lmem_hi.log");
@@ -1232,9 +1269,9 @@ struct CupbopLmemStackInfo {
 };
 static const CupbopLmemStackInfo &cupbop_lmem_stack_info() {
   static CupbopLmemStackInfo info;
-  static bool done = false;
-  if (done) return info;
-  done = true;
+  static uint64_t seen = 0;
+  if (!cupbop_module_changed(seen)) return info;
+  info = CupbopLmemStackInfo();
   std::ifstream f("cupbop_lmem_stack.txt");
   if (!f.is_open()) return info;
   info.loaded = true;
@@ -2169,7 +2206,6 @@ cudaError_t cudaLaunchKernel_vortex(
   };
   std::string func_stripped = stripPrefix(std::string(func));
   DBG_COUT("func_stripped: " << func_stripped << std::endl);
-  cupbop_apply_launch_fix(func_stripped, sharedMem);
 
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
@@ -2195,11 +2231,13 @@ cudaError_t cudaLaunchKernel_vortex(
     // Use func as path if it looks like a file path (absolute or relative with /), else fallback
     std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
     if (DC->module() == nullptr || krnl_path != DC->last_krnl_path()) {
+      cupbop_switch_module(DC->last_krnl_path(), krnl_path);
       DC->cleanup_krnl();
       DC->load_module(krnl_path);
       DC->set_last_krnl_path(krnl_path);
     }
   }
+  cupbop_apply_launch_fix(func_stripped, sharedMem);
 
 
   // Allocate context pool and set __ctx_pool pointer. The pool also holds the core mapping's context scratch
@@ -2620,7 +2658,6 @@ cudaError_t cudaLaunchKernel_vortex(
   // These are registered as memcpy_symbol entries so they get restored
   // before the next kernel launch (surviving BSS zeroing).
   {
-    static bool device_vars_registered = false;
     if (!device_vars_registered) {
       // Parse kernel_meta.log for DeviceVariables section
       std::ifstream meta("kernel_meta.log");
@@ -2673,7 +2710,6 @@ cudaError_t cudaLaunchKernel_vortex(
     // Read back only __device__ variable entries (not cudaMemcpyToSymbol ones).
     // device_var entries are appended at the end of memcpy_symbol by the
     // registration code above. Only read back those entries.
-    static size_t device_var_start_idx = 0;
     if (device_vars_registered && device_var_start_idx == 0 && !memcpy_symbol.empty()) {
       // device vars were just registered — they're at the end
       // Find where they start by checking kernel_meta.log count
