@@ -312,7 +312,7 @@ Module *run_triton_lo_mma(Module *M) {
   std::string text;
   raw_string_ostream(text) << *M;
   M = reload_text(M, text);
-  run_pipeline(M, "lo-mma<no-hoist;no-sched;no-f16;no-fp>,lo-sched,lo-f16", nullptr);
+  run_pipeline(M, "lo-mma<no-hoist;no-sched;no-f16;no-fp;lane-eval>,lo-saddr,lo-sched,lo-f16", nullptr);
   VerifyModule(M);
   text.clear();
   raw_string_ostream(text) << *M;

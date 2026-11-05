@@ -14,6 +14,7 @@
 #include "triton_ir.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/raw_ostream.h"
@@ -266,6 +267,31 @@ public:
         // softmax store ran on every 4th thread and overwrote the next CTAs' shared memory).
         std::vector<Value *> old;
         for (int d : dst) old.push_back(regs[d] ? regs[d] : Constant::getNullValue(outTy[d]));
+        // two 32-bit words of a vector load in one 64-bit load: PTX aligns the vector to its size. pair_shared_stores finds them again at the store that takes them to shared memory.
+        bool pairs = op.bits == 32 && op.vec >= 2 && op.addrspace == 1 && !op.isVolatile && !std::getenv("CUPBOP_TRITON_NO_PAIR");
+        for (int d : dst) pairs = pairs && outTy[d]->isIntegerTy(32);
+        if (pairs) {
+          Type *I64 = B.getInt64Ty();
+          std::vector<Value *> oldw, w;
+          for (unsigned i = 0; i < op.vec; i += 2) oldw.push_back(B.CreateOr(B.CreateZExt(old[i], I64), B.CreateShl(B.CreateZExt(old[i + 1], I64), 32)));
+          w = oldw;
+          guarded(P, B, [&](IRBuilder<> &G, Instruction *T) {
+            for (unsigned i = 0; i < op.vec; i += 2) {
+              Value *V = G.CreateAlignedLoad(I64, i ? G.CreateConstGEP1_32(G.getInt8Ty(), A, i * bytes) : A, Align(8));
+              if (!T) { w[i / 2] = V; continue; }
+              BasicBlock *Then = T->getParent(), *Cont = CI->getParent();
+              PHINode *Phi = PHINode::Create(I64, 2, "", Cont->begin());
+              Phi->addIncoming(V, Then);
+              Phi->addIncoming(oldw[i / 2], Then->getSinglePredecessor());
+              w[i / 2] = Phi;
+            }
+          });
+          for (unsigned i = 0; i < op.vec; i += 2) {
+            regs[dst[i]] = B.CreateTrunc(w[i / 2], B.getInt32Ty());
+            regs[dst[i + 1]] = B.CreateTrunc(B.CreateLShr(w[i / 2], 32), B.getInt32Ty());
+          }
+          continue;
+        }
         guarded(P, B, [&](IRBuilder<> &G, Instruction *T) {
           for (unsigned i = 0; i < op.vec; ++i) {
             Type *Ty = outTy[dst[i]];
@@ -357,6 +383,41 @@ bool handled_later(const std::string &a) {
   return false;
 }
 
+// the value of an element of an aggregate built by insertvalue, as AsmLowering leaves its results
+Value *through_aggregate(Value *V) {
+  auto *E = dyn_cast<ExtractValueInst>(V);
+  if (!E || E->getNumIndices() != 1) return V;
+  for (Value *A = E->getAggregateOperand(); auto *I = dyn_cast<InsertValueInst>(A); A = I->getAggregateOperand())
+    if (I->getNumIndices() == 1 && I->getIndices()[0] == E->getIndices()[0]) return I->getInsertedValueOperand();
+  return V;
+}
+
+// Two neighbouring 32-bit stores to shared memory, 8 bytes aligned, of the halves of a 64-bit value (the paired loads above: the copy from global to shared memory of a num_stages=1 tile): one 64-bit store
+void pair_shared_stores(Module *M) {
+  const DataLayout &DL = M->getDataLayout();
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto It = BB.begin(); It != BB.end();) {
+        auto *S = dyn_cast<StoreInst>(&*It);
+        ++It;
+        auto *N = It != BB.end() ? dyn_cast<StoreInst>(&*It) : nullptr;
+        if (!S || !N || S->getPointerAddressSpace() != 3 || N->getPointerAddressSpace() != 3 || S->isVolatile() || N->isVolatile() || S->getAlign().value() < 8) continue;
+        auto *L = dyn_cast<TruncInst>(through_aggregate(S->getValueOperand())), *H = dyn_cast<TruncInst>(through_aggregate(N->getValueOperand()));
+        auto *SH = H ? dyn_cast<BinaryOperator>(H->getOperand(0)) : nullptr;
+        if (!L || !SH || SH->getOpcode() != Instruction::LShr || SH->getOperand(0) != L->getOperand(0) || !L->getOperand(0)->getType()->isIntegerTy(64) || !L->getType()->isIntegerTy(32)) continue;
+        auto *K = dyn_cast<ConstantInt>(SH->getOperand(1));
+        if (!K || K->getZExtValue() != 32) continue;
+        APInt a(DL.getIndexTypeSizeInBits(S->getPointerOperandType()), 0), b(a.getBitWidth(), 0);
+        Value *pa = S->getPointerOperand()->stripAndAccumulateConstantOffsets(DL, a, true), *pb = N->getPointerOperand()->stripAndAccumulateConstantOffsets(DL, b, true);
+        if (pa != pb || (b - a).getSExtValue() != 4) continue;
+        IRBuilder<> B(S);
+        B.CreateAlignedStore(L->getOperand(0), S->getPointerOperand(), Align(8));
+        ++It;
+        S->eraseFromParent();
+        N->eraseFromParent();
+      }
+}
+
 // fptrunc / fpext between float and a vector of half: element by element. Next to a store the back end folds the vector form
 // into a truncating vector store, which a target without half registers cannot select ("Cannot select: store ... trunc to
 // v2f16", the p.to(tl.float16) of FlashAttention).
@@ -380,6 +441,35 @@ void scalarize_half_casts(Module *M) {
   }
 }
 
+// A shared pointer as a chain of byte GEPs from one global -> the window form of a lifted ldmatrix, ptrtoint(gep [N x i8] @g, 0, zext(off)), with the constant
+// part of off as the last add: what lo-ldsm reads (smemOffset, splitOffset). Null for any other pointer.
+Value *smem_window(Value *P, IRBuilder<> &B) {
+  LLVMContext &C = P->getContext();
+  Type *I8 = Type::getInt8Ty(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  std::vector<Value *> parts;
+  int64_t k = 0;
+  while (!isa<GlobalVariable>(P)) {
+    auto *G = dyn_cast<GEPOperator>(P);
+    if (!G || G->getNumIndices() != 1) return nullptr;
+    auto *ET = dyn_cast<ArrayType>(G->getSourceElementType());   // Triton steps through the stages of a buffer with [2 x i8]
+    if (G->getSourceElementType() != I8 && !(ET && ET->getElementType() == I8)) return nullptr;
+    const uint64_t size = ET ? ET->getNumElements() : 1;
+    Value *I = G->getOperand(1);
+    if (auto *K = dyn_cast<ConstantInt>(I)) k += K->getSExtValue() * (int64_t)size;
+    else if (I->getType() == I32) parts.push_back(size == 1 ? I : B.CreateMul(I, ConstantInt::get(I32, size)));
+    else return nullptr;
+    P = G->getPointerOperand();
+  }
+  auto *G = cast<GlobalVariable>(P);
+  auto *AT = dyn_cast<ArrayType>(G->getValueType());
+  if (!AT || AT->getElementType() != I8 || G->getAddressSpace() != 3 || parts.empty()) return nullptr;
+  Value *off = parts.back();
+  for (size_t i = parts.size() - 1; i-- > 0;) off = B.CreateAdd(off, parts[i]);
+  if (k) off = B.CreateAdd(off, ConstantInt::get(I32, k));
+  Value *E = B.CreateInBoundsGEP(AT, G, {ConstantInt::get(I64, 0), B.CreateZExt(off, I64)});
+  return B.CreatePtrToInt(E, I32, "smem.win");
+}
+
 // The ldmatrix intrinsic -> the asm CuLifter writes for LDSM, with an integer shared address: from here on a Triton ldmatrix is the
 // same thing as a lifted one (lower_ldmatrix_asm, and the lift passes that read it). Each lane passes the address of its own
 // row, so the layout, swizzled or not, stays Triton's business.
@@ -392,7 +482,8 @@ void lower_ldmatrix(CallInst *CI, StringRef name) {
   const std::string text = "ldmatrix.sync.aligned.m8n8.x" + std::to_string(num) + (name.contains(".trans") ? ".trans" : "") +
                            ".shared.b16 {" + regs + "}, [$" + std::to_string(num) + "];";
   IRBuilder<> B(CI);
-  Value *A32 = B.CreatePtrToInt(CI->getArgOperand(0), I32, "smem.win");
+  Value *A32 = smem_window(CI->getArgOperand(0), B);
+  if (!A32) A32 = B.CreatePtrToInt(CI->getArgOperand(0), I32, "smem.win");
   auto *FT = FunctionType::get(CI->getType(), {I32}, false);
   CI->replaceAllUsesWith(B.CreateCall(InlineAsm::get(FT, text, cons + "r", /*hasSideEffects=*/true), {A32}));
   CI->eraseFromParent();
@@ -450,6 +541,7 @@ void lower_triton_input(Module *M) {
     nIntr++;
   }
   scalarize_half_casts(M);
+  pair_shared_stores(M);
   if (const char *f = std::getenv("CUPBOP_TRITON_DUMP")) { // the module as lo-mma, or with CUPBOP_TRITON_LOMMA=0 the rest of the translator, sees it
     std::error_code EC;
     raw_fd_ostream os(f, EC);

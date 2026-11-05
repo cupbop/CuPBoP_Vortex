@@ -257,3 +257,204 @@
 +    p3RegisterPasses(PB);
    }};
  }
+--- a/tools/liftopt.cpp
++++ b/tools/liftopt.cpp
+@@ -31,6 +31,7 @@
+ #include "llvm/Passes/PassPlugin.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include "llvm/Transforms/Utils/Local.h"
++#include <algorithm>
+ #include <cstdlib>
+ #include <functional>
+ #include <map>
+@@ -47,9 +48,11 @@
+ static bool isConstZero(Value *V) { auto *C = dyn_cast<Constant>(peel(V)); return C && C->isNullValue(); }
+ 
+ // ---- per-function lane context: lane-derived values, built once per basic block ---------------------------------------
++Value *loLaneEval(IRBuilder<> &Q, Value *V, Value *tid);   // lopass.cpp
++static bool loLaneMode = false;   // lo-mma<lane-eval>: an ldmatrix row address is a function of tid.x, not of what another lane loaded (stock Triton)
+ struct Lanes {
+-  Module *M; Type *I32; FunctionCallee LaneFn, Shfl;
+-  struct PerBB { Value *lane = nullptr, *g = nullptr, *t = nullptr, *rg = nullptr, *bsrc = nullptr, *t4 = nullptr, *t2 = nullptr, *col = nullptr, *colp = nullptr, *t8 = nullptr, *th = nullptr; std::map<std::pair<Value *, Value *>, Instruction *> shfl, rowp; std::map<int, Value *> src; std::map<std::tuple<int, int, int, int>, Value *> ksrc; };
++  Module *M; Type *I32; FunctionCallee LaneFn, Shfl; Value *tid = nullptr;
++  struct PerBB { Value *lane = nullptr, *g = nullptr, *t = nullptr, *rg = nullptr, *bsrc = nullptr, *t4 = nullptr, *t2 = nullptr, *col = nullptr, *colp = nullptr, *t8 = nullptr, *th = nullptr; std::map<std::pair<Value *, Value *>, Instruction *> shfl, rowp; std::map<std::pair<Value *, Value *>, Value *> rows; std::map<int, Value *> src; std::map<std::tuple<int, int, int, int>, Value *> ksrc; };
+   // lane index for ldmatrix rows, one value per kind and j and block: kind 0 g | 8j, 1 rho(g) | 8j, 2 2t | 8j, 3 2t+1 | 8j
+   Value *srcIdx(BasicBlock *B, int kind, int j) {
+     PerBB &P = get(B); int key = kind * 8 + j;
+@@ -78,8 +81,9 @@
+   PerBB &get(BasicBlock *B) {
+     PerBB &P = bb[B];
+     if (P.lane) return P;
++    if (loLaneMode && !tid) { IRBuilder<> E(&*B->getParent()->getEntryBlock().getFirstInsertionPt()); tid = E.CreateCall(M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.tid.x", FunctionType::get(I32, false)), {}, "lo.tid"); }
+     IRBuilder<> Q(&*B->getFirstInsertionPt());
+-    P.lane = Q.CreateCall(LaneFn, {}, "lo.lane");
++    P.lane = loLaneMode ? Q.CreateAnd(tid, 31, "lo.lane") : (Value *)Q.CreateCall(LaneFn, {}, "lo.lane");
+     P.g = Q.CreateLShr(P.lane, 2, "lo.g"); P.t = Q.CreateAnd(P.lane, 3, "lo.t");
+     P.rg = Q.CreateOr(Q.CreateShl(Q.CreateAnd(P.g, 3), 1), Q.CreateLShr(P.g, 2), "lo.rho");   // rho(g)
+     P.bsrc = Q.CreateOr(Q.CreateShl(P.rg, 2), P.t, "lo.bsrc");                                 // 4 rho(g) + t
+@@ -88,6 +92,17 @@
+     P.t8 = Q.CreateShl(Q.CreateAnd(P.t, 1), 3, "lo.t8"); P.th = Q.CreateICmpNE(Q.CreateAnd(P.t, 2), ConstantInt::get(I32, 0), "lo.th");
+     return P;
+   }
++  // an ldmatrix row address of lane src: computed here from the lane number when lo-mma<lane-eval> and the address allow it, else the shuffle
++  Value *row(IRBuilder<> &Q, Value *L, Value *src) {
++    if (loLaneMode) {
++      auto &R = bb[Q.GetInsertBlock()].rows; auto key = std::make_pair(L, src);
++      auto it = R.find(key);
++      if (it != R.end() && (!isa<Instruction>(it->second) || cast<Instruction>(it->second)->comesBefore(&*Q.GetInsertPoint()))) return it->second;
++      Value *t = Q.CreateOr(Q.CreateAnd(tid, ~31u), src);
++      if (Value *v = loLaneEval(Q, L, t)) return R[key] = v;
++    }
++    return shfl(Q, L, src);
++  }
+   // index shuffle, cached per block: reused only if the cached copy is before the insertion point
+   Value *shfl(IRBuilder<> &Q, Value *v, Value *src) {
+     PerBB &P = get(Q.GetInsertBlock());
+@@ -260,6 +275,8 @@
+     for (size_t k = 1; k < cs.size(); ++k) par[find(cs[k])] = find(cs[0]);
+     if (!ok) for (CallInst *c : cs) bad.insert(c);
+   }
++  // an ldmatrix that stays asm has the plain k order, and all of a set must agree: one with an address form lowerLdsm does not read takes its set out (Triton: 8 of 40 lowered, the words of the rest in another order)
++  for (auto &kv : par) { Ldsm L; GlobalVariable *G; Value *o; if (!parseLdsm(kv.first, L) || !smemOffset(L.addr, G, o)) bad.insert(kv.first); }
+   // an ldmatrix read by anything else than an mma stays as it is
+   for (auto &kv : par) { CallInst *C = kv.first; for (User *U : C->users()) { auto *E = dyn_cast<ExtractValueInst>(U); if (!E) { bad.insert(C); continue; } std::function<void(Value *)> w = [&](Value *V) { for (User *X : V->users()) { if (isa<BitCastInst>(X)) { w(X); continue; } auto *M = dyn_cast<CallInst>(X); if (!M || !isMma(M)) bad.insert(C); } }; w(E); } }
+   std::set<CallInst *> badRoot; for (CallInst *c : bad) badRoot.insert(find(c));
+@@ -312,21 +329,21 @@
+       const bool kp = kit != kperm.end() && kit->second.m0[j] >= 0;
+       int m0 = 0, m1 = 0, kq = 0; if (kp) { m0 = kit->second.m0[j]; m1 = kit->second.m1[j]; kq = kit->second.q[j]; }
+       if (kp && !L.trans) {
+-        Value *row = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, perm ? 1 : 0, 0));
++        Value *row = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, perm ? 1 : 0, 0));
+         d = Q.CreateBitCast(rowLoad(F32, row, P.t8, 4, 4 * kq), I32);
+       } else if (kp) {
+-        Value *r0 = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq)), *r1 = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq + 1));
++        Value *r0 = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq)), *r1 = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq + 1));
+         Value *col = perm ? P.colp : P.col;
+         Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
+         d = Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
+       } else if (!L.trans) {
+         Value *rowLane = LN.srcIdx(L.CI->getParent(), perm ? 1 : 0, j);
+-        Value *row = LN.shfl(Q, Lf, rowLane);
++        Value *row = LN.row(Q, Lf, rowLane);
+         d = Q.CreateBitCast(rowLoad(F32, row, P.t4, 4), I32);
+       } else {
+         Value *s0 = LN.srcIdx(L.CI->getParent(), 2, j), *s1 = LN.srcIdx(L.CI->getParent(), 3, j);
+         Value *col = perm ? P.colp : P.col;
+-        Value *r0 = LN.shfl(Q, Lf, s0), *r1 = LN.shfl(Q, Lf, s1);
++        Value *r0 = LN.row(Q, Lf, s0), *r1 = LN.row(Q, Lf, s1);
+         Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
+         d = Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
+       }
+@@ -480,21 +497,29 @@
+   // load the word again here when the epoch check allowed it (placeFrag): the fragment does not stay live between its ldmatrix and the WMMA.
+   // volatile: otherwise GVN merges the loads and the live range is back
+   std::set<Value *> remat;
++  // lo-mma<lane-eval>: the words of the WMMA just before, at the same place with no epoch end between (emit): a word both read stays in its register
++  std::map<Value *, Value *> held, heldNext; Instruction *heldAt = nullptr;
+   Value *frag(IRBuilder<> &Q, Value *v) {
+     if (!remat.count(v)) return v;
++    if (loLaneMode) { auto it = held.find(v); if (it != held.end()) return heldNext[v] = it->second; }
++    Value *r = fragLoad(Q, v);
++    if (loLaneMode) heldNext[v] = r;
++    return r;
++  }
++  Value *fragLoad(IRBuilder<> &Q, Value *v) {
+     FragInfo &f = fragOf[v]; BasicBlock *B = Q.GetInsertBlock(); auto &P = LN.get(B); Type *I8 = Type::getInt8Ty(Ctx), *I16 = Type::getInt16Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
+     auto rowLoad = [&](Type *T, Value *row, Value *lanePart, unsigned al, int64_t Cx = 0) {
+       Value *p = Q.CreateGEP(I8, f.G, {Q.CreateSExt(Q.CreateAdd(row, lanePart), I64)});
+       if (f.C + Cx) p = Q.CreateGEP(I8, p, {ConstantInt::get(I64, f.C + Cx)});
+       auto *L = Q.CreateAlignedLoad(T, p, Align(al)); L->setVolatile(true); return L; };
+-    if (f.m0 >= 0 && !f.trans) return rowLoad(F32, LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, f.perm ? 1 : 0, 0)), P.t8, 4, 4 * f.q);
++    if (f.m0 >= 0 && !f.trans) return rowLoad(F32, LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, f.perm ? 1 : 0, 0)), P.t8, 4, 4 * f.q);
+     if (f.m0 >= 0) {
+-      Value *r0 = LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q)), *r1 = LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q + 1)); Value *col = f.perm ? P.colp : P.col;
++      Value *r0 = LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q)), *r1 = LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q + 1)); Value *col = f.perm ? P.colp : P.col;
+       Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
+       return Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
+     }
+-    if (!f.trans) return rowLoad(F32, LN.shfl(Q, f.L, LN.srcIdx(B, f.perm ? 1 : 0, f.j)), P.t4, 4);
+-    Value *r0 = LN.shfl(Q, f.L, LN.srcIdx(B, 2, f.j)), *r1 = LN.shfl(Q, f.L, LN.srcIdx(B, 3, f.j)); Value *col = f.perm ? P.colp : P.col;
++    if (!f.trans) return rowLoad(F32, LN.row(Q, f.L, LN.srcIdx(B, f.perm ? 1 : 0, f.j)), P.t4, 4);
++    Value *r0 = LN.row(Q, f.L, LN.srcIdx(B, 2, f.j)), *r1 = LN.row(Q, f.L, LN.srcIdx(B, 3, f.j)); Value *col = f.perm ? P.colp : P.col;
+     Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
+     return Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
+   }
+@@ -567,6 +592,8 @@
+   }
+   void emit(Group &G, Instruction *at) {
+     IRBuilder<> Q(at);
++    if (at != heldAt) heldNext.clear();
++    held.swap(heldNext); heldNext.clear(); heldAt = at;
+     for (int u = 0; u < G.nn; ++u) for (Op *o : G.st[u]) { o->C.clear(); readOp(o->CI, *o); }
+     Value *acc[2][4] = {}, *out[2][4] = {};
+     for (int u = 0; u < G.nn; ++u) accIn(Q, G.st[u][0], acc[u]);
+@@ -688,6 +715,30 @@
+   }
+ }
+ 
++// Groups placed at one point: the next one is a group whose chain predecessor is done, first the next step of the chain just emitted (its accumulators stay in the WMMA registers), then the one with
++// the most operand words in common with it (a snake through the tiles reads each fragment once instead of once per WMMA).
++static void orderForReuse(std::vector<Group> &gs, Place &R) {
++  std::vector<int> out; std::map<Op *, int> gof;
++  for (int i : R.order) for (int u = 0; u < gs[i].nn; ++u) for (Op *o : gs[i].st[u]) gof[o] = i;
++  auto words = [&](int i) { std::set<Value *> w; Group &g = gs[i]; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) { for (int k = 0; k < 2 * o->kb; ++k) w.insert(o->A[k]); for (int k = 0; k < o->kb; ++k) w.insert(o->B[k]); } return w; };
++  for (size_t a = 0; a < R.order.size();) {
++    size_t b = a; while (b < R.order.size() && R.P[R.order[b]] == R.P[R.order[a]]) ++b;
++    std::vector<int> left(R.order.begin() + a, R.order.begin() + b); std::set<int> done; int last = -1;
++    auto ready = [&](int i) { Group &g = gs[i]; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) if (o->prev && gof.count(o->prev) && gof[o->prev] != i && std::find(left.begin(), left.end(), gof[o->prev]) != left.end()) return false; return true; };
++    while (!left.empty()) {
++      int best = -1, bs = -1;
++      for (int i : left) { if (!ready(i)) continue; int sc = 0;
++        if (last >= 0) { Group &g = gs[i]; bool chain = false; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) if (o->prev && gof.count(o->prev) && gof[o->prev] == last) chain = true;
++          auto w = words(i), l = words(last); for (Value *v : w) sc += l.count(v); if (chain) sc += 1000; }
++        if (sc > bs) { bs = sc; best = i; } }
++      if (best < 0) best = left[0];
++      left.erase(std::find(left.begin(), left.end(), best)); out.push_back(best); last = best;
++    }
++    a = b;
++  }
++  R.order = out;
++}
++
+ static void lowerMma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
+   Lower Lw(F, LN, bPerm);
+   const bool doN = envOn("LO_MMA_N", true), doK = envOn("LO_MMA_K", true); const int f16Acc = envInt("LO_F16_ACC", 0);
+@@ -768,7 +819,7 @@
+       Instruction *S = epochEnd(E, DT, PDT, LI);
+       if (isa<PHINode>(S)) continue;
+       std::vector<Value *> v; bool all = true; std::set<Value *> seen;
+-      static const bool fragTrans = envOn("LO_FRAG_TRANS", false);   // a .trans word is two 16-bit loads: it stays where it is
++      static const bool fragTrans = envOn("LO_FRAG_TRANS", loLaneMode);   // a .trans word is two 16-bit loads: it stays where it is
+       args(g, [&](Value *x) { if (!seen.insert(x).second) return; auto it = fragOf.find(x); if (it == fragOf.end()) return;
+         if (!DT.dominates(it->second.at, S) || !epochClear(it->second.at, S)) all = false; if (fragTrans || !it->second.trans) v.push_back(x); });
+       if (!all || v.empty()) continue;
+@@ -784,6 +835,7 @@
+     }
+     for (auto &kv : at) { moved++; for (Value *v : ws[kv.first]) { Lw.remat.insert(v); words++; } }
+   }
++  if (loLaneMode) orderForReuse(gs, R);
+   for (int i : R.order) { Group &g = gs[i]; Lw.emit(g, R.P[i]); groups++; int kbs = 0; for (Op *o : g.st[0]) kbs += o->kb; shapes[g.nn * 100 + kbs]++; }
+   for (Group &g : gs) for (int u = 0; u < g.nn; ++u) for (int s = (int)g.st[u].size() - 1; s >= 0; --s) {
+     Op *o = g.st[u][s];
+@@ -1258,10 +1310,12 @@
+ void p3PromoteHalf(Function &F);
+ struct LoMma : PassInfoMixin<LoMma> {
+   bool hoist = true, sched = true, f16 = true, fp = true;   // lo-mma<no-hoist;no-sched;no-f16;no-fp>: without that step, whatever LO_HOIST, LO_SCHED, LO_F16, LO_FP say
++  bool laneEval = false;   // lo-mma<lane-eval>: see loLaneMode
+   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
++    loLaneMode = laneEval && envOn("LO_LANE_EVAL", true);
+     Lanes LN(&M); std::vector<Function *> fs; for (auto &F : M) if (!F.isDeclaration()) fs.push_back(&F);
+     for (Function *F : fs) {
+-      LN.bb.clear(); fragOf.clear();
++      LN.bb.clear(); LN.tid = nullptr; fragOf.clear();
+       std::set<Value *> bp;
+       splitAggPhis(*F); canonPacks(*F);
+       if (envOn("LO_CENSUS", false)) census(*F);
+@@ -1296,6 +1350,7 @@
+           else if (o == "no-sched") P.sched = false;
+           else if (o == "no-f16") P.f16 = false;
+           else if (o == "no-fp") P.fp = false;
++          else if (o == "lane-eval") P.laneEval = true;
+           else return false;
+         }
+         MPM.addPass(std::move(P)); return true;
