@@ -9,6 +9,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -1037,6 +1038,21 @@ llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *nam
   llvm::CallInst *C = B.CreateCall(FT, IA, {}, name);
   C->setDoesNotAccessMemory();
   C->setDoesNotThrow();
+  // CUPBOP_SREG_RANGE=1 (default 0; experiments/p2b): CUDA's limits as !range on the asm result, so that the optimizer
+  // knows threadIdx / blockDim are small and non-negative. Only what the CUDA launch rules guarantee: no limit on
+  // blockIdx or gridDim, which would be an assumption about the launch.
+  static const bool sreg_range = [] { const char *e = std::getenv("CUPBOP_SREG_RANGE"); return e && std::atoi(e) != 0; }();
+  if (sreg_range) {
+    uint64_t lo = 0, hi = 0;
+    if (csr == 0xCD3 || csr == 0xCD4) hi = 1024;                 // threadIdx.x / .y
+    else if (csr == 0xCD5) hi = 64;                              // threadIdx.z
+    else if (csr == 0xCD9 || csr == 0xCDA) lo = 1, hi = 1025;    // blockDim.x / .y
+    else if (csr == 0xCDB) lo = 1, hi = 65;                      // blockDim.z
+    if (hi) {
+      llvm::MDBuilder MDB(B.getContext());
+      C->setMetadata(llvm::LLVMContext::MD_range, MDB.createRange(llvm::APInt(32, lo), llvm::APInt(32, hi)));
+    }
+  }
   return C;
 }
 
@@ -1100,6 +1116,39 @@ bool fast_entry_s1_grid_csr() {
   return g.schedule == 1 && !need_nested_loop && g.subpasses == 1 && g.trips == 0;
 }
 
+// CUPBOP_BAR_INLINE=1 (default 0; 2026-11-04, experiments/p2b): the schedule-2 CTA barrier is a call of the out-of-line
+// vx_barrier in kernel_wrapper.cpp (`jal`), so every value live across a __syncthreads sits in a callee-saved register
+// or on the stack, and the kernel is not a leaf. Replace each call by the instruction itself, as an inline asm that
+// keeps vx_intrinsics.h's memory clobber and the call's convergent attribute (always-inlining a runtime wrapper would
+// lose it: the asm of __vx_barrier_arrive_and_wait is not convergent, and an unmarked barrier may be duplicated into
+// divergent branches; see the barrier lowering in replace_built_in_function). Last step of the translation: the passes
+// before it look for calls of vx_barrier by name.
+void inline_vx_barrier_calls(llvm::Module *M) {
+  const char *e = std::getenv("CUPBOP_BAR_INLINE");
+  if (!e || std::atoi(e) == 0) return;
+  llvm::Function *F = M->getFunction("vx_barrier");
+  if (!F || !F->isDeclaration() || F->arg_size() != 2) return;
+  auto *IA = llvm::InlineAsm::get(F->getFunctionType(), ".insn r 0x0b, 4, 0, x0, $0, $1", "r,r,~{memory}",
+                                  /*hasSideEffects=*/true);
+  std::vector<llvm::CallInst *> calls;
+  for (llvm::User *U : F->users())
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+      if (CI->getCalledFunction() == F) calls.push_back(CI);
+  long dbg_lo = 0, dbg_hi = 1L << 40, dbg_i = 0;   // CUPBOP_BAR_INLINE_RANGE=lo:hi (debug): only calls lo <= index < hi
+  if (const char *r = std::getenv("CUPBOP_BAR_INLINE_RANGE")) sscanf(r, "%ld:%ld", &dbg_lo, &dbg_hi);
+  for (llvm::CallInst *CI : calls) {
+    if (dbg_i < dbg_lo || dbg_i >= dbg_hi) { dbg_i++; continue; }
+    dbg_i++;
+    llvm::IRBuilder<> B(CI);
+    llvm::CallInst *N = B.CreateCall(F->getFunctionType(), IA, {CI->getArgOperand(0), CI->getArgOperand(1)});
+    N->addFnAttr(llvm::Attribute::Convergent);
+    N->addFnAttr(llvm::Attribute::NoUnwind);
+    N->copyMetadata(*CI);
+    CI->eraseFromParent();
+  }
+  if (F->use_empty()) F->eraseFromParent();
+}
+
 // P2 for the device runtime: __vx_warps_per_group() (cudaKernelImpl.cpp, reads the __warps_per_group global) -> the
 // CTA-size CSR. At the end of the translation, after every pass that creates such calls.
 void fast_entry_csr_runtime_calls(llvm::Module *M) {
@@ -1118,6 +1167,82 @@ void fast_entry_csr_runtime_calls(llvm::Module *M) {
   }
   if (cupbop_debug() || std::getenv("CUPBOP_FAST_ENTRY_REPORT"))
     std::cout << "[fast-entry] " << calls.size() << " __vx_warps_per_group() call(s) -> CTA-size CSR\n";
+}
+
+// CUPBOP_MUFU: lower the approximate NVVM math intrinsics to the Vortex MUFU, the special-function unit of the SFU
+// (custom-2, vortex sw/kernel/include/vx_mufu.h, hardware key VX_CFG_EXT_MUFU_ENABLE).
+//   unset/0  the translator's old path: libm exp2f/log2f calls, an fdiv for rcp, sqrt + fdiv for rsqrt.
+//   1        llvm.nvvm.{ex2,lg2}.approx[.ftz].f, llvm.nvvm.rcp.approx.ftz.f, llvm.nvvm.rsqrt.approx[.ftz].f -> MUFU.
+//   2        1, and llvm.exp2.f32 / llvm.log2.f32 too, as if they were the .ftz forms. llvm.exp2 means libm accuracy and
+//            subnormal results, so this is a fast-math choice of the user, not an equivalent rewrite. It is for code that
+//            wrote the libm form where the original had ex2.approx.ftz (FlashAttention arm AttB).
+// The MUFU is exactly the .ftz behaviour of PTX, specials included: a subnormal input counts as zero, a subnormal result
+// flushes to zero with the sign kept, -inf -> 0 / NaN as PTX tabulates (experiments/mufu/REPORT_KO.md, checked by
+// examples/mufu_approx). The non-ftz forms scale around the unit, as ptxas does around MUFU; the scale factors come from
+// an integer 0/1. LLVM may still fold those into a float select, which the Vortex backend wraps in split/join (checked
+// with mixed lanes in the example). Anything else (.d, .f16, rcp.rn, sin/cos) stays on the old path.
+static int mufu_level() {
+  static const int v = [] {
+    const char *e = std::getenv("CUPBOP_MUFU");
+    int l = e ? std::atoi(e) : 0;
+    const char *cfg = std::getenv("VORTEX_CONFIGS");
+    if (l > 0 && cfg && !std::strstr(cfg, "-DVX_CFG_EXT_MUFU_ENABLE")) {
+      fprintf(stderr, "error: CUPBOP_MUFU=%d needs a Vortex build with -DVX_CFG_EXT_MUFU_ENABLE (VORTEX_CONFIGS: %s)\n", l, cfg);
+      exit(1);
+    }
+    return l;
+  }();
+  return v;
+}
+static unsigned mufu_count[4]; // lowered calls by MUFU function: rcp, rsqrt, ex2, lg2
+enum { MUFU_RCP = 0, MUFU_RSQRT = 1, MUFU_EX2 = 2, MUFU_LG2 = 3 };
+static llvm::Value *mufu_op(llvm::IRBuilder<> &B, unsigned fn, llvm::Value *x) {
+  auto *F32 = B.getFloatTy();
+  auto *FT = llvm::FunctionType::get(F32, {F32}, false);
+  char asm_str[48];
+  snprintf(asm_str, sizeof(asm_str), ".insn r 0x5b, 0, 0, $0, $1, x%u", fn); // fn rides the rs2 field
+  llvm::CallInst *C = B.CreateCall(FT, llvm::InlineAsm::get(FT, asm_str, "=f,f", /*hasSideEffects=*/false), {x});
+  C->setDoesNotAccessMemory();
+  C->setDoesNotThrow();
+  ++mufu_count[fn];
+  return C;
+}
+// bits(base) + s * step, as a float: base when s == 0, or a power of two away from it when s == 1
+static llvm::Value *mufu_scale(llvm::IRBuilder<> &B, llvm::Value *s, uint32_t base, int32_t step) {
+  llvm::Value *bits = B.CreateAdd(B.getInt32(base), B.CreateMul(s, B.getInt32(step)));
+  return B.CreateBitCast(bits, B.getFloatTy());
+}
+// 1 when x is zero or subnormal
+static llvm::Value *mufu_tiny(llvm::IRBuilder<> &B, llvm::Value *x) {
+  llvm::Value *e = B.CreateAnd(B.CreateBitCast(x, B.getInt32Ty()), B.getInt32(0x7f800000));
+  return B.CreateZExt(B.CreateICmpEQ(e, B.getInt32(0)), B.getInt32Ty());
+}
+// the MUFU form of an approximate call, or nullptr for the old path
+static llvm::Value *mufu_lower(llvm::IRBuilder<> &B, const std::string &name, llvm::CallInst *Call) {
+  const int level = mufu_level();
+  if (level <= 0 || Call->arg_size() != 1 || !Call->getType()->isFloatTy()) return nullptr;
+  llvm::Value *x = Call->getArgOperand(0);
+  const uint32_t ONE = 0x3f800000, E = 1u << 23; // 1.0f, one binade
+  if (name == "llvm.nvvm.ex2.approx.ftz.f" || (level >= 2 && name == "llvm.exp2.f32")) return mufu_op(B, MUFU_EX2, x);
+  if (name == "llvm.nvvm.lg2.approx.ftz.f" || (level >= 2 && name == "llvm.log2.f32")) return mufu_op(B, MUFU_LG2, x);
+  if (name == "llvm.nvvm.rcp.approx.ftz.f") return mufu_op(B, MUFU_RCP, x);
+  if (name == "llvm.nvvm.rsqrt.approx.ftz.f") return mufu_op(B, MUFU_RSQRT, x);
+  if (name == "llvm.nvvm.ex2.approx.f") { // subnormal result: 2^(x+32) in range, then * 2^-32 rounds into the subnormals
+    llvm::Value *s = B.CreateZExt(B.CreateFCmpOLT(x, llvm::ConstantFP::get(B.getFloatTy(), -126.0)), B.getInt32Ty());
+    llvm::Value *r = mufu_op(B, MUFU_EX2, B.CreateFAdd(x, mufu_scale(B, s, 0, 0x42000000))); // + 32.0f or + 0.0f
+    return B.CreateFMul(r, mufu_scale(B, s, ONE, -32 * (int32_t)E));
+  }
+  if (name == "llvm.nvvm.lg2.approx.f") { // subnormal input: log2(x * 2^24) - 24
+    llvm::Value *s = mufu_tiny(B, x);
+    llvm::Value *r = mufu_op(B, MUFU_LG2, B.CreateFMul(x, mufu_scale(B, s, ONE, 24 * E)));
+    return B.CreateFSub(r, mufu_scale(B, s, 0, 0x41c00000)); // - 24.0f or - 0.0f
+  }
+  if (name == "llvm.nvvm.rsqrt.approx.f") { // subnormal input: rsqrt(x * 2^24) * 2^12
+    llvm::Value *s = mufu_tiny(B, x);
+    llvm::Value *r = mufu_op(B, MUFU_RSQRT, B.CreateFMul(x, mufu_scale(B, s, ONE, 24 * E)));
+    return B.CreateFMul(r, mufu_scale(B, s, ONE, 12 * E));
+  }
+  return nullptr;
 }
 
 void replace_built_in_function(llvm::Module *M) {
@@ -1773,7 +1898,8 @@ void replace_built_in_function(llvm::Module *M) {
                 name.find("llvm.nvvm.div.r") != std::string::npos ||
                 name.find("llvm.nvvm.fmin.") != std::string::npos ||
                 name.find("llvm.nvvm.fmax.") != std::string::npos ||
-                name.find("llvm.nvvm.saturate") != std::string::npos) {
+                name.find("llvm.nvvm.saturate") != std::string::npos ||
+                (mufu_level() >= 2 && (name == "llvm.exp2.f32" || name == "llvm.log2.f32"))) {
               to_replace.push_back(Call);
             }
           }
@@ -1790,10 +1916,12 @@ void replace_built_in_function(llvm::Module *M) {
       auto name = Call->getCalledFunction()->getName().str();
       IRBuilder<> Builder(Call);
 
-      Value *replacement = nullptr;
+      Value *replacement = mufu_lower(Builder, name, Call);
 
-      // FMA: fma(a,b,c) = a*b+c
-      if (name.find("llvm.nvvm.fma.") != std::string::npos) {
+      // MUFU (CUPBOP_MUFU), already lowered
+      if (replacement) {
+        // FMA: fma(a,b,c) = a*b+c
+      } else if (name.find("llvm.nvvm.fma.") != std::string::npos) {
         Value *a = Call->getArgOperand(0);
         Value *b = Call->getArgOperand(1);
         Value *c = Call->getArgOperand(2);
@@ -1996,6 +2124,9 @@ void replace_built_in_function(llvm::Module *M) {
         Call->eraseFromParent();
       }
     }
+    if (mufu_level() > 0)
+      fprintf(stderr, "mufu: level %d lowered ex2 %u lg2 %u rcp %u rsqrt %u\n", mufu_level(), mufu_count[MUFU_EX2],
+              mufu_count[MUFU_LG2], mufu_count[MUFU_RCP], mufu_count[MUFU_RSQRT]);
   }
 }
 

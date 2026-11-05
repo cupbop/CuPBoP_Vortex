@@ -1137,6 +1137,29 @@ static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
   auto it = table.find(func_stripped);
   return it == table.end() ? 0u : it->second;
 }
+// CUPBOP_SMEM_SHRINK (translator, smem_reserve.cpp): the CTA bytes a kernel can touch per block shape, from
+// kernel_lmem_hi.log ("<kernel> <X> <Y> <Z> <bytes>"; no file = no entry). Launch: the smallest entry covering blockDim,
+// at most the usual size. CUPBOP_SMEM_SHRINK_RT=0 at run time ignores the file.
+static uint32_t cupbop_lmem_touched(const std::string &func_stripped, uint32_t usual, const dim3 &b) {
+  struct E { uint32_t x, y, z, bytes; };
+  static std::map<std::string, std::vector<E>> table;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    const char *rt = std::getenv("CUPBOP_SMEM_SHRINK_RT");
+    if (!rt || std::atoi(rt) != 0) {
+      std::ifstream f("kernel_lmem_hi.log");
+      std::string name; E e;
+      while (f >> name >> e.x >> e.y >> e.z >> e.bytes) table[cupbop_strip_prefix(name)].push_back(e);
+    }
+  }
+  auto it = table.find(func_stripped);
+  if (it == table.end()) return usual;
+  uint32_t best = usual;
+  for (const E &e : it->second)
+    if (b.x <= e.x && b.y <= e.y && b.z <= e.z && e.bytes < best) best = e.bytes;
+  return best;
+}
 // Stack in local memory (CUPBOP_STACK_IN_LMEM = 0 | 1 | auto at translation; see generate_wrapper.cpp
 // stack_lmem_prelude). The kernel ELF then calls the kernel through __cupbop_kcall_lmem, and examples/stack_fallback.sh
 // wrote cupbop_lmem_stack.txt (mode, and per callbacks index the static stack bytes of the deepest call chain; flags
@@ -2462,7 +2485,7 @@ cudaError_t cudaLaunchKernel_vortex(
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
       block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
       ndim = 3;
-      lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
+      lmem = cupbop_lmem_touched(func_stripped, cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem, blockDim);
       uint64_t lmem_cap = 0;
       if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
         printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
@@ -2520,7 +2543,7 @@ cudaError_t cudaLaunchKernel_vortex(
       // Lane gating needs the full warps dispatched (the kernel entry retires lanes >= L).
       block[0] = (L == nt) ? (uint32_t)std::min<uint64_t>((uint64_t)P * nt, block_threads) : P * nt; block[1] = 1; block[2] = 1;
       ndim = 3;
-      lmem = cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem;
+      lmem = cupbop_lmem_touched(func_stripped, cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem, blockDim);
       DBG_PRINT("virt: block_warps=%u physical_warps=%u lanes=%u cta_threads=%u\n", block_warps, P, L, block[0]);
     } else {
       // flat schedule: one CUDA block per hardware thread; the device entry recovers

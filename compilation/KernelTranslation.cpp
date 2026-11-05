@@ -291,6 +291,10 @@ int main(int argc, char **argv) {
   }
 
   fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
+  inline_vx_barrier_calls(program); // CUPBOP_BAR_INLINE: vx_barrier calls -> the instruction (tool.cpp)
+  protect_dxa_operand_registers(program); // x30 / x31 hold nothing across a TMA copy (uniform_branch.cpp)
+  sign_extend_kernel_args(program); // CUPBOP_ARG_SIGNEXT (uniform_branch.cpp)
+  mark_uniform_branches(program); // CUPBOP_UNIFORM_BR: uniform branches get llvm.riscv.vx.uniform (uniform_branch.cpp)
   annotate_kernel_abi(program); // CUPBOP_KABI (default on): kernel calling convention, cupbop_kabi.txt
   fast_entry_finalize_wrapper(program); // CUPBOP_FAST_ENTRY: kernel_main stores only what the module reads
   describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
