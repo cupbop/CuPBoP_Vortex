@@ -16,6 +16,7 @@
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
@@ -394,6 +395,10 @@ std::map<std::string, llvm::Instruction *> contextArrays;
 // emits its own load and the function bloats with N extra loads of the
 // same address).
 std::map<llvm::Function *, llvm::Instruction *> ctxPoolLoadCache;
+// context arrays of values that do not depend on the thread as far as the analysis sees (a lifter's parameter block: an
+// alloca with GEP users gets a copy per slot whatever it holds), for s1_check_unlooped
+std::set<const llvm::Instruction *> ctxUniformArrays;
+static const CustomDivergenceAnalysis *g_ctx_DI = nullptr;
 int tempInstructionIndex = 0;
 static int g_ctx_pool_offset = 0;
 int need_nested_loop;
@@ -640,6 +645,7 @@ llvm::Instruction *GetContextArray(llvm::Instruction *instruction,
   }
 
   contextArrays[varName] = Result;
+  if (g_ctx_DI && !g_ctx_DI->isDivergent(instruction)) ctxUniformArrays.insert(Result);
   return Result;
 }
 
@@ -3141,6 +3147,137 @@ static void s1_split_two_arm_entries(llvm::Function &F, std::vector<llvm::BasicB
   stops.clear();
 }
 
+// ---- Core mapping: per-thread state read outside the warp loops (s1fix, 2026-11-04) ----------
+// Code outside a warp loop runs once per physical warp; slot 0 of a context array is all it can see (the loop index is
+// reset to 0 behind every loop, O3 folds the read to a load without index). A region the walk missed is not a crash, it is
+// a kernel that is right for the logical warps of slot 0 and wrong for the others, and right for every warp when
+// P = warps per CTA. So the translation ends with this test: starting at what depends on the thread outside the warp
+// loops (a read of a context array, a thread id), it follows the values there to what they can change:
+//   store, atomic, call with side effects, condition of a branch, and refuses the kernel if something is reached.
+// Not refused: a branch with a barrier of the kernel on an arm (block-uniform by CUDA's rules: slot 0 is as good as any);
+// a condition that only depends on the kernel's arguments; a context array of a value the analysis sees as uniform (a
+// lifter's parameter block). So a thread-dependent `return` in front of __syncthreads stays decided by slot 0.
+// CUPBOP_S1_CHECK=0: off; =warn: report only; =1 (default): refuse. CUPBOP_S1_CHECK_WHY=1: every finding.
+static int s1_check_mode() {
+  static const int m = [] {
+    const char *e = std::getenv("CUPBOP_S1_CHECK");
+    if (!e) return 2;
+    if (!strcmp(e, "warn")) return 1;
+    return std::atoi(e) ? 2 : 0;
+  }();
+  return m;
+}
+static void s1_check_unlooped(llvm::Function &F, bool nested) {
+  using namespace llvm;
+  if (!s1_check_mode()) return;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  PostDominatorTree PDT(F);
+  const StringRef hdr = nested ? "inter_warp_cond" : "intra_warp_cond";
+  auto in_loop = [&](const BasicBlock *B) {
+    if (B->getName().starts_with("intra_warp_init") || B->getName().starts_with("inter_warp_init")) return true;   // sets the loop index
+    for (Loop *L = LI.getLoopFor(B); L; L = L->getParentLoop())
+      if (L->getHeader()->getName().starts_with(hdr)) return true;
+    return false;
+  };
+  auto ctx_of = [](Value *P) -> AllocaInst * {
+    auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(P));
+    return AI && (AI->getName().contains("_intra_warp_") || AI->getName().contains("_inter_warp_")) ? AI : nullptr;
+  };
+  // A block with no path to a return is left out: no barrier closes a region there, so it never gets a warp loop, but
+  // what it does is undefined in any schedule (the lifter's `unreachable` behind a call it could not resolve).
+  std::set<const BasicBlock *> live;
+  {
+    std::vector<BasicBlock *> st;
+    for (BasicBlock &B : F) if (isa<ReturnInst>(B.getTerminator())) st.push_back(&B);
+    while (!st.empty()) {
+      BasicBlock *B = st.back(); st.pop_back();
+      if (live.insert(B).second) st.insert(st.end(), pred_begin(B), pred_end(B));
+    }
+  }
+  std::set<Instruction *> taint;
+  std::vector<Instruction *> work;
+  auto add = [&](Instruction *I) { if (taint.insert(I).second) work.push_back(I); };
+  for (BasicBlock &B : F) {
+    if (in_loop(&B) || !live.count(&B)) continue;
+    for (Instruction &I : B) {
+      if (auto *L = dyn_cast<LoadInst>(&I)) {
+        auto *AI = ctx_of(L->getPointerOperand());
+        if (AI && !ctxUniformArrays.count(AI)) add(L);
+      } else if (auto *C = dyn_cast<CallInst>(&I)) {
+        if (auto *G = C->getCalledFunction())
+          if (G->getName().starts_with("llvm.nvvm.read.ptx.sreg.tid.") || G->getName() == "llvm.nvvm.read.ptx.sreg.laneid") add(C);
+      }
+    }
+  }
+  std::map<std::string, int> count;
+  std::vector<std::string> first;
+  auto found = [&](const char *kind, const Instruction *I) {
+    if (count[kind]++ < 2 || std::getenv("CUPBOP_S1_CHECK_WHY"))
+      first.push_back(std::string(kind) + " " + I->getOpcodeName() + " in " + I->getParent()->getName().str());
+  };
+  std::set<Instruction *> sink_seen;
+  while (!work.empty()) {
+    Instruction *I = work.back(); work.pop_back();
+    for (User *U : I->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || in_loop(UI->getParent()) || !live.count(UI->getParent())) continue;
+      if (isa<StoreInst>(UI) || isa<AtomicRMWInst>(UI) || isa<AtomicCmpXchgInst>(UI)) {
+        if (!sink_seen.insert(UI).second) continue;
+        Value *P = getLoadStorePointerOperand(UI);
+        if (!P) P = UI->getOperand(0);
+        if (isa<StoreInst>(UI) && ctx_of(P)) found("ctx-store", UI);
+        else if (isa<StoreInst>(UI) && isa<AllocaInst>(getUnderlyingObject(P))) found("private-store", UI);
+        else found(isa<StoreInst>(UI) ? "store" : "atomic", UI);
+      } else if (auto *C = dyn_cast<CallInst>(UI)) {
+        if (isa<DbgInfoIntrinsic>(C) || C->isLifetimeStartOrEnd()) continue;
+        if (C->doesNotAccessMemory() || C->onlyReadsMemory()) { add(C); continue; }
+        if (sink_seen.insert(UI).second) found("call", UI);
+        if (!C->getType()->isVoidTy()) add(C);
+      } else if (auto *BI = dyn_cast<BranchInst>(UI)) {
+        if (!sink_seen.insert(UI).second) continue;
+        BasicBlock *X = BI->getParent(), *M = nullptr;
+        if (auto *N = PDT.getNode(X)) if (auto *IN = N->getIDom()) M = IN->getBlock();
+        std::vector<BasicBlock *> st(succ_begin(X), succ_end(X));
+        std::set<BasicBlock *> seen{X};
+        bool kernel = false, added = false, code = false;
+        while (!st.empty()) {
+          BasicBlock *B = st.back(); st.pop_back();
+          if (B == M || !seen.insert(B).second) continue;
+          for (Instruction &J : *B) {
+            if (s1_is_cta_barrier(J)) (strcmp(s1_barrier_kind(J), "kernel") ? added : kernel) = true;   // (dead blocks too: the source had it there)
+            else if (J.mayWriteToMemory() && live.count(B)) code = true;
+          }
+          st.insert(st.end(), succ_begin(B), succ_end(B));
+        }
+        std::set<Value *> vs;
+        bool dead_arm = false;
+        for (BasicBlock *S : successors(X)) dead_arm |= !live.count(S);
+        if (kernel) count["uniform-branch"]++;
+        else if (dead_arm) count["dead-arm-branch"]++;   // the other arm is undefined: nothing to decide
+        else if (virt_launch_uniform(BI->getCondition(), DT, vs)) count["launch-uniform-branch"]++;
+        else if (added) found("branch-added-barriers", UI);
+        else if (code) found("branch", UI);
+        else count["empty-branch"]++;
+      } else if (isa<SwitchInst>(UI)) {
+        if (sink_seen.insert(UI).second) found("switch", UI);
+      } else if (!UI->isTerminator()) add(UI);
+    }
+  }
+  if (count.empty()) return;
+  const int bad = count["store"] + count["atomic"] + count["call"] + count["private-store"] + count["ctx-store"] + count["branch"] +
+                  count["switch"] + count["branch-added-barriers"];
+  std::string line;
+  for (auto &c : count) if (c.second) line += " " + c.first + "=" + std::to_string(c.second);
+  fprintf(stderr, "[s1-check] %s:%s\n", F.getName().str().c_str(), line.c_str());
+  for (auto &s : first) fprintf(stderr, "[s1-check]   %s\n", s.c_str());
+  if (bad && s1_check_mode() == 2) {
+    fprintf(stderr, "error: core mapping (schedule 1): %s: code outside the warp loops depends on the thread: it would run for the "
+                    "logical warps of slot 0 only. CUPBOP_S1_CHECK=0 translates anyway\n", F.getName().str().c_str());
+    ::exit(3);
+  }
+}
+
 class InsertWarpLoopPass : public llvm::FunctionPass {
 
 public:
@@ -3629,6 +3766,7 @@ public:
     auto func_name = (&F)->getName().str();
     // clear context array, temp variables for new kernel function
     contextArrays.clear();
+    if (intra_warp_loop) ctxUniformArrays.clear();
     tempInstructionIds.clear();
     ctxPoolLoadCache.clear();
     g_schedule_flag = schedule_flag;
@@ -3837,11 +3975,14 @@ public:
       note_p1_only_kernel(F, parallel_regions, DI, absPDT ? *absPDT : *PDT);
     // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
     //printf("print parallel region done!\n");
+    const bool last_pass = g_schedule_flag == 1 && (need_nested_loop ? !intra_warp_loop : intra_warp_loop);
     if (parallel_regions.empty()) {
+      if (last_pass) s1_check_unlooped(F, need_nested_loop);
       remove_barrier(&F, intra_warp_loop, schedule_flag);
       return 1;      
     }
 
+    g_ctx_DI = &DI;
     if (intra_warp_loop) {
       handle_local_variable_intra_warp(parallel_regions, DI, need_nested_loop);
     }
@@ -3850,6 +3991,8 @@ public:
     // F.print(llvm::errs());
 
     add_warp_loop(parallel_regions, intra_warp_loop, DI, LI, *DT);
+    g_ctx_DI = nullptr;
+    if (last_pass) s1_check_unlooped(F, need_nested_loop);   // (the CTA barriers are still there: it tells the kernel's from added ones)
     remove_barrier(&F, intra_warp_loop, schedule_flag);
 
     // Fix domination errors created by warp loop insertion.
