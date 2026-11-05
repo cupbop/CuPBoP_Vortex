@@ -31,8 +31,9 @@ run_row() { # name example sched hw input expect group covers [VAR=VALUE...]
   rm -rf $d; cp -a examples/$ex $d; rm -f $d/lift_d2h.txt
   passes=$d/$input.passes.txt
   # the launch rewrite comes from the translator then (cupbop_launch_fix.txt): no LIFT_DYN_SMEM. LIFT_MERGE examples stay pre: a module with source kernels beside the lift is not a lifted module for the translator
+  # LIFT_TR_EXPECT=<expect>: what the row expects when it runs this way
   if [ "$input" = pre ] && [ -n "${LIFT_OPT_IN_TRANSLATOR:-}" ] && ! grep -q '^LIFT_MERGE *= *1' $d/Makefile; then
-    input=raw; passes=/dev/null; local a=(); for p in "$@"; do case $p in LIFT_DYN_SMEM=*) ;; *) a+=("$p") ;; esac; done; set -- "${a[@]}" CUPBOP_LIFT_OPT=1; fi
+    input=raw; passes=/dev/null; local a=(); for p in "$@"; do case $p in LIFT_DYN_SMEM=*) ;; LIFT_TR_EXPECT=*) expect=${p#LIFT_TR_EXPECT=} ;; *) a+=("$p") ;; esac; done; set -- "${a[@]}" CUPBOP_LIFT_OPT=1; fi
   # input that went through the passes already: a second run in the translator (default on) would change it
   [ "$input" = raw ] || set -- CUPBOP_LIFT_OPT=0 "$@"
   case $sch in s2) s=2 ;; s1) s=1 ;; s1p*) s=1; set -- CUPBOP_VIRT_WARPS=${sch#s1p} "$@" ;; *) echo "$name: bad schedule $sch"; return ;; esac

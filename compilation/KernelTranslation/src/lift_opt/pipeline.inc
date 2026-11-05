@@ -2,8 +2,8 @@
 // ${LP}, $IC, ${P4_PREHEXT:-}, $P4 and ${P4_POST:-} are expanded by lift_opt_driver.cpp as the scripts expand them.
 static const char LIFT_OPT_IC[] = R"LO(instcombine<no-verify-fixpoint>)LO";
 static const char LIFT_OPT_LP[] = R"LO(lo-pair,)LO";
-static const char LIFT_OPT_LIGHT[] = R"LO(function(lo-brmark,instsimplify,early-cse,${LP}dce,lo-brfix))LO";
-static const char LIFT_OPT_FULL[] = R"LO(function(lo-brmark,instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC,lo-brfix))LO";
+static const char LIFT_OPT_LIGHT[] = R"LO(function(instsimplify,early-cse,${LP}dce))LO";
+static const char LIFT_OPT_FULL[] = R"LO(function(instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC))LO";
 // mkp4.sh's second opt: reads what the first one printed, without the first one's options
 static const char LIFT_OPT_STAGE2[] = R"LO(function($P4${P4_POST:-}))LO";
 // a module with none of these words keeps the light pipeline
