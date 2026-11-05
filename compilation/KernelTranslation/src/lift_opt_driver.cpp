@@ -1,7 +1,7 @@
-// The lift optimisation inside the translator (2026-11-04). Until now a separate `opt -load-pass-plugin=libp3.so` step in front of
-// CuPBoP (experiments/p3/scripts/mkp3.sh). The passes in src/lift_opt are plain copies of the sources of experiments/p3/tools
-// and pipeline.inc is generated from mkp3.sh (sync_from_p3.py), so that this file holds no pipeline of its own: what
-// mkp3.sh writes to its output file is what the translator goes on with, byte for byte (CUPBOP_LIFT_OPT_DUMP).
+// The lift optimisation inside the translator (2026-11-04). Until now separate `opt` steps in front of CuPBoP (experiments/p4/scripts/mkp4.sh on
+// experiments/p3). The passes in src/lift_opt come from those trees and pipeline.inc is generated from their scripts (sync_from_p3.py), so that this file
+// holds no pipeline of its own: what mkp4.sh writes to its output file is what the translator goes on with, byte for byte (CUPBOP_LIFT_OPT_DUMP).
+// VORTEX_SCHEDULE_FLAG picks the row of schedule.inc, as the options of mkp4.sh would.
 //
 // CUPBOP_LIFT_OPT=1 (default 0)  runs the pipeline on a module that is_lifted_module accepts; never on anything else
 // CUPBOP_LIFT_OPT_WHY=1          prints the decision and the pipeline
@@ -10,7 +10,9 @@
 // CUPBOP_LIFT_OPT_BC=<file>      the bitcode the rest of the translation reads: the bytes of the harness's device bitcode
 // CUPBOP_LIFT_OPT_DETECT_ONLY=1  print lifted=0|1 and the reason, stop (corpus audits)
 // CUPBOP_LIFT_OPT_NOPAIR=1       without lo-pair (mkp3.sh P3_NOPAIR=1; comparison with CUPBOP_ADDR_CARRY)
-// CUPBOP_LIFT_OPT_PIPE=<p>       replaces the pipeline (mkp3.sh P3_PIPE; measurements)
+// CUPBOP_LIFT_OPT_PIPE=<p>       replaces the first stage (mkp3.sh P3_PIPE; measurements)
+// CUPBOP_LIFT_OPT_P4=0           the pipeline of experiments/p3 alone: no row of schedule.inc, the queue of p2c-fold instead of lo-dq
+// CUPBOP_LIFT_OPT_STALE=0        without lo-stale (its default waits for a decision: tg sm75 -19.5%, dotproduct s2 +12.2%)
 // The passes' own switches (P2C_*, LO_*, LP_*) are read as in the opt step; LIFT_OPT_ENV gives mkp3.sh's defaults.
 //
 // Every translation reads the original input and runs the pipeline once, so the translations of examples/stack_fallback.sh
@@ -40,8 +42,10 @@
 using namespace llvm;
 
 #include "lift_opt/pipeline.inc"
+#include "lift_opt/schedule.inc"
 
 extern "C" PassPluginLibraryInfo p3_all_info();   // src/lift_opt/p3plugin.cpp
+extern "C" PassPluginLibraryInfo p4_all_info();   // src/lift_opt/p4plugin.cpp
 
 static bool env_on(const char *n) {
   const char *e = std::getenv(n);
@@ -90,14 +94,38 @@ static void replace_all(std::string &s, const std::string &a, const std::string 
   for (size_t i = 0; (i = s.find(a, i)) != std::string::npos; i += b.size()) s.replace(i, a.size(), b);
 }
 
-static std::string pipeline_for(Module *M, const char *&kind) {
+// the row of schedule.inc for this translation, nullptr: none
+static const LiftOptRow *schedule_row() {
+  if (const char *e = std::getenv("CUPBOP_LIFT_OPT_P4"); e && std::atoi(e) == 0) return nullptr;
+  int s = 2;
+  if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) s = std::atoi(e);
+  for (const LiftOptRow &r : LIFT_OPT_SCHEDULES) if (r.schedule == s) return &r;
+  return nullptr;
+}
+
+static std::string pipeline_for(Module *M, const LiftOptRow *row, const char *&kind) {
   kind = "CUPBOP_LIFT_OPT_PIPE";
   if (const char *p = std::getenv("CUPBOP_LIFT_OPT_PIPE")) return p;
   const bool full = gate_full(M);
   kind = full ? "full" : "light";
   std::string s = full ? LIFT_OPT_FULL : LIFT_OPT_LIGHT;
   replace_all(s, "${LP}", env_on("CUPBOP_LIFT_OPT_NOPAIR") ? "" : LIFT_OPT_LP);
+  replace_all(s, "${P4_PREHEXT:-}", row ? row->prehext : "");
   replace_all(s, "$IC", LIFT_OPT_IC);
+  return s;
+}
+
+// mkp4.sh's second opt; empty: no such step
+static std::string stage2_for(const LiftOptRow *row) {
+  if (!row) return "";
+  std::string list = row->stage2;
+  if (const char *e = std::getenv("CUPBOP_LIFT_OPT_STALE"); e && std::atoi(e) == 0) {
+    replace_all(list, "lo-stale,", "");
+    replace_all(list, ",lo-stale", "");
+  }
+  std::string s = LIFT_OPT_STAGE2;
+  replace_all(s, "${P4_POST:-}", "");
+  replace_all(s, "$P4", list);
   return s;
 }
 
@@ -122,6 +150,7 @@ static void note_shared_fold(Module *M) {
 static void run_pipeline(Module *M, const std::string &pipe, PassInstrumentationCallbacks *PIC) {
   PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, PIC);
   p3_all_info().RegisterPassBuilderCallbacks(PB);
+  p4_all_info().RegisterPassBuilderCallbacks(PB);
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -184,10 +213,13 @@ Module *run_lift_opt(Module *M) {
     return M;
   }
   const char *kind;
-  const std::string pipe = pipeline_for(M, kind);
-  fprintf(stderr, "[lift-opt] %s: %s pipeline\n", why.c_str(), kind);
+  const LiftOptRow *row = schedule_row();
+  const std::string pipe = pipeline_for(M, row, kind), stage2 = stage2_for(row);
+  fprintf(stderr, "[lift-opt] %s: %s pipeline%s%s\n", why.c_str(), kind, stage2.empty() ? "" : ", then ", stage2.c_str());
   if (verbose) fprintf(stderr, "[lift-opt] %s\n", pipe.c_str());
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
+  if (row) { for (auto &e : row->env) if (e.name) setenv(e.name, e.value, 0); }
+  else for (auto &e : LIFT_OPT_NO_P4_ENV) setenv(e.name, e.value, 0);
 
   bool folded = false, fold_seen = false;
   PassInstrumentationCallbacks PIC;
@@ -210,6 +242,13 @@ Module *run_lift_opt(Module *M) {
   VerifyModule(M);
   std::string text;
   raw_string_ostream(text) << *M;
+  if (!stage2.empty()) {   // mkp4.sh: a second opt on the printed module, with none of the first one's options
+    M = reload_text(M, text);
+    run_pipeline(M, stage2, nullptr);
+    VerifyModule(M);
+    text.clear();
+    raw_string_ostream(text) << *M;
+  }
   if (const char *d = std::getenv("CUPBOP_LIFT_OPT_DUMP")) {
     std::error_code EC;
     raw_fd_ostream os(d, EC, sys::fs::OF_TextWithCRLF);

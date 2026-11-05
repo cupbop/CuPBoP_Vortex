@@ -1166,6 +1166,53 @@ void inline_vx_barrier_calls(llvm::Module *M) {
   if (F->use_empty()) F->eraseFromParent();
 }
 
+// CUPBOP_BAR_MERGE=1 (IDEAS 62, p4): barrier; only instructions that neither touch memory nor have side effects; barrier with
+// the same operands -> one barrier. Same block, or through an unconditional branch into a block with that single predecessor,
+// so the second barrier runs exactly when the first did. Everything before the first is visible after it and nothing between
+// touches memory, so the second orders nothing. =1: schedule 1 only (a region model: every thread of the CTA takes the same
+// barrier sequence). =2: every schedule (on the 1:1 schedule warps that reach different barrier sites would count arrivals, so
+// a merge on one path only could change the count).
+void merge_adjacent_barriers(llvm::Module *M) {
+  const char *e = std::getenv("CUPBOP_BAR_MERGE");
+  const int mode = e ? std::atoi(e) : 0;
+  if (!mode) return;
+  const char *sf = std::getenv("VORTEX_SCHEDULE_FLAG");
+  if (mode == 1 && !(sf && std::atoi(sf) == 1)) return;
+  auto bar = [](llvm::Instruction &I) -> llvm::CallInst * {
+    auto *C = llvm::dyn_cast<llvm::CallInst>(&I);
+    llvm::Function *F = C ? C->getCalledFunction() : nullptr;
+    if (!F || C->arg_size() != 2) return nullptr;
+    llvm::StringRef n = F->getName();
+    return n == "vx_barrier" || n == "_Z28__vx_barrier_arrive_and_waitjj" ? C : nullptr;
+  };
+  unsigned merged = 0;
+  for (llvm::Function &F : *M) for (llvm::BasicBlock &BB : F) {
+    std::vector<llvm::CallInst *> dead;
+    for (llvm::Instruction &I : BB) {
+      llvm::CallInst *A = bar(I);
+      if (!A) continue;
+      llvm::BasicBlock *B = &BB; llvm::Instruction *P = A->getNextNode();
+      while (P) {
+        llvm::CallInst *C = bar(*P);
+        if (C) {
+          if (C->getCalledFunction() == A->getCalledFunction() && C->getArgOperand(0) == A->getArgOperand(0) && C->getArgOperand(1) == A->getArgOperand(1) &&
+              std::find(dead.begin(), dead.end(), C) == dead.end()) dead.push_back(C);
+          break;
+        }
+        if (auto *T = llvm::dyn_cast<llvm::BranchInst>(P)) {
+          llvm::BasicBlock *S = T->isUnconditional() ? T->getSuccessor(0) : nullptr;
+          if (!S || S == B || S->getSinglePredecessor() != B) break;
+          B = S; P = &*S->getFirstNonPHIIt(); continue;
+        }
+        if (P->isTerminator() || P->mayReadOrWriteMemory() || P->mayHaveSideEffects()) break;
+        P = P->getNextNode();
+      }
+    }
+    for (llvm::CallInst *C : dead) { C->eraseFromParent(); merged++; }
+  }
+  if (merged) llvm::errs() << "[CuPBoP] barrier merge: " << merged << " barriers dropped\n";
+}
+
 // P2 for the device runtime: __vx_warps_per_group() (cudaKernelImpl.cpp, reads the __warps_per_group global) -> the
 // CTA-size CSR. At the end of the translation, after every pass that creates such calls.
 void fast_entry_csr_runtime_calls(llvm::Module *M) {

@@ -1,5 +1,5 @@
---- a/liftopt.cpp
-+++ b/liftopt.cpp
+--- a/tools/liftopt.cpp
++++ b/tools/liftopt.cpp
 @@ -1193,6 +1193,7 @@
    for (BasicBlock &BB : F) {
      if (pred_size(&BB) < 2) continue;
@@ -20,8 +20,8 @@
        auto &cs = kv.first; PHINode *P0 = kv.second[0].first; Ldsm L0; parseLdsm(cs[0], L0); GlobalVariable *G0 = nullptr; bool ok = true; std::vector<Value *> offs;
        for (unsigned k = 0; k < cs.size() && ok; ++k) {
          Ldsm L; parseLdsm(cs[k], L); GlobalVariable *G; Value *o; BasicBlock *In = P0->getIncomingBlock(k);
---- a/p2cfold.cpp
-+++ b/p2cfold.cpp
+--- a/tools/p2cfold.cpp
++++ b/tools/p2cfold.cpp
 @@ -29,6 +29,7 @@
  //    the split-K semaphore path, not taken by split-K 1 launches).
  //  - @shared_mem shrinks to the new footprint; the launch must pass dyn_smem = 0 (printed in the log line).
@@ -39,8 +39,8 @@
        for (Acc *a : mv) {
          Site st; st.C = cast<CallInst>(a->I);
          BasicBlock *key = nullptr;
---- a/pairjoin.cpp
-+++ b/pairjoin.cpp
+--- a/tools/pairjoin.cpp
++++ b/tools/pairjoin.cpp
 @@ -25,6 +25,7 @@
  // (-> icmp on the two i64 values). The remaining uses of a joined phi pair read trunc(V) and trunc(V >> 32).
  //
@@ -58,3 +58,30 @@
      for (auto &[I, lo, hi] : packs) {
        bool lf = false;
        Value *v = get(lo, hi, I, &lf);
+--- a/tools/lotree.cpp
++++ b/tools/lotree.cpp
+@@ -174,7 +174,7 @@
+     for (auto &A : As) { auto *I = dyn_cast<Instruction>(A.Own); if (I && !DT.dominates(I, Ch[k].BarBefore)) { if (V) errs() << "  own pointer not available\n"; k = n; As.clear(); break; } }
+     if (k < n && Ch[k].c + 0 > 32) { k = n; As.clear(); }
+     // p4: nothing to promote, nothing to do: narrowing and skipping alone only pay behind a promoted tail (softmax 128 64 32, the tail in another form: +6.3%; snrm2 with a tail: -5.3%)
+-    if (k == n) return false;
++    if (k == n || As.empty()) return false;   // a stage without a shared store (a tid < 1 guard around TMA code, chain 1 1 1 1) has no cell to promote: LastSt below stayed null
+     // later reads of the cells: only cell 0 -> guards of promoted stages can go, write back from lane 0
+     Value *TidV = Tid; LLVMContext &C = F.getContext(); auto *I32 = Type::getInt32Ty(C); Module *Mod = F.getParent();
+     if (V) errs() << "  promote from stage " << k << " of " << n << "\n";
+--- a/tools/p4plugin.cpp
++++ b/tools/p4plugin.cpp
+@@ -6,13 +6,11 @@
+ extern "C" PassPluginLibraryInfo p4_pred_info();
+ extern "C" PassPluginLibraryInfo p4_tree_info();
+ extern "C" PassPluginLibraryInfo p4_mm_info();
+-extern "C" PassPluginLibraryInfo p4_cta_info();
+ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+   return {LLVM_PLUGIN_API_VERSION, "p4", "0.1", [](PassBuilder &PB) {
+     p4_stale_info().RegisterPassBuilderCallbacks(PB);
+     p4_pred_info().RegisterPassBuilderCallbacks(PB);
+     p4_tree_info().RegisterPassBuilderCallbacks(PB);
+     p4_mm_info().RegisterPassBuilderCallbacks(PB);
+-    p4_cta_info().RegisterPassBuilderCallbacks(PB);
+   }};
+ }

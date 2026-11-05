@@ -47,6 +47,8 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "lodq.h"
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -838,12 +840,33 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
     for (auto &kv : gCols) { gBase[kv.first] = nq; nq += (kv.first + 1) * kv.second; }
   } else for (Site &st : P.sites) { st.q0 = nq; nq += st.d; }
   auto qEntry = [&](Site &st, int row) -> int { return gBase[st.d] + row * gCols[st.d] + st.q0; };
-  AllocaInst *Q = EB.CreateAlloca(I64, EB.getInt32(nq), "p2c.q");
-  if (P.Lp) for (unsigned i = 0; i < nq; ++i) EB.CreateStore(EB.getInt64(0), EB.CreateConstGEP1_32(I64, Q, i));
+  // p4 (IDEAS 54, lodq.cpp). P2C_DQ_MIN (default 3): queues at least that deep lose their steady state where the source is affine. Shallower ones stay packed entries, as scalars (phis) when P2C_QSSA (default 2)
+  // covers every queue of a straight-line prologue: measured conv -1.6%, hgemm -0.7%; deeper chains spill (fprop +6.8%, cuBLAS hgemm +1.5%).
+  int dmax = 0; for (Site &st : P.sites) dmax = std::max(dmax, st.d);
+  std::unique_ptr<LoDq> DQ;
+  if (Sn == 1 && !rowQ && dmax >= envInt("P2C_DQ_MIN", 3)) {
+    std::vector<LoDqSite> ds(P.sites.size());
+    for (Site &st : P.sites) { LoDqSite &q = ds[st.k]; q.k = st.k; q.d = st.d; q.Tn = st.Tn; q.C = st.C; }
+    for (auto &e : P.events) if (e.tile >= P.sites[e.k].Tn) ds[e.k].ev[e.tile - P.sites[e.k].Tn] = cast<CallInst>(e.A->I);
+    for (auto &pr : P.ploop) ds[pr.second].pl = cast<CallInst>(pr.first->I);
+    DQ = LoDq::build(F, X.DT, Lm, P.Lp, Pre, ds, P.needG);
+  }
+  const bool noq = DQ && DQ->noq();
+  auto dqs = [&](Site &st) { return DQ && DQ->affine(st.k); };
+  const int qssa = envInt("P2C_QSSA", 2);
+  const bool ssaQ = Sn == 1 && !rowQ && !DQ && !P.Lp && qssa && dmax <= qssa;
+  std::vector<std::vector<AllocaInst *>> EQ(ssaQ ? P.sites.size() : 0); std::vector<AllocaInst *> EQall;
+  AllocaInst *Q = nullptr;
+  if (ssaQ) {
+    for (Site &st : P.sites) for (int i = 0; i < st.d; ++i) { AllocaInst *a = EB.CreateAlloca(I64, nullptr, "p2c.qe"); EB.CreateStore(EB.getInt64(0), a); EQ[st.k].push_back(a); EQall.push_back(a); }
+  } else if (!noq) {
+    Q = EB.CreateAlloca(I64, EB.getInt32(nq), "p2c.q");
+    if (P.Lp) for (unsigned i = 0; i < nq; ++i) EB.CreateStore(EB.getInt64(0), EB.CreateConstGEP1_32(I64, Q, i));
+  }
   // queue index per depth in the main loop
   IRBuilder<> LB(Lat->getTerminator());
   std::map<int, PHINode *> qis;
-  for (Site &st : P.sites) if ((st.d > 1 || rowQ) && !qis.count(st.d)) {
+  if (!ssaQ) for (Site &st : P.sites) if ((st.d > 1 || rowQ) && !dqs(st) && !qis.count(st.d)) {
     PHINode *ph = PHINode::Create(I32, 2, "p2c.qi", H->begin());
     Value *nx = LB.CreateAdd(ph, LB.getInt32(1));
     nx = LB.CreateSelect(LB.CreateICmpEQ(nx, LB.getInt32(st.d + (rowQ ? 1 : 0))), LB.getInt32(0), nx);
@@ -904,7 +927,9 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
   // main-loop sites
   std::vector<Value *> popped(J, nullptr), hoisted(J, nullptr);
   IRBuilder<> HB2(&*H->getFirstNonPHIIt());
-  if (Sn == 1 && !rowQ) for (Site &st : P.sites) popped[st.k] = HB2.CreateLoad(I64, slotOf(HB2, st), "p2c.qo");   // the slot is free for this iteration's push
+  if (DQ) DQ->header(HB2);
+  if (ssaQ) for (Site &st : P.sites) { auto &e = EQ[st.k]; popped[st.k] = HB2.CreateLoad(I64, e[0], "p2c.qo"); for (int i = 0; i + 1 < st.d; ++i) HB2.CreateStore(HB2.CreateLoad(I64, e[i + 1]), e[i]); }
+  else if (Sn == 1 && !rowQ) for (Site &st : P.sites) if (!dqs(st)) popped[st.k] = HB2.CreateLoad(I64, slotOf(HB2, st), "p2c.qo");   // the slot is free for this iteration's push
   for (Site &st : P.sites) {
     Acc &a = *st.A; CallInst *C = st.C;
     hoisted[st.k] = hoist(a);
@@ -916,10 +941,10 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
     IRBuilder<> B(At);
     Value *g = nullptr;
     if (st.guardPred) g = st.guardTrueIsCopy ? st.guardCond : B.CreateNot(st.guardCond);
-    Value *en = pack(B, P, src, sz, g);
-    Value *sl = slotOf(B, st);
+    Value *en = dqs(st) ? nullptr : pack(B, P, src, sz, g);
+    Value *sl = dqs(st) ? nullptr : ssaQ ? (Value *)EQ[st.k].back() : slotOf(B, st);
     if (Sn == 1) {
-      B.CreateStore(en, sl);
+      if (dqs(st)) DQ->pushMain(B, st.k, sz, g); else B.CreateStore(en, sl);
       if (st.guardPred) {
         BasicBlock *Blk = C->getParent();
         BranchInst::Create(st.guardJoin, st.guardPred);
@@ -966,8 +991,9 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
     } else {
       int t = e.tile - s.Tn;                       // popped by site k at iteration t
       Value *sz = C->arg_size() == 3 ? C->getArgOperand(2) : nullptr;
-      Value *en = pack(B, P, C->getArgOperand(1), sz, nullptr);
-      B.CreateStore(en, B.CreateGEP(I64, Q, B.getInt32(rowQ ? qEntry(s, t % s.d) : s.q0 + t % s.d)));
+      Value *en = noq ? nullptr : pack(B, P, C->getArgOperand(1), sz, nullptr);
+      if (noq) DQ->pushEvent(B, s.k, t, C->getArgOperand(1), sz);
+      else B.CreateStore(en, ssaQ ? (Value *)EQ[s.k][t % s.d] : B.CreateGEP(I64, Q, B.getInt32(rowQ ? qEntry(s, t % s.d) : s.q0 + t % s.d)));
       C->eraseFromParent(); a.I = nullptr;
     }
   }
@@ -994,26 +1020,48 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
       IRBuilder<> B(C);
       Value *run = B.CreateICmpSLT(c, B.getInt32(s.Tn));
       Instruction *Th = nullptr, *El = nullptr;
-      SplitBlockAndInsertIfThenElse(run, C->getIterator(), &Th, &El);
       Value *sz = C->arg_size() == 3 ? C->getArgOperand(2) : nullptr;
+      if (noq) DQ->pushLoop(B, s.k, sz);
+      SplitBlockAndInsertIfThenElse(run, C->getIterator(), &Th, &El);
       { IRBuilder<> T(Th);
         Value *cm = P.Sn > 1 ? T.CreateURem(c, T.getInt32(P.Sn)) : (Value *)T.getInt32(0);
         Value *idx = T.CreateAdd(f, T.CreateMul(cm, T.getInt32(P.cls[a.cls].a)), "p2c.a");
         Value *nz = sz ? T.CreateICmpNE(sz, ConstantInt::get(sz->getType(), 0)) : (Value *)T.getTrue();
         emitCp(T, M, GV, idx, C->getArgOperand(1), nz); }
-      { IRBuilder<> E(El);
+      if (!noq) { IRBuilder<> E(El);
         Value *en = pack(E, P, C->getArgOperand(1), sz, nullptr);
         Value *rw = E.CreateSub(c, E.getInt32(s.Tn));
         E.CreateStore(en, E.CreateGEP(I64, Q, rowQ ? E.CreateAdd(E.CreateMul(rw, E.getInt32(gCols[s.d])), E.getInt32(qEntry(s, 0))) : E.CreateAdd(rw, E.getInt32(s.q0)))); }
       C->eraseFromParent(); a.I = nullptr;
     }
+    if (noq) { BasicBlock *Lt = nullptr; for (BasicBlock *X : predecessors(PH)) if (X != PP) Lt = X;   // the copies above split the old latch
+      IRBuilder<> B(Lt->getTerminator()); DQ->loopEnd(B, c); }
   }
+  if (noq) DQ->preheader(Pre->getTerminator());
   if (Sn == 1) {
     Module &Mm = M;
     FunctionCallee Bar = Mm.getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(Type::getVoidTy(Cx), false));
     if (rowQ && envInt("P2C_QEARLY", 1)) for (Site &st : P.sites) { IRBuilder<> B(P.bar); popped[st.k] = B.CreateLoad(I64, B.CreateConstGEP1_32(I64, popP[st.d], st.q0), "p2c.qo"); }   // in flight during the barrier
     if (!getenv("P2C_NOBAR")) { IRBuilder<> B(P.bar); B.CreateCall(Bar); }   // P2C_NOBAR: measurement only (cost of this barrier), wrong results
+    // sites without a steady-state queue, by depth: trips t < d copy what the prologue queued, later trips the affine source
+    auto emitEntry = [&](Instruction *At, Site &st, Value *eo) {
+      IRBuilder<> B(At);
+      if (P.needG) { Instruction *Th = SplitBlockAndInsertIfThen(B.CreateICmpNE(eo, B.getInt64(0)), At->getIterator(), false); IRBuilder<> T(Th); emitCp(T, M, GV, hoisted[st.k], eo, T.CreateICmpNE(eo, T.getInt64(1))); }
+      else emitCp(B, M, GV, hoisted[st.k], eo, B.CreateICmpNE(eo, B.getInt64(0)));
+    };
+    std::map<int, std::vector<Site *>> dg; for (Site &st : P.sites) if (dqs(st)) dg[st.d].push_back(&st);
+    for (auto &kv : dg) {
+      Instruction *Th = nullptr, *El = P.bar;
+      if (!noq) { IRBuilder<> B(P.bar); SplitBlockAndInsertIfThenElse(B.CreateICmpSLT(DQ->trip(), B.getInt32(kv.first)), P.bar->getIterator(), &Th, &El); }
+      if (!noq) for (Site *sp : kv.second) { IRBuilder<> T(Th); Value *eo = T.CreateLoad(I64, T.CreateGEP(I64, Q, T.CreateAdd(DQ->trip(), T.getInt32(sp->q0))), "p2c.qo"); emitEntry(Th, *sp, eo); }
+      for (Site *sp : kv.second) { IRBuilder<> T(El); Value *ad = DQ->addr(T, sp->k);
+        if (P.needG) { Instruction *Tg = SplitBlockAndInsertIfThen(DQ->go(T, sp->k), El->getIterator(), false); IRBuilder<> G(Tg); emitCp(G, M, GV, hoisted[sp->k], ad, DQ->nz(G, sp->k)); }
+        else emitCp(T, M, GV, hoisted[sp->k], ad, DQ->nz(T, sp->k));
+        IRBuilder<> Z(El); DQ->step(Z, sp->k); }
+    }
+    if (noq) DQ->fixup(P.bar);
     for (Site &st : P.sites) {
+      if (dqs(st)) continue;
       Acc &a = *st.A;
       Value *eo = popped[st.k];
       if (rowQ && !eo) { IRBuilder<> B(P.bar); eo = B.CreateLoad(I64, B.CreateConstGEP1_32(I64, popP[st.d], st.q0), "p2c.qo"); }
@@ -1030,6 +1078,8 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
       (void)a;
     }
   }
+  if (DQ) DQ->finish(F);
+  if (ssaQ) { DominatorTree DT2(F); PromoteMemToReg(EQall, DT2); }
   if (!barred.empty()) lowerBarRed(F, GV, barred);
   // the shared area
   Type *NT = ArrayType::get(Type::getInt8Ty(Cx), P.N);
