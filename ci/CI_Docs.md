@@ -27,6 +27,16 @@ A matrix entry is marked Passed in GitHub only if the Slurm job log contains the
 
     --- Execution completed!
 
+### Lift tests (`ci/lift_test.sbatch`, `ci/lift_test.sh`, `ci/lift_cases.txt`)
+The matrix above has source kernels only. Most of the lift optimisation (the switches `CUPBOP_DIV_RESTORE`, `CUPBOP_SQRT_RESTORE`, `CUPBOP_ADDR_CARRY`, `CUPBOP_PARAM_SPAN`, the passes lo-pair, p2c-fold, lo-mma) acts on IR lifted from machine code only, so the matrix proves nothing about it. `examples/lift_*` have lifted IR as device code (`examples/lift.mk`): the source examples' host programs (saxpy, conv3, hotspot, nn, backprop) or small hosts with a CPU reference (`examples/lift_host.h`: cuBLAS sgeam, sdot, strsm, hgemm, g32, cuDNN fprop). Each row of `ci/lift_cases.txt` is one example, schedule, input and switch set, and is good when:
+* the program verdict or golden of `ci/check_correctness.sh` says PASS,
+* the bit record agrees: `examples/lift_d2h.c` hashes every device-to-host copy and `check_bits` compares with the group line of the example's `lift_bits.txt` (a reduction or a division one ulp off passes a tolerance),
+* the coverage patterns are in the translator log or in `<input>.passes.txt`: the transformation under test really acted on this input.
+
+The inputs are CuLifter output of sm_52 (hotspot, nn, backprop), sm_80 (hgemm, g32, fprop) and sm_90 builds (saxpy, conv3, transpose, sgeam, sdot, strsm), xz-compressed: about 0.5 MB in all, 0.2 MB for strsm alone. `lift_addr` is written by hand in the form of the sm_5x lifts: no lifted kernel here takes a negative 32-bit index or crosses 2^32, so a lost sign or carry in the folded 64-bit addresses would change no other answer; `LIFT_STRADDLE=<k>` puts the k-th `cudaMalloc` across 2^32. The rows run on the two SimX drivers of the matrix. Rows with `hw mufu` (`CUPBOP_SQRT_RESTORE`, which needs the rsqrt call that only the MUFU path keeps) are skipped there; they run with a SimX build that has MUFU.
+
+`XFAIL` and `XHANG` rows keep known bugs as regression tests: the row must stay wrong until the table changes, a row that starts to pass is an error (XPASS) that says to change it. `pre.ll.xz` is the raw IR through the lift optimisation that still runs outside the translator; once the translator does it, `LIFT_OPT_IN_TRANSLATOR=1` runs the same rows from `raw.ll.xz` with `CUPBOP_LIFT_OPT=1`. `LIFT_BITS_RECORD=1` rewrites `lift_bits.txt`, for a change that may change the bits.
+
 ### Vortex 3.0 configuration (`ci/rg-ci-setup-v3.sh`)
 `VORTEX_CONFIGS = -DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=32 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_L2_ENABLE` (the tensor examples add `-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_EXT_DXA_ENABLE`). The three extension flags are required, not tuning: 3.0 ships with the A extension off (SimX aborts silently on the first atomic), `atomicCAS` lowered to an lr/sc loop livelocks across the lanes of a warp (Zacas gives a single `amocas`), and without an L2 every core's private L1 is the last-level cache where atomics commit, so cross-core atomics lose updates. Changing `VORTEX_CONFIGS` is enough; the next build job rebuilds SimX.
 

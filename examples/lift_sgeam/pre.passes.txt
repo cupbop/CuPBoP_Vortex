@@ -1,0 +1,2 @@
+lo-pair: _Z11geam_ker: carry=36 carry2=4 high=32 leaf=20 mul=22 pack_joined=55 phi=2 phi_hi_kept_use=2 phi_lo_kept_use=2 sum=72
+lo-brfix: _Z11geam_ker: 21 branch blocks kept

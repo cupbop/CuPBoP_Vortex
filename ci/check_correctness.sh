@@ -22,6 +22,13 @@ check_golden() { # <golden> <result>: ci/compare_golden.py, tolerance 1e-4
   elif python3 ./ci/compare_golden.py "$G" "$R" --tolerance=1e-4; then RESULT="PASS"
   else WHY="compare_golden.py: $R differs from $G"; fi
 }
+check_bits() { # after a PASS: the bit record of the device-to-host copies against group $LIFT_BITS_GROUP of the example's lift_bits.txt ("-": no record for this row)
+  [ "$RESULT" = PASS ] && [ -n "${LIFT_BITS_GROUP:-}" ] && [ "$LIFT_BITS_GROUP" != - ] && [ -z "${LIFT_BITS_RECORD:-}" ] || return 0
+  local want got f="${EXAMPLE_DIR}/lift_d2h.txt"
+  want=$(sed -n "s/^$LIFT_BITS_GROUP //p" "${EXAMPLE_DIR}/lift_bits.txt" 2>/dev/null)
+  [ -f "$f" ] && got="$(cksum < "$f" | cut -d' ' -f1)-$(wc -l < "$f")-$(sha1sum < "$f" | cut -c1-16)" || got=none
+  [ "$got" = "$want" ] || { RESULT=FAIL; WHY="bit record $got, group $LIFT_BITS_GROUP wants ${want:-nothing}"; }
+}
 check_diff() { # <golden> <result>: exact match
   G=$1; R=$2
   if [ ! -f "$G" ] || [ ! -f "$R" ]; then WHY="golden ($G) or result ($R) missing"
@@ -48,6 +55,12 @@ case $TEST_NAME in
     check_golden "${EXAMPLE_DIR}/golden_result_streamcluster.txt" "${EXAMPLE_DIR}/output.txt" ;;
   btree)
     check_diff "${EXAMPLE_DIR}/golden_result_btree.txt" "${EXAMPLE_DIR}/output.txt" ;;
+  lift_nn|lift_backprop)   # lift examples (examples/lift.mk, ci/lift_test.sh): as the source example, plus the bit record
+    check_golden "${EXAMPLE_DIR}/golden_output.txt" "$CI_OUTPUT"; check_bits ;;
+  lift_hotspot)
+    check_golden "${EXAMPLE_DIR}/golden_output_hotspot.txt" "${EXAMPLE_DIR}/output.out"; check_bits ;;
+  lift_*)
+    check_marker "PASSED"; check_bits ;;
   *)
     RESULT="SKIP"; WHY="no correctness check defined for $TEST_NAME" ;;
 esac

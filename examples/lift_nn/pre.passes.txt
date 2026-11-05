@@ -1,0 +1,2 @@
+lo-pair: _Z6euclidP7l: carry=2 leaf=8 pack_joined=2 sum=2
+lo-brfix: _Z6euclidP7l: 2 branch blocks kept

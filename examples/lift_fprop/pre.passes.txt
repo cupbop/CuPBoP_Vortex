@@ -1,0 +1,10 @@
+lo-pair: sm80_xmma_fprop: carry=37 carry2=8 high=68 leaf=138 mul=12 pack_joined=76 pack_kept=3 phi=51 phi_hi_kept_use=51 phi_lo_kept_use=51 sum=113
+[p2c-fold] sm80_xmma_fprop: ring S=5 -> 1, block 128, sites 6, prologue events 0 loop-sites 6, guarded 0, classes: (a=4096 P=20480 base=40960 rows=1 -> 8192) (a=8192 P=40960 base=0 rows=1 -> 0), ring 
+[p2c-alias] sm80_xmma_fprop: left as it is: two copy groups not found
+lo-frag: sm80_xmma_fprop: 5 ldmatrix moved through phis
+lo-kperm: sm80_xmma_fprop: 9 of 12 ldmatrix with the k-slot permutation
+lo-ldsm: sm80_xmma_fprop: 14 of 14 ldmatrix -> loads, 3 with the B lane permutation in the address
+lo-mma: sm80_xmma_fprop: 16 mma -> 4 groups, 4 WMMA (0 splits, 4 groups to the epoch end, 64 fragment words read there); n2kb4=4
+lo-f16: sm80_xmma_fprop: 32 fptrunc in 12 groups
+lo-hext: 48 fpext half inlined
+lo-brfix: sm80_xmma_fprop: 3 branch blocks kept

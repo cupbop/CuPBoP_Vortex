@@ -1,0 +1,2 @@
+lo-pair: _Z12saxpy_ke: high=4 pack_joined=4 sum=4
+lo-brfix: _Z12saxpy_ke: 1 branch blocks kept
