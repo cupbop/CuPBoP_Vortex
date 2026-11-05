@@ -3111,9 +3111,10 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
 // Both arms then run to the same barrier, so the region had two entry edges from X. add_warp_loop wraps one of them
 // (the first successor in the region; a region whose first arm is a chain of empty blocks counted as useless and got no
 // loop at all), the other edge runs past the loop header, and with a branch-only X everything in front of X had no
-// region either: that code ran once per physical warp with the values of slot 0, silently (lifted backprop s1p1,
-// sgeam s1 after adce, tg sm80 s1 after simplifycfg; when the walk met another stop as well the kernel was refused as
-// "two entry barriers": FA2, conv_1x1). Now, at schedule 1:
+// region either: that code ran once per physical warp with the values of slot 0, silently and only when there are
+// more slots than one, P < warps per CTA (lifted backprop s1p1 / p2 / p4, sgeam s1p1 / p2 after lo-stale and adce, tg sm80
+// s1p1 / p4 after simplifycfg; when the walk met another stop as well the kernel was refused as "two entry barriers":
+// FA2, conv_1x1). Now, at schedule 1:
 //   - a branch-only block whose every path reaches the region's barrier inside the region is part of the region, the
 //     walk goes on above it (greatest fixed point: taken as interior first, thrown out when an arm leaves the region);
 //   - a barrier block with such a branch is split in front of the branch (the caller, defer_two_arm); the branch goes
