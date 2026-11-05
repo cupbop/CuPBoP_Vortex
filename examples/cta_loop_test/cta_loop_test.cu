@@ -63,6 +63,20 @@ __global__ void k_last(int *o, const int *in, int *part, unsigned *done) {   // 
   __syncthreads();
   if (last && t == 0) { int s = 0; for (int b = 0; b < (int)gridDim.x; ++b) s += atomicAdd(&part[b], 0); o[0] = s; }
 }
+__global__ void k_ticket(int *o, int *ctr) {   // block numbers from an atomic ticket: order free, each ticket once
+  __shared__ int id;
+  if (threadIdx.x == 0) id = atomicAdd(ctr, 1);
+  __syncthreads();
+  o[id * blockDim.x + threadIdx.x] = id;
+  __syncthreads();   // the value is read before the next block's thread 0 may write it
+}
+__global__ void k_exit_bar(int *o) {   // a whole block leaves before its barrier
+  __shared__ int s;
+  if (blockIdx.x % 4 == 1) return;
+  if (threadIdx.x == 0) s = (int)blockIdx.x * 3;
+  __syncthreads();
+  o[blockIdx.x * blockDim.x + threadIdx.x] = s;
+}
 __global__ void k_spin(int *flag, int *o) {   // refused: block b waits for block b - 1
   const int b = blockIdx.x;
   if (threadIdx.x == 0) { if (b) while (atomicAdd(&flag[b - 1], 0) == 0) { } atomicExch(&o[b], b); __threadfence(); atomicExch(&flag[b], 1); }
@@ -112,6 +126,10 @@ int main(int argc, char **argv) {
     for (int b = 0; b < G; ++b) for (int t = 0; t < T; ++t) { int v = t; for (int k = 0; k < len[b]; ++k) v = v * 5 + k; CHECK(h[b * T + t] == v, "k_long %d %d", b, t); } }
   { const int G = 97; std::vector<int> a(G); int s = 0; for (int i = 0; i < G; ++i) { a[i] = i; s += a[i]; }
     int *da = put(a), *p = dev<int>(G, 0), *o = dev<int>(1, 0); unsigned *dn = dev<unsigned>(1, 0); k_last<<<G, 32>>>(o, da, p, dn); cudaDeviceSynchronize(); CHECK(get(o, 1)[0] == s, "k_last %d %d", get(o, 1)[0], s); }
+  { const int G = 211, T = 64; int *o = dev<int>(G * T, -1), *c = dev<int>(1, 0); k_ticket<<<G, T>>>(o, c); cudaDeviceSynchronize(); auto h = get(o, G * T);
+    for (int i = 0; i < G * T; ++i) CHECK(h[i] == i / T, "k_ticket [%d] = %d", i, h[i]);
+    int *e = dev<int>(G * T, -1); k_exit_bar<<<G, T>>>(e); cudaDeviceSynchronize(); auto he = get(e, G * T);
+    for (int i = 0; i < G * T; ++i) { int b = i / T; CHECK(he[i] == (b % 4 == 1 ? -1 : b * 3), "k_exit_bar [%d] = %d", i, he[i]); } }
   { const int G = 40; int *f = dev<int>(G, 0), *o = dev<int>(G, -1); k_spin<<<G, 32>>>(f, o); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == b, "k_spin %d", b); }
   { const int G = 40; int *f = dev<int>(G, 0), *o = dev<int>(G, -1); k_spin_vol<<<G, 32>>>(f, o, 0); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == b, "k_spin_vol %d", b); }
   { const int G = 40; int *l = dev<int>(1, 0), *o = dev<int>(G, -1); k_ticket_spin<<<G, 32>>>(l, o); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == 1, "k_ticket_spin %d", b); }

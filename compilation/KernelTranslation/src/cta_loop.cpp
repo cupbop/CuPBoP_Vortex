@@ -78,6 +78,8 @@ Mode cta_loop_mode() {
   std::exit(1);
 }
 bool report() { return cupbop_debug() || std::getenv("CUPBOP_CTA_LOOP_REPORT"); }
+// CUPBOP_CTA_LOOP_NEG=skip|nobar: negative controls, the conformance tests must fail with these (experiments/ctaloop)
+bool neg_control(const char *what) { const char *e = std::getenv("CUPBOP_CTA_LOOP_NEG"); return e && !std::strcmp(e, what); }
 
 // the CSR an asm "csrr $0, 0x..." reads, else -1
 int csr_of(const CallBase *C) {
@@ -180,8 +182,10 @@ std::string cta_loop_refusal(const std::set<Function *> &fs, Function *K) {
         if (!C) continue;
         Function *G = C->getCalledFunction();
         const std::string n = G ? G->getName().str() : "";
-        if (n.find("grid") != std::string::npos && n.find("sync") != std::string::npos) return "grid sync (" + n + ")";
-        if (n.find("cooperative") != std::string::npos || n.find("cudaCG") != std::string::npos || n.find("__cg_") != std::string::npos) return "cooperative groups (" + n + ")";
+        // cooperative groups at grid level (block-level ones became barriers)
+        if ((n.find("grid") != std::string::npos && n.find("sync") != std::string::npos) || n.find("grid_group") != std::string::npos || n.find("this_grid") != std::string::npos ||
+            n.find("cudaCG") != std::string::npos)
+          return "grid sync (" + n + ")";
         if (n.find("cluster") != std::string::npos) return "cluster (" + n + ")";
         if (n.find("mbarrier") != std::string::npos || n.find("__cupbop_tma") != std::string::npos || n.find("cp_async_bulk") != std::string::npos ||
             n.find("vx_dxa") != std::string::npos || n.find("cupbop_dxa") != std::string::npos)
@@ -338,6 +342,7 @@ void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
     if (!(dims >> i & 1)) continue;
     Value *nd = uniform_i32(B, read_cta_csr(B, CSR_GRID_DIM + i, "cta.n.ld"), "cta.n");
     st[i] = hw[i]; step[i] = nd; end[i] = g[i];
+    if (i == inner && neg_control("skip")) step[i] = B.CreateAdd(nd, B.getInt32(1));   // skips blocks: the checks must see it
     if (chunk_mode) {
       Value *k = ctx_word(B, Args, CTX_LOOP_PARAMS + 4 * i, "cta.k");
       Value *chunk = B.CreateICmpNE(k, B.getInt32(0));
@@ -403,7 +408,7 @@ void cta_loop_transform(Module *M) {
   const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
   const int sched = s ? std::atoi(s) : 0;
   if (sched != 1 && sched != 2) return;
-  if (!sreg_from_csr()) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP needs the CTA CSR reads (CUPBOP_SREG_TLS is set): off\n"); return; }
+  if (!sreg_from_csr() || !fast_entry_on()) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP needs the CTA CSR reads (CUPBOP_SREG_TLS or CUPBOP_FAST_ENTRY=0 is set): off\n"); return; }
   const bool call_mode = std::getenv("CUPBOP_CTA_LOOP_CALL") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_CALL"));
   // Legality is read from an optimized copy of the module: a CUDA source kernel has its values in allocas and its atomics
   // behind calls here, and a wait would hide behind them.
@@ -427,7 +432,7 @@ void cta_loop_transform(Module *M) {
     reachable(CK, cfs);
     const std::string why = CK ? cta_loop_refusal(cfs, CK) : std::string();
     if (!why.empty()) { std::fprintf(stderr, "[CuPBoP] cta_loop: %s: refused: %s\n", lookup.c_str(), why.c_str()); continue; }
-    const bool lmem = uses_local_memory(fs) || (std::getenv("CUPBOP_CTA_LOOP_SYNC") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_SYNC")));
+    const bool lmem = !neg_control("nobar") && (uses_local_memory(fs) || (std::getenv("CUPBOP_CTA_LOOP_SYNC") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_SYNC"))));
     const unsigned dims = block_dims_read(K);
     if (!dims) { std::fprintf(stderr, "[CuPBoP] cta_loop: %s: refused: reads no block index\n", lookup.c_str()); continue; }
     int inner = mode == M_AUTO ? cta_loop_pick_dim(dims) : mode - M_X;
