@@ -438,7 +438,7 @@ void lower_triton_input(Module *M) {
     nIntr++;
   }
   scalarize_half_casts(M);
-  if (const char *f = std::getenv("CUPBOP_TRITON_DUMP")) { // the module as the rest of the translator sees it
+  if (const char *f = std::getenv("CUPBOP_TRITON_DUMP")) { // the module as lo-mma, or with CUPBOP_TRITON_LOMMA=0 the rest of the translator, sees it
     std::error_code EC;
     raw_fd_ostream os(f, EC);
     if (!EC) M->print(os, nullptr);

@@ -59,6 +59,12 @@ static void dumpFile(llvm::Module *program, std::string name) {
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
+  // stock Triton IR: PTX asm and newer NVVM intrinsics -> what every later pass reads (triton_ir.cpp), then lo-mma on schedule 2
+  if (triton_cupbop_enabled()) {
+    normalize_ptx_kernel_cc(program);
+    lower_triton_input(program);
+    program = run_triton_lo_mma(program);
+  }
   // CUPBOP_LIFT_OPT: the lift optimisation sees the module as it was read; launch rewrites go to cupbop_launch_fix.txt
   program = run_lift_opt(program);
   launch_fix_collect(program);
@@ -69,8 +75,6 @@ int main(int argc, char **argv) {
   // LLVM 20 clang: kernels carry the ptx_kernel calling convention (no "kernel" annotation)
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
-  // stock Triton IR: PTX asm and newer NVVM intrinsics -> what every later pass reads (triton_ir.cpp)
-  if (triton_cupbop_enabled()) lower_triton_input(program);
   {
     // A module without any kernel entry (no nvvm.annotations "kernel" / ptx_kernel function) used to translate
     // into an ELF with an empty kernel table that only fails at launch. CuLifter's CPU-lifter output (kernel

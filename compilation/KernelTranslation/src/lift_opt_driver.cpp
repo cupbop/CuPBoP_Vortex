@@ -14,6 +14,7 @@
 // CUPBOP_LIFT_OPT_PIPE=<p>       replaces the first stage (mkp3.sh P3_PIPE; measurements)
 // CUPBOP_LIFT_OPT_P4=0           the pipeline of experiments/p3 alone: no row of schedule.inc, the queue of p2c-fold instead of lo-dq
 // CUPBOP_LIFT_OPT_STALE=0        without lo-stale (its default waits for a decision: tg sm75 -19.5%, dotproduct s2 +12.2%)
+// CUPBOP_TRITON_LOMMA (default 1)  lo-mma alone on stock Triton input (TRITON_CUPBOP=1), schedule 2 only: run_triton_lo_mma. =0: Triton input goes on as lower_triton_input left it
 // The passes' own switches (P2C_*, LO_*, LP_*) are read as in the opt step; LIFT_OPT_ENV gives mkp3.sh's defaults.
 //
 // Every translation reads the original input and runs the pipeline once, so the translations of examples/stack_fallback.sh
@@ -285,4 +286,33 @@ Module *run_lift_opt(Module *M) {
   M = reload_bitcode(M, std::getenv("CUPBOP_LIFT_OPT_BC"));
   if (folded) note_shared_fold(M);   // after the bytes above: launch_fix_collect takes the mark out again
   return M;
+}
+
+// A module's tensor operations can reach the TCU: not when CUPBOP_MMA_LOWERING=sw asks for the software forms or the build has no TCU, whose lowering lo-mma's WMMA calls would bypass
+static bool tcu_lowering() {
+  if (const char *e = std::getenv("CUPBOP_MMA_LOWERING"); e && std::string(e) == "sw") return false;
+  const char *c = std::getenv("VORTEX_CONFIGS");
+  return !c || !*c || std::string(c).find("-DVX_CFG_EXT_TCU_ENABLE") != std::string::npos;
+}
+
+// Stock Triton input: after lower_triton_input its mma and ldmatrix have the form of a lifted module, so lo-mma applies; the other lift passes find nothing there (experiments/triton/REPORT_KO.md).
+// is_lifted_module stays out of this: such a module is not lifted, and nothing else of run_lift_opt is for it. Schedule 1 keeps what lower_triton_input left: lo-mma makes matmul 9.1% slower there.
+// The steps are the measured ones, a filter in front of the plugin's opt (experiments/triton/scripts/liftpipe.sh, LIFTPIPE=lo-mma): text, lo-mma, text, llvm-as, the plugin's opt. See reload_text for why.
+// Of that script's settings only LO_F16_ACC reaches lo-mma (LIFT_OPT_ENV): P2C_STAGES belongs to p2c-fold, LO_HEXT to lo-hext, -instcombine-maxarray-size to instcombine.
+Module *run_triton_lo_mma(Module *M) {
+  if (const char *e = std::getenv("CUPBOP_TRITON_LOMMA"); e && std::atoi(e) == 0) return M;
+  const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
+  if (!s || std::atoi(s) != 2 || narrow_warp() || !tcu_lowering() || is_lifted_module(M)) return M;
+  fprintf(stderr, "[lift-opt] Triton input: lo-mma\n");
+  for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
+  std::string text;
+  raw_string_ostream(text) << *M;
+  M = reload_text(M, text);
+  run_pipeline(M, "lo-mma", nullptr);
+  VerifyModule(M);
+  text.clear();
+  raw_string_ostream(text) << *M;
+  M = reload_bitcode(reload_text(M, text), nullptr);
+  run_pipeline(M, "always-inline,globaldce,function(scalarizer<load-store>)", nullptr);
+  return reload_bitcode(M, nullptr);
 }
