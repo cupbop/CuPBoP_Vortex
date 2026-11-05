@@ -1,6 +1,7 @@
 #pragma once
 
 #include "flag.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Instructions.h"
@@ -16,6 +17,9 @@ namespace cupbop {
 
 using namespace llvm;
 using namespace std;
+
+// the calls a replacement pass rewrites, in program order (stable_order.h)
+using CallSet = llvm::SetVector<CallInst *>;
 
 class ReplaceWarpLevelPrimitive : public PassInfoMixin<ReplaceWarpLevelPrimitive> {
 
@@ -38,30 +42,30 @@ private:
   /// @brief replace warp vote for flat mapping
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpVoteFlat(Module &m, const set<CallInst *> &replace);
+  void replaceWarpVoteFlat(Module &m, const CallSet &replace);
   /// @brief replace warp vote for 1-to-1 mapping
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpVote1to1(Module &m, const set<CallInst *> &replace);
+  void replaceWarpVote1to1(Module &m, const CallSet &replace);
   // core mapping with sub-passes: staged operands + uniform glue (hardware ops per sub-pass)
-  void replaceWarpVoteStaged(Module &m, const set<CallInst *> &replace);
-  void replaceWarpShflStaged(Module &m, const set<CallInst *> &replace);
+  void replaceWarpVoteStaged(Module &m, const CallSet &replace);
+  void replaceWarpShflStaged(Module &m, const CallSet &replace);
   /// @brief replace warp shuffle for flat mappping (x86)
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpVoteX86(Module &m, const set<CallInst *> &replace);
+  void replaceWarpVoteX86(Module &m, const CallSet &replace);
   /// @brief replace warp shuffle for flat mappping
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpShflFlat(Module &m, const set<CallInst *> &replace);
+  void replaceWarpShflFlat(Module &m, const CallSet &replace);
   /// @brief replace warp shuffle for 1-to-1 mapping
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpShfl1to1(Module &m, const set<CallInst *> &replace);
+  void replaceWarpShfl1to1(Module &m, const CallSet &replace);
   /// @brief replace warp shuffle for flat mappping (x86)
   /// @param m the module where the instructions will be replaced
   /// @param replace the call instructions to be replaced
-  void replaceWarpShflX86(Module &m, const set<CallInst *> &replace);
+  void replaceWarpShflX86(Module &m, const CallSet &replace);
 };
 
 }
