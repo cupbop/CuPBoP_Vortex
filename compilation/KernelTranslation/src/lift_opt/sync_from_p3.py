@@ -104,7 +104,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) != 2:
         die(__doc__)
-    p3, p4 = args
+    p3, p4 = map(os.path.abspath, args)   # patch runs in the temporary directory
     check = "--check" in sys.argv[1:]
     bs, bs4 = open(f"{p3}/tools/build.sh").read(), open(f"{p4}/tools/build4.sh").read()
     cm, names = sources_cmake(bs, bs4)
