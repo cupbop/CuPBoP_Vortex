@@ -221,6 +221,14 @@ Module *run_lift_opt(Module *M) {
   if (row) { for (auto &e : row->env) if (e.name) setenv(e.name, e.value, 0); }
   else for (auto &e : LIFT_OPT_NO_P4_ENV) setenv(e.name, e.value, 0);
 
+  // mkp3.sh reads text, the harnesses hand over bitcode through llvm-as and opt: the same IR with other use lists, and lo-dq walks them (g32: two words swapped). Start from
+  // what the script starts from, whatever the input file was.
+  {
+    std::string in;
+    raw_string_ostream(in) << *M;
+    M = reload_text(M, in);
+  }
+
   bool folded = false, fold_seen = false;
   PassInstrumentationCallbacks PIC;
   PIC.registerAfterPassCallback([&](StringRef P, Any, const PreservedAnalyses &PA) {
