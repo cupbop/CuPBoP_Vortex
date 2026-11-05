@@ -146,19 +146,23 @@ public:
 
   bool lower() {
     static const std::regex mov(R"(^(?:@(!?)\$(\d+)\s+)?mov\.[bus]\d+\s+\$(\d+)\s*,\s*(\$\d+|0x[0-9a-fA-F]+|-?\d+)$)");
-    static const std::regex ld(R"(^(?:@(!?)\$(\d+)\s+)?ld((?:\.[A-Za-z0-9_:]+)+)\s+(\{[^}]*\}|\$\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]$)");
-    static const std::regex st(R"(^(?:@(!?)\$(\d+)\s+)?st((?:\.[A-Za-z0-9_:]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*(\{[^}]*\}|\$\d+)$)");
+    // a trailing $n is the cache policy of .L2::cache_hint; createpolicy makes that policy, which means nothing here
+    static const std::regex ld(R"(^(?:@(!?)\$(\d+)\s+)?ld((?:\.[A-Za-z0-9_:]+)+)\s+(\{[^}]*\}|\$\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\](?:\s*,\s*\$\d+)?$)");
+    static const std::regex st(R"(^(?:@(!?)\$(\d+)\s+)?st((?:\.[A-Za-z0-9_:]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*(\{[^}]*\}|\$\d+)(?:\s*,\s*\$\d+)?$)");
+    static const std::regex policy(R"(^createpolicy\.[A-Za-z0-9_:.]+\s+\$\d+\s*,.*$)");
     const auto stmts = split_statements(text);
     // parse everything first: a form with one unknown statement stays untouched
     for (const auto &s : stmts) {
       std::smatch m;
       if (std::regex_match(s, m, mov)) { if (m[2].matched) return false; continue; }
+      if (std::regex_match(s, policy)) continue;
       if (std::regex_match(s, m, ld) || std::regex_match(s, m, st)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
       return false;
     }
     IRBuilder<> B(CI);
     for (const auto &s : stmts) {
       std::smatch m;
+      if (std::regex_match(s, policy)) continue;
       if (std::regex_match(s, m, mov)) {
         const unsigned d = std::stoi(m[3].str());
         if (d >= nOut) die("mov to an input", text);
