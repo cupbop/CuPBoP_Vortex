@@ -1,4 +1,5 @@
 #include "memory_hierarchy.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -28,7 +29,7 @@ void mem_share2global(llvm::Module *M) {
   llvm::Type *Int64T = Type::getInt64Ty(*C);
   llvm::Type *Int8T = Type::getInt8Ty(*C);
 
-  std::map<GlobalVariable *, GlobalVariable *> corresponding_global_memory;
+  llvm::MapVector<GlobalVariable *, GlobalVariable *> corresponding_global_memory;
   std::set<llvm::Instruction *> need_remove;
   std::set<GlobalVariable *> need_remove_share_memory;
 
@@ -280,7 +281,7 @@ void mem_share2global_sche_2(llvm::Module *M) {
     }
   }
 
-  DenseMap<GlobalVariable*, GlobalVariable*> MapToSlicedGlobal;
+  llvm::MapVector<GlobalVariable*, GlobalVariable*> MapToSlicedGlobal;
 
   // 2) Create per-CTA slice globals in AS=1
   auto createNoTLSGlobal = [&](Type *Ty, StringRef Name) -> GlobalVariable* {
@@ -859,7 +860,7 @@ void mem_constant2global(llvm::Module *M, std::ofstream &fout) {
   llvm::Type *Int64T = Type::getInt64Ty(*C);
   llvm::Type *Int8T = Type::getInt8Ty(*C);
 
-  std::map<GlobalVariable *, GlobalVariable *> corresponding_global_memory;
+  llvm::MapVector<GlobalVariable *, GlobalVariable *> corresponding_global_memory;
   std::set<llvm::Instruction *> need_remove;
   std::set<GlobalVariable *> need_remove_constant_memory;
 

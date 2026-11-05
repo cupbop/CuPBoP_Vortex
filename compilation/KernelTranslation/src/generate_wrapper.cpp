@@ -2,6 +2,8 @@
 #include "base_address.h"
 #include "tool.h"
 #include "cg_sync.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
@@ -1469,7 +1471,7 @@ void describe_dyn_stack(llvm::Module *M) {
   LLVMContext &C = M->getContext();
   auto *I64 = Type::getInt64Ty(C);
   // run-time sized allocas per function (any non-static alloca once the module has one with a non-constant count)
-  std::map<Function *, std::vector<AllocaInst *>> dyn;
+  llvm::MapVector<Function *, std::vector<AllocaInst *>> dyn;
   bool any_var = false;
   for (Function &F : *M) {
     if (F.isDeclaration()) continue;
@@ -1492,7 +1494,7 @@ void describe_dyn_stack(llvm::Module *M) {
       if (cyc.count(AI->getParent()) && why.empty()) why = "alloca on a CFG cycle in " + kv.first->getName().str();
   }
   // direct callees, indirect calls, address-taken functions
-  std::map<Function *, std::set<Function *>> callees;
+  std::map<Function *, llvm::SetVector<Function *>> callees;
   std::set<Function *> has_indirect, has_caller, addr_taken;
   for (Function &F : *M) {
     if (F.isDeclaration()) continue;
@@ -1523,7 +1525,7 @@ void describe_dyn_stack(llvm::Module *M) {
     }
   }
   // functions that reach a run-time sized alloca through direct calls
-  std::set<Function *> reach;
+  llvm::SetVector<Function *> reach;
   for (auto &kv : dyn) reach.insert(kv.first);
   for (bool ch = true; ch;) {
     ch = false;

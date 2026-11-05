@@ -1,6 +1,7 @@
 #include "tool.h"
 #include "warp_func.h"
 #include "flag.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
@@ -966,18 +967,27 @@ void hoist_block_constant_loads(llvm::Module *M) {
     k = Key(gv, tls, off.getSExtValue(), L->getType());
     return true;
   };
+  // the entry loads go in the module order of the globals, then tls, offset and first use: the map's own order follows
+  // the pointers in the key, and it places these loads
+  std::map<llvm::GlobalVariable *, unsigned> gv_rank;
+  for (auto &gv : M->globals()) gv_rank.emplace(&gv, gv_rank.size());
   unsigned n_funcs = 0, n_loads = 0, n_entry = 0, n_straight = 0;
   llvm::MDNode *empty = llvm::MDNode::get(M->getContext(), {});
   for (auto &F : *M) {
     if (F.isDeclaration() || writers.count(&F)) continue;
     std::map<Key, std::vector<llvm::LoadInst *>> loads;
+    std::map<Key, unsigned> first_use;
     unsigned most_in_one_block = 0;
     for (auto &BB : F) {
       std::map<Key, unsigned> here;
       for (auto &I : BB)
         if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
           Key k;
-          if (L->isSimple() && key_of(L, k)) { loads[k].push_back(L); most_in_one_block = std::max(most_in_one_block, ++here[k]); }
+          if (L->isSimple() && key_of(L, k)) {
+            first_use.emplace(k, first_use.size());
+            loads[k].push_back(L);
+            most_in_one_block = std::max(most_in_one_block, ++here[k]);
+          }
         }
     }
     if (loads.empty()) continue;
@@ -999,7 +1009,14 @@ void hoist_block_constant_loads(llvm::Module *M) {
     // pointed at it was the translator crash of the first version (bh-cuda flat schedule, virt_warp_test L16).
     llvm::IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
     std::vector<std::pair<llvm::LoadInst *, llvm::Value *>> repl;
-    for (auto &[k, ls] : loads) {
+    std::vector<Key> keys;
+    for (auto &kv : loads) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end(), [&](const Key &a, const Key &b) {
+      return std::make_tuple(gv_rank.at(std::get<0>(a)), std::get<1>(a), std::get<2>(a), first_use.at(a)) <
+             std::make_tuple(gv_rank.at(std::get<0>(b)), std::get<1>(b), std::get<2>(b), first_use.at(b));
+    });
+    for (const Key &k : keys) {
+      auto &ls = loads[k];
       if (ls.size() < 2) continue;
       auto [gv, tls, off, T] = k;
       llvm::Value *addr = gv;
@@ -4163,8 +4180,8 @@ std::string maybeDemangle(StringRef Name) {
   return Name.str();
 }
 
-DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
-  DenseMap<CallInst *, WmmaCallDesc> CallToDesc;
+llvm::MapVector<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
+  llvm::MapVector<CallInst *, WmmaCallDesc> CallToDesc;   // program order: this order adds the replacement declarations
 
   auto toFragSuffix = [](WmmaFragKind K) -> const char * {
     switch (K) {
@@ -4371,7 +4388,7 @@ DenseMap<CallInst *, WmmaCallDesc> collectWMMADesc(llvm::Module *M) {
 }
 
 void replace_wmma_intrinsics(llvm::Module *M) {
-  DenseMap<CallInst *, WmmaCallDesc> CallToDesc = collectWMMADesc(M);
+  llvm::MapVector<CallInst *, WmmaCallDesc> CallToDesc = collectWMMADesc(M);
   SmallPtrSet<Function *, 8> ToErase;
 
   DBG(for (auto &It : CallToDesc) {
