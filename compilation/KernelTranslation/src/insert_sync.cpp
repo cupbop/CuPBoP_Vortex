@@ -3,6 +3,7 @@
 #include "handle_sync.h"
 #include "tool.h"
 #include "cg_sync.h"
+#include "llvm/ADT/SetVector.h"
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -548,7 +549,7 @@ public:
     if (s2_skip_cond_barriers(F))
       return 0;
     bool changed = false;
-    std::set<BasicBlock *> if_head;
+    llvm::SetVector<BasicBlock *> if_head;   // block order: this order places and numbers the if_end blocks
     // insert an extra block for the following case
     // 1) there is a merge point for an if-else branch,
     // but this merge point has other income edge
