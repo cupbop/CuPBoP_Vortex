@@ -4,7 +4,8 @@
 // uses NVVM intrinsics newer than this translator's LLVM. Both are lowered here, first thing, so that every later pass
 // sees plain loads, stores and the intrinsics it already handles:
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
-//               load): the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               load), [@p] atom.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               {rcp,ex2,lg2,rsqrt,sqrt,sin,cos}.approx[.ftz].f32 (libdevice)
 //               mma.sync m16n8k16 f16 -> llvm.nvvm.mma.m16n8k16.row.col.f32.f32, the form of a lifted module
 //   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
 //               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> the ldmatrix asm of a lifted module
@@ -14,6 +15,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <cstdio>
@@ -86,6 +88,42 @@ MemOp parse_modifiers(const std::string &m) {
   return r;
 }
 
+struct AtomOp {
+  AtomicRMWInst::BinOp rmw = AtomicRMWInst::BAD_BINOP;
+  unsigned bits = 0;
+  bool fp = false, cas = false, ok = false;
+};
+
+// ".gpu.acq_rel.add.f32": scope and ordering do not narrow anything here (acq_rel covers what Triton asks for)
+AtomOp parse_atomic(const std::string &m) {
+  AtomOp r;
+  std::string op, ty;
+  size_t p = 0;
+  while (p < m.size()) {
+    size_t q = m.find('.', p + 1);
+    std::string t = m.substr(p + 1, q == std::string::npos ? std::string::npos : q - p - 1);
+    p = q == std::string::npos ? m.size() : q;
+    if (t == "gpu" || t == "cta" || t == "sys" || t == "acq_rel" || t == "acquire" || t == "release" || t == "relaxed") continue;
+    if (t.size() >= 2 && (t[0] == 'b' || t[0] == 'u' || t[0] == 's' || t[0] == 'f') && isdigit((unsigned char)t[1])) ty = t;
+    else op = t;
+  }
+  if (ty.empty() || (ty[1] != '3' && ty[1] != '6')) return r;
+  r.bits = std::stoi(ty.substr(1));
+  r.fp = ty[0] == 'f';
+  const bool sgn = ty[0] == 's';
+  if (op == "cas") r.cas = true;
+  else if (op == "add") r.rmw = r.fp ? AtomicRMWInst::FAdd : AtomicRMWInst::Add;
+  else if (op == "exch") r.rmw = AtomicRMWInst::Xchg;
+  else if (op == "and") r.rmw = AtomicRMWInst::And;
+  else if (op == "or") r.rmw = AtomicRMWInst::Or;
+  else if (op == "xor") r.rmw = AtomicRMWInst::Xor;
+  else if (op == "min" && !r.fp) r.rmw = sgn ? AtomicRMWInst::Min : AtomicRMWInst::UMin;
+  else if (op == "max" && !r.fp) r.rmw = sgn ? AtomicRMWInst::Max : AtomicRMWInst::UMax;
+  else return r;
+  r.ok = true;
+  return r;
+}
+
 // the asm of one call, statement by statement, on values: operand $i of the asm text is regs[i]
 class AsmLowering {
   CallInst *CI;
@@ -150,12 +188,14 @@ public:
     static const std::regex ld(R"(^(?:@(!?)\$(\d+)\s+)?ld((?:\.[A-Za-z0-9_:]+)+)\s+(\{[^}]*\}|\$\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\](?:\s*,\s*\$\d+)?$)");
     static const std::regex st(R"(^(?:@(!?)\$(\d+)\s+)?st((?:\.[A-Za-z0-9_:]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*(\{[^}]*\}|\$\d+)(?:\s*,\s*\$\d+)?$)");
     static const std::regex policy(R"(^createpolicy\.[A-Za-z0-9_:.]+\s+\$\d+\s*,.*$)");
+    static const std::regex atom(R"(^(?:@(!?)\$(\d+)\s+)?atom\.global((?:\.[a-z0-9_]+)+)\s+\$(\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*\$(\d+)(?:\s*,\s*\$(\d+))?$)");
     const auto stmts = split_statements(text);
     // parse everything first: a form with one unknown statement stays untouched
     for (const auto &s : stmts) {
       std::smatch m;
       if (std::regex_match(s, m, mov)) { if (m[2].matched) return false; continue; }
       if (std::regex_match(s, policy)) continue;
+      if (std::regex_match(s, m, atom)) { if (!parse_atomic(m[3].str()).ok) return false; continue; }
       if (std::regex_match(s, m, ld) || std::regex_match(s, m, st)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
       return false;
     }
@@ -170,6 +210,38 @@ public:
         if (v[0] == '$') regs[d] = reg(std::stoi(v.substr(1)));
         else regs[d] = outTy[d]->isIntegerTy() ? (Value *)ConstantInt::get(outTy[d], std::stoull(v, nullptr, 0))
                                                : B.CreateBitCast(B.getIntN(outTy[d]->getPrimitiveSizeInBits(), std::stoull(v, nullptr, 0)), outTy[d]);
+      } else if (std::regex_match(s, m, atom)) {
+        const AtomOp op = parse_atomic(m[3].str());
+        const unsigned d = std::stoi(m[4].str());
+        Value *P = pred(m[1].str(), m[2].str(), B);
+        Value *A = address(m[5].str(), m[6].str(), 1, B);
+        Value *V = reg(std::stoi(m[7].str()));
+        Value *Cmp = m[8].matched ? reg(std::stoi(m[8].str())) : nullptr;
+        Value *old = regs[d] ? regs[d] : Constant::getNullValue(outTy[d]);
+        guarded(P, B, [&](IRBuilder<> &G, Instruction *T) {
+          Type *IT = G.getIntNTy(op.bits);
+          Value *R;
+          if (op.cas) {
+            R = G.CreateExtractValue(G.CreateAtomicCmpXchg(A, as_bits(V, op.bits, G), as_bits(Cmp, op.bits, G), MaybeAlign(op.bits / 8),
+                                                           AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire), 0);
+          } else if (op.fp) {
+            if (op.bits != 32 || op.rmw != AtomicRMWInst::FAdd) die("atomic of this float type", text);
+            Module *M = CI->getModule();
+            Type *F32 = G.getFloatTy(), *PT = PointerType::get(CI->getContext(), 0);
+            auto *FT = FunctionType::get(F32, {PT, F32}, false);
+            R = G.CreateBitCast(G.CreateCall(M->getOrInsertFunction("__cupbop_atomic_fadd_f32_llc", FT),
+                                             {G.CreateAddrSpaceCast(A, PT), G.CreateBitCast(as_bits(V, op.bits, G), F32)}), IT);
+          } else {
+            R = G.CreateAtomicRMW(op.rmw, A, as_bits(V, op.bits, G), MaybeAlign(op.bits / 8), AtomicOrdering::AcquireRelease);
+          }
+          if (R->getType() != outTy[d]) R = G.CreateBitCast(R, outTy[d]);
+          if (!T) { regs[d] = R; return; }
+          BasicBlock *Then = T->getParent(), *Cont = CI->getParent();
+          PHINode *Phi = PHINode::Create(outTy[d], 2, "", Cont->begin());
+          Phi->addIncoming(R, Then);
+          Phi->addIncoming(old, Then->getSinglePredecessor());
+          regs[d] = Phi;
+        });
       } else if (std::regex_match(s, m, ld)) {
         const MemOp op = parse_modifiers(m[3].str());
         const std::vector<int> dst = operand_list(m[4].str());
@@ -228,6 +300,23 @@ public:
     return true;
   }
 };
+
+// One approximate math instruction, as libdevice writes some of them: the intrinsic the translator lowers to the MUFU or to libm
+bool math_asm_to_intrinsic(CallInst *CI, const std::string &a) {
+  static const std::regex form(R"(^\s*(rcp|ex2|lg2|rsqrt|sqrt|sin|cos)\.approx(\.ftz)?\.f32\s+\$0\s*,\s*\$1\s*;?\s*$)");
+  std::smatch m;
+  if (!std::regex_match(a, m, form) || CI->arg_size() != 1) return false;
+  IRBuilder<> B(CI);
+  Value *X = CI->getArgOperand(0);
+  Type *F32 = B.getFloatTy();
+  if (X->getType() != F32) X = B.CreateBitCast(X, F32);
+  const std::string name = "llvm.nvvm." + m[1].str() + ".approx" + m[2].str() + ".f";
+  Value *R = B.CreateCall(CI->getModule()->getOrInsertFunction(name, FunctionType::get(F32, {F32}, false)), {X});
+  if (CI->getType() != F32) R = B.CreateBitCast(R, CI->getType());
+  CI->replaceAllUsesWith(R);
+  CI->eraseFromParent();
+  return true;
+}
 
 // Triton's mma.sync (i32 registers, the accumulator tied to the result) -> the intrinsic a lifted module has, with its operand
 // order: a, b, c. Other shapes stay asm for lower_inline_mma_sync.
@@ -311,7 +400,7 @@ void lower_triton_input(Module *M) {
   for (CallInst *CI : calls) {
     if (CI->isInlineAsm()) {
       const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
-      if (mma_to_intrinsic(CI, a)) { nAsm++; continue; }
+      if (mma_to_intrinsic(CI, a) || math_asm_to_intrinsic(CI, a)) { nAsm++; continue; }
       if (handled_later(a)) continue;
       if (!AsmLowering(CI).lower()) die("unknown PTX asm", a);
       nAsm++;
@@ -328,6 +417,9 @@ void lower_triton_input(Module *M) {
       CI->eraseFromParent();
     } else if (n == "llvm.nvvm.div.full") {
       CI->replaceAllUsesWith(B.CreateFDiv(CI->getArgOperand(0), CI->getArgOperand(1)));
+      CI->eraseFromParent();
+    } else if (n == "llvm.nvvm.fabs.f32" || n == "llvm.nvvm.fabs.ftz.f32") {
+      CI->replaceAllUsesWith(B.CreateUnaryIntrinsic(Intrinsic::fabs, CI->getArgOperand(0)));
       CI->eraseFromParent();
     } else if (std::regex_match(n.str(), nvvm_f32)) {
       // LLVM 21 renamed these .f -> .f32. Under the new name the .ftz forms missed the MUFU and became libm calls.
