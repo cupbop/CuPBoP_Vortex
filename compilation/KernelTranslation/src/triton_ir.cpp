@@ -229,7 +229,7 @@ public:
             Module *M = CI->getModule();
             Type *F32 = G.getFloatTy(), *PT = PointerType::get(CI->getContext(), 0);
             auto *FT = FunctionType::get(F32, {PT, F32}, false);
-            R = G.CreateBitCast(G.CreateCall(M->getOrInsertFunction("__cupbop_atomic_fadd_f32_llc", FT),
+            R = G.CreateBitCast(G.CreateCall(M->getOrInsertFunction("__cuda_atomic_fadd_f32", FT),
                                              {G.CreateAddrSpaceCast(A, PT), G.CreateBitCast(as_bits(V, op.bits, G), F32)}), IT);
           } else {
             R = G.CreateAtomicRMW(op.rmw, A, as_bits(V, op.bits, G), MaybeAlign(op.bits / 8), AtomicOrdering::AcquireRelease);

@@ -935,28 +935,6 @@ float __cuda_atomic_fadd_f32(float *addr, float val) {
   return old;
 }
 
-// The Triton front pass (triton_ir.cpp) calls this one. Same serialization as __cuda_atomic_fadd_f32, but the word goes through
-// AMOs, which commit at the last-level cache: L1 is per core, so a plain load under the lock misses the other cores' updates.
-extern "C" __attribute__((noinline))
-float __cupbop_atomic_fadd_f32_llc(float *addr, float val) {
-  int lane = vx_thread_id();
-  float old = 0.0f;
-  for (int k = 0; k < 32; k++) {
-    if (lane == k) {
-      while (__atomic_exchange_n((int *)&__cuda_atomic_fadd_lock, 1,
-                                 __ATOMIC_ACQUIRE) != 0) { }
-      const int bits = __atomic_fetch_or((int *)addr, 0, __ATOMIC_RELAXED);
-      __builtin_memcpy(&old, &bits, 4);
-      const float sum = old + val;
-      int next;
-      __builtin_memcpy(&next, &sum, 4);
-      __atomic_exchange_n((int *)addr, next, __ATOMIC_RELAXED);
-      __atomic_store_n((int *)&__cuda_atomic_fadd_lock, 0, __ATOMIC_RELEASE);
-    }
-  }
-  return old;
-}
-
 // ── Warp-sum over the ACTIVE lanes only ─────────────────────────────────────
 // Vortex 3.0's SHFL yields the reader's OWN value when the source lane is
 // inactive (simx alu_unit.cpp: "a masked source lane yields the reader's own
