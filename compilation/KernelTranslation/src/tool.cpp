@@ -2603,7 +2603,9 @@ void replace_asm_call(llvm::Module *M) {
               int lane_sched = 0;
               if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) lane_sched = std::atoi(e);
               Value *intra_warp_index;
-              if (lane_sched != 0) { // 1:1 and virt: hardware lane
+              if (lane_sched == 1 && getVirtGeom().subpasses > 1) { // sub-pass form: the logical lane (replace_built_in_function)
+                intra_warp_index = builder.CreateCall(M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.laneid", FunctionType::get(I32, {}, false)), {}, "laneid");
+              } else if (lane_sched != 0) { // 1:1 and virt: hardware lane
                 FunctionCallee fc = M->getOrInsertFunction(
                     "__cupbop_laneid", FunctionType::get(I32, {}, false));
                 CallInst *c = builder.CreateCall(fc, {}, "laneid");
@@ -5038,6 +5040,58 @@ void replace_nvvm_mma_intrinsics(llvm::Module *M) {
     CI->replaceAllUsesWith(Result);
     CI->eraseFromParent();
   }
+}
+
+// virt sub-pass form: the forms replace_nvvm_mma_intrinsics lowers, as replaceMmaStaged (warp_func.cpp) stages them.
+bool mma_subpass_form(const std::string &name, unsigned nargs, MmaSubpassForm &f, std::string &err) {
+  f = MmaSubpassForm();
+  std::string rest;
+  if (name.rfind("llvm.nvvm.mma.", 0) == 0) rest = name.substr(strlen("llvm.nvvm.mma."));
+  else if (name.rfind("cupbop.mma.", 0) == 0) rest = name.substr(strlen("cupbop.mma."));
+  else { err = "not an mma.sync"; return false; }
+  std::vector<std::string> tk;
+  for (size_t p = 0;;) {
+    size_t q = rest.find('.', p);
+    tk.push_back(rest.substr(p, q == std::string::npos ? std::string::npos : q - p));
+    if (q == std::string::npos) break;
+    p = q + 1;
+  }
+  const auto done = [&]() {
+    if (nargs == (unsigned)(f.nA + f.nB + f.nC)) return true;
+    err = "operand count";
+    return false;
+  };
+  if (rest == "m8n8k4.row.col.f64") {
+    f.sw = "__cupbop_mma_m8n8k4_f64f64"; f.nA = 1; f.nB = 1; f.nC = 2; f.f64 = true;
+    return done();
+  }
+  if (tk[0] == "m8n8k4" && tk.size() == 5 && (tk[1] == "row" || tk[1] == "col") && (tk[2] == "row" || tk[2] == "col") &&
+      tk[3] == "f32" && tk[4] == "f32") {
+    f.sw = "__cupbop_mma_m8n8k4_f16f32_" + tk[1] + "_" + tk[2]; f.nA = 2; f.nB = 2; f.nC = 8;
+    return done();
+  }
+  if (tk.size() < 4 || tk[1] != "row" || tk[2] != "col") { err = "only .row.col mma.sync is lowered"; return false; }
+  if ((tk[0] == "m16n8k16" || tk[0] == "m16n8k8") && tk.size() == 5 && tk[3] == "f16" && tk[4] == "f16") {
+    const bool k16 = tk[0] == "m16n8k16";
+    f.sw = "__cupbop_mma_" + tk[0] + "_f16f16"; f.tcu = "__cupbop_mma_m16n8k16_f16f16";
+    f.nA = k16 ? 4 : 2; f.nB = k16 ? 2 : 1; f.nC = 2; f.pad = !k16;
+    return done();
+  }
+  const bool sat = tk[3] == "satfinite";
+  const std::vector<std::string> sig(tk.begin() + (sat ? 4 : 3), tk.end());
+  std::string ta, tb, acc;
+  if (sig.size() == 2 && sig[0] == "f32" && sig[1] == "f32") { ta = tb = "f16"; acc = "f32"; }
+  else if (sig.size() == 1 || sig.size() == 2) {
+    if (sig[0] == "f16" || sig.back() == "f16") { err = "f16 accumulators of this shape are not lowered"; return false; }
+    ta = sig[0]; tb = sig.back();
+    acc = (tensor_is_int8(ta) || ta == "s4" || ta == "u4" || ta == "b1") ? "s32" : "f32";
+  } else { err = "unrecognized signature"; return false; }
+  TensorForm S;
+  if (!classify_mma_form(tk[0], ta, tb, sat, acc, S, err)) return false;
+  f.sw = "__cupbop_mma_" + S.geom + "_" + S.tag;
+  if (tensor_is_f16ish(ta)) { f.tcu = "__cupbop_mma_m16n8k16_" + S.tag; f.pad = !S.full; }
+  f.nA = S.nA; f.nB = S.nB; f.nC = 4;
+  return done();
 }
 
 // =============================================================================

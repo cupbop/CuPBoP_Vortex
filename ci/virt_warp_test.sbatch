@@ -16,7 +16,8 @@ OUT=$CuPBoP_PATH/ci/logs_v3/virt_warp_test_$SLURM_JOB_ID; mkdir -p $OUT
 VXH=$VORTEX_HOME
 CFG32="$VORTEX_CONFIGS"
 CFG16="-DVX_CFG_NUM_CORES=4 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_NUM_THREADS=16 -DVX_CFG_EXT_A_ENABLE -DVX_CFG_EXT_ZACAS_ENABLE -DVX_CFG_L2_ENABLE"
-cupbop_v3_ensure_simx $VXH/build64_cupbop_nt16 "$CFG16" || exit 1
+NT16B=${VORTEX_PATH_NT16:-$VXH/build64_cupbop_nt16}   # VORTEX_PATH_NT16: private overlay of the NT16 build (own kernel cells)
+[ -n "${VORTEX_PATH_NT16:-}" ] || cupbop_v3_ensure_simx $NT16B "$CFG16" || exit 1
 run() { # tag sched vortex_path configs nt [env...]
   local tag=$1 sched=$2 vp=$3 cfg=$4 nt=$5; shift 5
   ( cd examples/virt_warp_test && make clean > /dev/null 2>&1; rm -f ci_output.txt
@@ -29,17 +30,17 @@ run s1_nt32       1 $VORTEX_PATH "$CFG32" 32
 # translator refuses by default (no per-sub-pass loop gate yet) -> translate anyway to test the rest
 run s1_nt32_l16   1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
 run s1_nt32_l16p1 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-run s1_nt16       1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-run s1_nt16_p1    1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+run s1_nt16       1 $NT16B "$CFG16" 16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
+run s1_nt16_p1    1 $NT16B "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
 ( cd examples/virt_warp_test && make clean > /dev/null 2>&1
-  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
+  env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
 echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops are unsupported at S>1' $OUT/reject_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)'); $(grep -c 'trip count depends on the lane' $OUT/reject_nt16.log) sites"
 ( cd examples/virt_gate_refuse && make clean > /dev/null 2>&1
-  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/refuse_gate_nt16.log 2>&1 )
+  env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/refuse_gate_nt16.log 2>&1 )
 echo "== refuse_gate_nt16 (arms that cannot be gated): $(grep -q 'would be decided by sub-pass 0 for the whole CUDA warp; refusing' $OUT/refuse_gate_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)')"
 # 16 lanes without warp ops (single warp loop, S = 2): __syncthreads in a thread-dependent loop (nt16s1, 11/3)
 ( cd examples/dotproduct && make clean > /dev/null 2>&1; rm -f ci_output.txt
-  env VORTEX_PATH=$VXH/build64_cupbop_nt16 VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 CI_RUN_ARGS="-n 16384" RUN_ARGS="-n 16384" > $OUT/dotproduct_nt16.log 2>&1; cp -f ci_output.txt $OUT/dotproduct_nt16.out 2>/dev/null )
+  env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 CI_RUN_ARGS="-n 16384" RUN_ARGS="-n 16384" > $OUT/dotproduct_nt16.log 2>&1; cp -f ci_output.txt $OUT/dotproduct_nt16.out 2>/dev/null )
 echo "== dotproduct_nt16: $(grep -c 'FAILED!' $OUT/dotproduct_nt16.out) failed, $(grep -m1 'GPU result' $OUT/dotproduct_nt16.out), $(grep -m1 'CPU result' $OUT/dotproduct_nt16.out)"
 # ldmatrix / stmatrix forms, checked on the host against the PTX layout: 9 lines PASS each
 ldsm() { # tag sched vortex_path configs nt [env...]
@@ -51,8 +52,16 @@ ldsm() { # tag sched vortex_path configs nt [env...]
 ldsm s2_nt32 2 $VORTEX_PATH "$CFG32" 32
 ldsm s1_nt32 1 $VORTEX_PATH "$CFG32" 32
 ldsm s1_nt32_l16 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16
-ldsm s1_nt16 1 $VXH/build64_cupbop_nt16 "$CFG16" 16
-ldsm s1_nt16_p1 1 $VXH/build64_cupbop_nt16 "$CFG16" 16 CUPBOP_VIRT_WARPS=1
+ldsm s1_nt16 1 $NT16B "$CFG16" 16
+ldsm s1_nt16_p1 1 $NT16B "$CFG16" 16 CUPBOP_VIRT_WARPS=1
+# mma.sync forms at 16 lanes on the NT16 build without TCU (software glue; each test checks itself against a CPU model / A100 golden)
+mma16() { # example
+  local t=$1
+  ( cd examples/$t && make clean > /dev/null 2>&1; rm -f ci_output.txt
+    env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/mma16_$t.log 2>&1; cp -f ci_output.txt $OUT/mma16_$t.out 2>/dev/null )
+  echo "== mma16_$t: $(grep -c PASSED $OUT/mma16_$t.out 2>/dev/null) PASSED, $(grep -c 'FAIL\|mismatch' $OUT/mma16_$t.out 2>/dev/null) FAIL/mismatch lines"
+}
+for t in tcu_dt_mma_tf32 tcu_dt_mma_int8 tcu_dt_mma_fp8 mma884_test; do mma16 $t; done
 cp -f $OUT/golden_s2_nt32.out examples/virt_warp_test/golden_output.txt
 python3 - $OUT <<'PY'
 import sys,glob,os
