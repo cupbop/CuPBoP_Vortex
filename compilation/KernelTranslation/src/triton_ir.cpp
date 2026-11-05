@@ -5,6 +5,8 @@
 // sees plain loads, stores and the intrinsics it already handles:
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
 //               load), [@p] atom.global.*, [@p] red.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               { .reg .b32 ...; prmt.b32, and.b32, shr.b32, shl.b32, add.u32, lop3.b32 }: the fp8 -> fp16 conversions of
+//               ElementwiseOpToLLVM below capability 89
 //               {rcp,ex2,lg2,rsqrt,sqrt,sin,cos}.approx[.ftz].f32 (libdevice)
 //               mma.sync m16n8k16 f16 -> llvm.nvvm.mma.m16n8k16.row.col.f32.f32, the form of a lifted module
 //   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
@@ -18,6 +20,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -32,6 +35,13 @@ namespace {
 [[noreturn]] void die(const std::string &what, const std::string &a) {
   fprintf(stderr, "kernelTranslator: error: Triton input: %s: %s\n", what.c_str(), a.c_str());
   exit(1);
+}
+
+// "{ ...; }" -> what is inside: a PTX scope, whose .reg names this file keeps per asm call anyway
+std::string unscoped(const std::string &a) {
+  const size_t b = a.find_first_not_of(" \t\r\n"), e = a.find_last_not_of(" \t\r\n");
+  if (b == std::string::npos || a[b] != '{' || a[e] != '}') return a;
+  return a.substr(b + 1, e - b - 1);
 }
 
 std::vector<std::string> split_statements(const std::string &a) {
@@ -55,6 +65,25 @@ std::vector<int> operand_list(const std::string &s) {
   for (auto it = std::sregex_iterator(s.begin(), s.end(), tok); it != std::sregex_iterator(); ++it)
     out.push_back(std::stoi((*it)[1].str()));
   return out;
+}
+
+// "a, b" -> {"a", "b"}
+std::vector<std::string> comma_list(const std::string &s) {
+  std::vector<std::string> out;
+  size_t p = 0;
+  while (p <= s.size()) {
+    const size_t q = std::min(s.find(',', p), s.size());
+    const std::string t = s.substr(p, q - p);
+    const size_t b = t.find_first_not_of(" \t\r\n"), e = t.find_last_not_of(" \t\r\n");
+    out.push_back(b == std::string::npos ? "" : t.substr(b, e - b + 1));
+    p = q + 1;
+  }
+  return out;
+}
+
+bool is_literal(const std::string &s) {
+  static const std::regex lit(R"(^(?:0x[0-9a-fA-F]+|\d+)$)");
+  return std::regex_match(s, lit);
 }
 
 struct MemOp {
@@ -131,6 +160,7 @@ class AsmLowering {
   unsigned nOut = 0;
   std::vector<Value *> regs;
   std::vector<Type *> outTy;
+  std::map<std::string, Value *> named;  // the 32-bit .reg names of the asm
 
 public:
   explicit AsmLowering(CallInst *C) : CI(C), text(cast<InlineAsm>(C->getCalledOperand())->getAsmString()) {
@@ -192,6 +222,75 @@ public:
     B.SetInsertPoint(CI);
   }
 
+  // ".reg .b32 a<2>, t" -> a0, a1, t
+  bool declare(const std::string &list) {
+    static const std::regex item(R"(^([A-Za-z_]\w*?)(?:<(\d+)>)?$)");
+    for (const std::string &n : comma_list(list)) {
+      std::smatch m;
+      if (!std::regex_match(n, m, item)) return false;
+      if (!m[2].matched) { named[n] = nullptr; continue; }
+      for (int i = 0; i < std::stoi(m[2].str()); ++i) named[m[1].str() + std::to_string(i)] = nullptr;
+    }
+    return true;
+  }
+  bool word_operand(const std::string &s) {
+    static const std::regex out(R"(^\$\d+$)");
+    return std::regex_match(s, out) || is_literal(s) || named.count(s);
+  }
+  // <destination>, <sources>[, <literal>] of an ALU statement
+  bool alu_statement(const std::string &opc, const std::vector<std::string> &o) {
+    const unsigned want = opc == "prmt" ? 4 : opc == "lop3" ? 5 : 3;
+    if (o.size() != want || is_literal(o[0])) return false;
+    for (const std::string &s : o) if (!word_operand(s)) return false;
+    return opc == "and" || opc == "add" || is_literal(o.back());   // a selector, table or shift amount in a register has no lowering here
+  }
+  Value *word(const std::string &s, IRBuilder<> &B) {
+    if (is_literal(s)) return B.getInt32((uint32_t)std::stoull(s, nullptr, 0));
+    Value *V = s[0] == '$' ? reg(std::stoi(s.substr(1))) : named.at(s);
+    if (!V) die("read of a register never written", text);
+    return as_bits(V, 32, B);
+  }
+  void set_word(const std::string &s, Value *V, IRBuilder<> &B) {
+    if (s[0] != '$') { named[s] = V; return; }
+    const unsigned d = std::stoi(s.substr(1));
+    if (d >= nOut) die("write to an input", text);
+    if (outTy[d]->getPrimitiveSizeInBits() != 32) die("32-bit result into another width", text);
+    regs[d] = B.CreateBitCast(V, outTy[d]);
+  }
+  // Default mode: the bytes of {b, a} are numbered 0..7, nibble i of the selector picks byte i of the result, its top bit
+  // spreads the picked byte's sign over the byte
+  Value *prmt(Value *A, Value *C, uint32_t sel, IRBuilder<> &B) {
+    Value *R = B.getInt32(0);
+    for (unsigned i = 0; i < 4; ++i) {
+      const unsigned nib = sel >> (4 * i) & 0xF, src = nib & 7;
+      Value *Byte = B.CreateLShr(src < 4 ? A : C, 8 * (src & 3));
+      Byte = nib & 8 ? B.CreateAShr(B.CreateShl(Byte, 24), 31) : Byte;
+      R = B.CreateOr(R, B.CreateShl(B.CreateAnd(Byte, 0xFF), 8 * i));
+    }
+    return R;
+  }
+  // Bit i of the table is the result for a, b, c = bits 2, 1, 0 of i
+  Value *lop3(Value *A, Value *C, Value *D, uint32_t lut, IRBuilder<> &B) {
+    Value *R = B.getInt32(0);
+    for (unsigned i = 0; i < 8; ++i) {
+      if (!(lut >> i & 1)) continue;
+      Value *X = i & 4 ? A : B.CreateNot(A), *Y = i & 2 ? C : B.CreateNot(C), *Z = i & 1 ? D : B.CreateNot(D);
+      R = B.CreateOr(R, B.CreateAnd(B.CreateAnd(X, Y), Z));
+    }
+    return R;
+  }
+  void alu(const std::string &opc, const std::vector<std::string> &o, IRBuilder<> &B) {
+    const auto lit = [&](const std::string &s) { return (uint32_t)std::stoull(s, nullptr, 0); };
+    Value *A = word(o[1], B), *R;
+    if (opc == "prmt") R = prmt(A, word(o[2], B), lit(o[3]), B);
+    else if (opc == "lop3") R = lop3(A, word(o[2], B), word(o[3], B), lit(o[4]), B);
+    else if (opc == "shl") R = lit(o[2]) < 32 ? B.CreateShl(A, lit(o[2])) : B.getInt32(0);
+    else if (opc == "shr") R = lit(o[2]) < 32 ? B.CreateLShr(A, lit(o[2])) : B.getInt32(0);
+    else if (opc == "and") R = B.CreateAnd(A, word(o[2], B));
+    else R = B.CreateAdd(A, word(o[2], B));
+    set_word(o[0], R, B);
+  }
+
   bool lower() {
     static const std::regex mov(R"(^(?:@(!?)\$(\d+)\s+)?mov\.[bus]\d+\s+\$(\d+)\s*,\s*(\$\d+|0x[0-9a-fA-F]+|-?\d+)$)");
     // a trailing $n is the cache policy of .L2::cache_hint; createpolicy makes that policy, which means nothing here
@@ -201,12 +300,17 @@ public:
     static const std::regex atom(R"(^(?:@(!?)\$(\d+)\s+)?atom\.global((?:\.[a-z0-9_]+)+)\s+\$(\d+)\s*,\s*\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*\$(\d+)(?:\s*,\s*\$(\d+))?$)");
     // an atomic whose result nobody reads
     static const std::regex red(R"(^(?:@(!?)\$(\d+)\s+)?red\.global((?:\.[a-z0-9_]+)+)\s+\[\s*\$(\d+)(?:\s*\+\s*(-?\d+))?\s*\]\s*,\s*\$(\d+)$)");
-    const auto stmts = split_statements(text);
+    static const std::regex regdecl(R"(^\.reg\s+\.b32\s+(.+)$)");
+    static const std::regex alu32(R"(^(prmt|and|shl|shr|lop3|add)\.(b32|u32)\s+(.+)$)");
+    const auto is_alu = [](const std::smatch &m) { return (m[1].str() == "add") == (m[2].str() == "u32"); };   // add.u32, the others .b32
+    const auto stmts = split_statements(unscoped(text));
     // parse everything first: a form with one unknown statement stays untouched
     for (const auto &s : stmts) {
       std::smatch m;
       if (std::regex_match(s, m, mov)) { if (m[2].matched) return false; continue; }
       if (std::regex_match(s, policy)) continue;
+      if (std::regex_match(s, m, regdecl)) { if (!declare(m[1].str())) return false; continue; }
+      if (std::regex_match(s, m, alu32)) { if (!is_alu(m) || !alu_statement(m[1].str(), comma_list(m[3].str()))) return false; continue; }
       if (std::regex_match(s, m, atom) || std::regex_match(s, m, red)) { if (!parse_atomic(m[3].str()).ok) return false; continue; }
       if (std::regex_match(s, m, ld) || std::regex_match(s, m, st)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
       return false;
@@ -214,8 +318,10 @@ public:
     IRBuilder<> B(CI);
     for (const auto &s : stmts) {
       std::smatch m;
-      if (std::regex_match(s, policy)) continue;
-      if (std::regex_match(s, m, mov)) {
+      if (std::regex_match(s, policy) || std::regex_match(s, regdecl)) continue;
+      if (std::regex_match(s, m, alu32)) {
+        alu(m[1].str(), comma_list(m[3].str()), B);
+      } else if (std::regex_match(s, m, mov)) {
         const unsigned d = std::stoi(m[3].str());
         if (d >= nOut) die("mov to an input", text);
         const std::string v = m[4].str();
