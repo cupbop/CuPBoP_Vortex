@@ -1,0 +1,2 @@
+lo-pair: _Z14calculat: carry=3 high=15 leaf=11 pack_joined=18 sum=18
+lo-brfix: _Z14calculat: 35 branch blocks kept

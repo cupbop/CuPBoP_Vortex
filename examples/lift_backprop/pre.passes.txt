@@ -1,0 +1,2 @@
+lo-pair: _Z22bpnn_lay: carry=3 leaf=12 pack_joined=3 sum=3
+lo-brfix: _Z22bpnn_lay: 21 branch blocks kept

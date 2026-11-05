@@ -111,6 +111,7 @@ CUDA_GPU_ARCH ?= sm_90
 # CUPBOP_LTO=0 keeps the separate-object build (the pre-2026-10-21 cycle numbers).
 CUPBOP_LTO ?= 1
 DEVICE_BC  ?= $(KERNEL)-cuda-nvptx64-nvidia-cuda-sm_90.bc
+DEVICE_BC_SRC ?= $(DEVICE_BC)
 HOST_BC    ?= $(KERNEL)-host-x86_64-unknown-linux-gnu.bc
 EXTRA_OBJS = $(patsubst %.c,%.o,$(patsubst %.cpp,%.o,$(EXTRA_C_SRCS)))
 
@@ -202,7 +203,8 @@ ifeq ($(VORTEX_VER),3)
 # go through NVVM intrinsics the translator does not model (blackscholes produced NaN).
 # With -nocudalib this clang no longer reports the SDK version, which would select the pre-CUDA-9
 # cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
-$(DEVICE_BC): $(KERNEL_CU)
+# DEVICE_BC_SRC: the examples/lift.mk examples have their device bitcode from a lifted IR file and use this one at most for the source kernels of the program.
+$(DEVICE_BC_SRC): $(KERNEL_CU)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
 	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=$(CUDA_GPU_ARCH) --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
