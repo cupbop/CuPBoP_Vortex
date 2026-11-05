@@ -106,11 +106,13 @@ sg_wrap_pre_s2  lift_sgeam    s2   main pre PASS a lo-pair:,crosses~2.32        
 # --- regressions
 # clean-up (instcombine, simplifycfg) in front of the translator, lo-brfix as it is now: the s1p1 answer must stay right
 bp_clean_s1p1   lift_backprop s1p1 main clean PASS a -                                            %BASE
-# the same without lo-brfix on a branch behind a barrier (LO_BRFIX_NOBAR=1): silent wrong answer (layerforward 56 of 64 partial sums); the translator should refuse or get it right
-bp_cleanbug_s1p1 lift_backprop s1p1 main cleanbug XFAIL - -                                       %BASE
+# the same without lo-brfix on a branch behind a barrier (LO_BRFIX_NOBAR=1): was a silent wrong answer at P < warps per CTA (layerforward 56 of 64 partial sums); the translator now takes the branch into the region after the barrier
+bp_cleanbug_s1p1 lift_backprop s1p1 main cleanbug PASS a \[s1-arms\]                              %BASE
+bp_cleanbug_s1p2 lift_backprop s1p2 main cleanbug PASS a \[s1-arms\]                              %BASE
 bp_cleanbug_s2  lift_backprop s2   main cleanbug PASS a -                                         %BASE
-# lo-stale then adce in front of the translator: silent wrong answer on sgeam, s1p1 and s1p2 (6100 of 7000 elements at 100 x 70)
-sg_stale_s1p1   lift_sgeam    s1p1 main stale XFAIL - -                                           %BASE
+# lo-stale then adce in front of the translator: was a silent wrong answer on sgeam, s1p1 and s1p2 (6100 of 7000 elements at 100 x 70): a join with only a branch stopped the region walk
+sg_stale_s1p1   lift_sgeam    s1p1 main stale PASS a -                                            %BASE
+sg_stale_s1p2   lift_sgeam    s1p2 main stale PASS a -                                            %BASE
 sg_stale_s2     lift_sgeam    s2   main stale PASS a -                                            %BASE
 # fprop with lo-mma under core mapping and the parameter buffer left in place: the run never finishes (with or without p2c-fold; s2 is right, and so is s1p1 with the buffer gone, row fp_pre_s1p1)
 # with LIFT_OPT_IN_TRANSLATOR=1 this row runs raw through the translator and finishes (XPASS), with CUPBOP_LIFT_OPT_P4=0 too: what makes the difference to the input pre is not known (work S)
