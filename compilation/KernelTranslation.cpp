@@ -10,6 +10,7 @@
 #include "tool.h"
 #include "warp_func.h"
 #include "lifted_ir.h"
+#include "triton_ir.h"
 #include "smem_reserve.h"
 #include "simt_opt.h"
 #include "llvm/IR/Module.h"
@@ -63,6 +64,8 @@ int main(int argc, char **argv) {
   // LLVM 20 clang: kernels carry the ptx_kernel calling convention (no "kernel" annotation)
   DBG_LOG("normalize_ptx_kernel_cc\n");
   normalize_ptx_kernel_cc(program);
+  // stock Triton IR: PTX asm and newer NVVM intrinsics -> what every later pass reads (triton_ir.cpp)
+  if (triton_cupbop_enabled()) lower_triton_input(program);
   {
     // A module without any kernel entry (no nvvm.annotations "kernel" / ptx_kernel function) used to translate
     // into an ELF with an empty kernel table that only fails at launch. CuLifter's CPU-lifter output (kernel
