@@ -1294,7 +1294,7 @@ void annotate_kernel_abi(llvm::Module *M) {
       for (auto &I : BB)
         if (auto *CI = dyn_cast<CallBase>(&I))
           if (Function *Callee = CI->getCalledFunction())
-            if (Callee->getName() == kw.first) add(Callee);
+            if (Callee->getName() == kw.first || Callee->getName() == kw.first + ".cta.loop") add(Callee);   // .cta.loop: CUPBOP_CTA_LOOP
   }
   if (!names.empty()) {
     auto *AT = ArrayType::get(ElemTy, elems.size());

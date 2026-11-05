@@ -12,6 +12,8 @@
 #include "lifted_ir.h"
 #include "smem_reserve.h"
 #include "simt_opt.h"
+#include "cta_loop.h"
+#include "launch_fix.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -95,6 +97,7 @@ int main(int argc, char **argv) {
   shrink_lifter_local_mem(program);
   lower_redux_sync(program);
   lower_lanemask(program);
+  cta_empty_exit(program); // CUPBOP_CTA_EMPTY (default off)
   dumpFile(program, "00_after_async_ptx.ll");
 
   DBG_LOG("lower_named_barriers\n");
@@ -259,6 +262,8 @@ int main(int argc, char **argv) {
   DBG_LOG("generate_wrapper\n");
   generate_wrapper(program);
   dumpFile(program, "6_after_generate_wrapper.ll");
+  cta_loop_transform(program); // CUPBOP_CTA_LOOP (default off): one hardware CTA runs several CUDA blocks
+  dumpFile(program, "6b_after_cta_loop.ll");
 
   simt_measure_blockdim(program); // CUPBOP_MEASURE_BLOCKDIM: measurement only
   simt_trip_version(program); // CUPBOP_TRIP_VERSION (default 0)
@@ -305,7 +310,9 @@ int main(int argc, char **argv) {
   annotate_kernel_abi(program); // CUPBOP_KABI (default on): kernel calling convention, cupbop_kabi.txt
   fast_entry_finalize_wrapper(program); // CUPBOP_FAST_ENTRY: kernel_main stores only what the module reads
   describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
+  launch_fix_collect(program); // before the module is written: kernel.bc does not carry the marks
   DumpModule(program, argv[2]);
+  launch_fix_write();
 
   fout.close();
 

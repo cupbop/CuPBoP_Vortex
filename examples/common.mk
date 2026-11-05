@@ -186,7 +186,7 @@ clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:
