@@ -1,5 +1,6 @@
 #include "handle_sync.h"
 #include "tool.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Instructions.h"
@@ -14,7 +15,7 @@ using namespace llvm;
 
 
 void split_block_by_sync(llvm::Function *F) {
-  std::set<llvm::Instruction *> sync_inst;
+  llvm::SetVector<llvm::Instruction *> sync_inst;   // program order: the split numbers name the blocks
   // Jumping the first sync has been removed in LLVM 18 CPU CuPBoP
   // bool jump_first_sync = 1;
   for (Function::iterator b = F->begin(); b != F->end(); ++b) {

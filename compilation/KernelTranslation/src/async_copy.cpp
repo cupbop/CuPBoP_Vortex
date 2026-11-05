@@ -2,6 +2,7 @@
 #include "async_copy.h"
 #include "tool.h"
 
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
@@ -513,7 +514,7 @@ void virt_dxa_cta_once(Module *M) {
         if (isTripHeader(L->getHeader())) T = L;
       return T;
     };
-    std::map<Loop *, std::vector<CallInst *>> groups;
+    llvm::MapVector<Loop *, std::vector<CallInst *>> groups;
     for (auto *C : ops)
       if (Loop *T = outermostTrip(C->getParent())) groups[T].push_back(C);
     // uniform code (not in a warp loop) runs once per hardware warp already
