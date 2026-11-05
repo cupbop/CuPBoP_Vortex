@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <vector>
 __global__ void k_x(int *out) { out[threadIdx.x] = 3 * (int)threadIdx.x + 1; }   // threadIdx.x only: same value from every y, z
 __global__ void k_gx(int *out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = 5 * i + 2; }
@@ -30,6 +32,10 @@ __global__ void k_barrier(int *p, int *out) {                   // one thread wr
   if (threadIdx.x == 0) p[blockIdx.x] = 1000 + blockIdx.x;
   __syncthreads();
   out[blockIdx.x * blockDim.x + threadIdx.x] = p[blockIdx.x];
+}
+__global__ void k_fp(float *q, float *r, float *t, const float *a, const float *b, int n) {   // fdiv.s and fsqrt.s are what CUPBOP_DIV_RESTORE / CUPBOP_SQRT_RESTORE leave
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { q[i] = a[i] / b[i]; r[i] = 1.0f / b[i]; t[i] = sqrtf(a[i]); }
 }
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { if (fails++ < 20) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } } while (0)
@@ -67,6 +73,21 @@ int main(int argc, char **argv) {
     k_store_first<<<1, bs>>>(p, q); cudaDeviceSynchronize(); hq = get(q, bs);
     for (int i = 0; i < bs; ++i) CHECK(hq[i] == 77, "k_store_first bs %d at %d: %d", bs, i, hq[i]);
     cudaFree(p); cudaFree(q);
+  }
+  { // correctly rounded on the device, denormals, infinities, zeros included (bits equal; a NaN only has to be a NaN)
+    const unsigned sp[] = {0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000, 0x00800001, 0x3f800000, 0xbf800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x40490fdb, 0x1f800000, 0x5f000000, 0x00000003, 0x00400000, 0x7e800000};
+    const int ns = sizeof(sp) / sizeof(sp[0]), n = ns * ns + 4096; std::vector<float> a(n), b(n); unsigned x = 12345;
+    auto as_f = [](unsigned u) { float f; memcpy(&f, &u, 4); return f; }; auto as_u = [](float f) { unsigned u; memcpy(&u, &f, 4); return u; };
+    for (int i = 0; i < ns * ns; ++i) { a[i] = as_f(sp[i / ns]); b[i] = as_f(sp[i % ns]); }
+    for (int i = ns * ns; i < n; ++i) { x = x * 1664525u + 1013904223u; a[i] = as_f(x); x = x * 1664525u + 1013904223u; b[i] = as_f(x); }
+    float *da = dev<float>(n, 0), *db = dev<float>(n, 0), *q = dev<float>(n, 0), *r = dev<float>(n, 0), *t = dev<float>(n, 0);
+    cudaMemcpy(da, a.data(), n * 4, cudaMemcpyHostToDevice); cudaMemcpy(db, b.data(), n * 4, cudaMemcpyHostToDevice);
+    k_fp<<<(n + 255) / 256, 256>>>(q, r, t, da, db, n); cudaDeviceSynchronize(); auto hq = get(q, n), hr = get(r, n), ht = get(t, n);
+    auto same = [&](float g, float w) { return (g != g && w != w) || as_u(g) == as_u(w); };
+    for (int i = 0; i < n; ++i) { float w = (float)((double)a[i] / (double)b[i]), w1 = (float)(1.0 / (double)b[i]), w2 = (float)sqrt((double)a[i]);
+      CHECK(same(hq[i], w), "a/b %08x %08x: %08x want %08x", as_u(a[i]), as_u(b[i]), as_u(hq[i]), as_u(w));
+      CHECK(same(hr[i], w1), "1/b %08x: %08x want %08x", as_u(b[i]), as_u(hr[i]), as_u(w1));
+      CHECK(same(ht[i], w2), "sqrt %08x: %08x want %08x", as_u(a[i]), as_u(ht[i]), as_u(w2)); }
   }
   printf(fails ? "FAILED %d\n" : "PASSED\n", fails);
   return fails != 0;

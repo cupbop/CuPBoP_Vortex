@@ -528,3 +528,147 @@ void simt_div_restore(Module *M) {
     total += n;
   }
 }
+
+// --- CUPBOP_SQRT_RESTORE=1 (default 0): nvcc's IEEE single sqrt back to llvm.sqrt.f32 (fsqrt.s, correctly rounded like sqrt.rn, -prec-sqrt=true). Lifted form:
+//   r = MUFU.RSQ(x); y = x * r; h = 0.5 * r; e = fma(y, -y, x); s = fma(e, h, y), reached when (bits(x) + 0xf3000000) u< 0x72800000, the slow path otherwise; they join at a PHI.
+static Value *rsq_arg(Value *V) {
+  auto *C = dyn_cast<CallBase>(V);
+  if (!C) return nullptr;
+  if (C->isInlineAsm()) {   // MUFU_RSQ (tool.cpp mufu_op): .insn r 0x5b, 0, 0, rd, rs1, x1
+    const std::string &t = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
+    if (t.rfind(".insn r 0x5b, 0, 0,", 0) == 0 && t.size() >= 2 && t.compare(t.size() - 2, 2, "x1") == 0) return C->getArgOperand(0);
+    return nullptr;
+  }
+  if (Function *F = C->getCalledFunction(); F && F->getName().starts_with("llvm.nvvm.rsqrt.approx")) return C->getArgOperand(0);
+  return nullptr;
+}
+static bool fmul_of(Value *V, Value *&a, Value *&b) {
+  auto *I = dyn_cast<BinaryOperator>(V);
+  if (!I || I->getOpcode() != Instruction::FMul) return false;
+  a = I->getOperand(0); b = I->getOperand(1);
+  return true;
+}
+static bool restore_sqrt(PHINode *P, unsigned i) {
+  Value *Q = P->getIncomingValue(i);
+  BasicBlock *B0 = P->getIncomingBlock(i);
+  Fma s, e;
+  if (!as_fma(Q, s) || B0->getTerminator()->getNumSuccessors() != 1) return false;
+  Value *Y = s.c, *E = s.a, *H = s.b, *r1, *r2, *h1, *h2;
+  if (!as_fma(E, e)) { std::swap(E, H); if (!as_fma(E, e)) return false; }
+  if (!fmul_of(Y, r1, r2) || !fmul_of(H, h1, h2)) return false;
+  Value *R = rsq_arg(r1) ? r1 : r2;
+  Value *x = rsq_arg(R);
+  if (!x || (r1 != x && r2 != x) || !((h1 == R && is_float_const(h2, 0.5)) || (h2 == R && is_float_const(h1, 0.5)))) return false;
+  Value *ny = e.a == Y ? e.b : e.b == Y ? e.a : nullptr;
+  if (!ny || e.c != x) return false;
+  if (neg_of(ny) != Y) { auto *S = dyn_cast<BinaryOperator>(ny); if (!S || S->getOpcode() != Instruction::FSub || !is_float_const(S->getOperand(0), 0.0) || S->getOperand(1) != Y) return false; }
+  BasicBlock *PB = B0->getSinglePredecessor();
+  auto *Br = PB ? dyn_cast<BranchInst>(PB->getTerminator()) : nullptr;
+  if (!Br || !Br->isConditional()) return false;
+  Value *cond = Br->getCondition();
+  auto *C = dyn_cast<ICmpInst>(cond);
+  auto *A = C ? dyn_cast<BinaryOperator>(C->getOperand(0)) : nullptr;
+  auto *K = C ? dyn_cast<ConstantInt>(C->getOperand(1)) : nullptr;
+  if (!A || !K || C->getPredicate() != ICmpInst::ICMP_ULT || K->getZExtValue() != 0x72800000u || A->getOpcode() != Instruction::Add || A->getOperand(0) != bits_of(x) && bits_of(A->getOperand(0)) != bits_of(x)) return false;
+  auto *K2 = dyn_cast<ConstantInt>(A->getOperand(1));
+  if (!K2 || (uint32_t)K2->getZExtValue() != 0xf3000000u) return false;
+  for (User *U : cond->users()) {
+    if (U == Br) continue;
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB || !CB->getCalledFunction() || !CB->getCalledFunction()->getName().contains("ballot")) return false;
+  }
+  const bool fast_true = Br->getSuccessor(0) == B0;
+  IRBuilder<> B(B0->getTerminator());
+  P->setIncomingValue(i, B.CreateUnaryIntrinsic(Intrinsic::sqrt, x, nullptr, "sqrt_restored"));
+  cond->replaceAllUsesWith(ConstantInt::get(cond->getType(), fast_true ? 1 : 0));
+  return true;
+}
+void simt_sqrt_restore(Module *M) {
+  const char *e = std::getenv("CUPBOP_SQRT_RESTORE");
+  if (!e || !std::atoi(e)) return;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    unsigned n = 0;
+    std::vector<PHINode *> phis;
+    for (BasicBlock &BB : F)
+      for (PHINode &P : BB.phis())
+        if (P.getType()->isFloatTy()) phis.push_back(&P);
+    for (PHINode *P : phis)
+      for (unsigned i = 0; i < P->getNumIncomingValues(); ++i)
+        if (restore_sqrt(P, i)) { n++; break; }
+    if (n) fprintf(stderr, "[sqrt] %s: %u square roots restored\n", F.getName().str().c_str(), n);
+  }
+}
+
+// --- CUPBOP_ADDR_CARRY=1 (default 0): the 64-bit add the lifter spells in 32-bit halves (sm_5x IADD / IADD.X): lo = (B & m) + a, carry = lo > m, hi = (B >> 32) + ah + carry,
+// (hi << 32) | (lo & m), m = 0xffffffff, is B + ((ah << 32) | a) modulo 2^64: exact, no assumption. a = x << k with ah = x >>s (32 - k) is sext(x) << k.
+static bool and_mask(Value *V, Value *&x) {
+  auto *I = dyn_cast<BinaryOperator>(V);
+  if (!I || I->getOpcode() != Instruction::And) return false;
+  auto *C = dyn_cast<ConstantInt>(I->getOperand(1));
+  if (!C || C->getZExtValue() != 0xffffffffu) return false;
+  x = I->getOperand(0);
+  return true;
+}
+void simt_addr_carry(Module *M) {
+  const char *e = std::getenv("CUPBOP_ADDR_CARRY");
+  if (!e || !std::atoi(e)) return;
+  LLVMContext &C = M->getContext();
+  Type *I64 = Type::getInt64Ty(C);
+  auto add_ops = [](Value *V, Value *&a, Value *&b) { auto *I = dyn_cast<BinaryOperator>(V); if (!I || I->getOpcode() != Instruction::Add) return false; a = I->getOperand(0); b = I->getOperand(1); return true; };
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    unsigned n = 0;
+    std::vector<BinaryOperator *> shls;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *S = dyn_cast<BinaryOperator>(&I); S && S->getOpcode() == Instruction::Shl && S->getType()->isIntegerTy(64))
+          if (auto *K = dyn_cast<ConstantInt>(S->getOperand(1)); K && K->getZExtValue() == 32) shls.push_back(S);
+    for (BinaryOperator *S : shls) {
+      // hi = (B >> 32) + ah + zext(lo > m)
+      Value *h0, *h1, *cz = nullptr, *rest = nullptr;
+      if (!add_ops(S->getOperand(0), h0, h1)) continue;
+      if (isa<ZExtInst>(h1) && cast<ZExtInst>(h1)->getSrcTy()->isIntegerTy(1)) { cz = h1; rest = h0; }
+      else if (isa<ZExtInst>(h0) && cast<ZExtInst>(h0)->getSrcTy()->isIntegerTy(1)) { cz = h0; rest = h1; }
+      if (!cz) continue;
+      auto *cmp = dyn_cast<ICmpInst>(cast<ZExtInst>(cz)->getOperand(0));
+      if (!cmp || cmp->getPredicate() != ICmpInst::ICMP_UGT) continue;
+      auto *cm = dyn_cast<ConstantInt>(cmp->getOperand(1));
+      if (!cm || cm->getZExtValue() != 0xffffffffu) continue;
+      Value *lo = cmp->getOperand(0), *l0, *l1, *r0, *r1;
+      if (!add_ops(lo, l0, l1) || !add_ops(rest, r0, r1)) continue;
+      // lo = (B & m) + zext(a), rest = (B >> 32) + zext(ah), either order
+      Value *Bv = nullptr, *az = nullptr;
+      if (and_mask(l0, Bv)) az = l1; else if (and_mask(l1, Bv)) az = l0; else continue;
+      auto hi_of = [&](Value *V) { auto *I = dyn_cast<BinaryOperator>(V); auto *K = I ? dyn_cast<ConstantInt>(I->getOperand(1)) : nullptr; return I && I->getOpcode() == Instruction::LShr && I->getOperand(0) == Bv && K && K->getZExtValue() == 32; };
+      Value *ahz = hi_of(r0) ? r1 : hi_of(r1) ? r0 : nullptr;
+      if (!ahz) continue;
+      auto *za = dyn_cast<ZExtInst>(az), *zh = dyn_cast<ZExtInst>(ahz);
+      if (!za || !zh || !za->getSrcTy()->isIntegerTy(32) || !zh->getSrcTy()->isIntegerTy(32)) continue;
+      // uses of the shl: packed = shl | (lo & m), or shl + ((lo & m) + c)
+      for (User *U : std::vector<User *>(S->user_begin(), S->user_end())) {
+        auto *P = dyn_cast<BinaryOperator>(U);
+        if (!P || (P->getOpcode() != Instruction::Or && P->getOpcode() != Instruction::Add)) continue;
+        Value *O = P->getOperand(0) == S ? P->getOperand(1) : P->getOperand(0), *inner = nullptr, *c = nullptr;
+        if (!and_mask(O, inner)) {
+          Value *o0, *o1;
+          if (P->getOpcode() != Instruction::Add || !add_ops(O, o0, o1) || !isa<ConstantInt>(o1) || !and_mask(o0, inner)) continue;
+          c = o1;
+        }
+        if (inner != lo) continue;
+        IRBuilder<> B(P);
+        Value *a = za->getOperand(0), *ah = zh->getOperand(0), *A = nullptr;
+        auto *sa = dyn_cast<BinaryOperator>(a), *sh = dyn_cast<BinaryOperator>(ah);
+        if (sa && sh && sa->getOpcode() == Instruction::Shl && sh->getOpcode() == Instruction::AShr && sa->getOperand(0) == sh->getOperand(0))
+          if (auto *k = dyn_cast<ConstantInt>(sa->getOperand(1)), *k2 = dyn_cast<ConstantInt>(sh->getOperand(1)); k && k2 && k->getZExtValue() + k2->getZExtValue() == 32)
+            A = B.CreateShl(B.CreateSExt(sa->getOperand(0), I64), k->getZExtValue());
+        if (!A) A = B.CreateOr(B.CreateShl(B.CreateZExt(ah, I64), 32), B.CreateZExt(a, I64));
+        Value *R = B.CreateAdd(Bv, A, "addr_carry");
+        if (c) R = B.CreateAdd(R, c);
+        P->replaceAllUsesWith(R);
+        n++;
+      }
+    }
+    if (n) fprintf(stderr, "[addr-carry] %s: %u 64-bit adds in halves folded\n", F.getName().str().c_str(), n);
+  }
+}

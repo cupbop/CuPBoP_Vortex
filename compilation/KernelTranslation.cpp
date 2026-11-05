@@ -266,6 +266,8 @@ int main(int argc, char **argv) {
   performance_optimization(program);
   dumpFile(program, "7_after_perf_opt.ll");
   simt_div_restore(program); // CUPBOP_DIV_RESTORE (default 0)
+  simt_sqrt_restore(program); // CUPBOP_SQRT_RESTORE (default 0)
+  simt_addr_carry(program); // CUPBOP_ADDR_CARRY (default 0)
   simt_trip_hoist(program); // CUPBOP_TRIP_HOIST (default 0)
 
   DBG_LOG("hoist_block_constant_loads\n");

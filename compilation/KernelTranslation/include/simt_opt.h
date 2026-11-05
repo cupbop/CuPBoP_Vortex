@@ -6,4 +6,6 @@ void simt_measure_blockdim(llvm::Module *M);   // CUPBOP_MEASURE_BLOCKDIM=bx,by,
 void simt_trip_hoist(llvm::Module *M);         // CUPBOP_TRIP_HOIST
 void simt_trip_version(llvm::Module *M);       // CUPBOP_TRIP_VERSION
 void simt_div_restore(llvm::Module *M);        // CUPBOP_DIV_RESTORE
+void simt_sqrt_restore(llvm::Module *M);       // CUPBOP_SQRT_RESTORE
+void simt_addr_carry(llvm::Module *M);         // CUPBOP_ADDR_CARRY
 #endif
