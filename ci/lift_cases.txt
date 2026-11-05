@@ -64,6 +64,7 @@ fp_raw_s2       lift_fprop    s2   tcu  raw PASS a -                            
 fp_dyn_s2       lift_fprop    s2   tcu  pre PASS a parameter~buffers:~1~removed.~0~partly         %BASE %ON LIFT_DYN_SMEM=0 LIFT_NEEDS=CUPBOP_PARAM_DYN
 fp_on_s1p1      lift_fprop    s1p1 tcu  raw PASS a -                                              %RAW %BASE %ON
 fp_pre_s2       lift_fprop    s2   tcu  pre PASS a lo-pair:,\[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA %BASE %ON LIFT_DYN_SMEM=0
+fp_pre_s1p1     lift_fprop    s1p1 tcu  pre PASS a \[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA    %BASE %ON LIFT_DYN_SMEM=0 LIFT_NEEDS=CUPBOP_PARAM_DYN
 # --- 64-bit addresses in halves: a buffer across 2^32 (LIFT_STRADDLE, examples/lift_d2h.c); a lost carry shows only there
 ad_raw_s2       lift_addr     s2   main raw PASS a -                                              %RAW
 ad_on_s2        lift_addr     s2   main raw PASS a \[addr-carry\].*1~64-bit                       %RAW %BASE %ON
@@ -81,5 +82,5 @@ bp_cleanbug_s2  lift_backprop s2   main cleanbug PASS a -                       
 # lo-stale then adce in front of the translator: silent wrong answer on sgeam, s1p1 and s1p2 (6100 of 7000 elements at 100 x 70)
 sg_stale_s1p1   lift_sgeam    s1p1 main stale XFAIL - -                                           %BASE
 sg_stale_s2     lift_sgeam    s2   main stale PASS a -                                            %BASE
-# fprop with lo-mma under core mapping: the run never finishes (with or without p2c-fold; s2 is right)
-fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+# fprop with lo-mma under core mapping and the parameter buffer left in place: the run never finishes (with or without p2c-fold; s2 is right, and so is s1p1 with the buffer gone, row fp_pre_s1p1)
+fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
