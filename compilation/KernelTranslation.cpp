@@ -10,6 +10,8 @@
 #include "tool.h"
 #include "warp_func.h"
 #include "lifted_ir.h"
+#include "lift_opt.h"
+#include "launch_fix.h"
 #include "smem_reserve.h"
 #include "simt_opt.h"
 #include "llvm/IR/Module.h"
@@ -56,6 +58,9 @@ static void dumpFile(llvm::Module *program, std::string name) {
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
+  // CUPBOP_LIFT_OPT: the lift optimisation sees the module as it was read; launch rewrites go to cupbop_launch_fix.txt
+  program = run_lift_opt(program);
+  launch_fix_collect(program);
 
   std::ofstream fout;
   fout.open(PATH);
@@ -306,6 +311,7 @@ int main(int argc, char **argv) {
   fast_entry_finalize_wrapper(program); // CUPBOP_FAST_ENTRY: kernel_main stores only what the module reads
   describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
   DumpModule(program, argv[2]);
+  launch_fix_write();
 
   fout.close();
 

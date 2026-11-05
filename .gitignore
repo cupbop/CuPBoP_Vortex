@@ -78,6 +78,7 @@ Perf_counter_*.txt
 sche0_dbg*.txt
 debug_output*.txt*
 dxa_descriptors.txt
+cupbop_launch_fix.txt
 trace/
 ramulator.stats.log
 run_build.sh
