@@ -3,7 +3,7 @@
 // holds no pipeline of its own: what mkp4.sh writes to its output file is what the translator goes on with, byte for byte (CUPBOP_LIFT_OPT_DUMP).
 // VORTEX_SCHEDULE_FLAG picks the row of schedule.inc, as the options of mkp4.sh would.
 //
-// CUPBOP_LIFT_OPT (default 1)    the pipeline and the defaults of schedule.inc on a module that is_lifted_module accepts; never on anything else.
+// CUPBOP_LIFT_OPT (default 1)    the pipeline and the defaults of schedule.inc on a module that is_lifted_module accepts, with warps of 32 lanes; never on anything else.
 //                                =0: the translation of before, also for input that went through mkp4.sh already (a second run changes it)
 // CUPBOP_LIFT_OPT_WHY=1          prints the decision and the pipeline
 // CUPBOP_LIFT_OPT_DUMP=<file>    the module after the pipeline, as `opt -S` prints it
@@ -101,6 +101,14 @@ static const LiftOptRow *schedule_row() {
   if (const char *e = std::getenv("VORTEX_SCHEDULE_FLAG")) s = std::atoi(e);
   for (const LiftOptRow &r : LIFT_OPT_SCHEDULES) if (r.schedule == s) return &r;
   return nullptr;
+}
+
+// Hardware warps below 32 lanes: the tensor calls of lo-mma are refused there (warp_func.cpp, the TCU tile is fixed by the warp) and lo-tree promotes through a 32-lane warp. None of this was
+// measured at 16 lanes, so such a translation stays what CUPBOP_LIFT_OPT=0 gives.
+static bool narrow_warp() {
+  for (const char *n : {"VORTEX_NUM_THREADS", "CUPBOP_VIRT_LANES"})
+    if (const char *e = std::getenv(n); e && std::atoi(e) > 0 && std::atoi(e) < 32) return true;
+  return false;
 }
 
 static std::string pipeline_for(Module *M, const LiftOptRow *row, const char *&kind) {
@@ -210,6 +218,10 @@ Module *run_lift_opt(Module *M) {
   const bool verbose = env_on("CUPBOP_LIFT_OPT_WHY");
   if (!is_lifted_module(M, &why)) {
     if (verbose) fprintf(stderr, "[lift-opt] off: %s\n", why.c_str());
+    return M;
+  }
+  if (narrow_warp()) {
+    fprintf(stderr, "[lift-opt] off: %s, but a warp below 32 lanes\n", why.c_str());
     return M;
   }
   const char *kind;
