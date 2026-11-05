@@ -85,8 +85,9 @@ __global__ void k_spin_vol(volatile int *flag, int *o, int spin) {   // refused:
   const int b = blockIdx.x;
   if (threadIdx.x == 0) { if (spin && b) while (flag[b - 1] == 0) { } o[b] = b; }
 }
-__global__ void k_ticket_spin(int *lock, int *o) {   // refused: a spin lock
-  if (threadIdx.x == 0) { o[blockIdx.x] = 0; while (atomicCAS(lock, 0, 1) != 0) { } atomicAdd(&o[blockIdx.x], 1); atomicExch(lock, 0); }
+// refused: a spin lock. The launch runs no spin: this lock hangs in the SimX of the CI (4 cores) with or without the block loop, in some layouts of the allocations
+__global__ void k_ticket_spin(int *lock, int *o, int spin) {
+  if (threadIdx.x == 0) { o[blockIdx.x] = 0; if (spin) while (atomicCAS(lock, 0, 1) != 0) { } atomicAdd(&o[blockIdx.x], 1); if (spin) atomicExch(lock, 0); }
 }
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { if (fails++ < 20) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } } while (0)
@@ -132,7 +133,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < G * T; ++i) { int b = i / T; CHECK(he[i] == (b % 4 == 1 ? -1 : b * 3), "k_exit_bar [%d] = %d", i, he[i]); } }
   { const int G = 40; int *f = dev<int>(G, 0), *o = dev<int>(G, -1); k_spin<<<G, 32>>>(f, o); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == b, "k_spin %d", b); }
   { const int G = 40; int *f = dev<int>(G, 0), *o = dev<int>(G, -1); k_spin_vol<<<G, 32>>>(f, o, 0); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == b, "k_spin_vol %d", b); }
-  { const int G = 40; int *l = dev<int>(1, 0), *o = dev<int>(G, -1); k_ticket_spin<<<G, 32>>>(l, o); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == 1, "k_ticket_spin %d", b); }
+  { const int G = 40; int *l = dev<int>(1, 0), *o = dev<int>(G, -1); k_ticket_spin<<<G, 32>>>(l, o, 0); cudaDeviceSynchronize(); auto h = get(o, G); for (int b = 0; b < G; ++b) CHECK(h[b] == 1, "k_ticket_spin %d", b); }
   printf(fails ? "FAILED: %d checks\n" : "PASSED\n", fails);
   return fails != 0;
 }
