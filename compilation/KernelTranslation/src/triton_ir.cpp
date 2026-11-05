@@ -230,6 +230,29 @@ bool handled_later(const std::string &a) {
   return false;
 }
 
+// fptrunc / fpext between float and a vector of half: element by element. Next to a store the back end folds the vector form
+// into a truncating vector store, which a target without half registers cannot select ("Cannot select: store ... trunc to
+// v2f16", the p.to(tl.float16) of FlashAttention).
+void scalarize_half_casts(Module *M) {
+  std::vector<CastInst *> casts;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *C = dyn_cast<CastInst>(&I))
+          if ((isa<FPTruncInst>(C) || isa<FPExtInst>(C)) && C->getType()->isVectorTy()) casts.push_back(C);
+  for (CastInst *C : casts) {
+    IRBuilder<> B(C);
+    auto *VT = cast<FixedVectorType>(C->getType());
+    Value *R = PoisonValue::get(VT);
+    for (unsigned i = 0; i < VT->getNumElements(); ++i) {
+      Value *E = B.CreateExtractElement(C->getOperand(0), i);
+      R = B.CreateInsertElement(R, B.CreateCast(C->getOpcode(), E, VT->getElementType()), i);
+    }
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+  }
+}
+
 void lower_ldmatrix(CallInst *CI, StringRef name) {
   Module *M = CI->getModule();
   LLVMContext &C = M->getContext();
@@ -298,5 +321,6 @@ void lower_triton_input(Module *M) {
     }
     nIntr++;
   }
+  scalarize_half_casts(M);
   fprintf(stderr, "[CuPBoP] Triton input: %u PTX asm, %u intrinsics lowered\n", nAsm, nIntr);
 }
