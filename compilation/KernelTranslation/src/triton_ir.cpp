@@ -7,7 +7,7 @@
 //               load), [@p] atom.global.*, [@p] red.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
 //               {rcp,ex2,lg2,rsqrt,sqrt,sin,cos}.approx[.ftz].f32 (libdevice)
 //               mma.sync m16n8k16 f16 -> llvm.nvvm.mma.m16n8k16.row.col.f32.f32, the form of a lifted module
-//   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
+//   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv (arcp), llvm.nvvm.redux.sync of the whole warp -> shuffles,
 //               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> the ldmatrix asm of a lifted module
 // An asm this file does not know and no later pass handles stops the translation. replace_asm_call would drop it with
 // a warning and leave undef, which is how a stock Triton vecadd became an empty kernel.
@@ -20,6 +20,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <regex>
 #include <string>
@@ -398,6 +399,45 @@ void lower_ldmatrix(CallInst *CI, StringRef name) {
   CI->eraseFromParent();
 }
 
+// the flag for lo-fdiv; run_triton_lo_mma clears it again, whatever ran
+bool arcp_div() {
+  const char *e = std::getenv("CUPBOP_TRITON_SIMT");
+  return !e || std::atoi(e) != 0;
+}
+
+// redux.sync over the whole warp, which is what Triton's integer reductions use from capability 80: five butterfly shuffles. The translator's general form gathers the mask's lanes with 32 index
+// shuffles, because a partial mask needs that (lower_redux_sync). CUPBOP_TRITON_REDUX=0 leaves it to that one.
+bool redux_butterfly(CallInst *CI, StringRef op) {
+  const char *e = std::getenv("CUPBOP_TRITON_REDUX");
+  if (e && std::atoi(e) == 0) return false;
+  auto *K = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!K || !K->isAllOnesValue() || !CI->getType()->isIntegerTy(32)) return false;
+  Module *M = CI->getModule();
+  LLVMContext &C = M->getContext();
+  Type *I32 = Type::getInt32Ty(C);
+  FunctionCallee Sh = M->getOrInsertFunction("llvm.nvvm.shfl.sync.bfly.i32", FunctionType::get(I32, {I32, I32, I32, I32}, false));
+  if (auto *Fn = dyn_cast<Function>(Sh.getCallee())) Fn->addFnAttr(Attribute::Convergent);
+  IRBuilder<> B(CI);
+  Value *V = CI->getArgOperand(0);
+  auto combine = [&](Value *X, Value *Y) -> Value * {
+    if (op == "add") return B.CreateAdd(X, Y);
+    if (op == "and") return B.CreateAnd(X, Y);
+    if (op == "or") return B.CreateOr(X, Y);
+    if (op == "xor") return B.CreateXor(X, Y);
+    Intrinsic::ID id = op == "min" ? Intrinsic::smin : op == "max" ? Intrinsic::smax : op == "umin" ? Intrinsic::umin : Intrinsic::umax;
+    return B.CreateBinaryIntrinsic(id, X, Y);
+  };
+  if (op != "add" && op != "and" && op != "or" && op != "xor" && op != "min" && op != "max" && op != "umin" && op != "umax") return false;
+  for (int o = 16; o > 0; o >>= 1) {
+    CallInst *S = B.CreateCall(Sh, {B.getInt32(-1), V, B.getInt32(o), B.getInt32(31)});
+    S->addFnAttr(Attribute::Convergent);
+    V = combine(V, S);
+  }
+  CI->replaceAllUsesWith(V);
+  CI->eraseFromParent();
+  return true;
+}
+
 } // namespace
 
 void lower_triton_input(Module *M) {
@@ -428,8 +468,11 @@ void lower_triton_input(Module *M) {
       B.CreateCall(M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(Type::getVoidTy(C), false)));
       CI->eraseFromParent();
     } else if (n == "llvm.nvvm.div.full") {
-      CI->replaceAllUsesWith(B.CreateFDiv(CI->getArgOperand(0), CI->getArgOperand(1)));
+      Value *D = B.CreateFDiv(CI->getArgOperand(0), CI->getArgOperand(1));
+      if (arcp_div()) cast<Instruction>(D)->setHasAllowReciprocal(true);   // div.full allows 2 ulp: lo-fdiv reads the flag
+      CI->replaceAllUsesWith(D);
       CI->eraseFromParent();
+    } else if (n.starts_with("llvm.nvvm.redux.sync.") && redux_butterfly(CI, n.drop_front(strlen("llvm.nvvm.redux.sync.")))) {
     } else if (n == "llvm.nvvm.fabs.f32" || n == "llvm.nvvm.fabs.ftz.f32") {
       CI->replaceAllUsesWith(B.CreateUnaryIntrinsic(Intrinsic::fabs, CI->getArgOperand(0)));
       CI->eraseFromParent();

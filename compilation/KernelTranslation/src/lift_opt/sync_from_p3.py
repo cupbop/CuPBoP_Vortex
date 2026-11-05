@@ -8,7 +8,7 @@ What ends up here is built from those trees, never edited here:
   local.patch                      what exists only here: loops that created IR in heap-address or pointer-hash order (include/stable_order.h has the rule; lo-frag,
                                    p2c-alias byGuard, lo-pair repl), the lo-tree crash without a shared store, locta out of p4plugin.cpp, the hooks of lopass.cpp in liftopt.cpp and
                                    p3plugin.cpp. When one of the trees takes a change its hunk stops applying and the sync fails here: remove that hunk.
-  LOCAL_SOURCES                    sources that exist only here (lopass.cpp: lo-sched, lo-f16). No tree holds them: they go into sources.cmake, the sync neither copies nor compares them.
+  LOCAL_SOURCES                    sources that exist only here (lopass.cpp: lo-sched, lo-f16; lotriton.cpp: lo-tmask, lo-ex2, lo-fdiv, lo-fma). No tree holds them: they go into sources.cmake, the sync neither copies nor compares them.
   pipeline.inc                     pipelines, gate, opt options, env defaults from mkp3.sh and mkp4.sh;  sources.cmake from the build scripts
 schedule.inc is written by hand: no script holds the table of schedules.
 --check compares instead of writing (exit 1 on any difference). A line of those scripts that no longer has the expected form is an error, never a silent default.
@@ -22,7 +22,7 @@ import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH = f"{HERE}/local.patch"
 DROP = ("locta",)   # experiments/p4 recommends stopping it; its registration goes with local.patch
-LOCAL_SOURCES = ("lopass",)
+LOCAL_SOURCES = ("lopass", "lotriton")
 HEADERS = ("lodq.h", "lover.h")
 
 def die(msg):
