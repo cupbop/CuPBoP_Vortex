@@ -2,6 +2,8 @@
 // directory is the working directory of the launch and the kernel's name comes from its lookup.txt. host.out <order>:
 //   s1, s2   the small module, then the big one, then back, on that schedule
 //   mixed    the two schedules in one process
+//   lmem     modules with different local memory, by the runtime's tables of each module: kernel_lmem.log (static shared memory),
+//            cupbop_launch_fix.txt, kernel_lmem_hi.log. Enough CTAs per core that a CTA with too little of it collides with the others
 // All images link at the same addresses, and big.cu has code where small.cu has its symbols (check_layout): a symbol address that
 // outlives its module overwrites that code. Each launch is checked here, and `count` of each module has to go on from where
 // that module left it, however many other modules ran in between. Prints one line per launch; PASSED when all are right.
@@ -21,7 +23,8 @@ extern "C" int cudaFree(void *);
 extern "C" int cudaMemcpy(void *, const void *, size_t, int);
 extern "C" int cudaLaunchKernel_vortex(const char *, Dim3, Dim3, void **, size_t, void *, int);
 
-static const int kBlock = 128, kGrid = 4, kN = kBlock * kGrid;
+static const int kBlock = 128;
+static int kGrid = 4, kN = kBlock * kGrid;
 
 static uint32_t small_value(uint32_t x) { return x * 3u + 1u; }
 static uint32_t big_round(uint32_t v, uint32_t k) { v = (v ^ (k * 2654435761u)) * 2246822519u; return v ^ (v >> 13); }
@@ -55,8 +58,18 @@ static int failures = 0;
 static std::map<std::string, uint32_t> count_of;
 static char base[4096];
 
-static void step(const char *module, int schedule) {
-  const bool big = strstr(module, "big") != nullptr;
+// The local memory of the last launch, from the runtime's record (CUPBOP_PERF_KERNEL_FILE).
+static long last_lmem() {
+  std::ifstream f("perf.jsonl");
+  std::string line, last;
+  while (std::getline(f, line)) if (!line.empty()) last = line;
+  const size_t p = last.find("\"lmem\":");
+  return p == std::string::npos ? -1 : std::stol(last.substr(p + 7));
+}
+
+// want_lmem < 0: not checked. A module with a `count` (small, big) is also checked on it.
+static void step(const char *module, int schedule, size_t shared = kBlock * 4, long want_lmem = -1) {
+  const bool big = strstr(module, "big") != nullptr, counted = big || strstr(module, "small") || strstr(module, "launchfix");
   std::vector<uint32_t> x(kN), y(kN + 1, 0);
   for (int i = 0; i < kN; ++i) x[i] = (uint32_t)(i * 2246822519u + count_of[module]);
   void *dx, *dy;
@@ -70,7 +83,7 @@ static void step(const char *module, int schedule) {
   setenv("VORTEX_SCHEDULE_FLAG", std::to_string(schedule).c_str(), 1);
   setenv("VORTEX_LOCALMEM_FLAG", "1", 1);
   if (chdir(dir.c_str())) { perror("chdir"); exit(1); }
-  const int rc = cudaLaunchKernel_vortex(path.c_str(), Dim3{(unsigned)kGrid, 1, 1}, Dim3{(unsigned)kBlock, 1, 1}, argv, kBlock * 4, nullptr, 3);
+  const int rc = cudaLaunchKernel_vortex(path.c_str(), Dim3{(unsigned)kGrid, 1, 1}, Dim3{(unsigned)kBlock, 1, 1}, argv, shared, nullptr, 3);
   if (chdir(base)) { perror("chdir"); exit(1); }
   cudaMemcpy(y.data(), dy, (kN + 1) * 4, 2);
   cudaFree(dx); cudaFree(dy);
@@ -80,10 +93,11 @@ static void step(const char *module, int schedule) {
     const uint32_t v = big ? big_value(x[i]) : small_value(x[i]), w = big ? big_value(x[nb]) : small_value(x[nb]);
     wrong += y[i] != v + w;
   }
-  const uint32_t want = (count_of[module] += big ? 2 : 1);
-  const bool ok = rc == 0 && !wrong && y[kN] == want;
+  const uint32_t want = counted ? (count_of[module] += big ? 2 : 1) : 0;
+  const long lmem = want_lmem < 0 ? -1 : last_lmem();
+  const bool ok = rc == 0 && !wrong && y[kN] == want && lmem == want_lmem;
   failures += !ok;
-  printf("%s s%d: %d wrong values of %d, count %u (want %u): %s\n", module, schedule, wrong, kN, y[kN], want, ok ? "ok" : "FAIL");
+  printf("%s s%d: %d wrong values of %d, count %u (want %u), local memory %ld (want %ld): %s\n", module, schedule, wrong, kN, y[kN], want, lmem, want_lmem, ok ? "ok" : "FAIL");
   fflush(stdout);
 }
 
@@ -91,14 +105,25 @@ int main(int argc, char **argv) {
   const std::string order = argc > 1 ? argv[1] : "s1";
   if (!getcwd(base, sizeof base)) return 1;
   bool ok = true;
-  if (order != "s2") ok = check_layout("mmt_small_s1", "mmt_big_s1", true) && ok;
-  if (order != "s1") ok = check_layout("mmt_small_s2", "mmt_big_s2", false) && ok;
+  if (order == "s1" || order == "mixed") ok = check_layout("mmt_small_s1", "mmt_big_s1", true) && ok;
+  if (order == "s2" || order == "mixed") ok = check_layout("mmt_small_s2", "mmt_big_s2", false) && ok;
   if (!ok) { printf("FAIL layout\n"); return 1; }
   if (order == "s1") {
     for (int i = 0; i < 2; ++i) { step("mmt_small_s1", 1); step("mmt_big_s1", 1); }
     step("mmt_small_s1", 1); step("mmt_small_s1", 1); step("mmt_big_s1", 1);
   } else if (order == "s2") {
     for (int i = 0; i < 2; ++i) { step("mmt_small_s2", 2); step("mmt_big_s2", 2); }
+  } else if (order == "lmem") {
+    kGrid = 32; kN = kBlock * kGrid;
+    setenv("CUPBOP_PERF_KERNEL_FILE", (std::string(base) + "/perf.jsonl").c_str(), 1);
+    for (int i = 0; i < 2; ++i) {
+      step("mmt_static_s2", 2, 0, 4096);
+      step("mmt_static2_s2", 2, 0, 8192);
+      step("mmt_static_s1", 1, 0, 4096);
+      step("mmt_launchfix_s2", 2, 0, 512);   // the program launches it with no dynamic shared memory: cupbop_launch_fix.txt
+      step("mmt_lmemhi_s2", 2, 0, 1024);     // declares 8 KB, touches less: kernel_lmem_hi.log
+      step("mmt_static2_s2", 2, 0, 8192);
+    }
   } else {
     step("mmt_small_s2", 2); step("mmt_big_s1", 1); step("mmt_small_s1", 1); step("mmt_big_s2", 2);
     step("mmt_big_s1", 1); step("mmt_small_s2", 2); step("mmt_small_s1", 1); step("mmt_big_s2", 2);

@@ -6,8 +6,8 @@
 #SBATCH --mem=32G
 #SBATCH -t 00:30:00
 #SBATCH -o ci/logs_v3/multi_module_test_%j.out
-# Several kernel modules in one process (examples/multi_module_test): the three orders must print PASSED. A symbol address of one
-# module must not reach another module's image, and a module's __device__ values must come back with it. Optional
+# Several kernel modules in one process (examples/multi_module_test): every order must print PASSED. A symbol address of one
+# module must not reach another module's image, a module's __device__ values must come back with it, and its local memory comes from its own side files. Optional
 # OLD_CUPBOP=<CuPBoP tree with a build>: the same program on that tree's runtime is expected to fail, i.e. the test can tell.
 export CuPBoP_PATH=$SLURM_SUBMIT_DIR
 SIF=/projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif
@@ -30,7 +30,7 @@ grep -h '^multi_module_test ' $OUT/new.out || echo "NO RESULT (see $OUT/new.log)
 if [ -n "${OLD_CUPBOP:-}" ]; then
   make ci RT_LIB=$OLD_CUPBOP/build/runtime > $OUT/old.log 2>&1
   cp -f ci_output.txt $OUT/old.out 2>/dev/null
-  echo "old runtime (a failure is expected): $(grep -c '^multi_module_test .*PASSED' $OUT/old.out) of 3 orders PASSED; $(grep -m1 -h 'Illegal\|misaligned\|FAILED' $OUT/old.out)"
+  echo "old runtime (a failure is expected): $(grep -c '^multi_module_test .*PASSED' $OUT/old.out) of 4 orders PASSED; $(grep -m1 -h 'Illegal\|misaligned\|FAILED' $OUT/old.out)"
 fi
 make clean > /dev/null 2>&1
 INNER
