@@ -1193,6 +1193,7 @@ static void sinkLdsmPhis(Function &F) {
   for (BasicBlock &BB : F) {
     if (pred_size(&BB) < 2) continue;
     std::map<std::vector<CallInst *>, std::vector<std::pair<PHINode *, unsigned>>> sets;
+    std::vector<std::vector<CallInst *>> keyOrder;
     for (PHINode &P : BB.phis()) {
       std::vector<CallInst *> cs; int idx = -1; bool ok = true;
       for (unsigned k = 0; k < P.getNumIncomingValues() && ok; ++k) {
@@ -1201,9 +1202,9 @@ static void sinkLdsmPhis(Function &F) {
         idx = E->getIndices()[0]; cs.push_back(C);
       }
       if (dbg() && !ok) { errs() << "phi not ldsm: "; P.print(errs()); errs() << "\n"; }
-      if (ok && idx >= 0) sets[cs].push_back({&P, (unsigned)idx});
+      if (ok && idx >= 0) { if (!sets.count(cs)) keyOrder.push_back(cs); sets[cs].push_back({&P, (unsigned)idx}); }
     }
-    for (auto &kv : sets) {
+    for (auto &ko : keyOrder) { auto &kv = *sets.find(ko);
       auto &cs = kv.first; PHINode *P0 = kv.second[0].first; Ldsm L0; parseLdsm(cs[0], L0); GlobalVariable *G0 = nullptr; bool ok = true; std::vector<Value *> offs;
       for (unsigned k = 0; k < cs.size() && ok; ++k) {
         Ldsm L; parseLdsm(cs[k], L); GlobalVariable *G; Value *o; BasicBlock *In = P0->getIncomingBlock(k);

@@ -29,6 +29,7 @@
 //    the split-K semaphore path, not taken by split-K 1 launches).
 //  - @shared_mem shrinks to the new footprint; the launch must pass dyn_smem = 0 (printed in the log line).
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -1167,7 +1168,7 @@ static bool aliasFunction(Function &F, GlobalVariable *GV) {
       last = v.lastRead[other];
       Instruction *At = v.close && last->getParent() == v.close->getParent() ? v.close : last->getParent()->getTerminator();
       { IRBuilder<> B(At); B.CreateCall(Bar); ++nb; }
-      std::map<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded)
+      MapVector<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded); insertion order: the guards' code must not follow heap addresses
       for (Acc *a : mv) {
         Site st; st.C = cast<CallInst>(a->I);
         BasicBlock *key = nullptr;

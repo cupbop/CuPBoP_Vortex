@@ -1,0 +1,60 @@
+--- a/liftopt.cpp
++++ b/liftopt.cpp
+@@ -1193,6 +1193,7 @@
+   for (BasicBlock &BB : F) {
+     if (pred_size(&BB) < 2) continue;
+     std::map<std::vector<CallInst *>, std::vector<std::pair<PHINode *, unsigned>>> sets;
++    std::vector<std::vector<CallInst *>> keyOrder;
+     for (PHINode &P : BB.phis()) {
+       std::vector<CallInst *> cs; int idx = -1; bool ok = true;
+       for (unsigned k = 0; k < P.getNumIncomingValues() && ok; ++k) {
+@@ -1201,9 +1202,9 @@
+         idx = E->getIndices()[0]; cs.push_back(C);
+       }
+       if (dbg() && !ok) { errs() << "phi not ldsm: "; P.print(errs()); errs() << "\n"; }
+-      if (ok && idx >= 0) sets[cs].push_back({&P, (unsigned)idx});
++      if (ok && idx >= 0) { if (!sets.count(cs)) keyOrder.push_back(cs); sets[cs].push_back({&P, (unsigned)idx}); }
+     }
+-    for (auto &kv : sets) {
++    for (auto &ko : keyOrder) { auto &kv = *sets.find(ko);
+       auto &cs = kv.first; PHINode *P0 = kv.second[0].first; Ldsm L0; parseLdsm(cs[0], L0); GlobalVariable *G0 = nullptr; bool ok = true; std::vector<Value *> offs;
+       for (unsigned k = 0; k < cs.size() && ok; ++k) {
+         Ldsm L; parseLdsm(cs[k], L); GlobalVariable *G; Value *o; BasicBlock *In = P0->getIncomingBlock(k);
+--- a/p2cfold.cpp
++++ b/p2cfold.cpp
+@@ -29,6 +29,7 @@
+ //    the split-K semaphore path, not taken by split-K 1 launches).
+ //  - @shared_mem shrinks to the new footprint; the launch must pass dyn_smem = 0 (printed in the log line).
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/MapVector.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/Analysis/LoopInfo.h"
+@@ -1167,7 +1168,7 @@
+       last = v.lastRead[other];
+       Instruction *At = v.close && last->getParent() == v.close->getParent() ? v.close : last->getParent()->getTerminator();
+       { IRBuilder<> B(At); B.CreateCall(Bar); ++nb; }
+-      std::map<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded)
++      MapVector<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded); insertion order: the guards' code must not follow heap addresses
+       for (Acc *a : mv) {
+         Site st; st.C = cast<CallInst>(a->I);
+         BasicBlock *key = nullptr;
+--- a/pairjoin.cpp
++++ b/pairjoin.cpp
+@@ -25,6 +25,7 @@
+ // (-> icmp on the two i64 values). The remaining uses of a joined phi pair read trunc(V) and trunc(V >> 32).
+ //
+ // Env: LP_DEBUG=1 prints what stayed; LP_OFF_PHI=1, LP_OFF_CMP=1 turn off parts (diagnosis only).
++#include "llvm/ADT/MapVector.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+@@ -458,7 +459,7 @@
+       else if (auto *S = dyn_cast<SelectInst>(&I)) sels.push_back(S);
+     }
+     if (packs.empty() && sels.empty()) return false;
+-    DenseMap<Value *, Value *> repl;
++    MapVector<Value *, Value *> repl;   // insertion order: the RAUW order sets the use lists later passes walk
+     for (auto &[I, lo, hi] : packs) {
+       bool lf = false;
+       Value *v = get(lo, hi, I, &lf);

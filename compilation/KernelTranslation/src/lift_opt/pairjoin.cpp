@@ -25,6 +25,7 @@
 // (-> icmp on the two i64 values). The remaining uses of a joined phi pair read trunc(V) and trunc(V >> 32).
 //
 // Env: LP_DEBUG=1 prints what stayed; LP_OFF_PHI=1, LP_OFF_CMP=1 turn off parts (diagnosis only).
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -458,7 +459,7 @@ struct Join {
       else if (auto *S = dyn_cast<SelectInst>(&I)) sels.push_back(S);
     }
     if (packs.empty() && sels.empty()) return false;
-    DenseMap<Value *, Value *> repl;
+    MapVector<Value *, Value *> repl;   // insertion order: the RAUW order sets the use lists later passes walk
     for (auto &[I, lo, hi] : packs) {
       bool lf = false;
       Value *v = get(lo, hi, I, &lf);

@@ -19,6 +19,7 @@
 #include "lift_opt.h"
 #include "launch_fix.h"
 #include "tool.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -34,7 +35,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdio>
 #include <cstdlib>
-#include <set>
 #include <string>
 
 using namespace llvm;
@@ -106,7 +106,7 @@ static std::string pipeline_for(Module *M, const char *&kind) {
 static void note_shared_fold(Module *M) {
   GlobalVariable *G = M->getGlobalVariable("shared_mem", true);
   if (!G) report_fatal_error("lift optimisation: @shared_mem gone after a fold");
-  std::set<Function *> users;
+  SetVector<Function *> users;
   SmallVector<User *, 64> w(G->users().begin(), G->users().end());
   while (!w.empty()) {
     User *U = w.pop_back_val();

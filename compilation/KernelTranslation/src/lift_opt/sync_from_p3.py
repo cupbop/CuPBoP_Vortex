@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """sync_from_p3.py <p3 root> [--check]: bring src/lift_opt up to date with the lift optimisation developed in experiments/p3.
 
-The pass sources are plain copies (never edit them here); everything else about the pipeline is derived from the two scripts that
-define it, so that the translator cannot drift from them:
+The pass sources are plain copies (never edit them here) plus stable_order.patch; everything else about the pipeline is derived from the
+two scripts that define it, so that the translator cannot drift from them:
   <root>/tools/build.sh     the source list and each source's -D flags            -> sources.cmake
   <root>/scripts/mkp3.sh    pipelines, module gate, opt options, env defaults     -> pipeline.inc
+stable_order.patch: loops that created IR in heap-address or pointer-hash order (include/stable_order.h has the rule; lo-frag, p2c-alias byGuard,
+lo-pair repl), applied to every copy. When experiments/p3 takes a fix the hunk stops applying and the sync fails here: remove that hunk. An
+empty patch file means the copies are exact.
 --check compares instead of writing (exit 1 on any difference). A line of mkp3.sh or build.sh that no longer has the expected form
 is an error, never a silent default.
 
@@ -13,8 +16,9 @@ After a sync:
     minutes in the future, and make then skips a source edited in that window: once the old pipeline string ran with no sign of it.
  2. tools/param_dyn.patch is not a copy: it edits lifted_ir.cpp. For a new version: patch -R with the old one, patch with the new one.
  3. Compare: CUPBOP_LIFT_OPT_DUMP against mkp3.sh (bytes), CUPBOP_LIFT_OPT_BC against the harness's device bitcode (bytes)."""
-import os, re, sys
+import os, re, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
+PATCH = f"{HERE}/stable_order.patch"
 
 def die(msg):
     sys.exit(f"sync_from_p3: {msg}")
@@ -83,8 +87,15 @@ def main():
     bs = open(f"{root}/tools/build.sh").read()
     cm, names = sources_cmake(bs)
     want = {"pipeline.inc": pipeline_inc(mk).encode(), "sources.cmake": cm.encode()}
-    for n in names:
-        want[f"{n}.cpp"] = open(f"{root}/tools/{n}.cpp", "rb").read()
+    with tempfile.TemporaryDirectory() as tmp:
+        for n in names:
+            shutil.copy(f"{root}/tools/{n}.cpp", f"{tmp}/{n}.cpp")
+        if os.path.getsize(PATCH):
+            r = subprocess.run(["patch", "-s", "-p1", "-d", tmp, "-i", PATCH], capture_output=True, text=True)
+            if r.returncode:
+                die(f"stable_order.patch does not apply (a hunk taken over by experiments/p3?):\n{r.stdout}{r.stderr}")
+        for n in names:
+            want[f"{n}.cpp"] = open(f"{tmp}/{n}.cpp", "rb").read()
     bad = 0
     for f, b in want.items():
         p = f"{HERE}/{f}"
