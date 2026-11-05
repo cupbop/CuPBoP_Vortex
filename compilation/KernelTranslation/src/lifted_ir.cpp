@@ -10,12 +10,15 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Passes/PassBuilder.h"
 #include <algorithm>
 #include <cstdio>
 #include <functional>
 #include <memory>
 #include <regex>
+#include <set>
 #include <vector>
 
 using namespace llvm;
@@ -442,6 +445,30 @@ void lower_lanemask(Module *M) {
 // shrink-wrapped prologue and get slower (ctx_c README), so the 1:1 and flat schedules keep the 11770fc code.
 // CUPBOP_PARAM_FORWARD=all (or 1): every schedule; CUPBOP_PARAM_FORWARD=0 or CUPBOP_UNIFORM_NOREPL=0: off.
 // CUPBOP_PARAM_FORWARD_WHY=1: decisions.
+// smallest value V can take, unsigned, as far as flags, masks and constants prove it (0 = nothing proved)
+static uint64_t param_min(Value *V, unsigned d = 0) {
+  if (auto *C = dyn_cast<ConstantInt>(V)) return C->getZExtValue();
+  if (d > 8) return 0;
+  if (auto *Z = dyn_cast<ZExtInst>(V)) return param_min(Z->getOperand(0), d + 1);
+  if (auto *Se = dyn_cast<SelectInst>(V)) return std::min(param_min(Se->getTrueValue(), d + 1), param_min(Se->getFalseValue(), d + 1));
+  if (auto *B = dyn_cast<BinaryOperator>(V)) {
+    const uint64_t a = param_min(B->getOperand(0), d + 1), b = param_min(B->getOperand(1), d + 1);
+    if (B->getOpcode() == Instruction::Or) return std::max(a, b);   // or never clears a bit
+    if (B->getOpcode() == Instruction::Add && B->hasNoUnsignedWrap()) return a + b;
+    if (B->getOpcode() == Instruction::Add) {   // no flag: x + C does not wrap when the known zero bits of x keep it below 2^w - C
+      auto *C = dyn_cast<ConstantInt>(B->getOperand(1));
+      if (C) { KnownBits K = computeKnownBits(B->getOperand(0), B->getModule()->getDataLayout()); APInt mx = K.getMaxValue(); bool ov = false; (void)mx.uadd_ov(C->getValue(), ov); if (!ov) return K.getMinValue().getZExtValue() + C->getZExtValue(); }
+    }
+  }
+  return 0;
+}
+// CUPBOP_PARAM_DYN (p3 proposal, default 0): 1 = forward run-time indices when the range is proved, else keep the buffer; 2 = also when it is not: the index is clamped into the block.
+// Clamping changes nothing in range. Out of range the source reads bytes nothing ever wrote (the block is the only store), so any value is a refinement, and the read stays in the block.
+static int param_dyn_mode() {
+  static const int m = [] { const char *e = std::getenv("CUPBOP_PARAM_DYN"); return e ? std::atoi(e) : 0; }();
+  return m;
+}
+static bool param_dyn_on() { return param_dyn_mode() != 0; }
 static bool param_span_on() {
   static const bool on = [] { const char *e = std::getenv("CUPBOP_PARAM_SPAN"); return e && std::atoi(e) != 0; }();
   return on;
@@ -473,6 +500,8 @@ void forward_param_buffer_copies(Module *M) {
       std::vector<Src> srcs;
       std::vector<std::pair<LoadInst *, int64_t>> loads;
       std::vector<Instruction *> markers;
+      std::vector<GetElementPtrInst *> dyn;   // CUPBOP_PARAM_DYN: GEPs with a run-time index into the buffer, all their users plain loads
+      std::set<GetElementPtrInst *> clampLo, clampHi;
       std::string bad;
       std::vector<std::pair<Value *, int64_t>> work{{AI, 0}};
       while (!work.empty() && bad.empty()) {
@@ -481,7 +510,13 @@ void forward_param_buffer_copies(Module *M) {
         for (User *U : V->users()) {
           if (auto *G = dyn_cast<GEPOperator>(U)) {
             APInt off(DL.getIndexTypeSizeInBits(G->getType()), 0);
-            if (!isa<Instruction>(G) || !G->accumulateConstantOffset(DL, off)) { bad = "non-constant GEP"; break; }
+            if (!isa<Instruction>(G) || !G->accumulateConstantOffset(DL, off)) {
+              auto *GI = dyn_cast<GetElementPtrInst>(U);
+              bool plain = param_dyn_on() && GI && base == 0 && V == AI && GI->getNumIndices() == 2 && GI->getSourceElementType() == AI->getAllocatedType() && isa<ConstantInt>(GI->getOperand(1)) && cast<ConstantInt>(GI->getOperand(1))->isZero();
+              if (plain) for (User *GU : GI->users()) { auto *L2 = dyn_cast<LoadInst>(GU); if (!L2 || !L2->isSimple()) plain = false; }
+              if (plain) { dyn.push_back(GI); continue; }   // the proof comes below, when the block's offset is known
+              bad = "non-constant GEP"; break;
+            }
             work.push_back({G, base + off.getSExtValue()});
           } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) {
             work.push_back({U, base});
@@ -515,6 +550,14 @@ void forward_param_buffer_copies(Module *M) {
         }
       }
       if (bad.empty() && srcs.empty()) bad = "no parameter stored";
+      if (bad.empty() && !dyn.empty() && !(srcs.size() == 1 && srcs[0].slots)) bad = "run-time index, not one parameter block";
+      // Range proof: the index stays inside [B, B + N). Lower end from flags and constants (param_min). Upper end: the GEP is inbounds in an alloca that ends where the block ends, so a
+      // load past the end is undefined in the source program; the new GEP is not inbounds. Not proved: nothing changes.
+      if (bad.empty()) for (GetElementPtrInst *GI : dyn) {
+        const uint64_t lo = param_min(GI->getOperand(2)), sz = DL.getTypeAllocSize(AI->getAllocatedType());
+        if (lo < (uint64_t)srcs[0].off) { if (param_dyn_mode() != 2) { bad = "run-time index, lower bound not proved"; break; } clampLo.insert(GI); }
+        if (!GI->isInBounds() || sz != (uint64_t)(srcs[0].off + srcs[0].size)) { if (param_dyn_mode() != 2) { bad = "run-time index, upper bound not proved"; break; } clampHi.insert(GI); }
+      }
       if (bad.empty()) {
         std::sort(srcs.begin(), srcs.end(), [](const Src &a, const Src &b) { return a.off < b.off; });
         for (size_t i = 1; i < srcs.size(); ++i)
@@ -528,6 +571,15 @@ void forward_param_buffer_copies(Module *M) {
         continue;
       }
       unsigned fwd = 0, kept = 0;
+      for (GetElementPtrInst *GI : dyn) {   // the only initialised bytes are the block's: the same offset in the block, read in place
+        IRBuilder<> B(GI);
+        Value *i = B.CreateSExtOrTrunc(GI->getOperand(2), Type::getInt64Ty(C));
+        if (clampLo.count(GI)) i = B.CreateBinaryIntrinsic(Intrinsic::umax, i, B.getInt64(srcs[0].off));
+        if (clampHi.count(GI)) { uint64_t ls = 1; for (User *GU : GI->users()) ls = std::max<uint64_t>(ls, DL.getTypeStoreSize(GU->getType())); i = B.CreateBinaryIntrinsic(Intrinsic::umin, i, B.getInt64(srcs[0].off + srcs[0].size - ls)); }
+        i = B.CreateSub(i, B.getInt64(srcs[0].off));
+        Value *P = B.CreateGEP(Type::getInt8Ty(C), srcs[0].slots, i, GI->getName() + ".arg");
+        GI->replaceAllUsesWith(P); GI->eraseFromParent(); fwd++;
+      }
       for (auto [L, off] : loads) {
         const int64_t size = (int64_t)DL.getTypeStoreSize(L->getType());
         const Src *s = nullptr;
