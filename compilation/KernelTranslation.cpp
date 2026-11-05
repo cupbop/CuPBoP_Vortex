@@ -10,10 +10,11 @@
 #include "tool.h"
 #include "warp_func.h"
 #include "lifted_ir.h"
+#include "lift_opt.h"
+#include "launch_fix.h"
 #include "smem_reserve.h"
 #include "simt_opt.h"
 #include "cta_loop.h"
-#include "launch_fix.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -58,6 +59,9 @@ static void dumpFile(llvm::Module *program, std::string name) {
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
+  // CUPBOP_LIFT_OPT: the lift optimisation sees the module as it was read; launch rewrites go to cupbop_launch_fix.txt
+  program = run_lift_opt(program);
+  launch_fix_collect(program);
 
   std::ofstream fout;
   fout.open(PATH);
@@ -303,6 +307,7 @@ int main(int argc, char **argv) {
   }
 
   fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
+  merge_adjacent_barriers(program); // CUPBOP_BAR_MERGE: back-to-back CTA barriers (tool.cpp)
   inline_vx_barrier_calls(program); // CUPBOP_BAR_INLINE: vx_barrier calls -> the instruction (tool.cpp)
   protect_dxa_operand_registers(program); // x30 / x31 hold nothing across a TMA copy (uniform_branch.cpp)
   sign_extend_kernel_args(program); // CUPBOP_ARG_SIGNEXT (uniform_branch.cpp)

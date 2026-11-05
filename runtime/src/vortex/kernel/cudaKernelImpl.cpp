@@ -909,6 +909,9 @@ extern "C" void __vx_wmma_mma_m32n8k16_row_row_f16_f16_f32(float *d,
 //   1. Within a warp: lane-by-lane (only lane==k executes per iteration)
 //   2. Across warps/cores: spinlock acquired inside the per-lane region,
 //      so the spin's branch is single-threaded and uniform (no divergence).
+// The word itself goes through AMOs, which commit at the last-level cache (a shared
+// address: in the LMEM bank). L1 is per core, so a plain load under the lock misses
+// what the other cores added, and a plain store writes that stale sum back.
 static volatile int __cuda_atomic_fadd_lock __attribute__((aligned(4))) = 0;
 
 extern "C" __attribute__((noinline))
@@ -920,8 +923,12 @@ float __cuda_atomic_fadd_f32(float *addr, float val) {
       // Single active thread here; spin to acquire global lock.
       while (__atomic_exchange_n((int *)&__cuda_atomic_fadd_lock, 1,
                                  __ATOMIC_ACQUIRE) != 0) { }
-      old = *addr;
-      *addr = old + val;
+      const int bits = __atomic_fetch_or((int *)addr, 0, __ATOMIC_RELAXED);
+      __builtin_memcpy(&old, &bits, 4);
+      const float sum = old + val;
+      int next;
+      __builtin_memcpy(&next, &sum, 4);
+      __atomic_exchange_n((int *)addr, next, __ATOMIC_RELAXED);
       __atomic_store_n((int *)&__cuda_atomic_fadd_lock, 0, __ATOMIC_RELEASE);
     }
   }

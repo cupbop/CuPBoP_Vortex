@@ -600,8 +600,9 @@ public:
           need_replace.insert(Pred->getTerminator());
         }
       }
-      for (auto inst : need_replace) {
-        inst->replaceUsesOfWith(merge_point, Block);
+      // block order, not std::set order: this loop sets the use list of Block, which later passes walk (stable_order.h; cuBLAS isamax, cuDNN ctc_loss at s1)
+      for (BasicBlock &BB : F) {
+        if (need_replace.count(BB.getTerminator())) BB.getTerminator()->replaceUsesOfWith(merge_point, Block);
       }
       changed = 1;
     }

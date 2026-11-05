@@ -18,6 +18,9 @@ include_directories(./include)
 
 file(GLOB proj_HEADERS "include/*.h")
 file(GLOB proj_SOURCES "src/*.cpp")
+# the lift optimisation: copies of experiments/p3/tools (src/lift_opt/sync_from_p3.py)
+include(src/lift_opt/sources.cmake)
+list(APPEND proj_SOURCES ${lift_opt_SOURCES})
 
 # Add core library.
 add_library(${LIB_NAME} STATIC ${proj_HEADERS} ${proj_SOURCES})

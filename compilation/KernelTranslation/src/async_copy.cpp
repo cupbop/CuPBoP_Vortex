@@ -174,6 +174,21 @@ struct CopySite {
   bool ignore_src;
 };
 
+// What a lane with nothing to copy reads (the value is dropped). A global: when it read its local-memory destination, the load of one warp mixed local and global addresses, and
+// hw/rtl/mem/VX_lmem_switch.sv takes such a request more than once while one side is stalled, up to an assert or a wrong answer (experiments/rtlassert; RTL only, SimX is right).
+// CUPBOP_CPA_ZFILL_GLOBAL=0: the destination as before.
+static Value *zfillReadAddress(IRBuilder<> &B, Module *M, Value *dst) {
+  const char *e = std::getenv("CUPBOP_CPA_ZFILL_GLOBAL");
+  if (e && std::atoi(e) == 0) return toGeneric(B, dst);
+  GlobalVariable *G = M->getGlobalVariable("__cupbop_cpa_zfill", true);
+  if (!G) {
+    Type *A = ArrayType::get(Type::getInt8Ty(M->getContext()), 16);   // the largest cp.async
+    G = new GlobalVariable(*M, A, false, GlobalValue::InternalLinkage, Constant::getNullValue(A), "__cupbop_cpa_zfill");
+    G->setAlignment(Align(16));
+  }
+  return G;
+}
+
 // Emit the synchronous copy of one cp.async in front of S.call.
 void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> &DTs, unsigned &n_traced,
               unsigned &n_inttoptr) {
@@ -250,9 +265,9 @@ void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> 
     }
     return;
   }
-  // runtime: never read src when nothing is to be read (its address may be out of bounds) -- read the
-  // destination instead and discard the value
-  Value *rd = B.CreateSelect(nz, toGeneric(B, src), toGeneric(B, dst), "cpa_rdaddr");
+  // runtime: never read src when nothing is to be read (its address may be out of bounds) -- read something else
+  // and discard the value
+  Value *rd = B.CreateSelect(nz, toGeneric(B, src), zfillReadAddress(B, S.call->getModule(), dst), "cpa_rdaddr");
   Value *v = B.CreateAlignedLoad(T, rd, al, "cpa_val");
   Value *outv;
   if (partial_possible) {
