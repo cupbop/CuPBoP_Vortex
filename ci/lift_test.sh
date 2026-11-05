@@ -4,7 +4,8 @@
 #   usage (repository root, inside the CI container, ci/rg-ci-setup-v3.sh sourced): ci/lift_test.sh [regex on the row name]; Slurm job: ci/lift_test.sbatch
 #   env: PAR (rows at once, default 8), LIFT_OUT (log dir, default ci/logs_v3/lift_<job>), LIFT_CASES (table), LIFT_KEEP=1 (keep the work dirs), LIFT_ENV (VAR=VALUE added to every
 #        row), LIFT_BITS_RECORD=1 (write the bit records of the rows into the examples' lift_bits.txt instead of comparing), LIFT_OPT_IN_TRANSLATOR=1 (rows with input pre run
-#        as raw with CUPBOP_LIFT_OPT=1: the same test once the translator does the lift optimisation; the pass log then comes from the translator)
+#        as raw with CUPBOP_LIFT_OPT=1: the same test with the lift optimisation in the translator, the pass log then comes from the translator; without it they keep the input of
+#        the opt step, with CUPBOP_LIFT_OPT=0)
 # Prints one line per row, a summary, and exits 1 unless every row got what the table says. A row is good when
 #   PASS : it builds, ci/check_correctness.sh says PASS (program verdict or golden, and the bit record of its group), every coverage pattern is in the
 #          translator log or in the pass log <input>.passes.txt of the input (the transformation under test really acted on this input)
@@ -32,6 +33,8 @@ run_row() { # name example sched hw input expect group covers [VAR=VALUE...]
   # the launch rewrite comes from the translator then (cupbop_launch_fix.txt): no LIFT_DYN_SMEM. LIFT_MERGE examples stay pre: a module with source kernels beside the lift is not a lifted module for the translator
   if [ "$input" = pre ] && [ -n "${LIFT_OPT_IN_TRANSLATOR:-}" ] && ! grep -q '^LIFT_MERGE *= *1' $d/Makefile; then
     input=raw; passes=/dev/null; local a=(); for p in "$@"; do case $p in LIFT_DYN_SMEM=*) ;; *) a+=("$p") ;; esac; done; set -- "${a[@]}" CUPBOP_LIFT_OPT=1; fi
+  # input that went through the passes already: a second run in the translator (default on) would change it
+  [ "$input" = raw ] || set -- CUPBOP_LIFT_OPT=0 "$@"
   case $sch in s2) s=2 ;; s1) s=1 ;; s1p*) s=1; set -- CUPBOP_VIRT_WARPS=${sch#s1p} "$@" ;; *) echo "$name: bad schedule $sch"; return ;; esac
   [ "$hw" = main ] || [ "$hw" = mufu ] || set -- VORTEX_PATH=$VORTEX_PATH_TCU "VORTEX_CONFIGS=$VORTEX_CONFIGS_TCU" CUPBOP_MMA_LOWERING=tcu LD_LIBRARY_PATH=$VORTEX_PATH_TCU/sw/runtime:$LD_LIBRARY_PATH "$@"
   ( env ${LIFT_ENV:-} "$@" timeout ${LIFT_ROW_TIMEOUT:-600} make -C $d ci SCHEDULE=$s LOCALMEM=1 LIFT_INPUT=$input ) > $log 2>&1; rc=$?

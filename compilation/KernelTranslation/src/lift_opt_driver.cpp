@@ -3,7 +3,8 @@
 // holds no pipeline of its own: what mkp4.sh writes to its output file is what the translator goes on with, byte for byte (CUPBOP_LIFT_OPT_DUMP).
 // VORTEX_SCHEDULE_FLAG picks the row of schedule.inc, as the options of mkp4.sh would.
 //
-// CUPBOP_LIFT_OPT=1 (default 0)  runs the pipeline on a module that is_lifted_module accepts; never on anything else
+// CUPBOP_LIFT_OPT (default 1)    the pipeline and the defaults of schedule.inc on a module that is_lifted_module accepts; never on anything else.
+//                                =0: the translation of before, also for input that went through mkp4.sh already (a second run changes it)
 // CUPBOP_LIFT_OPT_WHY=1          prints the decision and the pipeline
 // CUPBOP_LIFT_OPT_DUMP=<file>    the module after the pipeline, as `opt -S` prints it
 // CUPBOP_LIFT_OPT_DUMP_ONLY=1    with _DUMP: stop there
@@ -17,7 +18,6 @@
 //
 // Every translation reads the original input and runs the pipeline once, so the translations of examples/stack_fallback.sh
 // (with the same environment) get the same module: nothing is applied twice and nothing is lost, unlike PRE_BACKEND_OPT.
-// Input that already went through mkp3.sh still looks lifted: such a flow keeps CUPBOP_LIFT_OPT=0.
 #include "lift_opt.h"
 #include "launch_fix.h"
 #include "tool.h"
@@ -206,7 +206,7 @@ Module *run_lift_opt(Module *M) {
     printf("lifted=%d %s\n", (int)l, why.c_str());
     std::exit(0);
   }
-  if (!env_on("CUPBOP_LIFT_OPT")) return M;
+  if (const char *e = std::getenv("CUPBOP_LIFT_OPT"); e && std::atoi(e) == 0) return M;
   const bool verbose = env_on("CUPBOP_LIFT_OPT_WHY");
   if (!is_lifted_module(M, &why)) {
     if (verbose) fprintf(stderr, "[lift-opt] off: %s\n", why.c_str());
@@ -218,6 +218,7 @@ Module *run_lift_opt(Module *M) {
   fprintf(stderr, "[lift-opt] %s: %s pipeline%s%s\n", why.c_str(), kind, stage2.empty() ? "" : ", then ", stage2.c_str());
   if (verbose) fprintf(stderr, "[lift-opt] %s\n", pipe.c_str());
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
+  for (auto &e : LIFT_OPT_DEFAULTS) setenv(e.name, e.value, 0);
   if (row) { for (auto &e : row->env) if (e.name) setenv(e.name, e.value, 0); }
   else for (auto &e : LIFT_OPT_NO_P4_ENV) setenv(e.name, e.value, 0);
 
