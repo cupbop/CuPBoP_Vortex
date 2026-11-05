@@ -1121,6 +1121,54 @@ static std::string cupbop_strip_prefix(const std::string &s) {
   while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
   return s.substr(i);
 }
+// Launch rewrites of the translator (compilation/KernelTranslation/include/launch_fix.h): cupbop_launch_fix.txt, one line per
+// kernel, <kernel> <key>=<value> ... What a kernel transformation changed about how its kernel has to be launched, so that the
+// program keeps its launch as written. CUPBOP_LAUNCH_FIX=0 at run time ignores the file.
+// A new key goes into cupbop_apply_launch_fix: a key this runtime does not know stops the launch, because a transformed kernel
+// launched without its rewrite runs wrongly.
+// cta_*: CUPBOP_CTA_LOOP; what the launched grid becomes is decided with the block's local memory, cupbop_cta_loop_launch.
+struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false; };
+static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem, cupbop_cta_fix &cta) {
+  static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    const char *rt = std::getenv("CUPBOP_LAUNCH_FIX");
+    if (!rt || std::atoi(rt) != 0) {
+      std::ifstream f("cupbop_launch_fix.txt");
+      std::string line;
+      while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream is(line);
+        std::string name, kv;
+        is >> name;
+        auto &e = table[cupbop_strip_prefix(name)];
+        while (is >> kv) {
+          const size_t eq = kv.find('=');
+          if (eq == std::string::npos) { fprintf(stderr, "cupbop_launch_fix.txt: bad entry `%s`\n", kv.c_str()); std::abort(); }
+          e.emplace_back(kv.substr(0, eq), std::stoull(kv.substr(eq + 1)));
+        }
+      }
+    }
+  }
+  auto it = table.find(func_stripped);
+  if (it == table.end()) return;
+  for (auto &[key, v] : it->second) {
+    if (key == "dyn_smem") {
+      DBG_PRINT("cudaLaunchKernel: %s: dynamic shared size %lu -> %lu (cupbop_launch_fix.txt)\n", func_stripped.c_str(), (unsigned long)sharedMem, (unsigned long)v);
+      sharedMem = v;
+    } else if (key == "cta_dims") {
+      cta.dims = (uint32_t)v;
+    } else if (key == "cta_inner") {
+      cta.inner = (uint32_t)v;
+    } else if (key == "cta_chunk") {
+      cta.chunk = v != 0;
+    } else {
+      fprintf(stderr, "cudaLaunchKernel: %s: unknown launch rewrite `%s` in cupbop_launch_fix.txt\n", func_stripped.c_str(), key.c_str());
+      std::abort();
+    }
+  }
+}
 // Per-kernel static __shared__ bytes, written by mem_share2local into kernel_lmem.log.
 static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
   static std::map<std::string, uint32_t> table;
@@ -1569,31 +1617,6 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   RT_CHECK((int)vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE));
   vx_event_release(ev);
 }
-// cupbop_launch_fix.txt (translator, launch_fix.h): <kernel as in lookup.txt> <key>=<value> ...: what a kernel transformation
-// changes in how the kernel has to be launched.
-static uint64_t cupbop_launch_fix(const std::string &lookup_name, const char *key) {
-  static const std::map<std::string, std::map<std::string, uint64_t>> table = []() {
-    std::map<std::string, std::map<std::string, uint64_t>> t;
-    std::ifstream f("cupbop_launch_fix.txt");
-    std::string line;
-    while (std::getline(f, line)) {
-      if (line.empty() || line[0] == '#') continue;
-      std::istringstream is(line);
-      std::string k, kv;
-      is >> k;
-      while (is >> kv) {
-        const size_t e = kv.find('=');
-        if (e != std::string::npos) t[k][kv.substr(0, e)] = std::stoull(kv.substr(e + 1));
-      }
-    }
-    return t;
-  }();
-  auto it = table.find(lookup_name);
-  if (it == table.end()) return 0;
-  auto v = it->second.find(key);
-  return v == it->second.end() ? 0 : v->second;
-}
-
 // CUPBOP_CTA_LOOP (compilation/KernelTranslation/src/cta_loop.cpp): a kernel translated with the block loop reads context words
 // no device code reads otherwise: printf_buffer (its low word: this launch loops) and, for the chunk form,
 // printf_buffer_position, printf_buffer_capacity, work_dim. dims: mask of the grid dimensions the loop walks, inner: the
@@ -2209,6 +2232,8 @@ cudaError_t cudaLaunchKernel_vortex(
   };
   std::string func_stripped = stripPrefix(std::string(func));
   DBG_COUT("func_stripped: " << func_stripped << std::endl);
+  cupbop_cta_fix cta_fix;
+  cupbop_apply_launch_fix(func_stripped, sharedMem, cta_fix);
 
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
@@ -2644,10 +2669,8 @@ cudaError_t cudaLaunchKernel_vortex(
       fprintf(stderr, "cupbop: lmem scale %u: %s %u -> %u bytes per CTA (capacity %lu)\n", cupbop_lmem_scale(),
               func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
     }
-    if (const uint64_t cta_dims = cupbop_launch_fix(kernel_name_tmp, "cta_dims"))   // CUPBOP_CTA_LOOP
-      if (schedule == 1 || schedule == 2)
-        cupbop_cta_loop_launch(abuf_ptr, (uint32_t)cta_dims, (uint32_t)cupbop_launch_fix(kernel_name_tmp, "cta_inner"),
-                               cupbop_launch_fix(kernel_name_tmp, "cta_chunk") != 0, grid, block, lmem);
+    if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
+      cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, grid, block, lmem);
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
