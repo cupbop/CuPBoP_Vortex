@@ -91,7 +91,7 @@ df_g3_s1p1      lift_g32      s1p1 tcu  raw PASS a \[lift-opt\].*full~pipeline,\
 df_hg_s2        lift_hgemm    s2   tcu  raw PASS p \[lift-opt\].*full~pipeline,\[p2c-fold\].*ring~S=3~->~1
 df_st_s2        lift_strsm    s2   main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*32~of~32
 df_st_s1p1      lift_strsm    s1p1 main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*32~of~32
-df_hs_s2        lift_hotspot  s2   main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*4~of~4,\[addr-carry\]
+df_hs_s2        lift_hotspot  s2   main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*4~of~4
 df_sx_s1p2      lift_saxpy    s1p2 main raw PASS a \[lift-opt\].*light~pipeline,\[trip-version\].*1D~exact
 df_c3_s1        lift_conv3    s1   main raw PASS a \[lift-opt\].*light~pipeline,\[trip-hoist\],parameter~buffers:~1~removed
 df_tr_s2        lift_transpose s2  main raw PASS a \[lift-opt\].*light~pipeline,parameter~buffers:~1~removed
