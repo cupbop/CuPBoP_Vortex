@@ -6,13 +6,14 @@
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
 //               load): the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
 //   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
-//               llvm.nvvm.ex2.approx.f32 -> llvm.nvvm.ex2.approx.f, llvm.nvvm.ldmatrix.*.p3 -> __cupbop_ldmatrix_m8n8_b16
+//               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> __cupbop_ldmatrix_m8n8_b16
 // An asm this file does not know and no later pass handles stops the translation. replace_asm_call would drop it with
 // a warning and leave undef, which is how a stock Triton vecadd became an empty kernel.
 #include "triton_ir.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <cstdio>
 #include <cstdlib>
@@ -289,6 +290,7 @@ void lower_triton_input(Module *M) {
     for (auto &BB : F)
       for (auto &I : BB)
         if (auto *CI = dyn_cast<CallInst>(&I)) calls.push_back(CI);
+  static const std::regex nvvm_f32(R"(^llvm\.nvvm\.(ex2|lg2|rcp|rsqrt|sqrt|sin|cos)\.[a-z]+(\.ftz)?\.f32$)");
   unsigned nAsm = 0, nIntr = 0;
   for (CallInst *CI : calls) {
     if (CI->isInlineAsm()) {
@@ -310,9 +312,14 @@ void lower_triton_input(Module *M) {
     } else if (n == "llvm.nvvm.div.full") {
       CI->replaceAllUsesWith(B.CreateFDiv(CI->getArgOperand(0), CI->getArgOperand(1)));
       CI->eraseFromParent();
-    } else if (n == "llvm.nvvm.ex2.approx.f32") {
-      FunctionType *FT = FunctionType::get(CI->getType(), {CI->getArgOperand(0)->getType()}, false);
-      CI->replaceAllUsesWith(B.CreateCall(M->getOrInsertFunction("llvm.nvvm.ex2.approx.f", FT), {CI->getArgOperand(0)}));
+    } else if (std::regex_match(n.str(), nvvm_f32)) {
+      // LLVM 21 renamed these .f -> .f32. Under the new name the .ftz forms missed the MUFU and became libm calls.
+      std::vector<Type *> tys;
+      std::vector<Value *> args;
+      for (Value *A : CI->args()) { tys.push_back(A->getType()); args.push_back(A); }
+      FunctionType *FT = FunctionType::get(CI->getType(), tys, false);
+      const std::string old = n.drop_back(2).str(); // ...f32 -> ...f
+      CI->replaceAllUsesWith(B.CreateCall(M->getOrInsertFunction(old, FT), args));
       CI->eraseFromParent();
     } else if (n.starts_with("llvm.nvvm.ldmatrix.sync.aligned.m8n8.")) {
       lower_ldmatrix(CI, n);
@@ -322,5 +329,10 @@ void lower_triton_input(Module *M) {
     nIntr++;
   }
   scalarize_half_casts(M);
+  if (const char *f = std::getenv("CUPBOP_TRITON_DUMP")) { // the module as the rest of the translator sees it
+    std::error_code EC;
+    raw_fd_ostream os(f, EC);
+    if (!EC) M->print(os, nullptr);
+  }
   fprintf(stderr, "[CuPBoP] Triton input: %u PTX asm, %u intrinsics lowered\n", nAsm, nIntr);
 }
