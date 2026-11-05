@@ -291,9 +291,9 @@ Function *with_block_args(Function *K) {
   return NF;
 }
 
-// CUPBOP_CTA_LOOP=auto: the innermost dimension is the highest one the kernel reads. A hardware CTA then keeps its position in the
-// lower dimensions: measured on 9 kernels with a 2D grid it is the best or within 1.1 points of the best (experiments/ctaloop);
-// walking x when y exists can cost: transpose +14% against -48%.
+// CUPBOP_CTA_LOOP=auto: the innermost dimension is the highest one the kernel reads. A rule of thumb: the rule of the store's smallest
+// stride, proposed by seed/transpose, is not implemented. Both directions measured on 2D grids (experiments/ctaloop m10): transpose y
+// -48.6%, x +2.2%; sgeam y -16.5%, x -18.9%; sger y -10.0%, x -6.6%; conv3, hotspot, g32, hgemm within 0.5 points of each other.
 int cta_loop_pick_dim(unsigned dims) { return dims & 4 ? 2 : dims & 2 ? 1 : 0; }
 
 unsigned block_dims_read(Function *K) {
