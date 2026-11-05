@@ -442,6 +442,11 @@ void lower_lanemask(Module *M) {
 // shrink-wrapped prologue and get slower (ctx_c README), so the 1:1 and flat schedules keep the 11770fc code.
 // CUPBOP_PARAM_FORWARD=all (or 1): every schedule; CUPBOP_PARAM_FORWARD=0 or CUPBOP_UNIFORM_NOREPL=0: off.
 // CUPBOP_PARAM_FORWARD_WHY=1: decisions.
+static bool param_span_on() {
+  static const bool on = [] { const char *e = std::getenv("CUPBOP_PARAM_SPAN"); return e && std::atoi(e) != 0; }();
+  return on;
+}
+
 void forward_param_buffer_copies(Module *M) {
   auto off_env = [](const char *n) { const char *e = std::getenv(n); return e && std::string(e) == "0"; };
   if (off_env("CUPBOP_UNIFORM_NOREPL") || off_env("CUPBOP_PARAM_FORWARD")) return;
@@ -530,6 +535,45 @@ void forward_param_buffer_copies(Module *M) {
           if (off >= x.off && off + size <= x.off + x.size) { s = &x; break; }
         Type *LT = L->getType();
         const bool type_ok = LT->isIntegerTy() || LT->isFloatingPointTy() || LT->isPointerTy();
+        // CUPBOP_PARAM_SPAN=1 (default 0): one wide load over several scalar parameters (SASS LDC.64 of two ints): the
+        // bits of each parameter, little-endian. Every byte of the load must lie in a stored scalar; the buffer then goes.
+        if (!s && type_ok && param_span_on() && size <= 8 && DL.isLittleEndian() && DL.getTypeSizeInBits(LT) == (uint64_t)size * 8) {
+          std::vector<const Src *> parts;
+          int64_t at = off;
+          bool ok = true;
+          while (at < off + size && ok) {
+            const Src *p = nullptr;
+            for (const Src &x : srcs)
+              if (at >= x.off && at < x.off + x.size) { p = &x; break; }
+            ok = p && p->scalar && !(L->getParent() == &Entry && !p->S->comesBefore(L));
+            if (ok) { parts.push_back(p); at = p->off + p->size; }
+          }
+          if (ok) {
+            IRBuilder<> B(L);
+            Type *WI = IntegerType::get(C, size * 8);
+            Value *R = ConstantInt::get(WI, 0);
+            for (const Src *p : parts) {
+              Value *X = p->scalar;
+              Type *XT = X->getType();
+              const unsigned xb = DL.getTypeSizeInBits(XT);
+              Type *XI = IntegerType::get(C, xb);
+              if (XT->isPointerTy()) X = B.CreatePtrToInt(X, XI);
+              else if (!XT->isIntegerTy()) X = B.CreateBitCast(X, XI);
+              const int64_t lo = std::max(p->off, off), hi = std::min(p->off + p->size, off + size);   // bytes this part gives
+              if (lo > p->off) X = B.CreateLShr(X, (uint64_t)(lo - p->off) * 8);
+              if ((hi - lo) * 8 < (int64_t)xb) X = B.CreateTrunc(X, IntegerType::get(C, (hi - lo) * 8));
+              X = B.CreateZExtOrTrunc(X, WI);
+              if (lo > off) X = B.CreateShl(X, (uint64_t)(lo - off) * 8);
+              R = B.CreateOr(R, X);
+            }
+            if (LT->isPointerTy()) R = B.CreateIntToPtr(R, LT);
+            else if (!LT->isIntegerTy()) R = B.CreateBitCast(R, LT);
+            L->replaceAllUsesWith(R);
+            L->eraseFromParent();
+            fwd++;
+            continue;
+          }
+        }
         if (!s || !type_ok || (L->getParent() == &Entry && !s->S->comesBefore(L)) ||
             (s->scalar && DL.getTypeSizeInBits(LT) != (uint64_t)size * 8)) {
           kept++;

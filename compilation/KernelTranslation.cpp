@@ -11,6 +11,7 @@
 #include "warp_func.h"
 #include "lifted_ir.h"
 #include "smem_reserve.h"
+#include "simt_opt.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -259,9 +260,13 @@ int main(int argc, char **argv) {
   generate_wrapper(program);
   dumpFile(program, "6_after_generate_wrapper.ll");
 
+  simt_measure_blockdim(program); // CUPBOP_MEASURE_BLOCKDIM: measurement only
+  simt_trip_version(program); // CUPBOP_TRIP_VERSION (default 0)
   DBG_LOG("performance_optimization\n");
   performance_optimization(program);
   dumpFile(program, "7_after_perf_opt.ll");
+  simt_div_restore(program); // CUPBOP_DIV_RESTORE (default 0)
+  simt_trip_hoist(program); // CUPBOP_TRIP_HOIST (default 0)
 
   DBG_LOG("hoist_block_constant_loads\n");
   hoist_block_constant_loads(program);
