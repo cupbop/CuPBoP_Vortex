@@ -8,6 +8,27 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+// LIFT_STRADDLE=<k>: the k-th cudaMalloc lands across the 2^32 address: the lifted 64-bit address arithmetic (two 32-bit halves and a carry) is only observable there.
+typedef int (*lift_malloc_fn)(void **, size_t);
+int cudaMalloc(void **p, size_t n) {
+  static lift_malloc_fn real;
+  static int calls;
+  if (!real) real = (lift_malloc_fn)dlsym(RTLD_NEXT, "cudaMalloc");
+  const char *k = getenv("LIFT_STRADDLE");
+  if (k && atoi(k) == ++calls) {
+    const uint64_t want = (1ull << 32) - (n / 2 & ~(uint64_t)4095);
+    void *at; real(&at, 64);
+    uint64_t end = (uint64_t)at + 64;
+    while (end + (1ull << 28) < want) { real(&at, (size_t)1 << 28); end = (uint64_t)at + (1ull << 28); }   // the runtime takes int sizes: pads of 256 MB, then the rest
+    if (end + 8192 < want) real(&at, (size_t)(want - end - 4096));
+    int r = real(p, n);
+    const uint64_t a = (uint64_t)*p;
+    if (a >= (1ull << 32) || a + n <= (1ull << 32)) printf("\nFAIL: LIFT_STRADDLE: buffer %llx + %zu does not cross 2^32\n", (unsigned long long)a, n);
+    else printf("\n[lift] buffer %llx + %zu crosses 2^32\n", (unsigned long long)a, n);
+    return r;
+  }
+  return real(p, n);
+}
 typedef int (*lift_memcpy_fn)(void *, const void *, size_t, int);
 int cudaMemcpy(void *dst, const void *src, size_t n, int kind) {
   static lift_memcpy_fn real;

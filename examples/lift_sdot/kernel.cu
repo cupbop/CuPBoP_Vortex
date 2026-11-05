@@ -13,7 +13,7 @@ int main() {
   memset(cb, 0, sizeof cb);
   lift_put<float>(cb, 0x218, 1.0f); lift_put<void *>(cb, 0x220, dW); lift_put<int64_t>(cb, 0x228, 8); lift_put<int64_t>(cb, 0x230, 8); lift_put<void *>(cb, 0x248, dR); lift_put<void *>(cb, 0x250, dR); lift_put<int>(cb, 0x25c, 1);
   lift_launch(K1, dim3(1), dim3(128), 0, "528:8 536:4 544:16 560:4 568:8 576:4 584:8 592:8 600:4 604:4 608:16", cb);
-  float r = 0; LIFT_CHECK(cudaMemcpy(&r, dR, 4, cudaMemcpyDeviceToHost));
+  float r = 0, part[8]; LIFT_CHECK(cudaMemcpy(part, dW, sizeof part, cudaMemcpyDeviceToHost)); LIFT_CHECK(cudaMemcpy(&r, dR, 4, cudaMemcpyDeviceToHost));   // the partial sums go into the bit record too: one float hides most of a rounding change
   double d = std::fabs(r - ref), tol = 1e-6 * sabs;
   printf("sdot n %d: %.9g, reference %.9g, |d| %.3g (limit %.3g)\n", n, r, ref, d, tol);
   return lift_finish(d <= tol ? 0 : 1);

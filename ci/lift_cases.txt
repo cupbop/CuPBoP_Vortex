@@ -7,8 +7,8 @@
 #             bit for bit, except LO_F16_ACC=2 in hgemm, which has its own group); - = none
 #   covers    comma list of extended regular expressions that must appear in the translator log or the pass log of the input, ~ = space; - = none
 #   env       %RAW %BASE %ON (ci/lift_test.sh); LIFT_NEEDS=<string>: SKIP when the translator binary does not have that string (a switch not merged yet)
-# Transformations (where each one acts): CUPBOP_DIV_RESTORE hotspot strsm; CUPBOP_SQRT_RESTORE nn (needs MUFU: rsqrt is lowered earlier without it); CUPBOP_ADDR_CARRY hotspot nn backprop (raw: lo-pair takes
-# them first); CUPBOP_PARAM_SPAN conv3 transpose (height and width differ, conv3 is square: a swapped pair shows only in transpose); CUPBOP_TRIP_HOIST conv3; CUPBOP_TRIP_VERSION saxpy nn; lo-pair every pre; p2c-fold hgemm g32 fprop; lo-mma hgemm g32 fprop; CUPBOP_PARAM_DYN fprop
+# Transformations (where each one acts): CUPBOP_DIV_RESTORE hotspot strsm; CUPBOP_SQRT_RESTORE nn (needs MUFU: rsqrt is lowered earlier without it); CUPBOP_ADDR_CARRY hotspot nn backprop addr (addr is written by hand; raw: lo-pair takes
+# them first; addr: negative index, 2^32); CUPBOP_PARAM_SPAN conv3 transpose (height and width differ, conv3 is square: a swapped pair shows only in transpose); CUPBOP_TRIP_HOIST conv3; CUPBOP_TRIP_VERSION saxpy nn; lo-pair every pre; p2c-fold hgemm g32 fprop; lo-mma hgemm g32 fprop; CUPBOP_PARAM_DYN fprop
 # --- SIMT kernels, host programs of the source examples
 sx_raw_s2       lift_saxpy    s2   main raw PASS a -                                              %RAW
 sx_raw_s1p1     lift_saxpy    s1p1 main raw PASS a -                                              %RAW
@@ -64,6 +64,14 @@ fp_raw_s2       lift_fprop    s2   tcu  raw PASS a -                            
 fp_dyn_s2       lift_fprop    s2   tcu  pre PASS a parameter~buffers:~1~removed.~0~partly         %BASE %ON LIFT_DYN_SMEM=0 LIFT_NEEDS=CUPBOP_PARAM_DYN
 fp_on_s1p1      lift_fprop    s1p1 tcu  raw PASS a -                                              %RAW %BASE %ON
 fp_pre_s2       lift_fprop    s2   tcu  pre PASS a lo-pair:,\[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA %BASE %ON LIFT_DYN_SMEM=0
+# --- 64-bit addresses in halves: a buffer across 2^32 (LIFT_STRADDLE, examples/lift_d2h.c); a lost carry shows only there
+ad_raw_s2       lift_addr     s2   main raw PASS a -                                              %RAW
+ad_on_s2        lift_addr     s2   main raw PASS a \[addr-carry\].*1~64-bit                       %RAW %BASE %ON
+ad_on_s1p2      lift_addr     s1p2 main raw PASS a \[addr-carry\]                                 %RAW %BASE %ON
+ad_wrap_s2      lift_addr     s2   main raw PASS a \[addr-carry\].*1~64-bit,crosses~2.32           %RAW %BASE %ON LIFT_STRADDLE=1
+nn_wrap_s2      lift_nn       s2   main raw PASS a \[addr-carry\].*2~64-bit,crosses~2.32           %RAW %BASE %ON LIFT_STRADDLE=1
+nn_wrap_pre_s2  lift_nn       s2   main pre PASS a lo-pair:,crosses~2.32                          %BASE %ON LIFT_STRADDLE=2
+sg_wrap_pre_s2  lift_sgeam    s2   main pre PASS a lo-pair:,crosses~2.32                          %BASE %ON LIFT_STRADDLE=3
 # --- regressions
 # clean-up (instcombine, simplifycfg) in front of the translator, lo-brfix as it is now: the s1p1 answer must stay right
 bp_clean_s1p1   lift_backprop s1p1 main clean PASS a -                                            %BASE

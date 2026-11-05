@@ -17,7 +17,7 @@ export PAR=${PAR:-8} RUN_TAG=${SLURM_JOB_ID:-manual}
 export LIFT_OUT=${LIFT_OUT:-$PWD/ci/logs_v3/lift_$RUN_TAG} LIFT_CASES=${LIFT_CASES:-$PWD/ci/lift_cases.txt}
 mkdir -p $LIFT_OUT; export RES=$LIFT_OUT/results.csv; echo "name,example,sched,hw,input,expect,group,verdict,stage,seconds" > $RES
 export VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOUT_S:-300}
-LIFT_RAW="CUPBOP_LIFT_OPT=0"   # table macros: %RAW %BASE %ON %PRE
+LIFT_RAW="CUPBOP_LIFT_OPT=0"   # table macros: %RAW %BASE %ON
 LIFT_BASE="CUPBOP_SMEM_RESERVE_DROP=1 CUPBOP_PARAM_FORWARD=all CUPBOP_DXA_CLOBBER=1 CUPBOP_SMEM_SHRINK=1"
 LIFT_ON="CUPBOP_DIV_RESTORE=1 CUPBOP_SQRT_RESTORE=1 CUPBOP_ADDR_CARRY=1 CUPBOP_PARAM_SPAN=1 CUPBOP_TRIP_HOIST=1 CUPBOP_TRIP_VERSION=1 CUPBOP_PARAM_DYN=2"
 export LIFT_RAW LIFT_BASE LIFT_ON
@@ -65,5 +65,5 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 print(dict(collections.Counter(r['verdict'] for r in rows)))
 bad = [r for r in rows if r['verdict'] not in ('PASS', 'XFAIL', 'XHANG', 'REFUSE', 'SKIP')]
 for r in bad: print(f"  {r['name']:28s} {r['verdict']} (expected {r['expect']}, stage {r['stage']})")
-sys.exit(1 if bad else 0)
+sys.exit(1 if bad or not rows else 0)
 PY
