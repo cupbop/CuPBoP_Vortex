@@ -1,0 +1,2 @@
+lo-pair: _Z15transpos: high=4 pack_joined=4 sum=4
+lo-brfix: _Z15transpos: 1 branch blocks kept

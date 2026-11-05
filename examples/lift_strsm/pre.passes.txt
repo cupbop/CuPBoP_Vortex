@@ -1,0 +1,2 @@
+lo-pair: _Z19kernel_t: carry=9 high=18 leaf=10 mul=6 pack_joined=19 phi=7 phi_hi_kept_use=7 phi_lo_kept_use=7 sum=27
+lo-brfix: _Z19kernel_t: 198 branch blocks kept
