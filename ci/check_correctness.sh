@@ -29,6 +29,13 @@ check_bits() { # after a PASS: the bit record of the device-to-host copies again
   [ -f "$f" ] && got="$(cksum < "$f" | cut -d' ' -f1)-$(wc -l < "$f")-$(sha1sum < "$f" | cut -c1-16)" || got=none
   [ "$got" = "$want" ] || { RESULT=FAIL; WHY="bit record $got, group $LIFT_BITS_GROUP wants ${want:-nothing}"; }
 }
+check_cta_loop() { # after a PASS: the translation has the block loop at schedule 2 and at no other, and not for the kernels that wait for another block. Not checked when a run asks for something else
+  [ "$RESULT" = PASS ] && [ -z "${CUPBOP_CTA_LOOP_S1:-}" ] && case "${CUPBOP_CTA_LOOP:-auto}" in off|0) false ;; esac || return 0
+  local f="${EXAMPLE_DIR}/cupbop_launch_fix.txt" n; n=$(cat "$f" 2>/dev/null | grep -c ' cta_dims=')
+  if [ "$SCHEDULE" = 2 ] && [ "$n" = 0 ]; then RESULT=FAIL; WHY="schedule 2 without the block loop"
+  elif [ "$SCHEDULE" != 2 ] && [ "$n" != 0 ]; then RESULT=FAIL; WHY="block loop at schedule $SCHEDULE"
+  elif grep -qE 'k_spin|k_ticket_spin' "$f" 2>/dev/null; then RESULT=FAIL; WHY="block loop in a kernel that must be refused"; fi
+}
 check_diff() { # <golden> <result>: exact match
   G=$1; R=$2
   if [ ! -f "$G" ] || [ ! -f "$R" ]; then WHY="golden ($G) or result ($R) missing"
@@ -37,10 +44,12 @@ check_diff() { # <golden> <result>: exact match
 }
 
 case $TEST_NAME in
-  simt_shape_test|cta_loop_test|mufu_approx|saxpy|struct_arg_test|mma884_test|launch_name_test|cp_async_test|cp_async_pipe|cp_async_asm|dxa_desc_test|async_*|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa|sgemm_wgmma_bf16|sgemm_tcu_bf16|tcu_dt_*|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda|mmafuse_test)
+  simt_shape_test|mufu_approx|saxpy|struct_arg_test|mma884_test|launch_name_test|cp_async_test|cp_async_pipe|cp_async_asm|dxa_desc_test|async_*|sgemm|sgemm_tcu|sgemm_dxa|sgemm_tcu_dxa|sgemm_wgmma|sgemm_wgmma_dxa|sgemm_wgmma_bf16|sgemm_tcu_bf16|tcu_dt_*|psum|conv3|dotproduct|vecadd|stencil|transpose|atomic_test|bh-cuda|blackscholes|cc-cuda|cfd|jaccard-cuda|lud|marchingCubes-cuda|psort|score-cuda|sfilter|spmv|wedford-cuda|mmafuse_test)
     check_marker "PASSED" ;;
   s1_arm_test)
     check_marker "PASSED" ;;
+  cta_loop_test)
+    check_marker "PASSED"; check_cta_loop ;;
   huffman)  # its checker (comparison_helpers.h) prints "PASS! vectors are matching!" / "FAIL! vectors are NOT matching!", never "PASSED"
     check_marker "PASS! vectors are matching" ;;
   backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda|virt_warp_test|virt_ldsm_test)

@@ -7,6 +7,9 @@
 //             innermost: hardware CTA (hx, hy, hz) of a launched grid (nx, ny, nz) runs the blocks hx + i nx, hy + j ny,
 //             hz + k nz. The host chooses the launched grid at each launch (cudaRuntimeImpl.cpp cupbop_cta_loop_launch)
 //   auto      the innermost dimension from cta_loop_pick_dim
+// Schedule 2 only. At schedule 1 (core mapping) the answers stay right but cells get much slower (sgeam 333x777 +34.1%, hotspot 512
+// +33.7%, experiments/ctaloop), so no value of the switch acts there unless CUPBOP_CTA_LOOP_S1=1 is set too, which is for measuring
+// that. Schedule 0 has none of this.
 // CUPBOP_CTA_LOOP_CALL=1 keeps the kernel a separate function: what the loop alone is worth, without the optimizer seeing
 // the kernel inside the loop. Otherwise the kernel is inlined into the wrapper's loop: everything that does not depend on
 // the block index leaves the loop.
@@ -84,6 +87,7 @@ Mode cta_loop_mode() {
   std::exit(1);
 }
 bool report() { return cupbop_debug() || std::getenv("CUPBOP_CTA_LOOP_REPORT"); }
+int schedule() { const char *s = std::getenv("VORTEX_SCHEDULE_FLAG"); return s ? std::atoi(s) : 0; }
 // CUPBOP_CTA_LOOP_NEG=skip|nobar: negative controls, the conformance tests must fail with these (experiments/ctaloop)
 bool neg_control(const char *what) { const char *e = std::getenv("CUPBOP_CTA_LOOP_NEG"); return e && !std::strcmp(e, what); }
 
@@ -406,9 +410,10 @@ void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
 void cta_loop_transform(Module *M) {
   const Mode mode = cta_loop_mode();
   if (mode == M_OFF) return;
-  const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
-  const int sched = s ? std::atoi(s) : 0;
-  if (sched != 1 && sched != 2) return;
+  const char *s1 = std::getenv("CUPBOP_CTA_LOOP_S1");
+  const bool measure_s1 = s1 && std::atoi(s1);
+  if (schedule() == 1 && !measure_s1) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP: not applied at schedule 1 (schedule 2 only; CUPBOP_CTA_LOOP_S1=1 measures it)\n"); return; }
+  if (schedule() != 1 && schedule() != 2) return;
   if (!sreg_from_csr() || !fast_entry_on()) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP needs the CTA CSR reads (CUPBOP_SREG_TLS or CUPBOP_FAST_ENTRY=0 is set): off\n"); return; }
   const bool call_mode = std::getenv("CUPBOP_CTA_LOOP_CALL") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_CALL"));
   // Legality is read from an optimized copy of the module: a CUDA source kernel has its values in allocas and its atomics
@@ -499,6 +504,8 @@ void cta_loop_finalize_wrapper() {
 // Only for kernels that read gridDim on that dimension (grid-stride): others size the grid to the data and have no empty block.
 // If any of this fails the kernel stays as it was. The kernel gets `if (U) { copy; return; }` at its entry. U is CTA-uniform, so
 // barriers stay uniform.
+// Schedule 2 only: sasum at s1p1 does not finish with it, also with no empty block (grid 1), and why is not known (experiments/ctaloop).
+// Set at another schedule it warns and leaves the translation as it was.
 namespace {
 using namespace llvm::PatternMatch;
 bool is_sreg(Value *V, const char *reg, int &dim) {
@@ -736,6 +743,7 @@ bool reduce_empty_copy(Function *E, std::string &why) {
 void cta_empty_exit(Module *M) {
   const char *en = std::getenv("CUPBOP_CTA_EMPTY");
   if (!en || !std::atoi(en)) return;
+  if (schedule() != 2) { std::fprintf(stderr, "[CuPBoP] warning: CUPBOP_CTA_EMPTY is for schedule 2 only: not applied at schedule %d\n", schedule()); return; }
   const DataLayout &DL = M->getDataLayout();
   std::vector<Function *> ks;
   for (auto &F : *M)
