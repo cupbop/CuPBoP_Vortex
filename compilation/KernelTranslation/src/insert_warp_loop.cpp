@@ -44,6 +44,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -3091,6 +3092,55 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
   return gates;
 }
 
+// ---- Core mapping: a conditional branch whose two arms stay inside one parallel region (s1fix, 2026-11-04) ----------
+// The region walk (getParallelRegionBefore) stops at a barrier block and at a block holding only a conditional branch
+// (the B-condition of the original CuPBoP: insert_sync leaves such a block in front of arms with barriers). Both tests
+// look at the shape of one block, not at where its arms go, and optimized input (lifted code after instcombine,
+// simplifycfg, adce) has both shapes with arms that hold no barrier at all:
+//   - X = [barrier; br c, A, B] (split_block_by_sync does not split in front of a terminator);
+//   - X = [br c, A, B] in the middle of a region (the i1 carriers in front of the branch are gone).
+// Both arms then run to the same barrier, so the region had two entry edges from X. add_warp_loop wraps one of them
+// (the first successor in the region; a region whose first arm is a chain of empty blocks counted as useless and got no
+// loop at all), the other edge runs past the loop header, and with a branch-only X everything in front of X had no
+// region either: that code ran once per physical warp with the values of slot 0, silently (lifted backprop s1p1,
+// sgeam s1 after adce, tg sm80 s1 after simplifycfg; when the walk met another stop as well the kernel was refused as
+// "two entry barriers": FA2, conv_1x1). Now, at schedule 1:
+//   - a branch-only block whose every path reaches the region's barrier inside the region is part of the region, the
+//     walk goes on above it (greatest fixed point: taken as interior first, thrown out when an arm leaves the region);
+//   - a barrier block with such a branch is split in front of the branch (the caller, defer_two_arm); the branch goes
+//     into the region (cupbop.s1_absorbed), the barrier stays the region's entry;
+//   - a region that still has two entry edges is handled as a region with two entry barriers: split, or refused.
+// CUPBOP_S1_TWO_ARM=0: off (the block-shape test alone, integ ab7f26b).
+static bool s1_two_arm_on() {
+  static const bool on = [] { const char *e = std::getenv("CUPBOP_S1_TWO_ARM"); return !(e && std::atoi(e) == 0); }();
+  return on;
+}
+// every path from S stays in W until it reaches the barrier block B
+static bool s1_closes_in_region(llvm::BasicBlock *S, const std::set<llvm::BasicBlock *> &W, llvm::BasicBlock *B) {
+  std::set<llvm::BasicBlock *> seen{S};
+  std::vector<llvm::BasicBlock *> work(llvm::succ_begin(S), llvm::succ_end(S));
+  while (!work.empty()) {
+    llvm::BasicBlock *X = work.back(); work.pop_back();
+    if (X == B || !seen.insert(X).second) continue;
+    if (!W.count(X)) return false;
+    work.insert(work.end(), llvm::succ_begin(X), llvm::succ_end(X));
+  }
+  return true;
+}
+static void s1_split_two_arm_entries(llvm::Function &F, std::vector<llvm::BasicBlock *> &stops) {
+  llvm::LLVMContext &C = F.getContext();
+  llvm::MDNode *mark = llvm::MDNode::get(C, llvm::MDString::get(C, "two-arm"));
+  std::set<llvm::BasicBlock *> done;
+  for (llvm::BasicBlock *S : stops) {
+    if (!done.insert(S).second) continue;
+    llvm::BasicBlock *T = S->splitBasicBlock(S->getTerminator(), S->getName() + ".s1arms");
+    T->getTerminator()->setMetadata("cupbop.s1_absorbed", mark);
+    fprintf(stderr, "[s1-arms] %s: branch of barrier block %s goes into the region after it\n", F.getName().str().c_str(),
+            S->getName().str().c_str());
+  }
+  stops.clear();
+}
+
 class InsertWarpLoopPass : public llvm::FunctionPass {
 
 public:
@@ -3111,6 +3161,8 @@ public:
   // core mapping, absorb on: the barrier blocks before which a thread-dependent region had two entry barriers
   // (refused otherwise), for split_multi_entry_merges
   std::vector<llvm::BasicBlock *> *defer_multi_entry = nullptr;
+  // core mapping: barrier blocks with a branch whose arms stay in the region after them, for s1_split_two_arm_entries
+  std::vector<llvm::BasicBlock *> *defer_two_arm = nullptr;
 
   void getParallelRegionBefore(llvm::BasicBlock *B, bool intra_warp_loop,
                                std::vector<ParallelRegion> &parallel_regions,
@@ -3132,6 +3184,16 @@ public:
         fprintf(stderr, "[PR]   glue_end exit: uniform glue, no region\n");
         return;
       }
+    // (see s1_two_arm_on) branch-only blocks walked through, those shown to be boundaries, the stops of the walk
+    const bool two_arm = g_schedule_flag == 1 && s1_two_arm_on();
+    std::set<BasicBlock *> interior_branches, boundary_branches;
+    std::vector<std::pair<BasicBlock *, bool>> stops;   // block, has a barrier
+    for (bool walk = true; walk;) {
+    walk = false;
+    current_region.wrapped_block.clear();
+    interior_branches.clear();
+    stops.clear();
+    region_entry_barrier = second_entry_barrier = NULL;
     for (BasicBlock *Pred : predecessors(B)) {
       pending_blocks.push_back(Pred);
     }
@@ -3210,6 +3272,11 @@ public:
         }
       }
 
+      if (two_arm && !has_barrier && is_single_conditional_branch_block && !boundary_branches.count(current)) {
+        interior_branches.insert(current);
+        is_single_conditional_branch_block = 0;
+      }
+
       if (has_barrier || is_single_conditional_branch_block) {
         fprintf(stderr, "[PR]   → barrier/branch stop: %s (has_barrier=%d, single_cond=%d)\n",
                 current->getName().str().c_str(), has_barrier, is_single_conditional_branch_block);
@@ -3217,6 +3284,8 @@ public:
           region_entry_barrier = current;
         else if (region_entry_barrier != current && !second_entry_barrier)
           second_entry_barrier = current;
+        if (std::find_if(stops.begin(), stops.end(), [&](auto &s) { return s.first == current; }) == stops.end())
+          stops.push_back({current, has_barrier != 0});
         continue;
       }
 
@@ -3226,6 +3295,14 @@ public:
       // Add predecessors to pending queue.
       for (BasicBlock *Pred : predecessors(current)) {
         pending_blocks.push_back(Pred);
+      }
+    }
+    // an arm of a branch-only block left the region: it is a boundary after all, walk again
+    for (BasicBlock *S : interior_branches)
+      if (!s1_closes_in_region(S, current_region.wrapped_block, B)) {
+        fprintf(stderr, "[PR]   branch %s leaves the region: stop\n", S->getName().str().c_str());
+        boundary_branches.insert(S);
+        walk = true;
       }
     }
 
@@ -3297,6 +3374,20 @@ public:
         }
       return false;
     };
+
+    // (see s1_two_arm_on) a stop with two edges into the region
+    if (two_arm && region_is_divergent())
+      for (auto &s : stops) {
+        std::set<BasicBlock *> arms;
+        for (BasicBlock *X : successors(s.first))
+          if (current_region.wrapped_block.count(X)) arms.insert(X);
+        if (arms.size() < 2) continue;
+        if (s.second && defer_two_arm && s1_closes_in_region(s.first, current_region.wrapped_block, B)) {
+          defer_two_arm->push_back(s.first);
+          return;
+        }
+        if (!second_entry_barrier) second_entry_barrier = s.first;
+      }
 
     if (second_entry_barrier) {
       // Two barriers lead into this region (e.g. a barrier on each arm of an if, or an irreducible cycle that
@@ -3602,9 +3693,9 @@ public:
     // joins the epilogue from the entry's barrier and from the loop's last barrier)
     const bool s1_split_merges = s1_absorb || (g_schedule_flag == 1 && need_nested_loop && !intra_warp_loop && virt_gate_on());
     s1_marker_is_warp_sync = g_schedule_flag == 1 && need_nested_loop && intra_warp_loop;
-    std::vector<llvm::BasicBlock *> multi_entry;
+    std::vector<llvm::BasicBlock *> multi_entry, two_arm_stops;
     if (s1_split_merges) defer_multi_entry = &multi_entry;
-    auto parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+    if (g_schedule_flag == 1 && s1_two_arm_on()) defer_two_arm = &two_arm_stops;
     std::unique_ptr<DominatorTree> absDT;
     std::unique_ptr<PostDominatorTree> absPDT;
     std::unique_ptr<LoopInfo> absLI;
@@ -3615,12 +3706,24 @@ public:
       DI.setAnalyzers(*absDT, *absPDT, *absLI);
       DI.analyze(F);
     };
+    // the regions, after the splits they ask for (s1_two_arm_on)
+    auto find_regions = [&]() {
+      auto r = getParallelRegions(&F, intra_warp_loop, DI);
+      while (!two_arm_stops.empty()) {
+        s1_split_two_arm_entries(F, two_arm_stops);
+        rebuild();
+        multi_entry.clear();
+        r = getParallelRegions(&F, intra_warp_loop, DI);
+      }
+      return r;
+    };
+    auto parallel_regions = find_regions();
     for (int round = 0; s1_split_merges && !multi_entry.empty(); round++) {
       std::vector<llvm::BasicBlock *> Bs;
       Bs.swap(multi_entry);
       if (round >= 8 || !split_multi_entry_merges(F, Bs)) defer_multi_entry = nullptr; // next pass: refuse as before
       rebuild();
-      parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+      parallel_regions = find_regions();
     }
     defer_multi_entry = nullptr;
     // virt sub-pass form: a region is a lane loop, so a store inside it runs once
@@ -3646,7 +3749,7 @@ public:
         fprintf(stderr, "[warp_loop] virt: %zu allocas stored inside lane loops forced per-lane (pass %d)\n", add.size(), iter);
         for (auto *AI : add) DI.addSource(AI);
         DI.analyze(F);
-        parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+        parallel_regions = find_regions();
       }
     };
     if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop) {
@@ -3661,7 +3764,7 @@ public:
             break;
           n++;
           rebuild();
-          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          parallel_regions = find_regions();
           force_lane_allocas();
         }
         if (n) fprintf(stderr, "[virt-gate] %s: %d areas absorbed into lane loops\n", func_name.c_str(), n);
@@ -3686,10 +3789,10 @@ public:
           }
           for (auto &g : gates) virt_gate_branch(g, F);
           rebuild();
-          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          parallel_regions = find_regions();
           virt_gate_guards(F, gates, parallel_regions);
           rebuild();
-          parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+          parallel_regions = find_regions();
           force_lane_allocas();
           int fw = 0;
           for (auto &g : gates) fw += !g.loop_branch;
@@ -3718,7 +3821,7 @@ public:
           break;
         n++;
         rebuild();
-        parallel_regions = getParallelRegions(&F, intra_warp_loop, DI);
+        parallel_regions = find_regions();
       }
       if (n) {
         fprintf(stderr, "[warp_loop] %s: %zu parallel regions after %d absorbed areas\n", func_name.c_str(),
@@ -3729,6 +3832,7 @@ public:
         }
       }
     }
+    defer_two_arm = nullptr;
     if (g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop)
       note_p1_only_kernel(F, parallel_regions, DI, absPDT ? *absPDT : *PDT);
     // assert(!parallel_regions.empty() && "can not find any parallel regions\n");
