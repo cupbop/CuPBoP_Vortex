@@ -405,6 +405,7 @@ static std::string big_stack_call(const std::string &fn = "callbacks[kernel_arg-
 static std::vector<std::pair<std::string, std::string>> g_kabi_kernels;   // (kernel, wrapper) in the IR
 static std::vector<std::string> g_kabi_cxx_wrappers;                      // cuda_* in kernel_wrapper.cpp
 const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list() { return g_kabi_kernels; }
+void kabi_add_wrapper(const std::string &wrapper) { g_kabi_kernels.emplace_back("", wrapper); }   // CUPBOP_CTA_LOOP: no kernel under it keeps the ABI
 
 using namespace llvm;
 
@@ -1296,7 +1297,7 @@ void annotate_kernel_abi(llvm::Module *M) {
       for (auto &I : BB)
         if (auto *CI = dyn_cast<CallBase>(&I))
           if (Function *Callee = CI->getCalledFunction())
-            if (Callee->getName() == kw.first || Callee->getName() == kw.first + ".cta.loop") add(Callee);   // .cta.loop: CUPBOP_CTA_LOOP
+            if (Callee->getName() == kw.first) add(Callee);
   }
   if (!names.empty()) {
     auto *AT = ArrayType::get(ElemTy, elems.size());

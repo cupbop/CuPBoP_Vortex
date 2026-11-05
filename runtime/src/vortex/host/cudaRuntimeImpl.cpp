@@ -1623,7 +1623,7 @@ static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inn
   const uint64_t nc = ncs && atoi(ncs) > 0 && (uint64_t)atoi(ncs) < NUM_CORES_VX ? (uint64_t)atoi(ncs) : NUM_CORES_VX;
   const uint64_t resident = per_core * nc;
   const uint32_t k = cupbop_env_u32("CUPBOP_CTA_K", 0);
-  const uint64_t target = k ? (blocks + k - 1) / k : resident * std::max<uint32_t>(cupbop_env_u32("CUPBOP_CTA_WAVES", 1), 1);
+  const uint64_t target = k ? std::max<uint64_t>((blocks + k - 1) / k, resident) : resident * std::max<uint32_t>(cupbop_env_u32("CUPBOP_CTA_WAVES", 1), 1);
   uint32_t *w = &ka->ctx.printf_buffer_position;   // w[d]: printf_buffer_position, printf_buffer_capacity, work_dim
   w[0] = w[1] = w[2] = 0;
   ka->ctx.printf_buffer = nullptr;                 // its low word: 1 = this launch loops

@@ -23,7 +23,8 @@
 //  * grid-wide sync, clusters: refused;
 //  * a block waiting for another block: a loop that keeps reading one address until it changes. With the original launch
 //    the block it waits for may be running; here it may be queued behind the waiter on the same hardware CTA. Refused
-//    (the rule is syntactic and conservative: an exit condition that hangs on a load or atomic at a loop-invariant address);
+//    (the rule is syntactic: an exit condition that hangs on a load or atomic at a loop-invariant address, with no induction
+//    variable in it: `while (flag == 0)`, not `for (i = 0; i < *n; ++i)`);
 //  * mbarrier / TMA / bulk copies: refused for now, their state lives across a block's end in the DXA unit;
 //  * shared memory: blocks that share a slot in time must not overlap, so the loop gets a CTA barrier between two blocks
 //    when the kernel touches local memory. A kernel without it has none: its warps run ahead independently. Every warp of
@@ -32,8 +33,10 @@
 //    legal reads the previous block's values.
 #include "cta_loop.h"
 #include "generate_wrapper.h"
+#include "stable_order.h"
 #include "launch_fix.h"
 #include "tool.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
@@ -60,12 +63,15 @@
 using namespace llvm;
 
 const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list();   // generate_wrapper.cpp: (kernel, wrapper)
+void kabi_add_wrapper(const std::string &wrapper);                            // generate_wrapper.cpp
 
 namespace {
 enum Mode { M_OFF = 0, M_X = 1, M_Y = 2, M_Z = 3, M_AUTO = 4 };
 const unsigned CSR_CTA_ID = 0xCD0, CSR_CTA_SIZE = 0xCD2, CSR_BLOCK_ID = 0xCD6, CSR_GRID_DIM = 0xCDC;
 // offsets from the wrapper's argument (kernel_arg_t.args) back into kernel_arg_t.ctx, generate_wrapper.cpp context_t
-const int ARGS_FROM_CTX = 72, CTX_NUM_GROUPS = 0, CTX_LOOP_FLAG = 40, CTX_LOOP_PARAMS = 48;
+const int ARGS_FROM_CTX = 72, CTX_NUM_GROUPS = 0, CTX_LOOP_PARAMS = 48;
+
+std::vector<std::pair<std::string, std::string>> loop_wrappers;   // (wrapper, its copy with the loop)
 
 Mode cta_loop_mode() {
   const char *e = std::getenv("CUPBOP_CTA_LOOP");
@@ -93,14 +99,15 @@ bool is_block_or_grid_csr(int c) {
   return (c >= (int)CSR_BLOCK_ID && c < (int)CSR_BLOCK_ID + 3) || (c >= (int)CSR_GRID_DIM && c < (int)CSR_GRID_DIM + 3);
 }
 
-void reachable(Function *F, std::set<Function *> &out) {
-  if (!F || F->isDeclaration() || !out.insert(F).second) return;
+using FunctionList = SetVector<Function *>;   // insertion order: the walk below must not depend on heap addresses (stable_order.h)
+void reachable(Function *F, FunctionList &out) {
+  if (!F || F->isDeclaration() || !out.insert(F)) return;
   for (auto &BB : *F)
     for (auto &I : BB)
       if (auto *C = dyn_cast<CallBase>(&I)) reachable(C->getCalledFunction(), out);
 }
 
-bool uses_local_memory(const std::set<Function *> &fs) {
+bool uses_local_memory(const FunctionList &fs) {
   for (Function *F : fs)
     for (auto &BB : *F)
       for (auto &I : BB) {
@@ -139,12 +146,15 @@ bool spin_loop(Function *F, std::string &where) {
       for (BasicBlock *B : exits) {
         auto *Br = dyn_cast<BranchInst>(B->getTerminator());
         if (!Br || !Br->isConditional()) continue;
-        std::set<Value *> seen;
+        std::set<Value *> seen;   // membership only
         SmallVector<Value *, 16> work{Br->getCondition()};
+        bool counted = false, waits = false;
+        std::string what;
         while (!work.empty()) {
           Value *V = work.pop_back_val();
           auto *I = dyn_cast<Instruction>(V);
           if (!I || !L->contains(I) || !seen.insert(V).second) continue;
+          if (isa<PHINode>(I)) { counted = true; continue; }   // an induction variable: this exit counts, it does not wait (bfs reloads its bound)
           Value *Ptr = nullptr;
           if (auto *Ld = dyn_cast<LoadInst>(I)) Ptr = Ld->getPointerOperand();
           else if (auto *A = dyn_cast<AtomicRMWInst>(I)) Ptr = A->getPointerOperand();
@@ -155,20 +165,20 @@ bool spin_loop(Function *F, std::string &where) {
             const bool priv = isa<AllocaInst>(O) || Ptr->getType()->getPointerAddressSpace() == 3;
             auto *G = dyn_cast<GlobalVariable>(O);
             if (!priv && !(G && G->isConstant()) && invariant_expr(Ptr, L)) {
-              std::string d; raw_string_ostream os(d); I->print(os);
-              where = "loop at " + B->getName().str() + " waits on" + os.str();
-              return true;
+              raw_string_ostream os(what); I->print(os);
+              waits = true;
             }
             continue;
           }
           for (Value *Op : I->operands()) work.push_back(Op);
         }
+        if (waits && !counted) { where = "loop at " + B->getName().str() + " waits on" + what; return true; }
       }
     }
   return false;
 }
 
-std::string cta_loop_refusal(const std::set<Function *> &fs, Function *K) {
+std::string cta_loop_refusal(const FunctionList &fs, Function *K) {
   {   // async_ptx: kernels with mbarrier waits, TMA or bulk copies
     std::ifstream af("cupbop_async_kernels.txt");
     std::string n;
@@ -200,9 +210,9 @@ std::string cta_loop_refusal(const std::set<Function *> &fs, Function *K) {
 // inline the functions (other than the kernel) that read the CTA's block or grid CSRs: only the kernel gets the arguments
 bool inline_block_readers(Function *K) {
   for (int round = 0; round < 16; ++round) {
-    std::set<Function *> fs;
+    FunctionList fs;
     reachable(K, fs);
-    std::set<Function *> readers;
+    std::set<Function *> readers;   // membership only
     for (Function *F : fs) {
       if (F == K) continue;
       for (auto &BB : *F)
@@ -299,25 +309,16 @@ unsigned block_dims_read(Function *K) {
 
 void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, bool barrier, bool call_mode) {
   LLVMContext &C = M->getContext();
-  // The wrapper keeps the kernel as it was: a launch without a loop (the host's word in the context says so) runs the old code,
-  // so a launch of few blocks pays one load and one branch and nothing else. The loop lives in a copy of the wrapper, with a
-  // copy of the kernel that takes the block index as arguments.
+  // The wrapper stays as it was, so a launch without a loop runs the old code; kernel_main takes the copy of the wrapper when the
+  // host's word in the context says so (cta_loop_finalize_wrapper). A branch inside the wrapper would not do: the wrapper then
+  // needs a frame, which moves the kernel's frame (conv +16% on a launch that never loops: the stack's L2 sets), and the backend
+  // does not tail-call here. The copy calls a copy of the kernel that takes the block index as arguments.
   ValueToValueMapTy VM0;
   Function *W = CloneFunction(W0, VM0);
-  W->setName(K->getName() + ".cta.loop");
-  W->setLinkage(GlobalValue::InternalLinkage);
-  W->addFnAttr(Attribute::NoInline);
-  {
-    BasicBlock *E0 = &W0->getEntryBlock();
-    BasicBlock *Rest = E0->splitBasicBlock(E0->getFirstNonPHIOrDbgOrAlloca(), "cta.plain");
-    E0->getTerminator()->eraseFromParent();
-    BasicBlock *Go = BasicBlock::Create(C, "cta.go", W0, Rest);
-    IRBuilder<> B0(E0);
-    B0.CreateCondBr(uniform_i1(B0, B0.CreateICmpNE(ctx_word(B0, W0->getArg(0), CTX_LOOP_FLAG, "cta.on"), B0.getInt32(0)), "cta.loop"), Go, Rest);
-    B0.SetInsertPoint(Go);
-    B0.CreateCall(W, {W0->getArg(0)});
-    B0.CreateRetVoid();
-  }
+  W->setName(W0->getName() + "_cta_loop");
+  W->setLinkage(GlobalValue::ExternalLinkage);
+  loop_wrappers.push_back({W0->getName().str(), W->getName().str()});
+  kabi_add_wrapper(W->getName().str());
   CallInst *Call = nullptr;
   for (auto &BB : *W)
     for (auto &I : BB)
@@ -421,12 +422,13 @@ void cta_loop_transform(Module *M) {
     ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O1);
     MPM.run(*Copy, MAM);
   }
-  for (auto &kw : kabi_kernel_list()) {
+  const auto kernels = kabi_kernel_list();   // a copy: build_loop adds to the list
+  for (auto &kw : kernels) {
     Function *K = M->getFunction(kw.first), *W = M->getFunction(kw.second);
     if (!K || !W || W->isDeclaration()) continue;
     const std::string lookup = cupbop_kernel_lookup_name(kw.first);
     if (!inline_block_readers(K)) { std::fprintf(stderr, "[CuPBoP] cta_loop: %s: refused: a function reads blockIdx and cannot be inlined\n", lookup.c_str()); continue; }
-    std::set<Function *> fs, cfs;
+    FunctionList fs, cfs;
     reachable(K, fs);
     Function *CK = Copy->getFunction(kw.first);
     reachable(CK, cfs);
@@ -445,6 +447,44 @@ void cta_loop_transform(Module *M) {
   }
 }
 
+// kernel_wrapper.cpp was written before the loops existed: kernel_main calls the copy of the wrapper when the context word is set.
+void cta_loop_finalize_wrapper() {
+  if (loop_wrappers.empty()) return;
+  std::ifstream in("kernel_wrapper.cpp");
+  if (!in) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP: no kernel_wrapper.cpp\n"); std::exit(1); }
+  std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  const size_t t0 = s.find("vx_kernel_func_cb callbacks[] = {"), t1 = t0 == std::string::npos ? t0 : s.find("};", t0);
+  if (t1 == std::string::npos) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP: no callbacks table\n"); std::exit(1); }
+  std::string decl, table = s.substr(t0, t1 + 2 - t0);
+  table.replace(0, std::strlen("vx_kernel_func_cb callbacks"), "static vx_kernel_func_cb __cupbop_loop_callbacks");
+  auto swap_all = [](std::string &t, const std::string &a, const std::string &b) {
+    for (size_t p = t.find(a); p != std::string::npos; p = t.find(a, p + b.size())) t.replace(p, a.size(), b);
+  };
+  for (auto &w : loop_wrappers) {
+    decl += "extern \"C\" void " + w.second + "(void *);\n";
+    swap_all(table, "(vx_kernel_func_cb)" + w.first + ",", "(vx_kernel_func_cb)" + w.second + ",");
+    swap_all(table, "cuda_" + w.first + ",", "(vx_kernel_func_cb)" + w.second + ",");
+  }
+  const size_t m = s.find("void kernel_main(kernel_arg_t");
+  if (m == std::string::npos) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP: no kernel_main\n"); std::exit(1); }
+  size_t a = std::string::npos, e = std::string::npos;
+  for (const char *pre : {"__cupbop_kcall(", "__cupbop_kcall_lmem(ctx, ", "__cupbop_call_kernel("}) {
+    const size_t p = s.find(pre, m);
+    if (p != std::string::npos) { a = p + std::strlen(pre); e = s.find(", (void *)args", a); break; }
+  }
+  if (e == std::string::npos) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP: no kernel call in kernel_main\n"); std::exit(1); }
+  const std::string fn = s.substr(a, e - a);
+  const std::string loop = fn.find("kernel_idx") != std::string::npos ? "__cupbop_loop_callbacks[kernel_arg->kernel_idx]" : "(vx_kernel_func_cb)" + loop_wrappers[0].second;
+  // two calls rather than a selected pointer: the launches that do not loop pay a load and a branch
+  const size_t l0 = s.rfind('\n', a) + 1, l1 = s.find('\n', e);
+  std::string call = s.substr(l0, l1 - l0), lcall = call;
+  lcall.replace(a - l0, e - a, loop);
+  s.replace(l0, l1 - l0, "    if (ctx->printf_buffer) {\n    " + lcall + "\n    } else {\n    " + call + "\n    }");
+  s.insert(t1 + 2, "\n// CUPBOP_CTA_LOOP: the wrappers with the block loop (cta_loop.cpp)\n" + decl + table + "\n");
+  std::ofstream("kernel_wrapper.cpp", std::ios::trunc) << s;
+}
+
 // CUPBOP_CTA_EMPTY=1 (default off; 2026-11-04, experiments/ctaloop): a block whose every thread fails the kernel's range guard
 // skips the kernel. cuBLAS asum and nrm2 launch 1024 blocks for n = 1024: 1020 blocks have no element, and each still runs the
 // tree reduction of zeros and stores the zero.
@@ -456,6 +496,7 @@ void cta_loop_transform(Module *M) {
 //    stores again (this is the identity: f(e, e) = e for the block's reduction, found by constant folding, whichever f is);
 //  * a load of a local-memory word that no thread of the block wrote would have read garbage in the original: not legal code;
 //  * nothing else reads memory: no global load and no atomic remains. The local-memory traffic and the barriers then go.
+// Only for kernels that read gridDim on that dimension (grid-stride): others size the grid to the data and have no empty block.
 // If any of this fails the kernel stays as it was. The kernel gets `if (U) { copy; return; }` at its entry. U is CTA-uniform, so
 // barriers stay uniform.
 namespace {
@@ -725,6 +766,15 @@ void cta_empty_exit(Module *M) {
     if (groups.empty()) continue;
     G *best = nullptr;
     for (auto &kv : groups) if (!best || kv.second.uses.size() > best->uses.size()) best = &kv.second;
+    // a kernel that reads gridDim on this dimension walks the grid (grid-stride): its grid need not be sized to the data, which
+    // is when whole blocks can be empty. Otherwise the test at the entry is only a cost (pool_avg +1.5%).
+    bool strided = false;
+    for (auto &BB : *K)
+      for (auto &I : BB) {
+        int d = -1;
+        if (is_sreg(&I, "nctaid", d) && d == best->dim) strided = true;
+      }
+    if (!strided) { if (report()) std::fprintf(stderr, "[CuPBoP] cta_empty: %s: not used: the kernel does not read gridDim\n", name.c_str()); continue; }
     ValueToValueMapTy VM;
     Function *E = CloneFunction(K, VM);
     E->setName(K->getName() + ".empty");

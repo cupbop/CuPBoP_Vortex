@@ -309,6 +309,7 @@ int main(int argc, char **argv) {
   mark_uniform_branches(program); // CUPBOP_UNIFORM_BR: uniform branches get llvm.riscv.vx.uniform (uniform_branch.cpp)
   annotate_kernel_abi(program); // CUPBOP_KABI (default on): kernel calling convention, cupbop_kabi.txt
   fast_entry_finalize_wrapper(program); // CUPBOP_FAST_ENTRY: kernel_main stores only what the module reads
+  cta_loop_finalize_wrapper(); // CUPBOP_CTA_LOOP: kernel_main takes the wrapper with the loop
   describe_dyn_stack(program); // CUPBOP_SP_SKEW: launch-time bounds of run-time sized stack arrays, cupbop_dyn_stack.txt
   launch_fix_collect(program); // before the module is written: kernel.bc does not carry the marks
   DumpModule(program, argv[2]);
