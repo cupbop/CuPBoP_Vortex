@@ -10,6 +10,7 @@
 #          translator log or in the pass log <input>.passes.txt of the input (the transformation under test really acted on this input)
 #   XFAIL: it builds and the answer is wrong (a known bug, kept as a regression test); a row that passes is an error too (XPASS: the bug is gone, change the table)
 #   XHANG: as XFAIL for a known hang
+#   REFUSE: the translator stops with the coverage patterns in its log (an input it must not compile silently)
 #   SKIP : a row that needs what this tree does not have (LIFT_NEEDS, hw mufu), printed in the summary
 set -u
 export PAR=${PAR:-8} RUN_TAG=${SLURM_JOB_ID:-manual}
@@ -18,7 +19,7 @@ mkdir -p $LIFT_OUT; export RES=$LIFT_OUT/results.csv; echo "name,example,sched,h
 export VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOUT_S:-300}
 LIFT_RAW="CUPBOP_LIFT_OPT=0"   # table macros: %RAW %BASE %ON %PRE
 LIFT_BASE="CUPBOP_SMEM_RESERVE_DROP=1 CUPBOP_PARAM_FORWARD=all CUPBOP_DXA_CLOBBER=1 CUPBOP_SMEM_SHRINK=1"
-LIFT_ON="CUPBOP_DIV_RESTORE=1 CUPBOP_SQRT_RESTORE=1 CUPBOP_ADDR_CARRY=1 CUPBOP_PARAM_SPAN=1 CUPBOP_TRIP_HOIST=1 CUPBOP_TRIP_VERSION=1 CUPBOP_PARAM_DYN=1"
+LIFT_ON="CUPBOP_DIV_RESTORE=1 CUPBOP_SQRT_RESTORE=1 CUPBOP_ADDR_CARRY=1 CUPBOP_PARAM_SPAN=1 CUPBOP_TRIP_HOIST=1 CUPBOP_TRIP_VERSION=1 CUPBOP_PARAM_DYN=2"
 export LIFT_RAW LIFT_BASE LIFT_ON
 run_row() { # name example sched hw input expect group covers [VAR=VALUE...]
   local name=$1 ex=$2 sch=$3 hw=$4 input=$5 expect=$6 group=$7 covers=$8; shift 8
@@ -28,7 +29,9 @@ run_row() { # name example sched hw input expect group covers [VAR=VALUE...]
   if [ -n "$skip" ]; then printf "%-26s %-14s %-5s %-4s %-6s expect=%-5s SKIP (%s)\n" $name $ex $sch $hw $input $expect "$skip"; echo "$name,$ex,$sch,$hw,$input,$expect,$group,SKIP,-,0" >> $RES; return; fi
   rm -rf $d; cp -a examples/$ex $d; rm -f $d/lift_d2h.txt
   passes=$d/$input.passes.txt
-  if [ "$input" = pre ] && [ -n "${LIFT_OPT_IN_TRANSLATOR:-}" ]; then input=raw; passes=/dev/null; set -- "$@" CUPBOP_LIFT_OPT=1; fi
+  # the launch rewrite comes from the translator then (cupbop_launch_fix.txt): no LIFT_DYN_SMEM. LIFT_MERGE examples stay pre: a module with source kernels beside the lift is not a lifted module for the translator
+  if [ "$input" = pre ] && [ -n "${LIFT_OPT_IN_TRANSLATOR:-}" ] && ! grep -q '^LIFT_MERGE *= *1' $d/Makefile; then
+    input=raw; passes=/dev/null; local a=(); for p in "$@"; do case $p in LIFT_DYN_SMEM=*) ;; *) a+=("$p") ;; esac; done; set -- "${a[@]}" CUPBOP_LIFT_OPT=1; fi
   case $sch in s2) s=2 ;; s1) s=1 ;; s1p*) s=1; set -- CUPBOP_VIRT_WARPS=${sch#s1p} "$@" ;; *) echo "$name: bad schedule $sch"; return ;; esac
   [ "$hw" = main ] || [ "$hw" = mufu ] || set -- VORTEX_PATH=$VORTEX_PATH_TCU "VORTEX_CONFIGS=$VORTEX_CONFIGS_TCU" CUPBOP_MMA_LOWERING=tcu LD_LIBRARY_PATH=$VORTEX_PATH_TCU/sw/runtime:$LD_LIBRARY_PATH "$@"
   ( env ${LIFT_ENV:-} "$@" timeout ${LIFT_ROW_TIMEOUT:-600} make -C $d ci SCHEDULE=$s LOCALMEM=1 LIFT_INPUT=$input ) > $log 2>&1; rc=$?
@@ -40,6 +43,7 @@ run_row() { # name example sched hw input expect group covers [VAR=VALUE...]
     PASS)  [ "$stage" = ok ] && verdict=PASS || verdict=UNEXPECTED ;;
     XFAIL) case $stage in ok) verdict=XPASS ;; run) verdict=XFAIL ;; *) verdict=UNEXPECTED ;; esac ;;
     XHANG) case $stage in ok) verdict=XPASS ;; hang) verdict=XHANG ;; *) verdict=UNEXPECTED ;; esac ;;
+    REFUSE) verdict=UNEXPECTED; if [ "$stage" = translate ]; then verdict=REFUSE; for p in ${covers//,/ }; do grep -qE "${p//\~/ }" $log || verdict=UNEXPECTED; done; fi ;;
   esac
   [ -f $d/lift_d2h.txt ] && cp $d/lift_d2h.txt $LIFT_OUT/$name.d2h
   [ -f $d/ci_output.txt ] && cp $d/ci_output.txt $LIFT_OUT/$name.out
@@ -59,7 +63,7 @@ python3 -I - "$RES" <<'PY'
 import csv, sys, collections
 rows = list(csv.DictReader(open(sys.argv[1])))
 print(dict(collections.Counter(r['verdict'] for r in rows)))
-bad = [r for r in rows if r['verdict'] not in ('PASS', 'XFAIL', 'XHANG', 'SKIP')]
+bad = [r for r in rows if r['verdict'] not in ('PASS', 'XFAIL', 'XHANG', 'REFUSE', 'SKIP')]
 for r in bad: print(f"  {r['name']:28s} {r['verdict']} (expected {r['expect']}, stage {r['stage']})")
 sys.exit(1 if bad else 0)
 PY

@@ -2,13 +2,13 @@
 #   schedule  s2 (one CUDA thread per hardware thread), s1 (core mapping, one physical warp per CUDA warp), s1p<k> (core mapping, k physical warps per CTA)
 #   hw        main, tcu (TCU + DXA SimX build, CUPBOP_MMA_LOWERING=tcu), mufu (a SimX build with MUFU: runs only when VORTEX_CONFIGS has it, otherwise SKIP)
 #   input     <input>.ll.xz of the example (examples/lift.mk): raw, pre, or a regression variant
-#   expect    PASS, XFAIL (known wrong answer, must stay wrong until the table changes), XHANG (known hang, ends with the CP poll timeout)
+#   expect    PASS, XFAIL (known wrong answer, must stay wrong until the table changes), XHANG (known hang, ends with the CP poll timeout), REFUSE (the translator stops, covers = its message)
 #   group     the bit record of the row, a line of the example's lift_bits.txt (rows of one group must give the same bits: the switches and passes under test keep the result
 #             bit for bit, except LO_F16_ACC=2 in hgemm, which has its own group); - = none
 #   covers    comma list of extended regular expressions that must appear in the translator log or the pass log of the input, ~ = space; - = none
 #   env       %RAW %BASE %ON (ci/lift_test.sh); LIFT_NEEDS=<string>: SKIP when the translator binary does not have that string (a switch not merged yet)
 # Transformations (where each one acts): CUPBOP_DIV_RESTORE hotspot strsm; CUPBOP_SQRT_RESTORE nn (needs MUFU: rsqrt is lowered earlier without it); CUPBOP_ADDR_CARRY hotspot nn backprop (raw: lo-pair takes
-# them first); CUPBOP_PARAM_SPAN conv3; CUPBOP_TRIP_HOIST conv3; CUPBOP_TRIP_VERSION saxpy nn; lo-pair every pre; p2c-fold hgemm g32 fprop; lo-mma hgemm g32 fprop; CUPBOP_PARAM_DYN fprop
+# them first); CUPBOP_PARAM_SPAN conv3 transpose (height and width differ, conv3 is square: a swapped pair shows only in transpose); CUPBOP_TRIP_HOIST conv3; CUPBOP_TRIP_VERSION saxpy nn; lo-pair every pre; p2c-fold hgemm g32 fprop; lo-mma hgemm g32 fprop; CUPBOP_PARAM_DYN fprop
 # --- SIMT kernels, host programs of the source examples
 sx_raw_s2       lift_saxpy    s2   main raw PASS a -                                              %RAW
 sx_raw_s1p1     lift_saxpy    s1p1 main raw PASS a -                                              %RAW
@@ -19,6 +19,10 @@ c3_raw_s2       lift_conv3    s2   main raw PASS a -                            
 c3_on_s2        lift_conv3    s2   main raw PASS a parameter~buffers:~1~removed.~0~partly         %RAW %BASE %ON
 c3_on_s1        lift_conv3    s1   main raw PASS a \[trip-hoist\].*9~loads,parameter~buffers:~1~removed.~0~partly %RAW %BASE %ON
 c3_pre_s1p1     lift_conv3    s1p1 main pre PASS a lo-pair:,parameter~buffers:~1~removed.~0~partly %BASE %ON
+tr_raw_s2       lift_transpose s2  main raw PASS a -                                              %RAW
+tr_on_s2        lift_transpose s2  main raw PASS a parameter~buffers:~1~removed.~0~partly         %RAW %BASE %ON
+tr_on_s1p1      lift_transpose s1p1 main raw PASS a parameter~buffers:~1~removed.~0~partly        %RAW %BASE %ON
+tr_pre_s1       lift_transpose s1  main pre PASS a lo-pair:,parameter~buffers:~1~removed.~0~partly %BASE %ON
 hs_raw_s2       lift_hotspot  s2   main raw PASS a -                                              %RAW
 hs_on_s2        lift_hotspot  s2   main raw PASS a \[div\].*4~of~4,\[addr-carry\].*3~64-bit       %RAW %BASE %ON
 hs_on_s1p1      lift_hotspot  s1p1 main raw PASS a \[div\].*divisions~restored,\[addr-carry\].*3~64-bit %RAW %BASE %ON
@@ -28,8 +32,8 @@ nn_raw_s2       lift_nn       s2   main raw PASS a -                            
 nn_on_s2        lift_nn       s2   main raw PASS a \[addr-carry\].*2~64-bit                       %RAW %BASE %ON
 nn_on_s1p2      lift_nn       s1p2 main raw PASS a \[addr-carry\]                                 %RAW %BASE %ON
 nn_pre_s2       lift_nn       s2   main pre PASS a lo-pair:                                       %BASE %ON
-nn_mufu_s2      lift_nn       s2   mufu raw PASS m \[sqrt\].*1~square,\[addr-carry\]              %RAW %BASE %ON CUPBOP_MUFU=1
-nn_mufu_s1p1    lift_nn       s1p1 mufu pre PASS m \[sqrt\].*1~square                             %BASE %ON CUPBOP_MUFU=1
+nn_mufu_s2      lift_nn       s2   mufu raw PASS a \[sqrt\].*square~roots,\[addr-carry\]              %RAW %BASE %ON CUPBOP_MUFU=1
+nn_mufu_s1p1    lift_nn       s1p1 mufu pre PASS a \[sqrt\].*square~roots                             %BASE %ON CUPBOP_MUFU=1
 bp_raw_s2       lift_backprop s2   main raw PASS a -                                              %RAW
 bp_on_s1p1      lift_backprop s1p1 main raw PASS a \[addr-carry\]                                 %RAW %BASE %ON
 bp_pre_s2       lift_backprop s2   main pre PASS a lo-pair:                                       %BASE %ON
@@ -57,7 +61,7 @@ g3_on_s1        lift_g32      s1   tcu  raw PASS a -                            
 g3_pre_s2       lift_g32      s2   tcu  pre PASS a lo-pair:,\[p2c-fold\].*ring~S=6~->~1,lo-mma:.*2~WMMA %BASE %ON LIFT_DYN_SMEM=0
 g3_pre_s1p1     lift_g32      s1p1 tcu  pre PASS a \[p2c-fold\].*ring~S=6~->~1,lo-mma:.*2~WMMA   %BASE %ON LIFT_DYN_SMEM=0
 fp_raw_s2       lift_fprop    s2   tcu  raw PASS a -                                              %RAW
-fp_dyn_s2       lift_fprop    s2   tcu  raw PASS a parameter~buffers:~1~removed.~0~partly         %RAW %BASE %ON LIFT_NEEDS=CUPBOP_PARAM_DYN
+fp_dyn_s2       lift_fprop    s2   tcu  pre PASS a parameter~buffers:~1~removed.~0~partly         %BASE %ON LIFT_DYN_SMEM=0 LIFT_NEEDS=CUPBOP_PARAM_DYN
 fp_on_s1p1      lift_fprop    s1p1 tcu  raw PASS a -                                              %RAW %BASE %ON
 fp_pre_s2       lift_fprop    s2   tcu  pre PASS a lo-pair:,\[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA %BASE %ON LIFT_DYN_SMEM=0
 # --- regressions
