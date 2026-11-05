@@ -12,6 +12,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -196,39 +197,47 @@ void simt_trip_hoist(Module *M) {
         }
       long n = 0, nguard = 0;
       std::map<Value *, Value *> safe_base;   // base -> checked integer base
-      {   // the range check of a load under a condition pays for itself over several loads only (cudnn_add: 2 loads, +3%)
-        long cnt = 0;
-        BasicBlock *La = L->getLoopLatch();
-        for (LoadInst *X : cand)
-          if (!(La && L->getExitingBlock() == La && DT.dominates(X->getParent(), La))) cnt++;
-        if (cnt < minn) {
-          std::vector<LoadInst *> kept;
-          for (LoadInst *X : cand)
-            if (La && L->getExitingBlock() == La && DT.dominates(X->getParent(), La)) kept.push_back(X);
-          cand.swap(kept);
-        }
-      }
       BasicBlock *Latch = L->getLoopLatch();
-      for (LoadInst *X : cand) {
-        if (n >= maxn) break;
-        if (store_before_in_trip(L, X, stores)) {
-          if (why) fprintf(stderr, "[trip-hoist] %s: %s kept: a store runs before it in the trip\n", F.getName().str().c_str(), X->getName().str().c_str());
-          continue;
+      auto runs_every_trip = [&](LoadInst *X) { return Latch && L->getExitingBlock() == Latch && DT.dominates(X->getParent(), Latch); };
+      // under a condition: worth it when the condition is the bounds check around the kernel's body, not a rare path. The blocks the load's block dominates must hold
+      // most of the trip (CUPBOP_TRIP_HOIST_SHARE percent, default 50), otherwise the load would run per region where it ran in few trips
+      auto main_path = [&](LoadInst *X) {
+        long in_loop = 0, under = 0;
+        for (BasicBlock *BB : L->blocks()) {
+          in_loop += BB->size();
+          if (DT.dominates(X->getParent(), BB)) under += BB->size();
         }
-        const bool every_trip = Latch && L->getExitingBlock() == Latch && DT.dominates(X->getParent(), Latch);
-        Instruction *T = PH->getTerminator();
-        if (!every_trip) {
-          // under a condition: worth it when the condition is the bounds check around the kernel's body, not a rare path. The blocks the load's block dominates must hold
-          // most of the trip (CUPBOP_TRIP_HOIST_SHARE percent, default 50), otherwise the load would run per region where it ran in few trips
-          long in_loop = 0, under = 0;
-          for (BasicBlock *BB : L->blocks()) {
-            in_loop += BB->size();
-            if (DT.dominates(X->getParent(), BB)) under += BB->size();
-          }
-          if (under * 100 < in_loop * share) {
-            if (why) fprintf(stderr, "[trip-hoist] %s: %s kept: its condition covers %ld of %ld instructions\n", F.getName().str().c_str(), X->getName().str().c_str(), under, in_loop);
+        return under * 100 >= in_loop * share;
+      };
+      {
+        std::vector<LoadInst *> go;
+        long guarded = 0;
+        for (LoadInst *X : cand) {
+          if (store_before_in_trip(L, X, stores)) {
+            if (why) fprintf(stderr, "[trip-hoist] %s: %s kept: a store runs before it in the trip\n", F.getName().str().c_str(), X->getName().str().c_str());
             continue;
           }
+          const bool every = runs_every_trip(X);
+          if (!every && !main_path(X)) {
+            if (why) fprintf(stderr, "[trip-hoist] %s: %s kept: its condition covers little of the trip\n", F.getName().str().c_str(), X->getName().str().c_str());
+            continue;
+          }
+          go.push_back(X);
+          guarded += !every;
+        }
+        if (guarded < minn) {   // the range check pays for itself over several loads only (cudnn_add: 2 loads, +3%)
+          std::vector<LoadInst *> kept;
+          for (LoadInst *X : go)
+            if (runs_every_trip(X)) kept.push_back(X);
+          go.swap(kept);
+        }
+        cand.swap(go);
+      }
+      for (LoadInst *X : cand) {
+        if (n >= maxn) break;
+        const bool every_trip = runs_every_trip(X);
+        Instruction *T = PH->getTerminator();
+        if (!every_trip) {
           Value *base; int64_t off;
           const bool ok = split_pointer(X->getPointerOperand(), L, base, off, DL) && off >= 0 && off + 16 < PAD &&
                           (base->getType()->isIntegerTy(64) || base->getType()->isPointerTy()) &&
@@ -338,7 +347,8 @@ void simt_trip_version(Module *M) {
     auto uni = [&](IRBuilder<> &X, Value *V) { return X.CreateICmpNE(X.CreateCall(U, {X.CreateZExt(V, I32)}), ConstantInt::get(I32, 0)); };
     // two tests: a small block leaves after the first, at two instructions (nn: 64 threads, 2 trips, +5% with one test of 11 instructions)
     BasicBlock *Test = BasicBlock::Create(C, "lv_test", &F, Body);
-    B.CreateCondBr(uni(B, B.CreateICmpUGE(bs, ConstantInt::get(I32, 128 * P), "lv_trips4")), Test, Body);
+    // the weights keep SimplifyCFG from folding the two tests into one
+    B.CreateCondBr(uni(B, B.CreateICmpUGE(bs, ConstantInt::get(I32, 128 * P), "lv_trips4")), Test, Body, MDBuilder(C).createBranchWeights(1, 1000));
     IRBuilder<> TB(Test);
     FunctionCallee ctaF = M->getOrInsertFunction("__cupbop_cta_size", FunctionType::get(I32, true));
     Value *c = TB.CreateICmpEQ(TB.CreateCall(ctaF, {}, "lv_cta_warps"), ConstantInt::get(I32, P), "lv_p");
