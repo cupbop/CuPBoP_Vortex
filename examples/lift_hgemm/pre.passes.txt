@@ -1,0 +1,12 @@
+lo-pair: _ZN7cutlass7K: carry=115 carry2=3 cmp_joined=8 high=64 lanes=6 leaf=541 mul=24 pack_joined=72 pack_kept=6 phi=13 phi_hi_kept_use=12 phi_lo_kept_use=12 sum=182
+[p2c-fold] _ZN7cutlass7K: ring S=3 -> 1, block 128, sites 8, prologue events 16 loop-sites 0, guarded 1, classes: (a=128 P=384 base=0 rows=64 -> 0) (a=8192 P=24576 base=24576 rows=1 -> 8192), ring foo
+[p2c-alias] _ZN7cutlass7K: left as it is: shared atomic
+lo-frag: _ZN7cutlass7K: 4 ldmatrix moved through phis
+lo-kperm: _ZN7cutlass7K: 16 of 16 ldmatrix with the k-slot permutation
+lo-ldsm: _ZN7cutlass7K: 16 of 16 ldmatrix -> loads, 8 with the B lane permutation in the address
+lo-mma: _ZN7cutlass7K: 32 mma -> 8 groups, 8 WMMA (0 splits, 8 groups to the epoch end, 64 fragment words read there); n2kb4=8
+lo-half: _ZN7cutlass7K: 129 half lanes
+lo-f16: _ZN7cutlass7K: 160 fptrunc in 50 groups
+lo-sink: _ZN7cutlass7K: 88 instructions moved to the exit
+lo-hext: 99 fpext half inlined
+lo-brfix: _ZN7cutlass7K: 6 branch blocks kept

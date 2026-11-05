@@ -1,0 +1,4 @@
+lo-pair: _Z10dot_kern: carry=10 cmp_joined=11 high=34 leaf=1 mul=6 pack_joined=18 phi=3 phi_hi_kept_use=3 phi_lo_kept_use=3 sum=44
+lo-brfix: _Z10dot_kern: 8 branch blocks kept
+lo-pair: _Z20reduce_1: carry=22 carry2=4 cmp_joined=4 high=19 leaf=50 mul=4 pack_joined=18 phi=17 phi_hi_kept_use=17 phi_lo_kept_use=17 sum=45
+lo-brfix: _Z20reduce_1: 13 branch blocks kept
