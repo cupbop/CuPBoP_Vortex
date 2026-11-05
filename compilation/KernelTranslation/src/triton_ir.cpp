@@ -5,8 +5,9 @@
 // sees plain loads, stores and the intrinsics it already handles:
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
 //               load): the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               mma.sync m16n8k16 f16 -> llvm.nvvm.mma.m16n8k16.row.col.f32.f32, the form of a lifted module
 //   intrinsics  llvm.nvvm.barrier.cta.sync.aligned.all -> llvm.nvvm.barrier0, llvm.nvvm.div.full -> fdiv,
-//               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> __cupbop_ldmatrix_m8n8_b16
+//               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> the ldmatrix asm of a lifted module
 // An asm this file does not know and no later pass handles stops the translation. replace_asm_call would drop it with
 // a warning and leave undef, which is how a stock Triton vecadd became an empty kernel.
 #include "triton_ir.h"
@@ -224,6 +225,26 @@ public:
   }
 };
 
+// Triton's mma.sync (i32 registers, the accumulator tied to the result) -> the intrinsic a lifted module has, with its operand
+// order: a, b, c. Other shapes stay asm for lower_inline_mma_sync.
+bool mma_to_intrinsic(CallInst *CI, const std::string &a) {
+  static const std::regex form(R"(^\s*mma\.sync\.aligned\.m16n8k16\.row\.col\.f32\.f16\.f16\.f32\s*\{\s*\$0,\s*\$1,\s*\$2,\s*\$3\s*\},\s*\{\s*\$8,\s*\$9,\s*\$10,\s*\$11\s*\},\s*\{\s*\$12,\s*\$13\s*\},\s*\{\s*\$4,\s*\$5,\s*\$6,\s*\$7\s*\};?\s*$)");
+  if (!std::regex_match(a, form) || CI->arg_size() != 10) return false;
+  LLVMContext &C = CI->getContext();
+  Type *F32 = Type::getFloatTy(C), *V2H = FixedVectorType::get(Type::getHalfTy(C), 2);
+  IRBuilder<> B(CI);
+  std::vector<Value *> args;
+  for (unsigned i = 4; i < 10; ++i) args.push_back(B.CreateBitCast(CI->getArgOperand(i), V2H));
+  for (unsigned i = 0; i < 4; ++i) args.push_back(CI->getArgOperand(i));
+  std::vector<Type *> tys;
+  for (Value *V : args) tys.push_back(V->getType());
+  Type *RT = StructType::get(C, {F32, F32, F32, F32});
+  if (CI->getType() != RT) return false;
+  CI->replaceAllUsesWith(B.CreateCall(CI->getModule()->getOrInsertFunction("llvm.nvvm.mma.m16n8k16.row.col.f32.f32", FunctionType::get(RT, tys, false)), args));
+  CI->eraseFromParent();
+  return true;
+}
+
 // what later passes lower themselves (replace_asm_call, lower_async_ptx, lower_ldmatrix_asm)
 bool handled_later(const std::string &a) {
   for (const char *k : {"mma.sync", "ldmatrix", "stmatrix", "cvt.rna", "%laneid", "mad.lo.cc", "mbarrier", "cp.async", "wgmma", "fence."})
@@ -254,30 +275,21 @@ void scalarize_half_casts(Module *M) {
   }
 }
 
+// The ldmatrix intrinsic -> the asm CuLifter writes for LDSM, with an integer shared address: from here on a Triton ldmatrix is the
+// same thing as a lifted one (lower_ldmatrix_asm, and the lift passes that read it). Each lane passes the address of its own
+// row, so the layout, swizzled or not, stays Triton's business.
 void lower_ldmatrix(CallInst *CI, StringRef name) {
-  Module *M = CI->getModule();
-  LLVMContext &C = M->getContext();
+  LLVMContext &C = CI->getContext();
   Type *I32 = Type::getInt32Ty(C);
   const int num = name.contains(".x4") ? 4 : name.contains(".x2") ? 2 : 1;
-  const bool trans = name.contains(".trans");
+  std::string regs, cons;
+  for (int i = 0; i < num; ++i) { regs += (i ? ",$" : "$") + std::to_string(i); cons += "=r,"; }
+  const std::string text = "ldmatrix.sync.aligned.m8n8.x" + std::to_string(num) + (name.contains(".trans") ? ".trans" : "") +
+                           ".shared.b16 {" + regs + "}, [$" + std::to_string(num) + "];";
   IRBuilder<> B(CI);
-  FunctionCallee FC = M->getOrInsertFunction("__cupbop_ldmatrix_m8n8_b16",
-                                             FunctionType::get(Type::getVoidTy(C), {I32, I32, I32, PointerType::get(C, 0)}, false));
-  if (auto *Fn = dyn_cast<Function>(FC.getCallee())) Fn->addFnAttr(Attribute::Convergent);
-  IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
-  AllocaInst *Buf = AB.CreateAlloca(ArrayType::get(I32, num), nullptr, "ldsm.d");
-  // each lane passes the address of its own row: the layout (swizzled or not) stays Triton's business
   Value *A32 = B.CreatePtrToInt(CI->getArgOperand(0), I32, "smem.win");
-  B.CreateCall(FC, {A32, ConstantInt::get(I32, num), ConstantInt::get(I32, trans), Buf});
-  Value *R;
-  if (auto *ST = dyn_cast<StructType>(CI->getType())) {
-    R = PoisonValue::get(ST);
-    for (int j = 0; j < num; ++j)
-      R = B.CreateInsertValue(R, B.CreateLoad(I32, B.CreateConstInBoundsGEP2_32(Buf->getAllocatedType(), Buf, 0, j)), j);
-  } else {
-    R = B.CreateLoad(I32, Buf);
-  }
-  CI->replaceAllUsesWith(R);
+  auto *FT = FunctionType::get(CI->getType(), {I32}, false);
+  CI->replaceAllUsesWith(B.CreateCall(InlineAsm::get(FT, text, cons + "r", /*hasSideEffects=*/true), {A32}));
   CI->eraseFromParent();
 }
 
@@ -295,6 +307,7 @@ void lower_triton_input(Module *M) {
   for (CallInst *CI : calls) {
     if (CI->isInlineAsm()) {
       const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
+      if (mma_to_intrinsic(CI, a)) { nAsm++; continue; }
       if (handled_later(a)) continue;
       if (!AsmLowering(CI).lower()) die("unknown PTX asm", a);
       nAsm++;
