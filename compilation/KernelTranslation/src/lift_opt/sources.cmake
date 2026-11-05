@@ -12,6 +12,7 @@ set(lift_opt_SOURCES
   src/lift_opt/lotree.cpp
   src/lift_opt/lomm.cpp
   src/lift_opt/p4plugin.cpp
+  src/lift_opt/lopass.cpp
 )
 set_source_files_properties(src/lift_opt/liftopt.cpp PROPERTIES COMPILE_DEFINITIONS "llvmGetPassPluginInfo=p3_liftopt_info")
 set_source_files_properties(src/lift_opt/p2cfold.cpp PROPERTIES COMPILE_DEFINITIONS "llvmGetPassPluginInfo=p3_fold_info")

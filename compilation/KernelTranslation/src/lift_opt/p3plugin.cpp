@@ -8,6 +8,7 @@ extern "C" PassPluginLibraryInfo p3_fold_info();
 extern "C" PassPluginLibraryInfo p3_pair_info();
 void p3RegisterSink(PassBuilder &PB);
 void p3RegisterNext(PassBuilder &PB);
+void p3RegisterPasses(PassBuilder &PB);
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "p3", "0.1", [](PassBuilder &PB) {
     p3_liftopt_info().RegisterPassBuilderCallbacks(PB);
@@ -15,5 +16,6 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
     p3_pair_info().RegisterPassBuilderCallbacks(PB);
     p3RegisterSink(PB);
     p3RegisterNext(PB);
+    p3RegisterPasses(PB);
   }};
 }

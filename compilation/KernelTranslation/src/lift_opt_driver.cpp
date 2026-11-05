@@ -14,7 +14,8 @@
 // CUPBOP_LIFT_OPT_PIPE=<p>       replaces the first stage (mkp3.sh P3_PIPE; measurements)
 // CUPBOP_LIFT_OPT_P4=0           the pipeline of experiments/p3 alone: no row of schedule.inc, the queue of p2c-fold instead of lo-dq
 // CUPBOP_LIFT_OPT_STALE=0        without lo-stale (its default waits for a decision: tg sm75 -19.5%, dotproduct s2 +12.2%)
-// CUPBOP_TRITON_LOMMA (default 1)  lo-mma alone on stock Triton input (TRITON_CUPBOP=1), schedule 2 only: run_triton_lo_mma. =0: Triton input goes on as lower_triton_input left it
+// CUPBOP_TRITON_LOMMA (default 1)  lo-mma, lo-sched and lo-f16 on stock Triton input (TRITON_CUPBOP=1), schedule 2 only: run_triton_lo_mma. =0: Triton input goes on as lower_triton_input left it
+// CUPBOP_LIFT_LOPASS=1           on schedule 2 a lifted module takes lo-sched and lo-f16 (src/lift_opt/lopass.cpp) for those steps of lo-mma. Off by default: it moves the measured baseline of the lift
 // The passes' own switches (P2C_*, LO_*, LP_*) are read as in the opt step; LIFT_OPT_ENV gives mkp3.sh's defaults.
 //
 // Every translation reads the original input and runs the pipeline once, so the translations of examples/stack_fallback.sh
@@ -121,6 +122,7 @@ static std::string pipeline_for(Module *M, const LiftOptRow *row, const char *&k
   replace_all(s, "${LP}", env_on("CUPBOP_LIFT_OPT_NOPAIR") ? "" : LIFT_OPT_LP);
   replace_all(s, "${P4_PREHEXT:-}", row ? row->prehext : "");
   replace_all(s, "$IC", LIFT_OPT_IC);
+  if (env_on("CUPBOP_LIFT_LOPASS") && row && row->schedule == 2) replace_all(s, ",lo-mma,", ",lo-mma<no-sched;no-f16>,lo-sched,lo-f16,");
   return s;
 }
 
@@ -296,6 +298,8 @@ static bool tcu_lowering() {
 }
 
 // Stock Triton input: after lower_triton_input its mma and ldmatrix have the form of a lifted module, so lo-mma applies; the other lift passes find nothing there (experiments/triton/REPORT_KO.md).
+// What lo-mma adds around the mma work does not suit a module that may hold no mma (experiments/triton_why/REPORT_KO.md): the frame pointer and the maxnum hoist stay off, and the scheduler and the
+// f16 fast path run as lo-sched and lo-f16.
 // is_lifted_module stays out of this: such a module is not lifted, and nothing else of run_lift_opt is for it. Schedule 1 keeps what lower_triton_input left: lo-mma makes matmul 9.1% slower there.
 // The steps are the measured ones, a filter in front of the plugin's opt (experiments/triton/scripts/liftpipe.sh, LIFTPIPE=lo-mma): text, lo-mma, text, llvm-as, the plugin's opt. See reload_text for why.
 // Of that script's settings only LO_F16_ACC reaches lo-mma (LIFT_OPT_ENV): P2C_STAGES belongs to p2c-fold, LO_HEXT to lo-hext, -instcombine-maxarray-size to instcombine.
@@ -308,10 +312,16 @@ Module *run_triton_lo_mma(Module *M) {
   std::string text;
   raw_string_ostream(text) << *M;
   M = reload_text(M, text);
-  run_pipeline(M, "lo-mma", nullptr);
+  run_pipeline(M, "lo-mma<no-hoist;no-sched;no-f16;no-fp>,lo-sched,lo-f16", nullptr);
   VerifyModule(M);
   text.clear();
   raw_string_ostream(text) << *M;
+  if (const char *d = std::getenv("CUPBOP_TRITON_LOMMA_DUMP")) {   // the module these passes leave, helpers not yet inlined
+    std::error_code EC;
+    raw_fd_ostream os(d, EC, sys::fs::OF_TextWithCRLF);
+    if (EC) report_fatal_error(Twine("lift optimisation: ") + d + ": " + EC.message());
+    os << text;
+  }
   M = reload_bitcode(reload_text(M, text), nullptr);
   run_pipeline(M, "always-inline,globaldce,function(scalarizer<load-store>)", nullptr);
   return reload_bitcode(M, nullptr);

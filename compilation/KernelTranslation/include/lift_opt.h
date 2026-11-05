@@ -12,7 +12,7 @@ bool is_lifted_module(llvm::Module *M, std::string *why = nullptr);
 // the translation; any other module goes on untouched. Returns the module to go on with. See lift_opt_driver.cpp.
 llvm::Module *run_lift_opt(llvm::Module *M);
 
-// CUPBOP_TRITON_LOMMA (default 1, =0 off): lo-mma alone on a stock Triton module, after lower_triton_input, on schedule 2. Returns the module to go on with.
+// CUPBOP_TRITON_LOMMA (default 1, =0 off): lo-mma without its frame pointer and maxnum hoist, lo-sched and lo-f16 on a stock Triton module, after lower_triton_input, on schedule 2. Returns the module to go on with.
 llvm::Module *run_triton_lo_mma(llvm::Module *M);
 
 #endif

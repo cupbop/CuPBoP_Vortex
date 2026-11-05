@@ -97,3 +97,163 @@
 -P=${P3_PIPE:-"function(lo-brmark,instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC,lo-brfix)"}
 +P=${P3_PIPE:-"function(instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC)"}
  opt -instcombine-maxarray-size=16 -load-pass-plugin=$R/tools/libp3.so -load-pass-plugin=$R/tools/libp4.so -passes="$P" -S "$1" -o "$2" 2>&1 | grep -v "failed to create target machine"
+--- a/tools/liftopt.cpp
++++ b/tools/liftopt.cpp
+@@ -829,8 +829,10 @@
+ // helpers, inlined by run_trial's always-inline step: @lo.cvt.<family><n>(float x n)
+ //   family e: exp2 results (x itself in [2^-14, 4), two ops per value for the test); a: any value (|x| in [2^-14, 65520)); both return {i32 x n} = zext(f16 bits)
+ //   family r: f16 accumulators kept as floats: fpext(fptrunc(x)) as float (same window as a)
+-static Function *getCvt(Module *M, char fam, unsigned n) {
+-  std::string name = std::string("lo.cvt.") + fam + std::to_string(n);
++// zero (lo-f16, name lo.cvt.<family><n>z): +0 and -0 are inside the window, so a warp with exact zeros stays on the fast path. Family a and e: one select in the test (t = 0 for x = 0) and one
++// in the result; both are a czero on Zicond, no branch. Family r needs none in the result: a = 0 gives 0 and the sign goes back on. Family e tests the value with its sign: -0 stays outside.
++static Function *getCvt(Module *M, char fam, unsigned n, bool zero = false) {
++  std::string name = std::string("lo.cvt.") + fam + std::to_string(n) + (zero ? "z" : "");
+   if (Function *F = M->getFunction(name)) return F;
+   LLVMContext &Ctx = M->getContext(); Type *I32 = Type::getInt32Ty(Ctx), *F32 = Type::getFloatTy(Ctx), *H = Type::getHalfTy(Ctx), *I16 = Type::getInt16Ty(Ctx);
+   Type *RE = fam == 'r' ? F32 : I32;
+@@ -843,6 +845,7 @@
+   for (unsigned i = 0; i < n; ++i) {
+     us[i] = Q.CreateBitCast(F->getArg(i), I32); a[i] = fam == 'e' ? us[i] : Q.CreateAnd(us[i], 0x7fffffff);
+     Value *t = Q.CreateSub(a[i], ConstantInt::get(I32, 0x38800000));
++    if (zero) t = Q.CreateSelect(Q.CreateICmpEQ(a[i], ConstantInt::get(I32, 0)), ConstantInt::get(I32, 0), t);
+     if (fam == 'e') acc = acc ? Q.CreateOr(acc, t) : t;
+     else { Value *c = Q.CreateICmpULT(t, ConstantInt::get(I32, 0x0EFFF000)); ok = ok ? Q.CreateAnd(ok, c) : c; }
+   }
+@@ -858,6 +861,7 @@
+       fv = QF.CreateBitCast(r, F32); sv = QS.CreateFPExt(S, F32);
+     } else {
+       Value *h = QF.CreateLShr(QF.CreateAdd(QF.CreateAdd(a[i], ConstantInt::get(I32, 0xC8000FFFu)), m), 13);
++      if (zero) h = QF.CreateSelect(QF.CreateICmpEQ(a[i], ConstantInt::get(I32, 0)), ConstantInt::get(I32, 0), h);
+       fv = fam == 'e' ? h : QF.CreateOr(h, QF.CreateAnd(QF.CreateLShr(us[i], 16), 0x8000));
+       sv = QS.CreateZExt(QS.CreateBitCast(S, I16), I32);
+     }
+@@ -868,7 +872,7 @@
+   QJ.CreateRet(R);
+   return F;
+ }
+-static void lowerF16(Function &F) {
++void loLowerF16(Function &F, bool zero) {
+   const unsigned N = envInt("LO_F16_N", 4);
+   LLVMContext &Ctx = F.getContext(); Type *I32 = Type::getInt32Ty(Ctx), *I16 = Type::getInt16Ty(Ctx), *H = Type::getHalfTy(Ctx);
+   unsigned total = 0, groups = 0;
+@@ -887,7 +891,7 @@
+         std::vector<Instruction *> p; pureClosure(fts[j], &BB, p, hard);
+       }
+       bool allExp = true; for (auto *T : g) if (!expLike(T->getOperand(0))) allExp = false;
+-      Function *C = getCvt(F.getParent(), k0 ? 'r' : allExp ? 'e' : 'a', g.size());
++      Function *C = getCvt(F.getParent(), k0 ? 'r' : allExp ? 'e' : 'a', g.size(), zero);
+       Instruction *last = g.back(); Instruction *next = last->getNextNode();
+       IRBuilder<> Q(next); SmallVector<Value *, 8> args; for (auto *T : g) args.push_back(T->getOperand(0));
+       auto *R = Q.CreateCall(C, args);
+@@ -952,16 +956,19 @@
+ // Dependences: SSA in the block; memory: reads and writes of one alloca in order, everything else (shared, global, calls, asm)
+ // in order against writers. Pure convergent ops (shuffles, the WMMA pseudo op) have no order among themselves: all lanes of a
+ // warp run the same straight-line block.
+-static bool isPseudoW(Instruction *I) { auto *C = dyn_cast<CallInst>(I); return C && C->getCalledFunction() && C->getCalledFunction()->getName() == "__lo_wmma"; }
++static bool isWmmaName(StringRef n) { return n == "__lo_wmma" || n == "lo.wmma"; }   // lo.wmma: the same op behind defineWmma, what lo-sched sees
++static bool isPseudoW(Instruction *I) { auto *C = dyn_cast<CallInst>(I); return C && C->getCalledFunction() && isWmmaName(C->getCalledFunction()->getName()); }
+ static bool isPureCall(CallInst *C) {
+   Function *F = C->getCalledFunction();
+   if (!F) return false;
+   StringRef n = F->getName();
+-  if (n == "__lo_wmma" || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.ex2") || n.starts_with("llvm.nvvm.lg2") ||
++  if (isWmmaName(n) || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.ex2") || n.starts_with("llvm.nvvm.lg2") ||
+       n.starts_with("llvm.nvvm.rcp") || n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.fma") || n.starts_with("llvm.maxnum") || n.starts_with("llvm.minnum") || n.starts_with("llvm.abs")) return true;
+   return false;
+ }
+-static void scheduleBlock(BasicBlock &BB) {
++// hold (lo-sched): a barrier or a call with side effects does not move up: all that stood before it stays before it. Moved up, it takes the values of what it passed across a real call
++// (LayerNorm 32x1000: floats across the first barrier 8 -> 24). What stood behind it may still go in front when it touches no memory: softmax's sum sits behind a barrier, its adds join the exps that way.
++void loScheduleBlock(BasicBlock &BB, bool hold) {
+   std::vector<Instruction *> nodes;
+   for (Instruction &I : BB) if (!isa<PHINode>(I) && !I.isTerminator() && !isa<AllocaInst>(I)) nodes.push_back(&I);
+   const int N = nodes.size();
+@@ -999,6 +1006,17 @@
+       readers[key].clear(); lastW[key] = i;
+     }
+   }
++  std::vector<char> held(N, 0);
++  if (hold) {
++    int last = -1;
++    for (int i = 0; i < N; ++i) {
++      auto *C = dyn_cast<CallInst>(nodes[i]);
++      if (!C || isPureCall(C) || !(C->mayHaveSideEffects() || C->isConvergent())) continue;
++      for (int j = last + 1; j < i; ++j) edge(j, i);
++      if (last >= 0) edge(last, i);
++      last = i; held[i] = 1;
++    }
++  }
+   // live values: uses left in the block; a value also used elsewhere never dies here
+   std::map<Value *, int> left; std::set<Value *> outside;
+   for (Instruction *I : nodes) for (Value *V : I->operands()) if (isa<Instruction>(V) || isa<Argument>(V)) left[V]++;
+@@ -1017,7 +1035,8 @@
+   std::vector<int> order; order.reserve(N); std::vector<char> done(N, 0); std::vector<int> seq(N, -1);
+   std::vector<int> ready; for (int i = 0; i < N; ++i) if (!npred[i]) ready.push_back(i);
+   std::vector<int> targets;
+-  for (int i = 0; i < N; ++i) { Instruction *I = nodes[i]; if (isPseudoW(I) || isa<StoreInst>(I) || (isa<CallInst>(I) && !isPureCall(cast<CallInst>(I)))) targets.push_back(i); }
++  // a held call is no target: it only waits for what stood before it, while the next target pulls its operands in use order, past the call
++  for (int i = 0; i < N; ++i) { Instruction *I = nodes[i]; if (!held[i] && (isPseudoW(I) || isa<StoreInst>(I) || (isa<CallInst>(I) && !isPureCall(cast<CallInst>(I))))) targets.push_back(i); }
+   size_t tpos = 0; int prefer = -1;
+   const int recent = envInt("LO_SCHED_RECENT", 16);
+   auto commit = [&](int i) {
+@@ -1238,6 +1257,7 @@
+ 
+ void p3PromoteHalf(Function &F);
+ struct LoMma : PassInfoMixin<LoMma> {
++  bool hoist = true, sched = true, f16 = true, fp = true;   // lo-mma<no-hoist;no-sched;no-f16;no-fp>: without that step, whatever LO_HOIST, LO_SCHED, LO_F16, LO_FP say
+   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+     Lanes LN(&M); std::vector<Function *> fs; for (auto &F : M) if (!F.isDeclaration()) fs.push_back(&F);
+     for (Function *F : fs) {
+@@ -1252,13 +1272,13 @@
+       if (envOn("LO_MMA", true)) lowerMma(*F, LN, bp);
+       for (bool again = true; again;) { again = false;
+         for (auto &BB : *F) for (Instruction &I : make_early_inc_range(llvm::reverse(BB))) if (isInstructionTriviallyDead(&I)) { I.eraseFromParent(); again = true; } }
+-      if (envOn("LO_HOIST", true)) hoistReductions(*F);
+-      if (envOn("LO_SCHED", true)) for (BasicBlock &BB : *F) scheduleBlock(BB);
++      if (hoist && envOn("LO_HOIST", true)) hoistReductions(*F);
++      if (sched && envOn("LO_SCHED", true)) for (BasicBlock &BB : *F) loScheduleBlock(BB, false);
+       p3PromoteHalf(*F);   // p3: half arithmetic -> float + fptrunc (lonext.cpp), before lo-f16 sees the fptruncs
+-      if (envOn("LO_F16", true)) lowerF16(*F);
++      if (f16 && envOn("LO_F16", true)) loLowerF16(*F, false);
+       // Frames over 2 KB: LLVM lays spill slots out from the top of the frame, sp-relative offsets of the early (hot) slots do not fit a
+       // 12-bit immediate and every access costs lui + add. fp-relative addressing reaches them directly.
+-      if (envOn("LO_FP", true)) F->addFnAttr("frame-pointer", "all");
++      if (fp && envOn("LO_FP", true)) F->addFnAttr("frame-pointer", "all");
+     }
+     defineWmma(M);
+     return PreservedAnalyses::none();
+@@ -1269,5 +1289,16 @@
+   return {LLVM_PLUGIN_API_VERSION, "liftopt", "0.1", [](PassBuilder &PB) {
+     PB.registerPipelineParsingCallback([](StringRef N, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
+       if (N == "lo-mma") { MPM.addPass(LoMma()); return true; }
++      if (N.consume_front("lo-mma<") && N.consume_back(">")) {
++        LoMma P; SmallVector<StringRef, 4> opts; N.split(opts, ';');
++        for (StringRef o : opts) {
++          if (o == "no-hoist") P.hoist = false;
++          else if (o == "no-sched") P.sched = false;
++          else if (o == "no-f16") P.f16 = false;
++          else if (o == "no-fp") P.fp = false;
++          else return false;
++        }
++        MPM.addPass(std::move(P)); return true;
++      }
+       return false; }); }};
+ }
+--- a/tools/p3plugin.cpp
++++ b/tools/p3plugin.cpp
+@@ -8,6 +8,7 @@
+ extern "C" PassPluginLibraryInfo p3_pair_info();
+ void p3RegisterSink(PassBuilder &PB);
+ void p3RegisterNext(PassBuilder &PB);
++void p3RegisterPasses(PassBuilder &PB);
+ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+   return {LLVM_PLUGIN_API_VERSION, "p3", "0.1", [](PassBuilder &PB) {
+     p3_liftopt_info().RegisterPassBuilderCallbacks(PB);
+@@ -15,5 +16,6 @@
+     p3_pair_info().RegisterPassBuilderCallbacks(PB);
+     p3RegisterSink(PB);
+     p3RegisterNext(PB);
++    p3RegisterPasses(PB);
+   }};
+ }
