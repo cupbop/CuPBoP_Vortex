@@ -15,6 +15,7 @@
 //
 // Every translation reads the original input and runs the pipeline once, so the translations of examples/stack_fallback.sh
 // (with the same environment) get the same module: nothing is applied twice and nothing is lost, unlike PRE_BACKEND_OPT.
+// Input that already went through mkp3.sh still looks lifted: such a flow keeps CUPBOP_LIFT_OPT=0.
 #include "lift_opt.h"
 #include "launch_fix.h"
 #include "tool.h"

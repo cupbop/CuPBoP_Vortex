@@ -6,7 +6,13 @@ define it, so that the translator cannot drift from them:
   <root>/tools/build.sh     the source list and each source's -D flags            -> sources.cmake
   <root>/scripts/mkp3.sh    pipelines, module gate, opt options, env defaults     -> pipeline.inc
 --check compares instead of writing (exit 1 on any difference). A line of mkp3.sh or build.sh that no longer has the expected form
-is an error, never a silent default."""
+is an error, never a silent default.
+
+After a sync:
+ 1. Rebuild with the old objects removed (rm the objects of src/lift_opt and lift_opt_driver.cpp.o). Objects on the group's NFS can carry an mtime
+    minutes in the future, and make then skips a source edited in that window: once the old pipeline string ran with no sign of it.
+ 2. tools/param_dyn.patch is not a copy: it edits lifted_ir.cpp. For a new version: patch -R with the old one, patch with the new one.
+ 3. Compare: CUPBOP_LIFT_OPT_DUMP against mkp3.sh (bytes), CUPBOP_LIFT_OPT_BC against the harness's device bitcode (bytes)."""
 import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
