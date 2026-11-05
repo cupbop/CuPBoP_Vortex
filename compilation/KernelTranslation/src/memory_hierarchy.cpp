@@ -538,7 +538,9 @@ static uint32_t smem_reserve_drop_bytes(llvm::Function &F, const Items &layout,
   std::vector<std::pair<llvm::GlobalVariable *, uint32_t>> st;
   for (auto &it : layout) st.push_back({it.GV, it.off});
   std::vector<llvm::GlobalVariable *> dy(usedDynamic.begin(), usedDynamic.end());
-  return smem_reserve_drop_for(F, st, dy, staticAligned);
+  const uint32_t drop = smem_reserve_drop_for(F, st, dy, staticAligned);
+  smem_shrink_log(F, st, dy, drop);   // CUPBOP_SMEM_SHRINK (no-op when off)
+  return drop;
 }
 
 void mem_share2local(llvm::Module *M) {

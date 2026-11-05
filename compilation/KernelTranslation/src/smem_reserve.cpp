@@ -41,6 +41,17 @@
 //
 // The switch only adds this analysis and the drop: with CUPBOP_SMEM_RESERVE_DROP unset or 0 nothing here runs and the
 // translation is unchanged.
+//
+// CUPBOP_SMEM_SHRINK=1 (default 0, needs CUPBOP_SMEM_RESERVE_DROP=1; 2026-11-04, experiments/p2b): the other end. CuLifter
+// declares @shared_mem with its default window (32 KB) whatever the kernel uses, so a kernel touching 4 KB reserves
+// 32 KB per CTA and fewer CTAs fit a core. The same walk records the end of every access (offset + access size), and
+// the host gives the CTA only the bytes below the highest proven end. Addresses are not moved: the kernel's code is
+// the same with the switch on, only the CTA's local-memory size differs. Most offsets depend on threadIdx, so the
+// bound is taken per block shape: the analysis runs again with threadIdx / blockDim limited to each shape of a small
+// list (kShapes; the limits reach the canonicalization as !range too), and kernel_lmem_hi.log gets
+// "<kernel> <X> <Y> <Z> <bytes>": sound for every launch with blockDim.x <= X, .y <= Y, .z <= Z. The host takes the
+// smallest entry covering the launch, at most the usual static + dynamic size; no covering entry = the usual size.
+// An access whose extent is not known (TMA / bulk copy helpers) or any failure of the proof leaves no entry.
 #include "smem_reserve.h"
 #include "tool.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -62,6 +73,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -71,6 +83,14 @@
 #include <vector>
 
 using namespace llvm;
+
+bool smem_shrink_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("CUPBOP_SMEM_SHRINK");
+    return smem_reserve_drop_enabled() && e && std::atoi(e) != 0;
+  }();
+  return on;
+}
 
 bool smem_reserve_drop_enabled() {
   static const bool on = [] {
@@ -90,6 +110,21 @@ bool debug() {
   return on;
 }
 std::string shortName(const std::string &n) { return n.size() > 48 ? n.substr(0, 40) + "..." + n.substr(n.size() - 8) : n; }
+
+struct Shape {
+  uint32_t x, y, z;
+};
+// the limits of threadIdx / blockDim during an analysis run: CUDA's (the drop) or one block shape (CUPBOP_SMEM_SHRINK)
+Shape g_shape = {1024, 1024, 64};
+const Shape kShapes[] = {{32, 1, 1},  {64, 1, 1},  {128, 1, 1}, {256, 1, 1},  {512, 1, 1}, {1024, 1, 1},
+                         {32, 2, 1},  {32, 4, 1},  {32, 8, 1},  {32, 16, 1},  {32, 32, 1}, {16, 16, 1},
+                         {64, 2, 1},  {64, 4, 1},  {128, 2, 1}, {8, 8, 1}};
+struct ShapeEnd {
+  Shape s;
+  uint64_t end;  // highest touched byte of the global + 1 (0: nothing touched)
+};
+// (function name, global name) -> the proven ends, one per shape that could be proven
+std::map<std::pair<std::string, std::string>, std::vector<ShapeEnd>> g_ends;
 
 const uint64_t kNone = UINT64_MAX;  // proven, but F never touches G
 // (function name, global name) -> lowest touched byte of the global; absent = not proven
@@ -562,10 +597,12 @@ ConstantRange RangeEval::transfer(Instruction *I, const Ctx &r, unsigned W) {
     if (!Fn) return full(W);
     StringRef n = Fn->getName();
     if (n.consume_front("llvm.nvvm.read.ptx.sreg.")) {
-      if (n == "tid.x" || n == "tid.y") return range(W, 0, 1024);
-      if (n == "tid.z") return range(W, 0, 64);
-      if (n == "ntid.x" || n == "ntid.y") return range(W, 1, 1025);
-      if (n == "ntid.z") return range(W, 1, 65);
+      if (n == "tid.x") return range(W, 0, g_shape.x);
+      if (n == "tid.y") return range(W, 0, g_shape.y);
+      if (n == "tid.z") return range(W, 0, g_shape.z);
+      if (n == "ntid.x") return range(W, 1, g_shape.x + 1);
+      if (n == "ntid.y") return range(W, 1, g_shape.y + 1);
+      if (n == "ntid.z") return range(W, 1, g_shape.z + 1);
       if (n == "laneid") return range(W, 0, 32);
       if (n == "warpsize") return range(W, 32, 33);
       return full(W);
@@ -614,6 +651,8 @@ public:
   GlobalUses(GlobalVariable *G, Function &F, RangeEval &E) : G(G), F(F), E(E), DL(F.getParent()->getDataLayout()) {}
   // true: proven, *lowest = the lowest touched byte (kNone: nothing touched)
   bool run(uint64_t *lowest, std::string &why);
+  uint64_t end() const { return high; }      // highest touched byte + 1, valid when endKnown()
+  bool endKnown() const { return highOk; }
 
 private:
   GlobalVariable *G;
@@ -624,6 +663,8 @@ private:
   std::map<const Value *, std::optional<Off>> offs;
   std::set<const Value *> busy;
   uint64_t low = kNone;
+  uint64_t high = 0;
+  bool highOk = true;  // every access had a known extent
   std::string err;
 
   bool inF(const User *U) const {
@@ -631,7 +672,8 @@ private:
     return true;  // constant expressions: their instruction users are filtered
   }
   std::optional<Off> off(Value *V);
-  bool access(Value *P, const char *what);
+  // size: the bytes touched at or above P; 0 = not known (no end for this global)
+  bool access(Value *P, const char *what, uint64_t size);
   bool fail(const std::string &w) {
     if (err.empty()) err = w;
     return false;
@@ -704,7 +746,7 @@ std::optional<Off> GlobalUses::off(Value *V) {
   return R;
 }
 
-bool GlobalUses::access(Value *P, const char *what) {
+bool GlobalUses::access(Value *P, const char *what, uint64_t size) {
   auto O = off(P);
   if (debug()) {
     std::string t;
@@ -721,6 +763,8 @@ bool GlobalUses::access(Value *P, const char *what) {
   const int64_t lo = R.getSignedMin().getSExtValue();
   if (R.getSignedMax().sgt(APInt(64, 1ull << 40))) return fail(std::string(what) + ": offset not bounded");
   low = std::min<uint64_t>(low, lo < 0 ? 0 : (uint64_t)lo);
+  if (size) high = std::max<uint64_t>(high, (uint64_t)R.getSignedMax().getSExtValue() + size);
+  else highOk = false;
   return true;
 }
 
@@ -775,18 +819,18 @@ bool GlobalUses::checkUse(Value *V, User *U) {
     if (S->getCondition() == V) return fail("address as a select condition");
     return true;
   }
-  if (auto *L = dyn_cast<LoadInst>(I)) return access(L->getPointerOperand(), "load");
+  if (auto *L = dyn_cast<LoadInst>(I)) return access(L->getPointerOperand(), "load", DL.getTypeStoreSize(L->getType()));
   if (auto *S = dyn_cast<StoreInst>(I)) {
     if (S->getValueOperand() == V) return fail("shared address stored to memory");
-    return access(S->getPointerOperand(), "store");
+    return access(S->getPointerOperand(), "store", DL.getTypeStoreSize(S->getValueOperand()->getType()));
   }
   if (auto *A = dyn_cast<AtomicRMWInst>(I)) {
     if (A->getValOperand() == V) return fail("shared address in an atomic value");
-    return access(A->getPointerOperand(), "atomicrmw");
+    return access(A->getPointerOperand(), "atomicrmw", DL.getTypeStoreSize(A->getValOperand()->getType()));
   }
   if (auto *A = dyn_cast<AtomicCmpXchgInst>(I)) {
     if (A->getCompareOperand() == V || A->getNewValOperand() == V) return fail("shared address in a cmpxchg value");
-    return access(A->getPointerOperand(), "cmpxchg");
+    return access(A->getPointerOperand(), "cmpxchg", DL.getTypeStoreSize(A->getCompareOperand()->getType()));
   }
   if (auto *Cm = dyn_cast<ICmpInst>(I)) {
     Value *A = Cm->getOperand(0), *B = Cm->getOperand(1);
@@ -809,7 +853,11 @@ bool GlobalUses::checkUse(Value *V, User *U) {
         for (unsigned a = 0; a < 2 && a < CB->arg_size(); ++a)
           if (CB->getArgOperand(a) == V) {
             if (id == Intrinsic::memset && a == 1) return fail("shared address as a memset value");
-            if (!access(V, "memory intrinsic")) return false;
+            uint64_t len = 0;   // constant length, or the largest value of a bounded one
+            ConstantRange LR = E.eval(CB->getArgOperand(2), {});
+            if (!LR.isFullSet() && !LR.isEmptySet() && !LR.isWrappedSet() && LR.getUnsignedMax().getActiveBits() <= 32)
+              len = LR.getUnsignedMax().getZExtValue();
+            if (!access(V, "memory intrinsic", len)) return false;
           }
         for (unsigned a = 2; a < CB->arg_size(); ++a)
           if (CB->getArgOperand(a) == V) return fail("shared address as a memory intrinsic length");
@@ -823,7 +871,9 @@ bool GlobalUses::checkUse(Value *V, User *U) {
       if (std::find(h->second.begin(), h->second.end(), a) == h->second.end())
         return fail("shared address as argument " + std::to_string(a) + " of `" + n + "`");
       if (auto O = off(V); O && O->mixed) return fail("mixed pointer passed to `" + n + "`");
-      if (!access(V, n.c_str())) return false;
+      // the row of ldmatrix / stmatrix, the 64-bit word of an mbarrier; TMA and bulk copies: extent not known here
+      const uint64_t ext = n.find("matrix") != std::string::npos ? 16 : n.find("__cupbop_mbar") == 0 ? 8 : 0;
+      if (!access(V, n.c_str(), ext)) return false;
     }
     return true;
   }
@@ -921,10 +971,12 @@ std::unique_ptr<Module> canonical_clone(Module *M) {
         if (!n.consume_front("llvm.nvvm.read.ptx.sreg.")) continue;
         const unsigned W = CB->getType()->getIntegerBitWidth();
         uint64_t lo = 0, hi = 0;
-        if (n == "tid.x" || n == "tid.y") hi = 1024;
-        else if (n == "tid.z") hi = 64;
-        else if (n == "ntid.x" || n == "ntid.y") lo = 1, hi = 1025;
-        else if (n == "ntid.z") lo = 1, hi = 65;
+        if (n == "tid.x") hi = g_shape.x;
+        else if (n == "tid.y") hi = g_shape.y;
+        else if (n == "tid.z") hi = g_shape.z;
+        else if (n == "ntid.x") lo = 1, hi = g_shape.x + 1;
+        else if (n == "ntid.y") lo = 1, hi = g_shape.y + 1;
+        else if (n == "ntid.z") lo = 1, hi = g_shape.z + 1;
         else if (n == "laneid") hi = 32;
         if (hi) CB->setMetadata(LLVMContext::MD_range, MDB.createRange(APInt(W, lo), APInt(W, hi)));
       }
@@ -947,6 +999,46 @@ std::unique_ptr<Module> canonical_clone(Module *M) {
   }
   MPM.run(*C, MAM);
   return C;
+}
+
+// CUPBOP_SMEM_SHRINK: one run per block shape; g_ends gets the ends of the globals proven for that shape
+void analyze_shape(Module *Orig, const Shape &sh) {
+  g_shape = sh;
+  std::unique_ptr<Module> Clone = canonical_clone(Orig);
+  g_shape = Shape{1024, 1024, 64};
+  if (!Clone) return;
+  g_shape = sh;
+  Module *M = Clone.get();
+  std::vector<GlobalVariable *> shared;
+  for (GlobalVariable &G : M->globals())
+    if (G.getType()->getAddressSpace() == 3) shared.push_back(&G);
+  std::map<Function *, std::unique_ptr<RangeEval>> evals;
+  for (GlobalVariable *G : shared) {
+    std::set<Function *> fs;
+    std::vector<const User *> w(G->user_begin(), G->user_end());
+    std::set<const User *> vis;
+    while (!w.empty()) {
+      const User *U = w.back();
+      w.pop_back();
+      if (!vis.insert(U).second) continue;
+      if (auto *I = dyn_cast<Instruction>(U)) fs.insert(const_cast<Function *>(I->getFunction()));
+      else for (const User *UU : U->users()) w.push_back(UU);
+    }
+    bool kernels_only = true;
+    for (Function *F : fs) kernels_only &= isKernelFunction(M, F);
+    if (!kernels_only) continue;
+    for (Function *F : fs) {
+      auto &E = evals[F];
+      if (!E) E = std::make_unique<RangeEval>(*F);
+      if (E->aborted) continue;
+      GlobalUses GU(G, *F, *E);
+      uint64_t low = kNone;
+      std::string why;
+      if (GU.run(&low, why) && GU.endKnown())
+        g_ends[{F->getName().str(), G->getName().str()}].push_back({sh, GU.end()});
+    }
+  }
+  g_shape = Shape{1024, 1024, 64};
 }
 
 void analyze_impl(Module *Orig) {
@@ -1016,12 +1108,15 @@ void analyze_impl(Module *Orig) {
 
 void *analyze_thread(void *p) {
   analyze_impl(static_cast<Module *>(p));
+  if (smem_shrink_enabled())
+    for (const Shape &sh : kShapes) analyze_shape(static_cast<Module *>(p), sh);
   return nullptr;
 }
 
 } // namespace
 
 void analyze_smem_reserve(Module *M) {
+  std::remove("kernel_lmem_hi.log");   // a stale table from an earlier translation in this directory
   if (!smem_reserve_drop_enabled()) return;
   // deep def-use chains of lifted kernels: the recursive evaluation runs on a thread with a 1 GB stack
   pthread_attr_t a;
@@ -1029,7 +1124,7 @@ void analyze_smem_reserve(Module *M) {
   pthread_attr_setstacksize(&a, size_t(1) << 30);
   pthread_t t;
   if (pthread_create(&t, &a, analyze_thread, M) == 0) pthread_join(t, nullptr);
-  else analyze_impl(M);
+  else analyze_thread(M);
   pthread_attr_destroy(&a);
 }
 
@@ -1056,4 +1151,33 @@ uint32_t smem_reserve_drop_for(Function &F, const std::vector<std::pair<GlobalVa
   fprintf(stderr, "[CuPBoP] smem reserve: %s: %u of %u static shared bytes dropped (lowest touched byte %llu)\n",
           shortName(F.getName().str()).c_str(), drop, staticAligned, (unsigned long long)lowest);
   return drop;
+}
+
+// CUPBOP_SMEM_SHRINK: F's lines of kernel_lmem_hi.log: for each block shape where every global of the CTA area has a
+// proven end, the CTA bytes the kernel can touch (above the dropped prefix), rounded up to 64. A kernel with a used
+// dynamic marker gets none (its size is the launch's). Nothing when the switch is off.
+void smem_shrink_log(Function &F, const std::vector<std::pair<GlobalVariable *, uint32_t>> &statics,
+                     const std::vector<GlobalVariable *> &dynamics, uint32_t drop) {
+  if (!smem_shrink_enabled() || !dynamics.empty() || statics.empty()) return;
+  static std::ofstream log("kernel_lmem_hi.log");
+  for (const Shape &sh : kShapes) {
+    uint64_t need = 0;
+    bool ok = true;
+    for (auto &[G, o] : statics) {
+      auto it = g_ends.find({F.getName().str(), G->getName().str()});
+      const ShapeEnd *e = nullptr;
+      if (it != g_ends.end())
+        for (auto &x : it->second)
+          if (x.s.x == sh.x && x.s.y == sh.y && x.s.z == sh.z) e = &x;
+      if (!e) { ok = false; break; }
+      if (e->end) need = std::max<uint64_t>(need, o + e->end);
+    }
+    if (!ok) continue;
+    need = need > drop ? need - drop : 0;
+    need = (need + 63) & ~uint64_t(63);
+    log << F.getName().str() << " " << sh.x << " " << sh.y << " " << sh.z << " " << need << "\n";
+    log.flush();
+    fprintf(stderr, "[CuPBoP] smem shrink: %s: block <= %ux%ux%u touches %llu CTA bytes\n", shortName(F.getName().str()).c_str(),
+            sh.x, sh.y, sh.z, (unsigned long long)need);
+  }
 }

@@ -1100,6 +1100,39 @@ bool fast_entry_s1_grid_csr() {
   return g.schedule == 1 && !need_nested_loop && g.subpasses == 1 && g.trips == 0;
 }
 
+// CUPBOP_BAR_INLINE=1 (default 0; 2026-11-04, experiments/p2b): the schedule-2 CTA barrier is a call of the out-of-line
+// vx_barrier in kernel_wrapper.cpp (`jal`), so every value live across a __syncthreads sits in a callee-saved register
+// or on the stack, and the kernel is not a leaf. Replace each call by the instruction itself, as an inline asm that
+// keeps vx_intrinsics.h's memory clobber and the call's convergent attribute (always-inlining a runtime wrapper would
+// lose it: the asm of __vx_barrier_arrive_and_wait is not convergent, and an unmarked barrier may be duplicated into
+// divergent branches; see the barrier lowering in replace_built_in_function). Last step of the translation: the passes
+// before it look for calls of vx_barrier by name.
+void inline_vx_barrier_calls(llvm::Module *M) {
+  const char *e = std::getenv("CUPBOP_BAR_INLINE");
+  if (!e || std::atoi(e) == 0) return;
+  llvm::Function *F = M->getFunction("vx_barrier");
+  if (!F || !F->isDeclaration() || F->arg_size() != 2) return;
+  auto *IA = llvm::InlineAsm::get(F->getFunctionType(), ".insn r 0x0b, 4, 0, x0, $0, $1", "r,r,~{memory}",
+                                  /*hasSideEffects=*/true);
+  std::vector<llvm::CallInst *> calls;
+  for (llvm::User *U : F->users())
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+      if (CI->getCalledFunction() == F) calls.push_back(CI);
+  long dbg_lo = 0, dbg_hi = 1L << 40, dbg_i = 0;   // CUPBOP_BAR_INLINE_RANGE=lo:hi (debug): only calls lo <= index < hi
+  if (const char *r = std::getenv("CUPBOP_BAR_INLINE_RANGE")) sscanf(r, "%ld:%ld", &dbg_lo, &dbg_hi);
+  for (llvm::CallInst *CI : calls) {
+    if (dbg_i < dbg_lo || dbg_i >= dbg_hi) { dbg_i++; continue; }
+    dbg_i++;
+    llvm::IRBuilder<> B(CI);
+    llvm::CallInst *N = B.CreateCall(F->getFunctionType(), IA, {CI->getArgOperand(0), CI->getArgOperand(1)});
+    N->addFnAttr(llvm::Attribute::Convergent);
+    N->addFnAttr(llvm::Attribute::NoUnwind);
+    N->copyMetadata(*CI);
+    CI->eraseFromParent();
+  }
+  if (F->use_empty()) F->eraseFromParent();
+}
+
 // P2 for the device runtime: __vx_warps_per_group() (cudaKernelImpl.cpp, reads the __warps_per_group global) -> the
 // CTA-size CSR. At the end of the translation, after every pass that creates such calls.
 void fast_entry_csr_runtime_calls(llvm::Module *M) {

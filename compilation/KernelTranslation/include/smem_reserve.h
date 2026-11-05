@@ -27,4 +27,9 @@ uint32_t smem_reserve_drop_for(llvm::Function &F,
                                const std::vector<std::pair<llvm::GlobalVariable *, uint32_t>> &statics,
                                const std::vector<llvm::GlobalVariable *> &dynamics, uint32_t staticAligned);
 
+// CUPBOP_SMEM_SHRINK (default 0, needs CUPBOP_SMEM_RESERVE_DROP=1): kernel_lmem_hi.log lines for F (see smem_reserve.cpp)
+bool smem_shrink_enabled();
+void smem_shrink_log(llvm::Function &F, const std::vector<std::pair<llvm::GlobalVariable *, uint32_t>> &statics,
+                     const std::vector<llvm::GlobalVariable *> &dynamics, uint32_t drop);
+
 #endif

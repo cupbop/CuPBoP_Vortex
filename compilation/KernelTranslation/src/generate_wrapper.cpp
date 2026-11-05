@@ -402,6 +402,7 @@ static std::string big_stack_call(const std::string &fn = "callbacks[kernel_arg-
 // annotate_kernel_abi (end of the translation) annotates the IR ones and writes cupbop_kabi.txt for abi_check.py.
 static std::vector<std::pair<std::string, std::string>> g_kabi_kernels;   // (kernel, wrapper) in the IR
 static std::vector<std::string> g_kabi_cxx_wrappers;                      // cuda_* in kernel_wrapper.cpp
+const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list() { return g_kabi_kernels; }
 
 using namespace llvm;
 
