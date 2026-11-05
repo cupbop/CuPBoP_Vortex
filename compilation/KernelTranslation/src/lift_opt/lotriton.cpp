@@ -9,6 +9,7 @@
 //              above the band the scale is 1, below it both give 0. lg2.approx.f and rsqrt.approx.f the same way, for zero and subnormal arguments. LO_EX2=0 turns it off, LO_EX2_N the group size.
 //   lo-fdiv  : divisions with the arcp flag (div.full.f32, which allows 2 ulp) by one divisor in one block: one reciprocal and multiplications, when the divisor is in the range where 1/s is a
 //              normal number; otherwise the divisions. LO_FDIV=0 turns it off, LO_FDIV_N the group size.
+//   lo-fpext : fpext half -> float is a call, tens of instructions and branches per value. A group of N takes a few integer operations when its values are zeros or normal numbers. LO_FPEXT=0 turns it off.
 //   lo-gep   : constant parts of an element offset into the address's immediate.  LO_GEP=0 turns it off.
 //   lo-fma   : the contract flag on float multiplications, additions and subtractions, which is what Triton's enable_fp_fusion (default on) asks ptxas for. CUPBOP_TRITON_FMA=0 in the environment turns it off.
 // LO_DEBUG=1 prints what each pass did.
@@ -191,7 +192,7 @@ unsigned foldRun(Function &F, std::vector<Guard> &run, DenseSet<BasicBlock *> &s
   run[0].C->replacePhiUsesWith(P1, Slow);
   Term->removeFromParent(); Term->insertInto(Slow, Slow->end());
   BranchInst::Create(cast<BasicBlock>(VM[run[0].T]), Slow, All, P1);
-  { // the slow side tests each mask where it needs it
+  if (envI("LO_TMASK_REMAT", 1)) { // the slow side tests each mask where it needs it
     DenseSet<BasicBlock *> slow(region.begin(), region.end()); slow.insert(Slow);
     IRBuilder<> S(Slow->getTerminator());
     for (Value *M : masks) {
@@ -272,6 +273,8 @@ void joinResults(Function *F, BasicBlock *Fast, BasicBlock *Slow, BasicBlock *J,
   Q.CreateRet(R);
 }
 
+Value *anyLane(Module &M, IRBuilder<> &Q, Value *lane);
+
 // The forms the translator scales around the MUFU (tool.cpp mufu_lower) and the arguments that need the scaling: ex2 the band of subnormal results; lg2 and rsqrt zero and subnormal arguments.
 struct Scaled { const char *full, *ftz; bool band; };
 const Scaled SCALED[] = {{"llvm.nvvm.ex2.approx.f", "llvm.nvvm.ex2.approx.ftz.f", true}, {"llvm.nvvm.lg2.approx.f", "llvm.nvvm.lg2.approx.ftz.f", false}, {"llvm.nvvm.rsqrt.approx.f", "llvm.nvvm.rsqrt.approx.ftz.f", false}};
@@ -291,7 +294,7 @@ Function *mufuGroup(Module &M, const Scaled &K, unsigned N) {
     else c = Q.CreateICmpEQ(Q.CreateAnd(b, Q.getInt32(0x7f800000u)), Q.getInt32(0));
     any = any ? Q.CreateOr(any, c) : c;
   }
-  Q.CreateCondBr(any, Sl, Fa);
+  Q.CreateCondBr(anyLane(M, Q, any), Sl, Fa);
   auto *FT = FunctionType::get(F32, {F32}, false);
   FunctionCallee ftz = M.getOrInsertFunction(K.ftz, FT), full = M.getOrInsertFunction(K.full, FT);
   SmallVector<Value *, 16> f, s;
@@ -300,6 +303,40 @@ Function *mufuGroup(Module &M, const Scaled &K, unsigned N) {
   QF.CreateBr(J); QS.CreateBr(J);
   joinResults(F, Fa, Sl, J, f, s);
   return F;
+}
+
+// From the first member I: the group as it can grow, up to N. mv: what reads a member and has to move behind the group
+template <class Is> Instruction *formGroup(Instruction *I, Is is, unsigned N, std::vector<Instruction *> &g, std::vector<Instruction *> &mv) {
+  g.assign(1, I); DenseSet<Value *> dep{I}; std::vector<Instruction *> mvNow; Instruction *last = I;
+  for (Instruction *J = I->getNextNode(); J && !J->isTerminator() && g.size() < N; J = J->getNextNode()) {
+    bool reads = false; for (Value *V : J->operands()) if (dep.count(V)) reads = true;
+    if (is(J)) { if (reads) break; g.push_back(J); dep.insert(J); last = J; mv.insert(mv.end(), mvNow.begin(), mvNow.end()); mvNow.clear(); continue; }
+    if (reads) { if (isa<PHINode>(J) || J->mayHaveSideEffects() || J->mayReadOrWriteMemory()) break; dep.insert(J); mvNow.push_back(J); }
+  }
+  return last;
+}
+
+// the group's helper call behind `last`, members replaced, readers moved behind it; returns the instruction after the group
+Instruction *callGroup(Function *H, std::vector<Instruction *> &g, std::vector<Instruction *> &mv, Instruction *last) {
+  Instruction *next = last->getNextNode();
+  SmallVector<Value *, 16> args; for (Instruction *C : g) args.push_back(C->getOperand(0));
+  IRBuilder<> Q(next);
+  CallInst *R = Q.CreateCall(H, args);
+  for (size_t i = 0; i < g.size(); ++i) g[i]->replaceAllUsesWith(Q.CreateExtractValue(R, i));
+  for (Instruction *X : mv) X->moveBefore(next);
+  for (Instruction *C : g) C->eraseFromParent();
+  return next;
+}
+
+} // namespace
+namespace {
+// One lane with an exception sends the whole warp the old way: the MUFU is 32 cycles per warp with one lane active too, so taking both sides would double the expensive part
+Value *anyLane(Module &M, IRBuilder<> &Q, Value *lane) {
+  Type *I1 = Q.getInt1Ty();
+  FunctionCallee Vote = M.getOrInsertFunction("llvm.nvvm.vote.any.sync", FunctionType::get(I1, {Q.getInt32Ty(), I1}, false));
+  if (auto *VF = dyn_cast<Function>(Vote.getCallee())) VF->addFnAttr(Attribute::Convergent);
+  CallInst *W = Q.CreateCall(Vote, {Q.getInt32(-1), lane}); W->addFnAttr(Attribute::Convergent);
+  return W;
 }
 
 struct LoEx2 : PassInfoMixin<LoEx2> {
@@ -312,27 +349,60 @@ struct LoEx2 : PassInfoMixin<LoEx2> {
       for (Function *F : fs) for (BasicBlock &B : *F) {
         for (Instruction *I = &B.front(); I;) {
           if (!is(I)) { I = I->getNextNode(); continue; }
-          // from the first call: walk on while the group can grow; what reads a member moves behind the group
-          std::vector<CallInst *> g{cast<CallInst>(I)}; DenseSet<Value *> dep{I}; std::vector<Instruction *> mv, mvNow; Instruction *last = I;
-          for (Instruction *J = I->getNextNode(); J && !J->isTerminator() && g.size() < N; J = J->getNextNode()) {
-            bool reads = false; for (Value *V : J->operands()) if (dep.count(V)) reads = true;
-            if (is(J)) { if (reads) break; g.push_back(cast<CallInst>(J)); dep.insert(J); last = J; mv.insert(mv.end(), mvNow.begin(), mvNow.end()); mvNow.clear(); continue; }
-            if (reads) { if (isa<PHINode>(J) || J->mayHaveSideEffects() || J->mayReadOrWriteMemory()) break; dep.insert(J); mvNow.push_back(J); }
-          }
-          Function *H = mufuGroup(M, K, g.size());
-          Instruction *next = last->getNextNode();
-          SmallVector<Value *, 16> args; for (CallInst *C : g) args.push_back(C->getArgOperand(0));
-          IRBuilder<> Q(next);
-          CallInst *R = Q.CreateCall(H, args);
-          for (size_t i = 0; i < g.size(); ++i) { Value *E = Q.CreateExtractValue(R, i); g[i]->replaceAllUsesWith(E); }
-          for (Instruction *X : mv) X->moveBefore(next);
-          for (CallInst *C : g) C->eraseFromParent();
+          std::vector<Instruction *> g, mv;
+          Instruction *last = formGroup(I, is, N, g, mv);
+          Instruction *next = callGroup(mufuGroup(M, K, g.size()), g, mv, last);
           total += g.size(); ++groups; I = next;
         }
       }
     }
     if (dbg && groups) errs() << "lo-ex2: " << total << " calls in " << groups << " groups\n";
     return groups ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+};
+
+// half -> float, N at a time: normal numbers and zeros in integers, any other value in a warp sends it to fpext (a call: the target has no half)
+Function *hextGroup(Module &M, unsigned N) {
+  std::string name = "lo.hext." + std::to_string(N);
+  if (Function *F = M.getFunction(name)) return F;
+  LLVMContext &C = M.getContext(); Type *F32 = Type::getFloatTy(C), *H = Type::getHalfTy(C), *I32 = Type::getInt32Ty(C), *I16 = Type::getInt16Ty(C);
+  SmallVector<Type *, 16> rt(N, F32), at(N, H);
+  Function *F = Function::Create(FunctionType::get(StructType::get(C, rt), at, false), GlobalValue::InternalLinkage, name, &M);
+  F->addFnAttr(Attribute::AlwaysInline); F->addFnAttr(Attribute::NoUnwind);
+  BasicBlock *E = BasicBlock::Create(C, "e", F), *Fa = BasicBlock::Create(C, "f", F), *Sl = BasicBlock::Create(C, "s", F), *J = BasicBlock::Create(C, "j", F);
+  IRBuilder<> Q(E), QF(Fa), QS(Sl);
+  Value *any = nullptr; SmallVector<Value *, 16> f, s;
+  for (Argument &A : F->args()) {
+    Value *z = Q.CreateZExt(Q.CreateBitCast(&A, I16), I32), *x = Q.CreateAnd(z, Q.getInt32(0x7fff));
+    Value *normal = Q.CreateICmpULT(Q.CreateSub(x, Q.getInt32(0x400)), Q.getInt32(0x7800)), *zero = Q.CreateICmpEQ(x, Q.getInt32(0));
+    Value *c = Q.CreateNot(Q.CreateOr(normal, zero));
+    any = any ? Q.CreateOr(any, c) : c;
+    Value *b = QF.CreateAdd(QF.CreateShl(x, 13), QF.getInt32(0x38000000));
+    b = QF.CreateSelect(QF.CreateICmpEQ(x, QF.getInt32(0)), QF.getInt32(0), b);
+    b = QF.CreateOr(b, QF.CreateShl(QF.CreateAnd(z, QF.getInt32(0x8000)), 16));
+    f.push_back(QF.CreateBitCast(b, F32)); s.push_back(QS.CreateFPExt(&A, F32));
+  }
+  Q.CreateCondBr(anyLane(M, Q, any), Sl, Fa);
+  QF.CreateBr(J); QS.CreateBr(J);
+  joinResults(F, Fa, Sl, J, f, s);
+  return F;
+}
+
+struct LoFpext : PassInfoMixin<LoFpext> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    if (!envI("LO_FPEXT", 1) || hasDot(M)) return PreservedAnalyses::all();
+    const unsigned N = envI("LO_FPEXT_N", 8); unsigned total = 0;
+    std::vector<Function *> fs; for (Function &F : M) if (!F.isDeclaration() && !F.getName().starts_with("lo.")) fs.push_back(&F);
+    auto is = [](Instruction *I) { auto *X = dyn_cast<FPExtInst>(I); return X && X->getSrcTy()->isHalfTy() && X->getType()->isFloatTy(); };
+    for (Function *F : fs) for (BasicBlock &B : *F) for (Instruction *I = &B.front(); I;) {
+      if (!is(I)) { I = I->getNextNode(); continue; }
+      std::vector<Instruction *> g, mv;
+      Instruction *last = formGroup(I, is, N, g, mv);
+      total += g.size();
+      I = callGroup(hextGroup(M, g.size()), g, mv, last);
+    }
+    if (envI("LO_DEBUG", 0) && total) errs() << "lo-fpext: " << total << " fpext\n";
+    return total ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 
@@ -436,5 +506,6 @@ void loTritonRegister(PassBuilder &PB) {
     if (N == "lo-fdiv") { MPM.addPass(LoFdiv()); return true; }
     if (N == "lo-fma") { MPM.addPass(LoFma()); return true; }
     if (N == "lo-gep") { MPM.addPass(LoGep()); return true; }
+    if (N == "lo-fpext") { MPM.addPass(LoFpext()); return true; }
     return false; });
 }
