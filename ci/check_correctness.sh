@@ -29,6 +29,13 @@ check_bits() { # after a PASS: the bit record of the device-to-host copies again
   [ -f "$f" ] && got="$(cksum < "$f" | cut -d' ' -f1)-$(wc -l < "$f")-$(sha1sum < "$f" | cut -c1-16)" || got=none
   [ "$got" = "$want" ] || { RESULT=FAIL; WHY="bit record $got, group $LIFT_BITS_GROUP wants ${want:-nothing}"; }
 }
+check_cta_loop() { # after a PASS: the translation has the block loop at schedule 2 and at no other, and not for the kernels that wait for another block. Not checked when a run asks for something else
+  [ "$RESULT" = PASS ] && [ -z "${CUPBOP_CTA_LOOP_S1:-}" ] && case "${CUPBOP_CTA_LOOP:-auto}" in off|0) false ;; esac || return 0
+  local f="${EXAMPLE_DIR}/cupbop_launch_fix.txt" n; n=$(cat "$f" 2>/dev/null | grep -c ' cta_dims=')
+  if [ "$SCHEDULE" = 2 ] && [ "$n" = 0 ]; then RESULT=FAIL; WHY="schedule 2 without the block loop"
+  elif [ "$SCHEDULE" != 2 ] && [ "$n" != 0 ]; then RESULT=FAIL; WHY="block loop at schedule $SCHEDULE"
+  elif grep -qE 'k_spin|k_ticket_spin' "$f" 2>/dev/null; then RESULT=FAIL; WHY="block loop in a kernel that must be refused"; fi
+}
 check_diff() { # <golden> <result>: exact match
   G=$1; R=$2
   if [ ! -f "$G" ] || [ ! -f "$R" ]; then WHY="golden ($G) or result ($R) missing"
@@ -41,6 +48,8 @@ case $TEST_NAME in
     check_marker "PASSED" ;;
   s1_arm_test)
     check_marker "PASSED" ;;
+  cta_loop_test)
+    check_marker "PASSED"; check_cta_loop ;;
   huffman)  # its checker (comparison_helpers.h) prints "PASS! vectors are matching!" / "FAIL! vectors are NOT matching!", never "PASSED"
     check_marker "PASS! vectors are matching" ;;
   backprop|nn|pathfinder|gauss|srad_v2|jacobi-cuda|virt_warp_test|virt_ldsm_test)

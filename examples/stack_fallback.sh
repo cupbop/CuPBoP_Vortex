@@ -209,6 +209,26 @@ lmem_chain() {
   echo "--- [stack] lmem: static call-chain stack per kernel: $(awk '$1 == "kernel" {printf "%s%s=%s(%s)", s, $2, $3, $4; s=" "}' cupbop_lmem_stack.txt)"
 }
 
+# --- CUPBOP_CTA_LOOP (compilation/KernelTranslation/src/cta_loop.cpp): the wrappers with the block loop are copies, and their frames
+# count like any other for the frame limit and the sp skew modulus. A loop whose frame would lower M (or need the software stack)
+# moves the stacks of every launch, also of those that never loop: conv, grid 8, no loop, +17% cycles at M 4 (the stack's L2 sets).
+# Such a module is translated again without the loops.
+cta_loop_fit() {
+  [ -f cupbop_launch_fix.txt ] && grep -q ' cta_dims=' cupbop_launch_fix.txt || return 0
+  local M STEP ALL REST MA MR
+  M=$(sed -n 's/^#define __CUPBOP_SP_SKEW_M \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp 2>/dev/null); M=${M:-1}
+  STEP=$(sed -n 's/^#define __CUPBOP_SP_SKEW_STEP \([0-9][0-9]*\).*/\1/p' kernel_wrapper.cpp); STEP=${STEP:-0}
+  ALL=$(python3 $HERE/stack_frames.py kernel.dump | awk 'NR==1{print $1+0}'); ALL=${ALL:-0}
+  REST=$(python3 $HERE/stack_frames.py kernel.dump | awk '$2 !~ /_cta_loop$|\.cta$/ {print $1+0; exit}'); REST=${REST:-0}
+  MA=$M; while [ $MA -gt 1 ] && [ $((ALL + (MA - 1) * STEP)) -gt $LIM ]; do MA=$((MA / 2)); done
+  MR=$M; while [ $MR -gt 1 ] && [ $((REST + (MR - 1) * STEP)) -gt $LIM ]; do MR=$((MR / 2)); done
+  if [ $MA -ge $MR ] && { [ $ALL -le $LIM ] || [ $REST -gt $LIM ]; }; then return 0; fi
+  echo "--- [stack] cta loop: frame $ALL bytes against $REST without the loop (sp skew modulus $MA, $MR): translating without the loop"
+  mkdir -p $B
+  export CUPBOP_CTA_LOOP=off
+  rebuild ctaloop "$@" || { echo "--- [stack] rebuild without the loop failed ($B/ctaloop.*.log)"; return 1; }
+}
+cta_loop_fit "$@" || exit 1
 frame_fallback "$@"
 skew_fit "$@" || exit 1
 lmem_chain

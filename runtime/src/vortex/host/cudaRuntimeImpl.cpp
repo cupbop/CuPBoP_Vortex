@@ -1163,7 +1163,9 @@ static std::string cupbop_strip_prefix(const std::string &s) {
 // program keeps its launch as written. CUPBOP_LAUNCH_FIX=0 at run time ignores the file.
 // A new key goes into cupbop_apply_launch_fix: a key this runtime does not know stops the launch, because a transformed kernel
 // launched without its rewrite runs wrongly.
-static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem) {
+// cta_*: CUPBOP_CTA_LOOP; what the launched grid becomes is decided with the block's local memory, cupbop_cta_loop_launch.
+struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false; };
+static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem, cupbop_cta_fix &cta) {
   static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
   static uint64_t seen = 0;
   if (cupbop_module_changed(seen)) {
@@ -1192,6 +1194,12 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
     if (key == "dyn_smem") {
       DBG_PRINT("cudaLaunchKernel: %s: dynamic shared size %lu -> %lu (cupbop_launch_fix.txt)\n", func_stripped.c_str(), (unsigned long)sharedMem, (unsigned long)v);
       sharedMem = v;
+    } else if (key == "cta_dims") {
+      cta.dims = (uint32_t)v;
+    } else if (key == "cta_inner") {
+      cta.inner = (uint32_t)v;
+    } else if (key == "cta_chunk") {
+      cta.chunk = v != 0;
     } else {
       fprintf(stderr, "cudaLaunchKernel: %s: unknown launch rewrite `%s` in cupbop_launch_fix.txt\n", func_stripped.c_str(), key.c_str());
       std::abort();
@@ -1645,6 +1653,61 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
   RT_CHECK((int)vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE));
   vx_event_release(ev);
+}
+// CUPBOP_CTA_LOOP (compilation/KernelTranslation/src/cta_loop.cpp): a kernel translated with the block loop reads context words
+// no device code reads otherwise: printf_buffer (its low word: this launch loops) and, for the chunk form,
+// printf_buffer_position, printf_buffer_capacity, work_dim. dims: mask of the grid dimensions the loop walks, inner: the
+// innermost one. The other dimensions stay in the launched grid.
+//   CUPBOP_CTA_K=<k>      about k blocks per hardware CTA. 0 or unset: persistent (what fits the cores at once)
+//   CUPBOP_CTA_WAVES=<m>  persistent: m times what fits the cores at once (default 1)
+//   CUPBOP_CTA_MIN_TRIPS=<t>  a launch loops when it has at least t blocks per hardware CTA (default 2)
+//   chunk (translated with CUPBOP_CTA_LOOP_CHUNK=1, measurement): a hardware CTA runs neighbouring blocks, not a cyclic walk
+static uint32_t cupbop_env_u32(const char *name, uint32_t dflt) {
+  const char *e = getenv(name);
+  return e && *e ? (uint32_t)strtoul(e, nullptr, 10) : dflt;
+}
+static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inner, bool chunk, uint32_t grid[3],
+                                   const uint32_t block[3], uint32_t lmem) {
+  const uint64_t cg[3] = {ka->ctx.num_groups[0], ka->ctx.num_groups[1], ka->ctx.num_groups[2]};
+  const uint64_t blocks = cg[0] * cg[1] * cg[2];
+  const uint64_t nt = CUPBOP_EFF_NUM_THREADS(), nw = CUPBOP_EFF_NUM_WARPS();
+  const uint64_t cta_warps = ((uint64_t)block[0] * block[1] * block[2] + nt - 1) / nt;
+  uint64_t per_core = cta_warps ? nw / cta_warps : 1;
+  if (lmem) {   // the dispatcher's slots: LMEM capacity / stride (cta_dispatcher.cpp usable_slots)
+    uint64_t cap = 0;
+    if (vx_dev_caps(DeviceContext::instance()->device(), VX_CAPS_LOCAL_MEM_SIZE, &cap) == 0 && cap)
+      per_core = std::min<uint64_t>(per_core, cap / (((uint64_t)lmem + 63) & ~63ull));
+  }
+  per_core = std::max<uint64_t>(per_core, 1);
+  const char *ncs = getenv("VX_RT_NUM_CORES");
+  const uint64_t nc = ncs && atoi(ncs) > 0 && (uint64_t)atoi(ncs) < NUM_CORES_VX ? (uint64_t)atoi(ncs) : NUM_CORES_VX;
+  const uint64_t resident = per_core * nc;
+  const uint32_t k = cupbop_env_u32("CUPBOP_CTA_K", 0);
+  const uint64_t target = k ? std::max<uint64_t>((blocks + k - 1) / k, resident) : resident * std::max<uint32_t>(cupbop_env_u32("CUPBOP_CTA_WAVES", 1), 1);
+  uint32_t *w = &ka->ctx.printf_buffer_position;   // w[d]: printf_buffer_position, printf_buffer_capacity, work_dim
+  w[0] = w[1] = w[2] = 0;
+  ka->ctx.printf_buffer = nullptr;                 // its low word: 1 = this launch loops
+  if (target * cupbop_env_u32("CUPBOP_CTA_MIN_TRIPS", 2) > blocks) return;   // the old code, the grid as launched
+  ka->ctx.printf_buffer = (char *)1;
+  int order[3], n = 0;
+  order[n++] = (int)inner;
+  for (int d = 2; d >= 0; --d)
+    if ((dims >> d & 1) && d != (int)inner) order[n++] = d;
+  uint64_t hw[3] = {cg[0], cg[1], cg[2]};
+  for (int i = 0; i < n; ++i) {
+    const int d = order[i];
+    const uint64_t other = hw[0] * hw[1] * hw[2] / hw[d];
+    if (other >= target) { hw[d] = 1; continue; }
+    hw[d] = std::max<uint64_t>(std::min(cg[d], target / other), 1);
+    break;
+  }
+  for (int d = 0; d < 3; ++d) {
+    grid[d] = (uint32_t)hw[d];
+    if (chunk && hw[d] != cg[d]) w[d] = (uint32_t)((cg[d] + hw[d] - 1) / hw[d]);
+    if (chunk && hw[d] != cg[d]) grid[d] = (uint32_t)((cg[d] + w[d] - 1) / w[d]);
+  }
+  DBG_PRINT("cta_loop: blocks=%lu resident=%lu target=%lu hw grid=(%u,%u,%u) k=(%u,%u,%u)\n", (unsigned long)blocks, (unsigned long)resident,
+            (unsigned long)target, grid[0], grid[1], grid[2], w[0], w[1], w[2]);
 }
 // Service launch (grid 1, block 1): kernel_idx -1 or -2 with the op list after the header.
 static void cupbop_service_launch(DeviceContext *DC, int kind, const std::vector<uint64_t> &list) {
@@ -2206,6 +2269,7 @@ cudaError_t cudaLaunchKernel_vortex(
   };
   std::string func_stripped = stripPrefix(std::string(func));
   DBG_COUT("func_stripped: " << func_stripped << std::endl);
+  cupbop_cta_fix cta_fix;
 
   while(readfile >> kernel_idx_tmp) {
     readfile >> kernel_name_tmp;
@@ -2239,7 +2303,7 @@ cudaError_t cudaLaunchKernel_vortex(
       DC->set_last_krnl_path(krnl_path);
     }
   }
-  cupbop_apply_launch_fix(table_name, sharedMem);
+  cupbop_apply_launch_fix(table_name, sharedMem, cta_fix);
 
 
   // Allocate context pool and set __ctx_pool pointer. The pool also holds the core mapping's context scratch
@@ -2645,6 +2709,8 @@ cudaError_t cudaLaunchKernel_vortex(
       fprintf(stderr, "cupbop: lmem scale %u: %s %u -> %u bytes per CTA (capacity %lu)\n", cupbop_lmem_scale(),
               func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
     }
+    if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
+      cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, grid, block, lmem);
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);

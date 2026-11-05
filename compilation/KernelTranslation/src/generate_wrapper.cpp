@@ -405,6 +405,7 @@ static std::string big_stack_call(const std::string &fn = "callbacks[kernel_arg-
 static std::vector<std::pair<std::string, std::string>> g_kabi_kernels;   // (kernel, wrapper) in the IR
 static std::vector<std::string> g_kabi_cxx_wrappers;                      // cuda_* in kernel_wrapper.cpp
 const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list() { return g_kabi_kernels; }
+void kabi_add_wrapper(const std::string &wrapper) { g_kabi_kernels.emplace_back("", wrapper); }   // CUPBOP_CTA_LOOP: no kernel under it keeps the ABI
 
 using namespace llvm;
 

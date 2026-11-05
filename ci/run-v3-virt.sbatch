@@ -16,7 +16,7 @@
 set -u
 export PATH=$HOME/.local/bin:/usr/bin:/bin:/usr/local/bin
 export CuPBoP_PATH=$SLURM_SUBMIT_DIR
-export TESTS=${TESTS:-"backprop dotproduct pathfinder psum bfs btree conv3 nn saxpy sgemm stencil transpose vecadd bh-cuda blackscholes cc-cuda cfd gauss hotspot huffman jaccard-cuda jacobi-cuda lud marchingCubes-cuda nw psort score-cuda sfilter spmv srad_v2 streamcluster wedford-cuda sgemm_tcu sgemm_dxa sgemm_tcu_dxa sgemm_wgmma sgemm_wgmma_dxa sgemm_wgmma_bf16 s1_arm_test"}
+export TESTS=${TESTS:-"backprop dotproduct pathfinder psum bfs btree conv3 nn saxpy sgemm stencil transpose vecadd bh-cuda blackscholes cc-cuda cfd gauss hotspot huffman jaccard-cuda jacobi-cuda lud marchingCubes-cuda nw psort score-cuda sfilter spmv srad_v2 streamcluster wedford-cuda sgemm_tcu sgemm_dxa sgemm_tcu_dxa sgemm_wgmma sgemm_wgmma_dxa sgemm_wgmma_bf16 s1_arm_test cta_loop_test"}
 export PAR=${PAR:-4}
 export VIRTS=${VIRTS:-"0 2 1"}   # CUPBOP_VIRT_WARPS values; 0 = all block warps (no virtualization)
 export RUN_TAG=${SLURM_JOB_ID:-manual}
