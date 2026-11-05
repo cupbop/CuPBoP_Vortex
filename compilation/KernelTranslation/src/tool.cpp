@@ -9,6 +9,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -1037,6 +1038,21 @@ llvm::CallInst *read_cta_csr(llvm::IRBuilder<> &B, unsigned csr, const char *nam
   llvm::CallInst *C = B.CreateCall(FT, IA, {}, name);
   C->setDoesNotAccessMemory();
   C->setDoesNotThrow();
+  // CUPBOP_SREG_RANGE=1 (default 0; experiments/p2b): CUDA's limits as !range on the asm result, so that the optimizer
+  // knows threadIdx / blockDim are small and non-negative. Only what the CUDA launch rules guarantee: no limit on
+  // blockIdx or gridDim, which would be an assumption about the launch.
+  static const bool sreg_range = [] { const char *e = std::getenv("CUPBOP_SREG_RANGE"); return e && std::atoi(e) != 0; }();
+  if (sreg_range) {
+    uint64_t lo = 0, hi = 0;
+    if (csr == 0xCD3 || csr == 0xCD4) hi = 1024;                 // threadIdx.x / .y
+    else if (csr == 0xCD5) hi = 64;                              // threadIdx.z
+    else if (csr == 0xCD9 || csr == 0xCDA) lo = 1, hi = 1025;    // blockDim.x / .y
+    else if (csr == 0xCDB) lo = 1, hi = 65;                      // blockDim.z
+    if (hi) {
+      llvm::MDBuilder MDB(B.getContext());
+      C->setMetadata(llvm::LLVMContext::MD_range, MDB.createRange(llvm::APInt(32, lo), llvm::APInt(32, hi)));
+    }
+  }
   return C;
 }
 

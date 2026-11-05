@@ -219,6 +219,24 @@ void protect_dxa_operand_registers(Module *M) {
   }
 }
 
+// CUPBOP_ARG_SIGNEXT=1 (default 0): i32 kernel parameters are `signext` on the kernel and in its wrapper's call. The
+// wrapper's `lw` already gives the RV64 form the attribute promises, and the kernel drops its own sext.w copies.
+void sign_extend_kernel_args(Module *M) {
+  const char *e = std::getenv("CUPBOP_ARG_SIGNEXT");
+  if (!e || std::atoi(e) == 0) return;
+  for (auto &kw : kabi_kernel_list()) {
+    Function *F = M->getFunction(kw.first);
+    if (!F || F->isDeclaration()) continue;
+    for (Argument &A : F->args()) {
+      if (!A.getType()->isIntegerTy(32) || A.hasZExtAttr()) continue;
+      A.addAttr(Attribute::SExt);
+      for (User *U : F->users())
+        if (auto *C = dyn_cast<CallBase>(U))
+          if (C->getCalledFunction() == F) C->addParamAttr(A.getArgNo(), Attribute::SExt);
+    }
+  }
+}
+
 void mark_uniform_branches(Module *M) {
   if (level() <= 0) return;
   const char *sc = std::getenv("VORTEX_SCHEDULE_FLAG");

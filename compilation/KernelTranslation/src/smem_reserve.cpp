@@ -116,6 +116,7 @@ struct Shape {
 };
 // the limits of threadIdx / blockDim during an analysis run: CUDA's (the drop) or one block shape (CUPBOP_SMEM_SHRINK)
 Shape g_shape = {1024, 1024, 64};
+bool g_hull = false;   // CUPBOP_SMEM_SHRINK runs: see RangeEval::fix
 const Shape kShapes[] = {{32, 1, 1},  {64, 1, 1},  {128, 1, 1}, {256, 1, 1},  {512, 1, 1}, {1024, 1, 1},
                          {32, 2, 1},  {32, 4, 1},  {32, 8, 1},  {32, 16, 1},  {32, 32, 1}, {16, 16, 1},
                          {64, 2, 1},  {64, 4, 1},  {128, 2, 1}, {8, 8, 1}};
@@ -307,12 +308,23 @@ Fix *RangeEval::fix(const Loop *L, const Ctx &r) {
   for (BasicBlock *B : predecessors(H))
     if (L->contains(B) && std::find(latches.begin(), latches.end(), B) == latches.end()) latches.push_back(B);
   std::vector<bool> topped(ph.size(), false);
+  // CUPBOP_SMEM_SHRINK runs: a widened phi keeps the union of its values instead of "any value", so a reduction loop's
+  // stride (s >>= 1) or a stale register carried around the loop stays bounded; 8 growths, then any value.
+  std::vector<ConstantRange> hull;
+  for (auto &x : init) hull.push_back(ConstantRange::getEmpty(x.getBitWidth()));
+  std::vector<int> grown(ph.size(), 0);
   bool ok = false;
-  for (int round = 0; round < 12 && !ok && !aborted; ++round) {
+  for (int round = 0; round < (g_hull ? 32 : 12) && !ok && !aborted; ++round) {
     fx->tuples.clear();
     auto add = [&](std::vector<ConstantRange> v) -> bool {  // false: too many tuples
       for (size_t k = 0; k < v.size(); ++k)
-        if (topped[k]) v[k] = full(v[k].getBitWidth());
+        if (topped[k]) {
+          if (!g_hull) { v[k] = full(v[k].getBitWidth()); continue; }
+          ConstantRange U = hull[k].unionWith(v[k]);
+          if (U != hull[k] && ++grown[k] > 8) U = full(v[k].getBitWidth());
+          hull[k] = U;
+          v[k] = U;
+        }
       for (auto &t : fx->tuples)
         if (t->v == v) return true;
       if (fx->tuples.size() >= kMaxTuples) return false;
@@ -1004,10 +1016,9 @@ std::unique_ptr<Module> canonical_clone(Module *M) {
 // CUPBOP_SMEM_SHRINK: one run per block shape; g_ends gets the ends of the globals proven for that shape
 void analyze_shape(Module *Orig, const Shape &sh) {
   g_shape = sh;
+  g_hull = true;
   std::unique_ptr<Module> Clone = canonical_clone(Orig);
-  g_shape = Shape{1024, 1024, 64};
-  if (!Clone) return;
-  g_shape = sh;
+  if (!Clone) { g_shape = Shape{1024, 1024, 64}; g_hull = false; return; }
   Module *M = Clone.get();
   std::vector<GlobalVariable *> shared;
   for (GlobalVariable &G : M->globals())
@@ -1039,6 +1050,7 @@ void analyze_shape(Module *Orig, const Shape &sh) {
     }
   }
   g_shape = Shape{1024, 1024, 64};
+  g_hull = false;
 }
 
 void analyze_impl(Module *Orig) {

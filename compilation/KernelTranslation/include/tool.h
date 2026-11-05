@@ -50,6 +50,7 @@ bool fast_entry_s1_grid_csr();
 void fast_entry_csr_runtime_calls(llvm::Module *M);
 void inline_vx_barrier_calls(llvm::Module *M);
 void protect_dxa_operand_registers(llvm::Module *M); // CUPBOP_BAR_INLINE / CUPBOP_DXA_CLOBBER (uniform_branch.cpp)
+void sign_extend_kernel_args(llvm::Module *M); // CUPBOP_ARG_SIGNEXT (uniform_branch.cpp)
 void mark_uniform_branches(llvm::Module *M); // CUPBOP_UNIFORM_BR (uniform_branch.cpp)
 void fast_entry_finalize_wrapper(llvm::Module *M);
 
