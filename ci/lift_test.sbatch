@@ -7,7 +7,7 @@
 #SBATCH --mem=48G
 #SBATCH -t 00:30:00
 #SBATCH -o ci/logs_v3/lift_test_%j.out
-# Lift tests (examples/lift_*, rows of ci/lift_cases.txt, runner ci/lift_test.sh) as one Slurm job, about 3 minutes on 8 cores after the translators are built. Submit from the repository root:
+# Lift tests (examples/lift_*, rows of ci/lift_cases.txt, runner ci/lift_test.sh) as one Slurm job, 3 to 5 minutes on 8 cores after the translators are built. Submit from the repository root:
 #   sbatch ci/lift_test.sbatch                                  # needs the two SimX drivers of ci/rg-ci-setup-v3.sh; builds what is missing
 #   sbatch --export=ALL,PAR=16,ROWS='hg_.*|sg_.*' ci/lift_test.sbatch
 # The job fails when a row does not get what the table says.
