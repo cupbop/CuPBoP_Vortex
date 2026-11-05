@@ -27,6 +27,9 @@ A matrix entry is marked Passed in GitHub only if the Slurm job log contains the
 
     --- Execution completed!
 
+### Determinism test (`ci/determinism_test.sbatch`, `ci/determinism_test.sh`, `ci/shufmalloc.c`)
+The same input must give the same translation wherever the allocator puts the IR (`compilation/KernelTranslation/include/stable_order.h`). Lifted and source kernels, schedules 2 and 1, three seeds of a random-address allocator: one hash per row. A plain run often does not show a pointer-ordered loop.
+
 ### Lift tests (`ci/lift_test.sbatch`, `ci/lift_test.sh`, `ci/lift_cases.txt`)
 The matrix above has source kernels only. Most of the lift optimisation (the switches `CUPBOP_DIV_RESTORE`, `CUPBOP_SQRT_RESTORE`, `CUPBOP_ADDR_CARRY`, `CUPBOP_PARAM_SPAN`, the passes lo-pair, p2c-fold, lo-mma) acts on IR lifted from machine code only, so the matrix proves nothing about it. `examples/lift_*` have lifted IR as device code (`examples/lift.mk`): the source examples' host programs (saxpy, conv3, hotspot, nn, backprop) or small hosts with a CPU reference (`examples/lift_host.h`: cuBLAS sgeam, sdot, strsm, hgemm, g32, cuDNN fprop). Each row of `ci/lift_cases.txt` is one example, schedule, input and switch set, and is good when:
 * the program verdict or golden of `ci/check_correctness.sh` says PASS,

@@ -65,6 +65,36 @@ fp_dyn_s2       lift_fprop    s2   tcu  pre PASS a parameter~buffers:~1~removed.
 fp_on_s1p1      lift_fprop    s1p1 tcu  raw PASS a -                                              %RAW %BASE %ON
 fp_pre_s2       lift_fprop    s2   tcu  pre PASS a lo-pair:,\[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA %BASE %ON LIFT_DYN_SMEM=0
 fp_pre_s1p1     lift_fprop    s1p1 tcu  pre PASS a \[p2c-fold\].*ring~S=5~->~1,lo-mma:.*WMMA    %BASE %ON LIFT_DYN_SMEM=0 LIFT_NEEDS=CUPBOP_PARAM_DYN
+# --- the lift optimisation inside the translator: raw input, CUPBOP_LIFT_OPT=1, table of compilation/KernelTranslation/src/lift_opt/schedule.inc (s2 everything; s1 without lo-mm, lo-stale, skip of lo-tree)
+# the passes print nothing without LO_PRED_V, LO_STALE_V, LO_TREE_V. lift_backprop is not here: LIFT_MERGE puts source kernels beside the lift, so it is not a lifted module
+p4_g3_s2        lift_g32      s2   tcu  raw PASS a \[lo-dq\].*no~queue,lo-mm:,lo-cvtphi:,lo-pred.*merges,lo-stale.*dropped  %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1 LO_STALE_V=1
+p4_g3_s1p1      lift_g32      s1p1 tcu  raw PASS a \[lo-dq\].*no~queue,lo-cvtphi:,lo-pred.*merges,barrier~merge:         %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1
+p4_fp_s2        lift_fprop    s2   tcu  raw PASS a lo-mm:,lo-cvtphi:,lo-pred.*merges,lo-stale.*dropped                     %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1 LO_STALE_V=1
+p4_fp_s1p1      lift_fprop    s1p1 tcu  raw PASS a lo-cvtphi:,lo-pred.*merges,barrier~merge:                               %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1
+# with lo-dq the switches of fp_pre_hang_s1p1 finish
+p4_fp_nodyn_s1p1 lift_fprop   s1p1 tcu  raw PASS a lo-cvtphi:                                                              %BASE %ON CUPBOP_LIFT_OPT=1 CUPBOP_PARAM_DYN=0
+p4_hg_s2        lift_hgemm    s2   tcu  raw PASS p lo-cvtphi:,\[p2c-fold\].*ring~S=3~->~1                                  %BASE %ON CUPBOP_LIFT_OPT=1
+p4_hg_s1p1      lift_hgemm    s1p1 tcu  raw PASS p lo-cvtphi:,barrier~merge:                                               %BASE %ON CUPBOP_LIFT_OPT=1
+p4_sd_s2        lift_sdot     s2   main raw PASS a promote~from~stage,lo-stale.*dropped                                    %BASE %ON CUPBOP_LIFT_OPT=1 LO_TREE_V=1 LO_STALE_V=1
+p4_sd_s1p1      lift_sdot     s1p1 main raw PASS a promote~from~stage,barrier~merge:                                       %BASE %ON CUPBOP_LIFT_OPT=1 LO_TREE_V=1
+p4_sd_s1p4      lift_sdot     s1p4 main raw PASS a promote~from~stage,barrier~merge:                                       %BASE %ON CUPBOP_LIFT_OPT=1 LO_TREE_V=1
+p4_sg_s2        lift_sgeam    s2   main raw PASS a lo-pred.*merges,lo-stale.*dropped                                       %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1 LO_STALE_V=1
+p4_st_s2        lift_strsm    s2   main raw PASS a lo-pred.*merges,lo-stale.*dropped                                       %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1 LO_STALE_V=1
+p4_st_s1p1      lift_strsm    s1p1 main raw PASS a lo-pred.*merges,barrier~merge:                                          %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1
+p4_hs_s2        lift_hotspot  s2   main raw PASS a lo-stale.*dropped                                                       %BASE %ON CUPBOP_LIFT_OPT=1 LO_STALE_V=1
+p4_hs_s1p1      lift_hotspot  s1p1 main raw PASS a barrier~merge:                                                          %BASE %ON CUPBOP_LIFT_OPT=1
+p4_nostale_s2   lift_strsm    s2   main raw PASS a then~function\(lo-mm.lo-pred.lo-tree\)                                   %BASE %ON CUPBOP_LIFT_OPT=1 CUPBOP_LIFT_OPT_STALE=0
+p4_off_s2       lift_g32      s2   tcu  raw PASS a \[p2c-fold\].*ring~S=6~->~1,full~pipeline$                                %BASE %ON CUPBOP_LIFT_OPT=1 CUPBOP_LIFT_OPT_P4=0
+# --- an empty environment: what a lifted module gets by default (schedule.inc); only the hardware choices are left to the row
+df_g3_s2        lift_g32      s2   tcu  raw PASS a \[lift-opt\].*full~pipeline,\[lo-dq\].*no~queue,parameter~buffers:~1~removed
+df_g3_s1p1      lift_g32      s1p1 tcu  raw PASS a \[lift-opt\].*full~pipeline,\[lo-dq\].*no~queue,barrier~merge:
+df_hg_s2        lift_hgemm    s2   tcu  raw PASS p \[lift-opt\].*full~pipeline,\[p2c-fold\].*ring~S=3~->~1
+df_st_s2        lift_strsm    s2   main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*32~of~32
+df_st_s1p1      lift_strsm    s1p1 main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*32~of~32
+df_hs_s2        lift_hotspot  s2   main raw PASS a \[lift-opt\].*light~pipeline,\[div\].*4~of~4
+df_sx_s1p2      lift_saxpy    s1p2 main raw PASS a \[lift-opt\].*light~pipeline,\[trip-version\].*1D~exact
+df_c3_s1        lift_conv3    s1   main raw PASS a \[lift-opt\].*light~pipeline,\[trip-hoist\],parameter~buffers:~1~removed
+df_tr_s2        lift_transpose s2  main raw PASS a \[lift-opt\].*light~pipeline,parameter~buffers:~1~removed
 # --- 64-bit addresses in halves: a buffer across 2^32 (LIFT_STRADDLE, examples/lift_d2h.c); a lost carry shows only there
 ad_raw_s2       lift_addr     s2   main raw PASS a -                                              %RAW
 ad_on_s2        lift_addr     s2   main raw PASS a \[addr-carry\].*1~64-bit                       %RAW %BASE %ON
@@ -85,4 +115,8 @@ sg_stale_s1p1   lift_sgeam    s1p1 main stale PASS a -                          
 sg_stale_s1p2   lift_sgeam    s1p2 main stale PASS a -                                            %BASE
 sg_stale_s2     lift_sgeam    s2   main stale PASS a -                                            %BASE
 # fprop with lo-mma under core mapping and the parameter buffer left in place: the run never finishes (with or without p2c-fold; s2 is right, and so is s1p1 with the buffer gone, row fp_pre_s1p1)
-fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+# The hang needs the cp.async zero-fill reading its local-memory destination: CUPBOP_CPA_ZFILL_GLOBAL=0 keeps that path here, fp_pre_zf_s1p1 below is the same row on the path of today. Why that
+# read hangs is not known. With LIFT_OPT_IN_TRANSLATOR=1 the row runs raw through the translator and finishes even with the old read: the determinism fix settled the translation on a form that
+# does not hang (experiments/s1fix/REPORT_KO.md: before it the same row hung or passed from run to run), so the problem is latent there.
+fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 CUPBOP_LIFT_OPT_P4=0 LIFT_TR_EXPECT=PASS CUPBOP_CPA_ZFILL_GLOBAL=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+fp_pre_zf_s1p1 lift_fprop   s1p1 tcu  pre PASS a -                                             %BASE %ON CUPBOP_PARAM_DYN=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60

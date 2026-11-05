@@ -1,0 +1,99 @@
+--- a/tools/liftopt.cpp
++++ b/tools/liftopt.cpp
+@@ -1193,6 +1193,7 @@
+   for (BasicBlock &BB : F) {
+     if (pred_size(&BB) < 2) continue;
+     std::map<std::vector<CallInst *>, std::vector<std::pair<PHINode *, unsigned>>> sets;
++    std::vector<std::vector<CallInst *>> keyOrder;
+     for (PHINode &P : BB.phis()) {
+       std::vector<CallInst *> cs; int idx = -1; bool ok = true;
+       for (unsigned k = 0; k < P.getNumIncomingValues() && ok; ++k) {
+@@ -1201,9 +1202,9 @@
+         idx = E->getIndices()[0]; cs.push_back(C);
+       }
+       if (dbg() && !ok) { errs() << "phi not ldsm: "; P.print(errs()); errs() << "\n"; }
+-      if (ok && idx >= 0) sets[cs].push_back({&P, (unsigned)idx});
++      if (ok && idx >= 0) { if (!sets.count(cs)) keyOrder.push_back(cs); sets[cs].push_back({&P, (unsigned)idx}); }
+     }
+-    for (auto &kv : sets) {
++    for (auto &ko : keyOrder) { auto &kv = *sets.find(ko);
+       auto &cs = kv.first; PHINode *P0 = kv.second[0].first; Ldsm L0; parseLdsm(cs[0], L0); GlobalVariable *G0 = nullptr; bool ok = true; std::vector<Value *> offs;
+       for (unsigned k = 0; k < cs.size() && ok; ++k) {
+         Ldsm L; parseLdsm(cs[k], L); GlobalVariable *G; Value *o; BasicBlock *In = P0->getIncomingBlock(k);
+--- a/tools/p2cfold.cpp
++++ b/tools/p2cfold.cpp
+@@ -29,6 +29,7 @@
+ //    the split-K semaphore path, not taken by split-K 1 launches).
+ //  - @shared_mem shrinks to the new footprint; the launch must pass dyn_smem = 0 (printed in the log line).
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/MapVector.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/Analysis/LoopInfo.h"
+@@ -1167,7 +1168,7 @@
+       last = v.lastRead[other];
+       Instruction *At = v.close && last->getParent() == v.close->getParent() ? v.close : last->getParent()->getTerminator();
+       { IRBuilder<> B(At); B.CreateCall(Bar); ++nb; }
+-      std::map<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded)
++      MapVector<BasicBlock *, std::vector<Acc *>> byGuard;   // guard block -> its copies (nullptr: unguarded); insertion order: the guards' code must not follow heap addresses
+       for (Acc *a : mv) {
+         Site st; st.C = cast<CallInst>(a->I);
+         BasicBlock *key = nullptr;
+--- a/tools/pairjoin.cpp
++++ b/tools/pairjoin.cpp
+@@ -25,6 +25,7 @@
+ // (-> icmp on the two i64 values). The remaining uses of a joined phi pair read trunc(V) and trunc(V >> 32).
+ //
+ // Env: LP_DEBUG=1 prints what stayed; LP_OFF_PHI=1, LP_OFF_CMP=1 turn off parts (diagnosis only).
++#include "llvm/ADT/MapVector.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+@@ -458,7 +459,7 @@
+       else if (auto *S = dyn_cast<SelectInst>(&I)) sels.push_back(S);
+     }
+     if (packs.empty() && sels.empty()) return false;
+-    DenseMap<Value *, Value *> repl;
++    MapVector<Value *, Value *> repl;   // insertion order: the RAUW order sets the use lists later passes walk
+     for (auto &[I, lo, hi] : packs) {
+       bool lf = false;
+       Value *v = get(lo, hi, I, &lf);
+--- a/tools/lotree.cpp
++++ b/tools/lotree.cpp
+@@ -174,7 +174,7 @@
+     for (auto &A : As) { auto *I = dyn_cast<Instruction>(A.Own); if (I && !DT.dominates(I, Ch[k].BarBefore)) { if (V) errs() << "  own pointer not available\n"; k = n; As.clear(); break; } }
+     if (k < n && Ch[k].c + 0 > 32) { k = n; As.clear(); }
+     // p4: nothing to promote, nothing to do: narrowing and skipping alone only pay behind a promoted tail (softmax 128 64 32, the tail in another form: +6.3%; snrm2 with a tail: -5.3%)
+-    if (k == n) return false;
++    if (k == n || As.empty()) return false;   // a stage without a shared store (a tid < 1 guard around TMA code, chain 1 1 1 1) has no cell to promote: LastSt below stayed null
+     // later reads of the cells: only cell 0 -> guards of promoted stages can go, write back from lane 0
+     Value *TidV = Tid; LLVMContext &C = F.getContext(); auto *I32 = Type::getInt32Ty(C); Module *Mod = F.getParent();
+     if (V) errs() << "  promote from stage " << k << " of " << n << "\n";
+--- a/tools/p4plugin.cpp
++++ b/tools/p4plugin.cpp
+@@ -6,13 +6,11 @@
+ extern "C" PassPluginLibraryInfo p4_pred_info();
+ extern "C" PassPluginLibraryInfo p4_tree_info();
+ extern "C" PassPluginLibraryInfo p4_mm_info();
+-extern "C" PassPluginLibraryInfo p4_cta_info();
+ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+   return {LLVM_PLUGIN_API_VERSION, "p4", "0.1", [](PassBuilder &PB) {
+     p4_stale_info().RegisterPassBuilderCallbacks(PB);
+     p4_pred_info().RegisterPassBuilderCallbacks(PB);
+     p4_tree_info().RegisterPassBuilderCallbacks(PB);
+     p4_mm_info().RegisterPassBuilderCallbacks(PB);
+-    p4_cta_info().RegisterPassBuilderCallbacks(PB);
+   }};
+ }
+--- a/scripts/mkp3.sh
++++ b/scripts/mkp3.sh
+@@ -5,7 +5,7 @@
+ export P2C_STAGES=${3:-${P2C_STAGES:-1}} LO_F16_ACC=${LO_F16_ACC:-2}
+ LP=lo-pair,; [ "${P3_NOPAIR:-0}" = 1 ] && LP=""
+ # The clean-up (instcombine, simplifycfg) only serves p2c-fold and lo-mma. A module without mma, ldmatrix, cp.async, wgmma keeps the light form (P2F): the clean-up costs SIMT kernels (pool_avg +43%, backprop s1p1 wrong).
+-L="function(lo-brmark,instsimplify,early-cse,${LP}dce,lo-brfix)"
++L="function(instsimplify,early-cse,${LP}dce)"
+ grep -qE 'nvvm\.mma|ldmatrix|cp\.async|wgmma' "$1" || P3_PIPE=${P3_PIPE:-$L}
+-P=${P3_PIPE:-"function(lo-brmark,instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC,lo-brfix)"}
++P=${P3_PIPE:-"function(instsimplify,early-cse,${LP}dce),function($IC,simplifycfg,$IC),p2c-fold,p2c-alias,function($IC,simplifycfg,$IC),lo-mma,function($IC,loop-simplify),lo-sink,${P4_PREHEXT:-}lo-hext,lo-shfl,function($IC)"}
+ opt -instcombine-maxarray-size=16 -load-pass-plugin=$R/tools/libp3.so -load-pass-plugin=$R/tools/libp4.so -passes="$P" -S "$1" -o "$2" 2>&1 | grep -v "failed to create target machine"

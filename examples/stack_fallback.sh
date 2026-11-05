@@ -46,7 +46,7 @@ KT=$1; DEV=$2; CELL=$3; shift 3
 LIM=${CUPBOP_FRAME_LIMIT:-7168}
 HERE=$(dirname $0)
 B=.stack_fallback
-FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt cupbop_kabi.txt cupbop_dyn_stack.txt kernel.elf kernel.vxbin kernel.dump"
+FILES="kernel.bc kernel.ll kernel_wrapper.cpp kernel_meta.log cupbop_ctx_scratch.txt cupbop_big_stack.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_launch_fix.txt kernel.elf kernel.vxbin kernel.dump"
 maxf() { python3 $HERE/stack_frames.py kernel.dump | awk -v l="$1" 'BEGIN{n=split(l,a,",");for(i=1;i<=n;i++)w[a[i]]=1} {if($2 in w && $1>m)m=$1; if($1>all)all=$1} END{print m+0, all+0}'; }
 save() { rm -rf $B/keep; mkdir -p $B/keep; for f in $FILES; do [ -f $f ] && cp -p $f $B/keep/; done; }
 restore() { for f in $FILES; do if [ -f $B/keep/$f ]; then cp -p $B/keep/$f .; else rm -f $f; fi; done; }
