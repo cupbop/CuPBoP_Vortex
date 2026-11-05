@@ -2218,6 +2218,8 @@ cudaError_t cudaLaunchKernel_vortex(
     }
   }
   readfile.close();                    
+  // The side-file tables hold kernel names. A launch by path names the module, and its kernel is what lookup.txt gave.
+  const std::string table_name = strchr(func, '/') ? stripPrefix(kernel_name_tmp) : func_stripped;
                       
   DBG_PRINT("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
@@ -2237,7 +2239,7 @@ cudaError_t cudaLaunchKernel_vortex(
       DC->set_last_krnl_path(krnl_path);
     }
   }
-  cupbop_apply_launch_fix(func_stripped, sharedMem);
+  cupbop_apply_launch_fix(table_name, sharedMem);
 
 
   // Allocate context pool and set __ctx_pool pointer. The pool also holds the core mapping's context scratch
@@ -2564,7 +2566,7 @@ cudaError_t cudaLaunchKernel_vortex(
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
       block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
       ndim = 3;
-      lmem = cupbop_lmem_touched(func_stripped, cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem, blockDim);
+      lmem = cupbop_lmem_touched(table_name, cupbop_static_lmem_bytes(table_name) + (uint32_t)sharedMem, blockDim);
       uint64_t lmem_cap = 0;
       if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
         printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
@@ -2622,7 +2624,7 @@ cudaError_t cudaLaunchKernel_vortex(
       // Lane gating needs the full warps dispatched (the kernel entry retires lanes >= L).
       block[0] = (L == nt) ? (uint32_t)std::min<uint64_t>((uint64_t)P * nt, block_threads) : P * nt; block[1] = 1; block[2] = 1;
       ndim = 3;
-      lmem = cupbop_lmem_touched(func_stripped, cupbop_static_lmem_bytes(func_stripped) + (uint32_t)sharedMem, blockDim);
+      lmem = cupbop_lmem_touched(table_name, cupbop_static_lmem_bytes(table_name) + (uint32_t)sharedMem, blockDim);
       DBG_PRINT("virt: block_warps=%u physical_warps=%u lanes=%u cta_threads=%u\n", block_warps, P, L, block[0]);
     } else {
       // flat schedule: one CUDA block per hardware thread; the device entry recovers
