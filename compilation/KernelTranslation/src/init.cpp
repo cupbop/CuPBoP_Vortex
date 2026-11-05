@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 
+#include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -44,7 +45,7 @@ using namespace llvm;
 
 bool inline_warp_level_func(llvm::Module *M) {
   bool changed = false;
-  std::set<llvm::Function *> need_remove;
+  llvm::SetVector<llvm::Function *> need_remove;
 
   // For SCHE_0 (FLAT), skip inlining shfl wrappers — they will be
   // replaced by ReplaceWarpLevelPrimitive with warp_shfl emulation.
@@ -124,7 +125,7 @@ bool inline_shfl_helpers(llvm::Module *M) {
   bool changed = false;
   // Collect inline targets first (avoid iterator invalidation)
   SmallVector<CallInst *, 16> to_inline;
-  std::set<llvm::Function *> need_remove;
+  llvm::SetVector<llvm::Function *> need_remove;
   for (auto &F : *M) {
     if (!isKernelFunction(M, &F))
       continue;
@@ -192,8 +193,8 @@ bool find_sreg_inst(llvm::Function *F) {
 }
 bool inline_func_with_tid(llvm::Module *M) {
   bool changed = false;
-  std::set<llvm::Function *> need_remove;
-  std::set<CallInst *> need_inline;
+  llvm::SetVector<llvm::Function *> need_remove;
+  llvm::SetVector<CallInst *> need_inline;
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
     auto func_name = F->getName().str();

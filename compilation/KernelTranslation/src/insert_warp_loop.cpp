@@ -2,11 +2,13 @@
 #include <optional>
 #include "insert_warp_loop.h"
 #include "handle_sync.h"
+#include "stable_order.h"
 #include "tool.h"
 #include <assert.h>
 #include <iostream>
 #include <set>
 
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/Statistic.h"
 // LLVM 18
 #include "llvm/TargetParser/Triple.h"
@@ -86,7 +88,7 @@ public:
   // Values forced divergent by the caller (virt sub-pass form: allocas that are
   // stored inside a lane-looped region -- the store runs once per lane, so the
   // variable must be per-lane even when the stored value is uniform).
-  std::unordered_set<const Value *> ExtraSources;
+  llvm::SetVector<const Value *> ExtraSources;
   void addSource(const Value *V) { ExtraSources.insert(V); }
 
   // a function body that may compute something thread-dependent on its own (not from its arguments)
@@ -386,6 +388,7 @@ struct ParallelRegion {
 };
 
 std::map<llvm::Instruction *, unsigned> tempInstructionIds;
+std::map<llvm::Instruction *, unsigned> cmpGuardIds;   // unnamed guards: a number, not the address, goes into the array's name
 std::map<std::string, llvm::Instruction *> contextArrays;
 // Per-function cache of the volatile __ctx_pool load. Volatile prevents O3
 // from CSE-ing duplicate loads, so we share one explicit instruction across
@@ -938,7 +941,7 @@ void handle_alloc(llvm::Function *F) {
                                        inst->getName().str() + "inter_warp");
 
     // replace all usage
-    std::set<Instruction *> replace_user;
+    llvm::SetVector<Instruction *> replace_user;
     for (Instruction::use_iterator ui = inst->use_begin(), ue = inst->use_end();
          ui != ue; ++ui) {
       auto *cast_user = dyn_cast<Instruction>(ui->getUser());
@@ -1309,7 +1312,7 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
       regionBBs.push_back(pr.wrapped_block);
 
     // Find allocas with cross-region store→load
-    std::set<AllocaInst *> cross_region_allocas;
+    llvm::SetVector<AllocaInst *> cross_region_allocas;   // entry block order
     for (auto &F_inst : F->getEntryBlock()) {
       auto *AI = dyn_cast<AllocaInst>(&F_inst);
       if (!AI) continue;
@@ -1396,7 +1399,7 @@ void handle_local_variable_intra_warp(std::vector<ParallelRegion> &PRs,
        check if they need to be context saved. */
     SmallVector<BasicBlock *, 16> blocks_to_check;
     blocks_to_check.push_back(&F->getEntryBlock());
-    for (auto bb : parallel_regions.wrapped_block) {
+    for (auto bb : cupbop::blocks_in_order(*F, parallel_regions.wrapped_block)) {
       blocks_to_check.push_back(bb);
     }
     for (auto *bb : blocks_to_check) {
@@ -1802,7 +1805,7 @@ allocateCmpContextArray(llvm::Function *F, llvm::Instruction *cmp_inst,
   // in ctx_pool, padded to elemSize alignment).
   std::ostringstream var;
   if (cmp_inst->getName().empty())
-    var << "cmpguard_" << (uintptr_t)cmp_inst;
+    var << "cmpguard_" << cmpGuardIds.emplace(cmp_inst, cmpGuardIds.size()).first->second;
   else
     var << cmp_inst->getName().str();
   var << (intra_warp_loop ? "_intra_warp_" : "_inter_warp_");
@@ -1857,7 +1860,7 @@ static bool findDivergentIfGuard(const ParallelRegion &region,
                                   llvm::BranchInst *&out_br,
                                   unsigned &out_outside_idx,
                                   llvm::Value *&out_cond) {
-  for (auto *bb : region.wrapped_block) {
+  for (auto *bb : cupbop::blocks_in_order(*tail_block->getParent(), region.wrapped_block)) {
     if (bb == tail_block) continue;
     auto *term = bb->getTerminator();
     auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
@@ -2623,7 +2626,7 @@ static bool s1_area_of(llvm::BasicBlock *X, llvm::DominatorTree &DT, llvm::PostD
     if (B == ar.M || !ar.A.insert(B).second) continue;
     for (llvm::BasicBlock *S : llvm::successors(B)) work.push_back(S);
   }
-  for (llvm::BasicBlock *B : ar.A) {
+  for (llvm::BasicBlock *B : cupbop::blocks_in_order(*ar.head->getParent(), ar.A)) {
     if (B != ar.head)
       for (llvm::BasicBlock *P : llvm::predecessors(B))
         if (!ar.A.count(P)) {
@@ -2755,7 +2758,7 @@ static int split_multi_entry_merges(llvm::Function &F, const std::vector<llvm::B
       if (hasBar(*X) || !R.insert(X).second) continue;
       st.insert(st.end(), llvm::pred_begin(X), llvm::pred_end(X));
     }
-    for (llvm::BasicBlock *Mg : std::vector<llvm::BasicBlock *>(R.begin(), R.end())) {
+    for (llvm::BasicBlock *Mg : cupbop::blocks_in_order(F, R)) {
       if (done.count(Mg)) continue;
       bool differ = false;
       llvm::BasicBlock *first = nullptr;
@@ -3539,6 +3542,7 @@ public:
     // clear context array, temp variables for new kernel function
     contextArrays.clear();
     tempInstructionIds.clear();
+    cmpGuardIds.clear();
     ctxPoolLoadCache.clear();
     g_schedule_flag = schedule_flag;
     tempInstructionIndex = 0;
@@ -3631,7 +3635,7 @@ public:
     // expansion below gives them a context array.
     auto force_lane_allocas = [&]() {
       for (int iter = 0; iter < 8; iter++) {
-        std::set<const AllocaInst *> add;
+        llvm::SetVector<const AllocaInst *> add;
         for (auto &pr : parallel_regions)
           for (auto *bb : pr.wrapped_block)
             for (auto &I : *bb)

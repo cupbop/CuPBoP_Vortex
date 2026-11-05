@@ -515,7 +515,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
               "llvm.nvvm.vote.ballot.sync"};
 
   // get the callee functions to be replaced
-  set<CallInst *> replace;
+  CallSet replace;
   for (auto &f : m.functions()) {
     // if (isKernelFunction(&m, &f))
     //   continue;
@@ -555,7 +555,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
-    Module &m, const set<CallInst *> &replace) {
+    Module &m, const CallSet &replace) {
   // type
   Type *Int1T = Type::getInt1Ty(m.getContext());
   Type *I32 = Type::getInt32Ty(m.getContext());
@@ -622,7 +622,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteFlat(
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
-    Module &m, const set<CallInst *> &replace) {
+    Module &m, const CallSet &replace) {
   auto &ctx = m.getContext();
   Type *I1 = Type::getInt1Ty(ctx);
   Type *I32 = Type::getInt32Ty(ctx);
@@ -671,7 +671,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpVoteX86(
-    Module &m, const set<CallInst *> &replace) {}
+    Module &m, const CallSet &replace) {}
 
 bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
 
@@ -705,7 +705,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
   };
 
   // get the callee functions to be replaced
-  set<CallInst *> replace;
+  CallSet replace;
   const bool coreStaged = (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1);
   if (mapping_ == MAPPING_FLAT || coreStaged) {
     // FLAT mode: replace C++ wrapper CALLS in the kernel body directly.
@@ -810,7 +810,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
-    Module &m, const set<CallInst *> &replace) {
+    Module &m, const CallSet &replace) {
   // type
   Type *Int1T = Type::getInt1Ty(m.getContext());
   Type *I32 = Type::getInt32Ty(m.getContext());
@@ -970,7 +970,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
-    Module &m, const set<CallInst *> &replace) {
+    Module &m, const CallSet &replace) {
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx);
   Type *F32 = Type::getFloatTy(ctx);
@@ -1057,7 +1057,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShfl1to1(
 }
 
 void ReplaceWarpLevelPrimitive::replaceWarpShflX86(
-    Module &m, const set<CallInst *> &replace) {}
+    Module &m, const CallSet &replace) {}
 
 
 
@@ -1090,12 +1090,12 @@ static Instruction *virtEntryInsertPt(Function *F) {
   return F->getEntryBlock().getTerminator();
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallInst *> &replace_in) {
+void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const CallSet &replace_in) {
   const VirtGeom vg = getVirtGeom();
   const int S = vg.subpasses, L = vg.lanes, LG = vg.lg_lanes;
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *I1 = Type::getInt1Ty(ctx), *VoidT = Type::getVoidTy(ctx);
-  set<CallInst *> replace = replace_in;
+  CallSet replace = replace_in;
   for (auto &f : m.functions())
     for (auto &bb : f)
       for (auto &i : bb)
@@ -1115,7 +1115,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
     std::string name = ci->getCalledOperand()->getName().str();
     if (!isKernelFunction(&m, F)) {
       fprintf(stderr, "[virt-stage] WARNING: %s in non-kernel %s left to the hardware lowering\n", name.c_str(), F->getName().str().c_str());
-      set<CallInst *> one; one.insert(ci);
+      CallSet one; one.insert(ci);
       if (name != "__cupbop_activemask") replaceWarpVote1to1(m, one);
       continue;
     }
@@ -1164,7 +1164,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVoteStaged(Module &m, const set<CallI
   fprintf(stderr, "[virt-stage] %d vote/activemask sites staged over %d sub-passes of %d lanes\n", n, S, L);
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallInst *> &replace) {
+void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const CallSet &replace) {
   const VirtGeom vg = getVirtGeom();
   const int S = vg.subpasses, L = vg.lanes, LG = vg.lg_lanes;
   auto &ctx = m.getContext();
@@ -1183,7 +1183,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const set<CallI
     std::string name = ci->getCalledOperand()->getName().str();
     if (!isKernelFunction(&m, F)) {
       fprintf(stderr, "[virt-stage] WARNING: %s in non-kernel %s left to the hardware lowering\n", name.c_str(), F->getName().str().c_str());
-      set<CallInst *> one; one.insert(ci); replaceWarpShfl1to1(m, one);
+      CallSet one; one.insert(ci); replaceWarpShfl1to1(m, one);
       continue;
     }
     const bool isIntrinsic = name.rfind("llvm.nvvm.shfl.sync.", 0) == 0;

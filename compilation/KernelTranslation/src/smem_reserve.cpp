@@ -54,6 +54,7 @@
 // An access whose extent is not known (TMA / bulk copy helpers) or any failure of the proof leaves no entry.
 #include "smem_reserve.h"
 #include "tool.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/CFG.h"
@@ -671,7 +672,7 @@ private:
   Function &F;
   RangeEval &E;
   const DataLayout &DL;
-  std::set<const Value *> D;  // values derived from G (pointers, and integers made from them)
+  llvm::SetVector<const Value *> D;  // values derived from G (pointers, and integers made from them), in discovery order
   std::map<const Value *, std::optional<Off>> offs;
   std::set<const Value *> busy;
   uint64_t low = kNone;
