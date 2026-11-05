@@ -115,6 +115,8 @@ sg_stale_s1p1   lift_sgeam    s1p1 main stale PASS a -                          
 sg_stale_s1p2   lift_sgeam    s1p2 main stale PASS a -                                            %BASE
 sg_stale_s2     lift_sgeam    s2   main stale PASS a -                                            %BASE
 # fprop with lo-mma under core mapping and the parameter buffer left in place: the run never finishes (with or without p2c-fold; s2 is right, and so is s1p1 with the buffer gone, row fp_pre_s1p1)
-# With LIFT_OPT_IN_TRANSLATOR=1 this row runs raw through the translator and finishes, also with CUPBOP_LIFT_OPT_P4=0: the determinism fix settled the translation on a form that does not
-# hang (experiments/s1fix/REPORT_KO.md: before it the same row hung or passed from run to run). The input pre still hangs, so the problem is latent, not gone; its cause is not known.
-fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 CUPBOP_LIFT_OPT_P4=0 LIFT_TR_EXPECT=PASS LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+# The hang needs the cp.async zero-fill reading its local-memory destination: CUPBOP_CPA_ZFILL_GLOBAL=0 keeps that path here, fp_pre_zf_s1p1 below is the same row on the path of today. Why that
+# read hangs is not known. With LIFT_OPT_IN_TRANSLATOR=1 the row runs raw through the translator and finishes even with the old read: the determinism fix settled the translation on a form that
+# does not hang (experiments/s1fix/REPORT_KO.md: before it the same row hung or passed from run to run), so the problem is latent there.
+fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 CUPBOP_LIFT_OPT_P4=0 LIFT_TR_EXPECT=PASS CUPBOP_CPA_ZFILL_GLOBAL=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+fp_pre_zf_s1p1 lift_fprop   s1p1 tcu  pre PASS a -                                             %BASE %ON CUPBOP_PARAM_DYN=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
