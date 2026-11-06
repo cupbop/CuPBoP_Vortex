@@ -82,7 +82,7 @@ bool guardAt(BasicBlock *P, Guard &G) {
 void runFrom(BasicBlock *P, const DominatorTree &DT, const DenseSet<BasicBlock *> &skip, std::vector<Guard> &run) {
   Guard G;
   if (!guardAt(P, G) || skip.count(P)) return;
-  auto known = [&](Value *M) { auto *I = dyn_cast<Instruction>(M); return !I || DT.dominates(I, P->getTerminator()); };
+  auto known = [&](Value *M) { auto *I = dyn_cast<Instruction>(M); return isa<Argument>(M) || (I && DT.dominates(I, P->getTerminator())); };
   while (known(G.M)) {
     run.push_back(G);
     BasicBlock *C = G.C;
