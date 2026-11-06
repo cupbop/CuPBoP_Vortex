@@ -15,6 +15,7 @@
 // CUPBOP_LIFT_OPT_P4=0           the pipeline of experiments/p3 alone: no row of schedule.inc, the queue of p2c-fold instead of lo-dq
 // CUPBOP_LIFT_OPT_STALE=0        without lo-stale (its default waits for a decision: tg sm75 -19.5%, dotproduct s2 +12.2%)
 // CUPBOP_TRITON_LOMMA (default 1)  lo-mma, lo-sched and lo-f16 on stock Triton input (TRITON_CUPBOP=1), schedule 2 only: run_triton_lo_mma. =0: Triton input goes on as lower_triton_input left it
+// CUPBOP_TRITON_SIMT (default 1)   lo-gep, lo-tmask, lo-fdiv, lo-ex2, lo-fpext, lo-fma on stock Triton input without tl.dot, in the same place (src/lift_opt/lotriton.cpp); each has its own switch there. =0: what run_triton_lo_mma did before
 // CUPBOP_LIFT_LOPASS=1           on schedule 2 a lifted module takes lo-sched and lo-f16 (src/lift_opt/lopass.cpp) for those steps of lo-mma. Off by default: it moves the measured baseline of the lift
 // The passes' own switches (P2C_*, LO_*, LP_*) are read as in the opt step; LIFT_OPT_ENV gives mkp3.sh's defaults.
 //
@@ -300,19 +301,34 @@ static bool tcu_lowering() {
 // Stock Triton input: after lower_triton_input its mma and ldmatrix have the form of a lifted module, so lo-mma applies; the other lift passes find nothing there (experiments/triton/REPORT_KO.md).
 // What lo-mma adds around the mma work does not suit a module that may hold no mma (experiments/triton_why/REPORT_KO.md): the frame pointer and the maxnum hoist stay off, and the scheduler and the
 // f16 fast path run as lo-sched and lo-f16.
-// is_lifted_module stays out of this: such a module is not lifted, and nothing else of run_lift_opt is for it. Schedule 1 keeps what lower_triton_input left: lo-mma makes matmul 9.1% slower there.
+// is_lifted_module stays out of this: such a module is not lifted, and nothing else of run_lift_opt is for it. Schedule 1 takes only the SIMT passes: lo-mma makes matmul 9.1% slower there.
 // The steps are the measured ones, a filter in front of the plugin's opt (experiments/triton/scripts/liftpipe.sh, LIFTPIPE=lo-mma): text, lo-mma, text, llvm-as, the plugin's opt. See reload_text for why.
 // Of that script's settings only LO_F16_ACC reaches lo-mma (LIFT_OPT_ENV): P2C_STAGES belongs to p2c-fold, LO_HEXT to lo-hext, -instcombine-maxarray-size to instcombine.
+void loTritonClearArcp(Module &M);   // src/lift_opt/lotriton.cpp
+bool loTritonHasDot(Module &M);
+
 Module *run_triton_lo_mma(Module *M) {
-  if (const char *e = std::getenv("CUPBOP_TRITON_LOMMA"); e && std::atoi(e) == 0) return M;
-  const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
-  if (!s || std::atoi(s) != 2 || narrow_warp() || !tcu_lowering() || is_lifted_module(M)) return M;
+  const char *e = std::getenv("CUPBOP_TRITON_LOMMA"), *s = std::getenv("VORTEX_SCHEDULE_FLAG"), *simt = std::getenv("CUPBOP_TRITON_SIMT");
+  const bool off = e && std::atoi(e) == 0, simt_on = !simt || std::atoi(simt) != 0;
+  const int sched = s ? std::atoi(s) : -1;
+  const bool mma = sched == 2 && !narrow_warp() && tcu_lowering();
+  // the SIMT passes (src/lift_opt/lotriton.cpp) skip a module with tl.dot. They do not need the tensor unit, and neither do lo-sched and lo-f16
+  const bool simt_here = simt_on && (sched == 2 || sched == 1) && !loTritonHasDot(*M);
+  if (off || is_lifted_module(M) || (!mma && !simt_here)) { loTritonClearArcp(*M); return M; }
   fprintf(stderr, "[lift-opt] Triton input: lo-mma\n");
+  // What a lifted module has by default (LIFT_OPT_DEFAULTS), for the same reasons: a barrier that is a call keeps every value live across it in the 12 callee-saved registers or on the stack, and a branch on
+  // a kernel argument takes split/join. An existing value stays
+  if (simt_here && sched == 2) { setenv("CUPBOP_BAR_INLINE", "1", 0); setenv("CUPBOP_UNIFORM_BR", "1", 0); }
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
   std::string text;
   raw_string_ostream(text) << *M;
   M = reload_text(M, text);
-  run_pipeline(M, triton_has_dot() ? "lo-mma<no-hoist;no-sched;no-f16;no-fp;lane-eval>,lo-saddr,lo-sched,lo-f16" : "lo-mma<no-hoist;no-sched;no-f16;no-fp>,lo-sched,lo-f16", nullptr);
+  std::string pipe;
+  if (simt_here) pipe += "lo-gep,lo-tmask,lo-fdiv,lo-ex2,lo-fpext,lo-fma,";
+  if (mma) pipe += triton_has_dot() ? "lo-mma<no-hoist;no-sched;no-f16;no-fp;lane-eval>,lo-saddr," : "lo-mma<no-hoist;no-sched;no-f16;no-fp>,";
+  pipe += sched == 2 ? "lo-sched,lo-f16" : "verify";   // schedule 1 keeps what lo-mma's measurements found there
+  run_pipeline(M, pipe, nullptr);
+  loTritonClearArcp(*M);
   VerifyModule(M);
   text.clear();
   raw_string_ostream(text) << *M;

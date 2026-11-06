@@ -287,7 +287,10 @@ struct LoF16 : PassInfoMixin<LoF16> {
 };
 } // namespace
 
+void loTritonRegister(PassBuilder &PB);   // lotriton.cpp
+
 void p3RegisterPasses(PassBuilder &PB) {
+  loTritonRegister(PB);
   PB.registerPipelineParsingCallback([](StringRef N, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {
     if (N == "lo-sched") { MPM.addPass(LoSched()); return true; }
     if (N == "lo-saddr") { MPM.addPass(LoSAddr()); return true; }
