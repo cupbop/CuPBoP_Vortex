@@ -12,6 +12,7 @@
 // An asm this file does not know and no later pass handles stops the translation. replace_asm_call would drop it with
 // a warning and leave undef, which is how a stock Triton vecadd became an empty kernel.
 #include "triton_ir.h"
+#include "tool.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Operator.h"
@@ -123,6 +124,19 @@ AtomOp parse_atomic(const std::string &m) {
   else return r;
   r.ok = true;
   return r;
+}
+
+// the results of a load asm go to shared memory and nowhere else: a tile on its way to a dot. Words used for arithmetic gain nothing from a 64-bit load, the halves would have to be taken apart.
+bool only_copied_to_shared(CallInst *CI) {
+  for (User *U : CI->users()) {
+    auto *E = dyn_cast<ExtractValueInst>(U);
+    if (!E) return false;
+    for (User *X : E->users()) {
+      auto *S = dyn_cast<StoreInst>(X);
+      if (!S || S->getValueOperand() != E || S->getPointerAddressSpace() != 3) return false;
+    }
+  }
+  return true;
 }
 
 // the asm of one call, statement by statement, on values: operand $i of the asm text is regs[i]
@@ -268,7 +282,7 @@ public:
         std::vector<Value *> old;
         for (int d : dst) old.push_back(regs[d] ? regs[d] : Constant::getNullValue(outTy[d]));
         // two 32-bit words of a vector load in one 64-bit load: PTX aligns the vector to its size. pair_shared_stores finds them again at the store that takes them to shared memory.
-        bool pairs = op.bits == 32 && op.vec >= 2 && op.addrspace == 1 && !op.isVolatile && !std::getenv("CUPBOP_TRITON_NO_PAIR");
+        bool pairs = triton_has_dot() && op.bits == 32 && op.vec >= 2 && op.addrspace == 1 && !op.isVolatile && !std::getenv("CUPBOP_TRITON_NO_PAIR") && only_copied_to_shared(CI);
         for (int d : dst) pairs = pairs && outTy[d]->isIntegerTy(32);
         if (pairs) {
           Type *I64 = B.getInt64Ty();
@@ -484,7 +498,7 @@ void lower_ldmatrix(CallInst *CI, StringRef name) {
   const std::string text = "ldmatrix.sync.aligned.m8n8.x" + std::to_string(num) + (name.contains(".trans") ? ".trans" : "") +
                            ".shared.b16 {" + regs + "}, [$" + std::to_string(num) + "];";
   IRBuilder<> B(CI);
-  Value *A32 = std::getenv("CUPBOP_TRITON_NO_WINDOW") ? nullptr : smem_window(CI->getArgOperand(0), B);
+  Value *A32 = !triton_has_dot() || std::getenv("CUPBOP_TRITON_NO_WINDOW") ? nullptr : smem_window(CI->getArgOperand(0), B);
   if (!A32) A32 = B.CreatePtrToInt(CI->getArgOperand(0), I32, "smem.win");
   auto *FT = FunctionType::get(CI->getType(), {I32}, false);
   CI->replaceAllUsesWith(B.CreateCall(InlineAsm::get(FT, text, cons + "r", /*hasSideEffects=*/true), {A32}));
@@ -502,6 +516,8 @@ void lower_triton_input(Module *M) {
         if (auto *CI = dyn_cast<CallInst>(&I)) calls.push_back(CI);
   static const std::regex nvvm_f32(R"(^llvm\.nvvm\.(ex2|lg2|rcp|rsqrt|sqrt|sin|cos)\.[a-z]+(\.ftz)?\.f32$)");
   unsigned nAsm = 0, nIntr = 0;
+  for (CallInst *CI : calls)
+    if (CI->isInlineAsm() && cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("mma.sync") != std::string::npos) triton_set_has_dot(true);
   for (CallInst *CI : calls) {
     if (CI->isInlineAsm()) {
       const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();

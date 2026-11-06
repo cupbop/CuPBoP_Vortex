@@ -195,7 +195,7 @@ private:
 // registers. Runs with CUPBOP_BAR_INLINE or CUPBOP_DXA_CLOBBER, schedule 2.
 void protect_dxa_operand_registers(Module *M) {
   auto on = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) != 0; };
-  if (!on("CUPBOP_BAR_INLINE") && !on("CUPBOP_DXA_CLOBBER")) return;
+  if (!bar_inline_on() && !on("CUPBOP_DXA_CLOBBER")) return;
   const char *sc = std::getenv("VORTEX_SCHEDULE_FLAG");
   if (!sc || std::atoi(sc) != 2) return;
   auto *FT = FunctionType::get(Type::getVoidTy(M->getContext()), false);
