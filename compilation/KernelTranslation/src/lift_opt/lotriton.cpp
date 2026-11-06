@@ -37,6 +37,8 @@
 #include <vector>
 using namespace llvm;
 
+unsigned triton_warp_mask();   // triton_ir.cpp
+
 namespace {
 int envI(const char *n, int d) { const char *e = getenv(n); return e && *e ? atoi(e) : d; }
 
@@ -335,7 +337,7 @@ Value *anyLane(Module &M, IRBuilder<> &Q, Value *lane) {
   Type *I1 = Q.getInt1Ty();
   FunctionCallee Vote = M.getOrInsertFunction("llvm.nvvm.vote.any.sync", FunctionType::get(I1, {Q.getInt32Ty(), I1}, false));
   if (auto *VF = dyn_cast<Function>(Vote.getCallee())) VF->addFnAttr(Attribute::Convergent);
-  CallInst *W = Q.CreateCall(Vote, {Q.getInt32(-1), lane}); W->addFnAttr(Attribute::Convergent);
+  CallInst *W = Q.CreateCall(Vote, {Q.getInt32(triton_warp_mask()), lane}); W->addFnAttr(Attribute::Convergent);
   return W;
 }
 

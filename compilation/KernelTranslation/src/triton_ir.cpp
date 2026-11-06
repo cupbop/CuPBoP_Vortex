@@ -668,6 +668,12 @@ int triton_warp_size() {
   return k;
 }
 
+// The lanes of a warp for a vote the passes add: on schedule 2 one hardware warp, also below 32 lanes, where the narrow-warp check takes a vote only with a mask inside it. Schedule 1 stages warps of 32.
+unsigned triton_warp_mask() {
+  const VirtGeom g = getVirtGeom();
+  return g.schedule == 2 && g.nt < 32 ? (1u << g.nt) - 1 : ~0u;
+}
+
 // A k-lane module on k-lane warps. Its shuffles are k-lane by construction. Triton 3.5 and 3.6 write shfl.up with an offset of
 // k in scans, for a result they discard: past the end of the warp PTX returns the lane's own value, and the hardware, which cuts
 // the offset to the lane-index width, must not see it.
