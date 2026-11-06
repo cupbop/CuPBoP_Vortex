@@ -31,6 +31,7 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -47,9 +48,11 @@ static Value *peel(Value *V) { while (auto *B = dyn_cast<BitCastInst>(V)) V = B-
 static bool isConstZero(Value *V) { auto *C = dyn_cast<Constant>(peel(V)); return C && C->isNullValue(); }
 
 // ---- per-function lane context: lane-derived values, built once per basic block ---------------------------------------
+Value *loLaneEval(IRBuilder<> &Q, Value *V, Value *tid);   // lopass.cpp
+static bool loLaneMode = false;   // lo-mma<lane-eval>: an ldmatrix row address is a function of tid.x, not of what another lane loaded (stock Triton)
 struct Lanes {
-  Module *M; Type *I32; FunctionCallee LaneFn, Shfl;
-  struct PerBB { Value *lane = nullptr, *g = nullptr, *t = nullptr, *rg = nullptr, *bsrc = nullptr, *t4 = nullptr, *t2 = nullptr, *col = nullptr, *colp = nullptr, *t8 = nullptr, *th = nullptr; std::map<std::pair<Value *, Value *>, Instruction *> shfl, rowp; std::map<int, Value *> src; std::map<std::tuple<int, int, int, int>, Value *> ksrc; };
+  Module *M; Type *I32; FunctionCallee LaneFn, Shfl; Value *tid = nullptr;
+  struct PerBB { Value *lane = nullptr, *g = nullptr, *t = nullptr, *rg = nullptr, *bsrc = nullptr, *t4 = nullptr, *t2 = nullptr, *col = nullptr, *colp = nullptr, *t8 = nullptr, *th = nullptr; std::map<std::pair<Value *, Value *>, Instruction *> shfl, rowp; std::map<std::pair<Value *, Value *>, Value *> rows; std::map<int, Value *> src; std::map<std::tuple<int, int, int, int>, Value *> ksrc; };
   // lane index for ldmatrix rows, one value per kind and j and block: kind 0 g | 8j, 1 rho(g) | 8j, 2 2t | 8j, 3 2t+1 | 8j
   Value *srcIdx(BasicBlock *B, int kind, int j) {
     PerBB &P = get(B); int key = kind * 8 + j;
@@ -78,8 +81,9 @@ struct Lanes {
   PerBB &get(BasicBlock *B) {
     PerBB &P = bb[B];
     if (P.lane) return P;
-    IRBuilder<> Q(&*B->getFirstInsertionPt());
-    P.lane = Q.CreateCall(LaneFn, {}, "lo.lane");
+    if (loLaneMode && !tid) { IRBuilder<> E(&*B->getParent()->getEntryBlock().getFirstInsertionPt()); tid = E.CreateCall(M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.tid.x", FunctionType::get(I32, false)), {}, "lo.tid"); }
+    IRBuilder<> Q(loLaneMode && cast<Instruction>(tid)->getParent() == B ? cast<Instruction>(tid)->getNextNode() : &*B->getFirstInsertionPt());
+    P.lane = loLaneMode ? Q.CreateAnd(tid, 31, "lo.lane") : (Value *)Q.CreateCall(LaneFn, {}, "lo.lane");
     P.g = Q.CreateLShr(P.lane, 2, "lo.g"); P.t = Q.CreateAnd(P.lane, 3, "lo.t");
     P.rg = Q.CreateOr(Q.CreateShl(Q.CreateAnd(P.g, 3), 1), Q.CreateLShr(P.g, 2), "lo.rho");   // rho(g)
     P.bsrc = Q.CreateOr(Q.CreateShl(P.rg, 2), P.t, "lo.bsrc");                                 // 4 rho(g) + t
@@ -87,6 +91,17 @@ struct Lanes {
     P.t4 = Q.CreateShl(P.t, 2, "lo.t4");
     P.t8 = Q.CreateShl(Q.CreateAnd(P.t, 1), 3, "lo.t8"); P.th = Q.CreateICmpNE(Q.CreateAnd(P.t, 2), ConstantInt::get(I32, 0), "lo.th");
     return P;
+  }
+  // an ldmatrix row address of lane src: computed here from the lane number when lo-mma<lane-eval> and the address allow it, else the shuffle
+  Value *row(IRBuilder<> &Q, Value *L, Value *src) {
+    if (loLaneMode) {
+      auto &R = bb[Q.GetInsertBlock()].rows; auto key = std::make_pair(L, src);
+      auto it = R.find(key);
+      if (it != R.end() && (!isa<Instruction>(it->second) || cast<Instruction>(it->second)->comesBefore(&*Q.GetInsertPoint()))) return it->second;
+      Value *t = Q.CreateOr(Q.CreateAnd(tid, ~31u), src);
+      if (Value *v = loLaneEval(Q, L, t)) return R[key] = v;
+    }
+    return shfl(Q, L, src);
   }
   // index shuffle, cached per block: reused only if the cached copy is before the insertion point
   Value *shfl(IRBuilder<> &Q, Value *v, Value *src) {
@@ -119,7 +134,7 @@ static bool parseLdsm(CallInst *CI, Ldsm &L) {
 
 // is V (through bitcasts) used only as a B operand of an mma the pass will lower?
 static bool isMma(CallInst *C) { Function *F = C->getCalledFunction(); if (!F) return false; StringRef n = F->getName();
-  return n == "llvm.nvvm.mma.m16n8k16.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k16.row.col.f16.f16" || n == "llvm.nvvm.mma.m16n8k8.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k8.row.col.f16.f16"; }
+  return (loLaneMode && n == "llvm.nvvm.mma.m16n8k16.row.col.bf16") || n == "llvm.nvvm.mma.m16n8k16.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k16.row.col.f16.f16" || n == "llvm.nvvm.mma.m16n8k8.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k8.row.col.f16.f16"; }
 // k-blocks of 8 in one mma: m16n8k16 = 2 (args a0..a3, b0, b1, c...), m16n8k8 = 1 (args a0, a1, b0, c...)
 static int mmaKb(CallInst *C) { return C->getCalledFunction()->getName().contains("m16n8k16") ? 2 : 1; }
 // An ldmatrix row offset: E = window mask of (L + C). The mask (shared window < 16 MB; row addresses are 16-byte aligned for
@@ -260,6 +275,8 @@ static void findKPerm(Function &F) {
     for (size_t k = 1; k < cs.size(); ++k) par[find(cs[k])] = find(cs[0]);
     if (!ok) for (CallInst *c : cs) bad.insert(c);
   }
+  // an ldmatrix that stays asm has the plain k order, and all of a set must agree: one with an address form lowerLdsm does not read takes its set out (Triton: 8 of 40 lowered, the words of the rest in another order)
+  for (auto &kv : par) { Ldsm L; GlobalVariable *G; Value *o; if (!parseLdsm(kv.first, L) || !smemOffset(L.addr, G, o)) bad.insert(kv.first); }
   // an ldmatrix read by anything else than an mma stays as it is
   for (auto &kv : par) { CallInst *C = kv.first; for (User *U : C->users()) { auto *E = dyn_cast<ExtractValueInst>(U); if (!E) { bad.insert(C); continue; } std::function<void(Value *)> w = [&](Value *V) { for (User *X : V->users()) { if (isa<BitCastInst>(X)) { w(X); continue; } auto *M = dyn_cast<CallInst>(X); if (!M || !isMma(M)) bad.insert(C); } }; w(E); } }
   std::set<CallInst *> badRoot; for (CallInst *c : bad) badRoot.insert(find(c));
@@ -312,21 +329,21 @@ static void lowerLdsm(Function &F, Lanes &LN, std::set<Value *> &bPermuted) {
       const bool kp = kit != kperm.end() && kit->second.m0[j] >= 0;
       int m0 = 0, m1 = 0, kq = 0; if (kp) { m0 = kit->second.m0[j]; m1 = kit->second.m1[j]; kq = kit->second.q[j]; }
       if (kp && !L.trans) {
-        Value *row = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, perm ? 1 : 0, 0));
+        Value *row = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, perm ? 1 : 0, 0));
         d = Q.CreateBitCast(rowLoad(F32, row, P.t8, 4, 4 * kq), I32);
       } else if (kp) {
-        Value *r0 = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq)), *r1 = LN.shfl(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq + 1));
+        Value *r0 = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq)), *r1 = LN.row(Q, Lf, LN.kIdx(L.CI->getParent(), m0, m1, 2, 2 * kq + 1));
         Value *col = perm ? P.colp : P.col;
         Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
         d = Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
       } else if (!L.trans) {
         Value *rowLane = LN.srcIdx(L.CI->getParent(), perm ? 1 : 0, j);
-        Value *row = LN.shfl(Q, Lf, rowLane);
+        Value *row = LN.row(Q, Lf, rowLane);
         d = Q.CreateBitCast(rowLoad(F32, row, P.t4, 4), I32);
       } else {
         Value *s0 = LN.srcIdx(L.CI->getParent(), 2, j), *s1 = LN.srcIdx(L.CI->getParent(), 3, j);
         Value *col = perm ? P.colp : P.col;
-        Value *r0 = LN.shfl(Q, Lf, s0), *r1 = LN.shfl(Q, Lf, s1);
+        Value *r0 = LN.row(Q, Lf, s0), *r1 = LN.row(Q, Lf, s1);
         Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
         d = Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
       }
@@ -346,11 +363,11 @@ static void lowerLdsm(Function &F, Lanes &LN, std::set<Value *> &bPermuted) {
 }
 
 // ---- mma.sync -> WMMA ---------------------------------------------------------------------------------------------------
-struct Op { CallInst *CI; Value *A[4], *B[2]; SmallVector<Value *, 4> C; bool f16; int kb = 2; Op *prev = nullptr, *next = nullptr; bool used = false; int chainPos = 0; };
+struct Op { CallInst *CI; Value *A[4], *B[2]; SmallVector<Value *, 4> C; bool f16, bf16 = false; int kb = 2; Op *prev = nullptr, *next = nullptr; bool used = false; int chainPos = 0; };
 struct Group { std::vector<Op *> st[2]; int nn = 1, L = 1; };   // st[u][s]: n-half u, k-step s
 
 static void readOp(CallInst *C, Op &o) {
-  o.CI = C; o.f16 = C->getCalledFunction()->getName().ends_with("f16.f16"); o.kb = mmaKb(C);
+  o.CI = C; o.f16 = C->getCalledFunction()->getName().ends_with("f16.f16"); o.bf16 = C->getCalledFunction()->getName().ends_with(".bf16"); o.kb = mmaKb(C);
   for (int i = 0; i < 2 * o.kb; ++i) o.A[i] = peel(C->getArgOperand(i));
   for (int i = 0; i < o.kb; ++i) o.B[i] = peel(C->getArgOperand(2 * o.kb + i));
   for (unsigned i = 3 * o.kb; i < C->arg_size(); ++i) o.C.push_back(C->getArgOperand(i));
@@ -413,7 +430,7 @@ static void census(Function &F) {
 
 struct Lower {
   Function &F; Lanes &LN; std::set<Value *> &bPerm; Module *M; LLVMContext &Ctx; Type *I32, *F32, *H16, *V2H;
-  FunctionCallee W; DominatorTree *DTp = nullptr;
+  FunctionCallee W, Wb; DominatorTree *DTp = nullptr;
   unsigned nW = 0, nOps = 0;
   // f16 accumulators stay f32 values that are exactly f16 (fpext(fptrunc(x))): a packed register -> its two halves as floats
   std::map<Value *, std::pair<Value *, Value *>> wide; std::vector<std::tuple<PHINode *, PHINode *, PHINode *>> widePhis;
@@ -476,25 +493,35 @@ struct Lower {
     Type *RT = StructType::get(Ctx, SmallVector<Type *, 8>(8, F32));
     W = M->getOrInsertFunction("__lo_wmma", FunctionType::get(RT, pa, false));   // pseudo op, expanded by expandWmma
     if (auto *Fn = dyn_cast<Function>(W.getCallee())) { Fn->addFnAttr(Attribute::Convergent); Fn->setDoesNotAccessMemory(); Fn->setDoesNotThrow(); }
+    if (loLaneMode) { Wb = M->getOrInsertFunction("__lo_wmma_bf16", FunctionType::get(RT, pa, false)); if (auto *Fn = dyn_cast<Function>(Wb.getCallee())) { Fn->addFnAttr(Attribute::Convergent); Fn->setDoesNotAccessMemory(); Fn->setDoesNotThrow(); } }
   }
   // load the word again here when the epoch check allowed it (placeFrag): the fragment does not stay live between its ldmatrix and the WMMA.
   // volatile: otherwise GVN merges the loads and the live range is back
   std::set<Value *> remat;
+  // lo-mma<lane-eval>: the words of the WMMA just before, at the same place with no epoch end between (emit): a word both read stays in its register
+  std::map<Value *, Value *> held, heldNext; Instruction *heldAt = nullptr;
   Value *frag(IRBuilder<> &Q, Value *v) {
     if (!remat.count(v)) return v;
+    static const bool reuse = envOn("LO_REUSE", true);
+    if (loLaneMode && reuse) { auto it = held.find(v); if (it != held.end()) return heldNext[v] = it->second; }
+    Value *r = fragLoad(Q, v);
+    if (loLaneMode && reuse) heldNext[v] = r;
+    return r;
+  }
+  Value *fragLoad(IRBuilder<> &Q, Value *v) {
     FragInfo &f = fragOf[v]; BasicBlock *B = Q.GetInsertBlock(); auto &P = LN.get(B); Type *I8 = Type::getInt8Ty(Ctx), *I16 = Type::getInt16Ty(Ctx), *I64 = Type::getInt64Ty(Ctx);
     auto rowLoad = [&](Type *T, Value *row, Value *lanePart, unsigned al, int64_t Cx = 0) {
       Value *p = Q.CreateGEP(I8, f.G, {Q.CreateSExt(Q.CreateAdd(row, lanePart), I64)});
       if (f.C + Cx) p = Q.CreateGEP(I8, p, {ConstantInt::get(I64, f.C + Cx)});
       auto *L = Q.CreateAlignedLoad(T, p, Align(al)); L->setVolatile(true); return L; };
-    if (f.m0 >= 0 && !f.trans) return rowLoad(F32, LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, f.perm ? 1 : 0, 0)), P.t8, 4, 4 * f.q);
+    if (f.m0 >= 0 && !f.trans) return rowLoad(F32, LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, f.perm ? 1 : 0, 0)), P.t8, 4, 4 * f.q);
     if (f.m0 >= 0) {
-      Value *r0 = LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q)), *r1 = LN.shfl(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q + 1)); Value *col = f.perm ? P.colp : P.col;
+      Value *r0 = LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q)), *r1 = LN.row(Q, f.L, LN.kIdx(B, f.m0, f.m1, 2, 2 * f.q + 1)); Value *col = f.perm ? P.colp : P.col;
       Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
       return Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
     }
-    if (!f.trans) return rowLoad(F32, LN.shfl(Q, f.L, LN.srcIdx(B, f.perm ? 1 : 0, f.j)), P.t4, 4);
-    Value *r0 = LN.shfl(Q, f.L, LN.srcIdx(B, 2, f.j)), *r1 = LN.shfl(Q, f.L, LN.srcIdx(B, 3, f.j)); Value *col = f.perm ? P.colp : P.col;
+    if (!f.trans) return rowLoad(F32, LN.row(Q, f.L, LN.srcIdx(B, f.perm ? 1 : 0, f.j)), P.t4, 4);
+    Value *r0 = LN.row(Q, f.L, LN.srcIdx(B, 2, f.j)), *r1 = LN.row(Q, f.L, LN.srcIdx(B, 3, f.j)); Value *col = f.perm ? P.colp : P.col;
     Value *lo = rowLoad(I16, r0, col, 2), *hi = rowLoad(I16, r1, col, 2);
     return Q.CreateOr(Q.CreateZExt(lo, I32), Q.CreateShl(Q.CreateZExt(hi, I32), 16));
   }
@@ -524,7 +551,7 @@ struct Lower {
       cv[2 * u] = acc[u][0]; cv[2 * u + 1] = acc[u][1]; cv[4 + 2 * u] = acc[u][2]; cv[5 + 2 * u] = acc[u][3];
     }
     SmallVector<Value *, 24> args; for (int i = 0; i < 8; ++i) args.push_back(av[i]); for (int i = 0; i < 8; ++i) args.push_back(bv[i]); for (int i = 0; i < 8; ++i) args.push_back(cv[i]);
-    auto *C = Q.CreateCall(W, args, "lo.w"); C->addFnAttr(Attribute::Convergent);
+    auto *C = Q.CreateCall(G.st[0][s0]->bf16 ? Wb : W, args, "lo.w"); C->addFnAttr(Attribute::Convergent);
     for (int u = 0; u < G.nn; ++u) {
       out[u][0] = Q.CreateExtractValue(C, 2 * u); out[u][1] = Q.CreateExtractValue(C, 2 * u + 1);
       out[u][2] = Q.CreateExtractValue(C, 4 + 2 * u); out[u][3] = Q.CreateExtractValue(C, 5 + 2 * u);
@@ -567,6 +594,8 @@ struct Lower {
   }
   void emit(Group &G, Instruction *at) {
     IRBuilder<> Q(at);
+    if (at != heldAt) heldNext.clear();
+    held.swap(heldNext); heldNext.clear(); heldAt = at;
     for (int u = 0; u < G.nn; ++u) for (Op *o : G.st[u]) { o->C.clear(); readOp(o->CI, *o); }
     Value *acc[2][4] = {}, *out[2][4] = {};
     for (int u = 0; u < G.nn; ++u) accIn(Q, G.st[u][0], acc[u]);
@@ -660,7 +689,7 @@ static bool endsEpoch(Instruction *I) {
   if (auto *IA = dyn_cast<InlineAsm>(C->getCalledOperand())) { StringRef a = IA->getAsmString(); return !(a.starts_with("cp.async.c") || a.starts_with("cp.async.w") || a.starts_with("ldmatrix.sync") || a.starts_with("activemask")); }
   Function *F = C->getCalledFunction(); if (!F) return true;
   StringRef n = F->getName();
-  if (n.starts_with("llvm.nvvm.mma.") || n == "__lo_wmma" || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.bar.warp.sync") || n.starts_with("llvm.nvvm.ex2") ||
+  if (n.starts_with("llvm.nvvm.mma.") || n == "__lo_wmma" || n == "__lo_wmma_bf16" || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.bar.warp.sync") || n.starts_with("llvm.nvvm.ex2") ||
       n.starts_with("llvm.fma") || n.starts_with("llvm.maxnum") || n.starts_with("llvm.minnum") || n.starts_with("llvm.abs") || n.starts_with("llvm.lifetime") || n.starts_with("llvm.umin") || n.starts_with("llvm.umax") || n.starts_with("llvm.smin") || n.starts_with("llvm.smax") || n.starts_with("llvm.fshl") || n.starts_with("llvm.fshr")) return false;
   return true;
 }
@@ -686,6 +715,30 @@ static Instruction *epochEnd(Instruction *from, DominatorTree &DT, PostDominator
     if (!N || !DT.dominates(B, N) || LI.getLoopFor(N) != L0 || !epochClear(B->getTerminator(), &*N->getFirstInsertionPt())) return B->getTerminator();
     B = N; I = &B->front();
   }
+}
+
+// Groups placed at one point: the next one is a group whose chain predecessor is done, first the next step of the chain just emitted (its accumulators stay in the WMMA registers), then the one with
+// the most operand words in common with it (a snake through the tiles reads each fragment once instead of once per WMMA).
+static void orderForReuse(std::vector<Group> &gs, Place &R) {
+  std::vector<int> out; std::map<Op *, int> gof;
+  for (int i : R.order) for (int u = 0; u < gs[i].nn; ++u) for (Op *o : gs[i].st[u]) gof[o] = i;
+  auto words = [&](int i) { std::set<Value *> w; Group &g = gs[i]; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) { for (int k = 0; k < 2 * o->kb; ++k) w.insert(o->A[k]); for (int k = 0; k < o->kb; ++k) w.insert(o->B[k]); } return w; };
+  for (size_t a = 0; a < R.order.size();) {
+    size_t b = a; while (b < R.order.size() && R.P[R.order[b]] == R.P[R.order[a]]) ++b;
+    std::vector<int> left(R.order.begin() + a, R.order.begin() + b); std::set<int> done; int last = -1;
+    auto ready = [&](int i) { Group &g = gs[i]; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) if (o->prev && gof.count(o->prev) && gof[o->prev] != i && std::find(left.begin(), left.end(), gof[o->prev]) != left.end()) return false; return true; };
+    while (!left.empty()) {
+      int best = -1, bs = -1;
+      for (int i : left) { if (!ready(i)) continue; int sc = 0;
+        if (last >= 0) { Group &g = gs[i]; bool chain = false; for (int u = 0; u < g.nn; ++u) for (Op *o : g.st[u]) if (o->prev && gof.count(o->prev) && gof[o->prev] == last) chain = true;
+          auto w = words(i), l = words(last); for (Value *v : w) sc += l.count(v); if (chain) sc += 1000; }
+        if (sc > bs) { bs = sc; best = i; } }
+      if (best < 0) best = left[0];
+      left.erase(std::find(left.begin(), left.end(), best)); out.push_back(best); last = best;
+    }
+    a = b;
+  }
+  R.order = out;
 }
 
 static void lowerMma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
@@ -784,6 +837,7 @@ static void lowerMma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
     }
     for (auto &kv : at) { moved++; for (Value *v : ws[kv.first]) { Lw.remat.insert(v); words++; } }
   }
+  if (loLaneMode && envOn("LO_REUSE", true)) orderForReuse(gs, R);
   for (int i : R.order) { Group &g = gs[i]; Lw.emit(g, R.P[i]); groups++; int kbs = 0; for (Op *o : g.st[0]) kbs += o->kb; shapes[g.nn * 100 + kbs]++; }
   for (Group &g : gs) for (int u = 0; u < g.nn; ++u) for (int s = (int)g.st[u].size() - 1; s >= 0; --s) {
     Op *o = g.st[u][s];
@@ -956,7 +1010,7 @@ static void hoistReductions(Function &F) {
 // Dependences: SSA in the block; memory: reads and writes of one alloca in order, everything else (shared, global, calls, asm)
 // in order against writers. Pure convergent ops (shuffles, the WMMA pseudo op) have no order among themselves: all lanes of a
 // warp run the same straight-line block.
-static bool isWmmaName(StringRef n) { return n == "__lo_wmma" || n == "lo.wmma"; }   // lo.wmma: the same op behind defineWmma, what lo-sched sees
+static bool isWmmaName(StringRef n) { return n == "__lo_wmma" || n == "lo.wmma" || n == "__lo_wmma_bf16" || n == "lo.wmma.bf16"; }   // lo.wmma: the same op behind defineWmma, what lo-sched sees
 static bool isPseudoW(Instruction *I) { auto *C = dyn_cast<CallInst>(I); return C && C->getCalledFunction() && isWmmaName(C->getCalledFunction()->getName()); }
 static bool isPureCall(CallInst *C) {
   Function *F = C->getCalledFunction();
@@ -1173,15 +1227,15 @@ static void splitWide(Function &F) {
 
 // ---- body of the WMMA op (one definition; call sites stay one line): @lo.wmma(a0..7, b0..7, c0..7) -> {d0..7}; fragment arrays + the runtime's
 // WMMA helper, always_inline here and inlined again by CuPBoP's LTO, the arrays become registers (fixed f0-f23 of the asm)
-static void defineWmma(Module &M) {
-  Function *L = M.getFunction("__lo_wmma");
+static void defineWmma(Module &M, const char *pseudo = "__lo_wmma", const char *body = "lo.wmma", const char *rt = "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32") {
+  Function *L = M.getFunction(pseudo);
   if (!L || !L->isDeclaration()) return;
   LLVMContext &Ctx = M.getContext(); Type *F32 = Type::getFloatTy(Ctx), *P = PointerType::getUnqual(Ctx);
   if (L->use_empty()) { L->eraseFromParent(); return; }
-  FunctionCallee W = M.getOrInsertFunction("__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32", FunctionType::get(Type::getVoidTy(Ctx), {P, P, P, P}, false));
+  FunctionCallee W = M.getOrInsertFunction(rt, FunctionType::get(Type::getVoidTy(Ctx), {P, P, P, P}, false));
   if (auto *Fn = dyn_cast<Function>(W.getCallee())) Fn->addFnAttr(Attribute::Convergent);
   SmallVector<Type *, 25> pa{P}; pa.append(24, F32);
-  auto *N = Function::Create(FunctionType::get(L->getReturnType(), pa, false), GlobalValue::InternalLinkage, "lo.wmma", &M);
+  auto *N = Function::Create(FunctionType::get(L->getReturnType(), pa, false), GlobalValue::InternalLinkage, body, &M);
   N->addFnAttr(Attribute::AlwaysInline); N->addFnAttr(Attribute::Convergent);
   // one fragment scratch per kernel (first argument): per-call-site arrays would survive into the frame when CuPBoP's LTO keeps a helper out of line
   BasicBlock *E = BasicBlock::Create(Ctx, "entry", N); IRBuilder<> Q(E);
@@ -1258,10 +1312,12 @@ static void sinkLdsmPhis(Function &F) {
 void p3PromoteHalf(Function &F);
 struct LoMma : PassInfoMixin<LoMma> {
   bool hoist = true, sched = true, f16 = true, fp = true;   // lo-mma<no-hoist;no-sched;no-f16;no-fp>: without that step, whatever LO_HOIST, LO_SCHED, LO_F16, LO_FP say
+  bool laneEval = false;   // lo-mma<lane-eval>: see loLaneMode
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    loLaneMode = laneEval && envOn("LO_LANE_EVAL", true);
     Lanes LN(&M); std::vector<Function *> fs; for (auto &F : M) if (!F.isDeclaration()) fs.push_back(&F);
     for (Function *F : fs) {
-      LN.bb.clear(); fragOf.clear();
+      LN.bb.clear(); LN.tid = nullptr; fragOf.clear();
       std::set<Value *> bp;
       splitAggPhis(*F); canonPacks(*F);
       if (envOn("LO_CENSUS", false)) census(*F);
@@ -1281,6 +1337,7 @@ struct LoMma : PassInfoMixin<LoMma> {
       if (fp && envOn("LO_FP", true)) F->addFnAttr("frame-pointer", "all");
     }
     defineWmma(M);
+    defineWmma(M, "__lo_wmma_bf16", "lo.wmma.bf16", "__vx_wmma_mma_m16n16k16_row_row_bf16_bf16_f32");
     return PreservedAnalyses::none();
   }
 };
@@ -1296,6 +1353,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
           else if (o == "no-sched") P.sched = false;
           else if (o == "no-f16") P.f16 = false;
           else if (o == "no-fp") P.fp = false;
+          else if (o == "lane-eval") P.laneEval = true;
           else return false;
         }
         MPM.addPass(std::move(P)); return true;

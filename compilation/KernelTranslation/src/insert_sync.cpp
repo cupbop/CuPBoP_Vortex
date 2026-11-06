@@ -232,6 +232,8 @@ static bool syncRightBefore(llvm::Instruction *I) {
 static bool s2_skip_cond_barriers(Function &F) {
   static const int sched = [] { const char *e = std::getenv("VORTEX_SCHEDULE_FLAG"); return e ? std::atoi(e) : 0; }();
   if (sched != 2 || std::getenv("CUPBOP_S2_COND_BARRIERS") || F.arg_empty()) return false;
+  // Triton tl.dot: every barrier of the kernel is a CTA barrier that Triton put where all the warps pass; nothing depends on the added ones
+  if (triton_cupbop_enabled() && triton_has_dot() && !std::getenv("CUPBOP_TRITON_COND_BARRIERS")) return true;
   for (Argument &A : F.args()) {
     StringRef n = A.getName();
     if (!n.consume_front("arg_") || n.empty() || !isdigit((unsigned char)n[0])) return false;

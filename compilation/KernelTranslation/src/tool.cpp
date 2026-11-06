@@ -80,6 +80,10 @@ std::string cupbop_kernel_lookup_name(const std::string &name) {
       if (name[i] < '0' || name[i] > '9') return name.substr(i);
   return name;
 }
+static bool g_triton_has_dot = false;
+bool triton_has_dot() { return g_triton_has_dot; }
+void triton_set_has_dot(bool v) { g_triton_has_dot = v; }
+
 bool triton_cupbop_enabled() {
   static bool enabled = [] {
     const char *v = std::getenv("TRITON_CUPBOP");
@@ -1140,9 +1144,15 @@ bool fast_entry_s1_grid_csr() {
 // lose it: the asm of __vx_barrier_arrive_and_wait is not convergent, and an unmarked barrier may be duplicated into
 // divergent branches; see the barrier lowering in replace_built_in_function). Last step of the translation: the passes
 // before it look for calls of vx_barrier by name.
+// On for a Triton tl.dot on schedule 2: with the call gone, the values live across the two barriers of a tile can stay in caller-saved registers, and the loop has none of the frame loads of its
+// row addresses left. CUPBOP_BAR_INLINE=0 turns it off.
+bool bar_inline_on() {
+  if (const char *e = std::getenv("CUPBOP_BAR_INLINE")) return std::atoi(e) != 0;
+  const char *s = std::getenv("VORTEX_SCHEDULE_FLAG");
+  return triton_cupbop_enabled() && triton_has_dot() && s && std::atoi(s) == 2;
+}
 void inline_vx_barrier_calls(llvm::Module *M) {
-  const char *e = std::getenv("CUPBOP_BAR_INLINE");
-  if (!e || std::atoi(e) == 0) return;
+  if (!bar_inline_on()) return;
   llvm::Function *F = M->getFunction("vx_barrier");
   if (!F || !F->isDeclaration() || F->arg_size() != 2) return;
   auto *IA = llvm::InlineAsm::get(F->getFunctionType(), ".insn r 0x0b, 4, 0, x0, $0, $1", "r,r,~{memory}",
