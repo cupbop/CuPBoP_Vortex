@@ -285,9 +285,10 @@
    PerBB &get(BasicBlock *B) {
      PerBB &P = bb[B];
      if (P.lane) return P;
-+    if (loLaneMode && !tid) { IRBuilder<> E(&*B->getParent()->getEntryBlock().getFirstInsertionPt()); tid = E.CreateCall(M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.tid.x", FunctionType::get(I32, false)), {}, "lo.tid"); }
-     IRBuilder<> Q(&*B->getFirstInsertionPt());
+-    IRBuilder<> Q(&*B->getFirstInsertionPt());
 -    P.lane = Q.CreateCall(LaneFn, {}, "lo.lane");
++    if (loLaneMode && !tid) { IRBuilder<> E(&*B->getParent()->getEntryBlock().getFirstInsertionPt()); tid = E.CreateCall(M->getOrInsertFunction("llvm.nvvm.read.ptx.sreg.tid.x", FunctionType::get(I32, false)), {}, "lo.tid"); }
++    IRBuilder<> Q(loLaneMode && cast<Instruction>(tid)->getParent() == B ? cast<Instruction>(tid)->getNextNode() : &*B->getFirstInsertionPt());
 +    P.lane = loLaneMode ? Q.CreateAnd(tid, 31, "lo.lane") : (Value *)Q.CreateCall(LaneFn, {}, "lo.lane");
      P.g = Q.CreateLShr(P.lane, 2, "lo.g"); P.t = Q.CreateAnd(P.lane, 3, "lo.t");
      P.rg = Q.CreateOr(Q.CreateShl(Q.CreateAnd(P.g, 3), 1), Q.CreateLShr(P.g, 2), "lo.rho");   // rho(g)
