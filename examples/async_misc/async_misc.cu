@@ -2,7 +2,7 @@
 // elect.sync with a lane result, setmaxnreg, griddepcontrol, barrier.cluster.arrive/wait, fence.proxy.async,
 // fence.mbarrier_init, a bulk L2 prefetch. Each thread writes what it saw; the host checks against the CUDA meaning.
 #include "../async_common.h"
-__global__ void misc(const float *__restrict__ in, int *__restrict__ out) {
+__global__ void misc(const float *__restrict__ in, int *__restrict__ out, int *__restrict__ part) {
   const int t = threadIdx.x;
   uint32_t rank, nrank, lane, elected;
   asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
@@ -15,6 +15,11 @@ __global__ void misc(const float *__restrict__ in, int *__restrict__ out) {
   asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   out[blockIdx.x * blockDim.x + t] = (int)(rank * 100000 + nrank * 10000 + lane * 10 + elected);
+  // lanes 0-4 off: lane 5 is the lowest active one
+  uint32_t plane = 99, pelected = 0;
+  if ((t & 31) >= 5)
+    asm volatile("{ .reg .pred p; elect.sync %0|p, 0xffffffe0; selp.u32 %1, 1, 0, p; }" : "=r"(plane), "=r"(pelected));
+  part[blockIdx.x * blockDim.x + t] = (int)(plane * 10 + pelected);
 }
 
 int main(int argc, char **argv) {
@@ -24,15 +29,18 @@ int main(int argc, char **argv) {
   const int threads = 96;
   printf("async_misc: blocks=%d threads=%d\n", blocks, threads);
   const size_t n = (size_t)blocks * threads;
-  int *h = (int *)malloc(n * 4);
+  int *h = (int *)malloc(n * 4), *hp = (int *)malloc(n * 4);
   float *d_in;
-  int *d_out;
+  int *d_out, *d_part;
   ASYNC_CHECK(cudaMalloc(&d_in, (size_t)blocks * 64 * 4));
   ASYNC_CHECK(cudaMalloc(&d_out, n * 4));
+  ASYNC_CHECK(cudaMalloc(&d_part, n * 4));
   ASYNC_CHECK(cudaMemset(d_out, 0xff, n * 4));
-  misc<<<blocks, threads>>>(d_in, d_out);
+  ASYNC_CHECK(cudaMemset(d_part, 0xff, n * 4));
+  misc<<<blocks, threads>>>(d_in, d_out, d_part);
   ASYNC_CHECK(cudaDeviceSynchronize());
   ASYNC_CHECK(cudaMemcpy(h, d_out, n * 4, cudaMemcpyDeviceToHost));
+  ASYNC_CHECK(cudaMemcpy(hp, d_part, n * 4, cudaMemcpyDeviceToHost));
   int errors = 0;
   for (int b = 0; b < blocks; ++b)
     for (int t = 0; t < threads; ++t) {
@@ -40,6 +48,11 @@ int main(int argc, char **argv) {
       const int want = 0 * 100000 + 1 * 10000 + lane0 * 10 + ((t % 32) == lane0 ? 1 : 0);
       if (h[b * threads + t] != want) {
         if (errors < 10) printf("MISMATCH out[%d][%d]: got %d, expected %d\n", b, t, h[b * threads + t], want);
+        errors++;
+      }
+      const int l = t % 32, wantp = l >= 5 ? 5 * 10 + (l == 5 ? 1 : 0) : 99 * 10;
+      if (hp[b * threads + t] != wantp) {
+        if (errors < 10) printf("MISMATCH part[%d][%d]: got %d, expected %d\n", b, t, hp[b * threads + t], wantp);
         errors++;
       }
     }
