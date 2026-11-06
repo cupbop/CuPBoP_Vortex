@@ -71,7 +71,7 @@ p4_g3_s2        lift_g32      s2   tcu  raw PASS a \[lo-dq\].*no~queue,lo-mm:,lo
 p4_g3_s1p1      lift_g32      s1p1 tcu  raw PASS a \[lo-dq\].*no~queue,lo-cvtphi:,lo-pred.*merges,barrier~merge:         %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1
 p4_fp_s2        lift_fprop    s2   tcu  raw PASS a lo-mm:,lo-cvtphi:,lo-pred.*merges,lo-stale.*dropped                     %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1 LO_STALE_V=1
 p4_fp_s1p1      lift_fprop    s1p1 tcu  raw PASS a lo-cvtphi:,lo-pred.*merges,barrier~merge:                               %BASE %ON CUPBOP_LIFT_OPT=1 LO_PRED_V=1
-# with lo-dq the switches of fp_pre_hang_s1p1 finish
+# with lo-dq the switches of fp_pre_hang_s1p1 finish. That row hung until stack_frames.py read a frame of 12,784 bytes made with li and slli
 p4_fp_nodyn_s1p1 lift_fprop   s1p1 tcu  raw PASS a lo-cvtphi:                                                              %BASE %ON CUPBOP_LIFT_OPT=1 CUPBOP_PARAM_DYN=0
 p4_hg_s2        lift_hgemm    s2   tcu  raw PASS p lo-cvtphi:,\[p2c-fold\].*ring~S=3~->~1                                  %BASE %ON CUPBOP_LIFT_OPT=1
 p4_hg_s1p1      lift_hgemm    s1p1 tcu  raw PASS p lo-cvtphi:,barrier~merge:                                               %BASE %ON CUPBOP_LIFT_OPT=1
@@ -118,5 +118,5 @@ sg_stale_s2     lift_sgeam    s2   main stale PASS a -                          
 # The hang needs the cp.async zero-fill reading its local-memory destination: CUPBOP_CPA_ZFILL_GLOBAL=0 keeps that path here, fp_pre_zf_s1p1 below is the same row on the path of today. Why that
 # read hangs is not known. With LIFT_OPT_IN_TRANSLATOR=1 the row runs raw through the translator and finishes even with the old read: the determinism fix settled the translation on a form that
 # does not hang (experiments/s1fix/REPORT_KO.md: before it the same row hung or passed from run to run), so the problem is latent there.
-fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre XHANG - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 CUPBOP_LIFT_OPT_P4=0 LIFT_TR_EXPECT=PASS CUPBOP_CPA_ZFILL_GLOBAL=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
+fp_pre_hang_s1p1 lift_fprop   s1p1 tcu  pre PASS  - -                                             %BASE %ON CUPBOP_PARAM_DYN=0 CUPBOP_LIFT_OPT_P4=0 LIFT_TR_EXPECT=PASS CUPBOP_CPA_ZFILL_GLOBAL=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
 fp_pre_zf_s1p1 lift_fprop   s1p1 tcu  pre PASS a -                                             %BASE %ON CUPBOP_PARAM_DYN=0 LIFT_DYN_SMEM=0 VORTEX_CP_POLL_TIMEOUT_S=60
