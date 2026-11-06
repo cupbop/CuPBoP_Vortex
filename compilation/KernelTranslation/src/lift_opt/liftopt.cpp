@@ -821,7 +821,7 @@ static void lowerMma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
       Instruction *S = epochEnd(E, DT, PDT, LI);
       if (isa<PHINode>(S)) continue;
       std::vector<Value *> v; bool all = true; std::set<Value *> seen;
-      static const bool fragTrans = envOn("LO_FRAG_TRANS", loLaneMode);   // a .trans word is two 16-bit loads: it stays where it is
+      static const bool fragTrans = envOn("LO_FRAG_TRANS", false);   // a .trans word is two 16-bit loads: it stays where it is
       args(g, [&](Value *x) { if (!seen.insert(x).second) return; auto it = fragOf.find(x); if (it == fragOf.end()) return;
         if (!DT.dominates(it->second.at, S) || !epochClear(it->second.at, S)) all = false; if (fragTrans || !it->second.trans) v.push_back(x); });
       if (!all || v.empty()) continue;
