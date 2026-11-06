@@ -498,6 +498,7 @@ struct LoFma : PassInfoMixin<LoFma> {
 } // namespace
 
 void loTritonClearArcp(Module &M) { clearArcp(M); }
+bool loTritonHasDot(Module &M) { return hasDot(M); }
 
 void loTritonRegister(PassBuilder &PB) {
   PB.registerPipelineParsingCallback([](StringRef N, ModulePassManager &MPM, ArrayRef<PassBuilder::PipelineElement>) {

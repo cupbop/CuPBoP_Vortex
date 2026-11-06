@@ -305,6 +305,7 @@ static bool tcu_lowering() {
 // The steps are the measured ones, a filter in front of the plugin's opt (experiments/triton/scripts/liftpipe.sh, LIFTPIPE=lo-mma): text, lo-mma, text, llvm-as, the plugin's opt. See reload_text for why.
 // Of that script's settings only LO_F16_ACC reaches lo-mma (LIFT_OPT_ENV): P2C_STAGES belongs to p2c-fold, LO_HEXT to lo-hext, -instcombine-maxarray-size to instcombine.
 void loTritonClearArcp(Module &M);   // src/lift_opt/lotriton.cpp
+bool loTritonHasDot(Module &M);
 
 Module *run_triton_lo_mma(Module *M) {
   const char *e = std::getenv("CUPBOP_TRITON_LOMMA"), *s = std::getenv("VORTEX_SCHEDULE_FLAG"), *simt = std::getenv("CUPBOP_TRITON_SIMT");
@@ -315,6 +316,9 @@ Module *run_triton_lo_mma(Module *M) {
   const bool simt_here = simt_on && (sched == 2 || sched == 1);
   if (off || is_lifted_module(M) || (!mma && !simt_here)) { loTritonClearArcp(*M); return M; }
   fprintf(stderr, "[lift-opt] Triton input: lo-mma\n");
+  // What a lifted module has by default (LIFT_OPT_DEFAULTS), for the same reasons: a barrier that is a call keeps every value live across it in the 12 callee-saved registers or on the stack, and a branch on
+  // a kernel argument takes split/join. An existing value stays
+  if (simt_here && sched == 2 && !loTritonHasDot(*M)) { setenv("CUPBOP_BAR_INLINE", "1", 0); setenv("CUPBOP_UNIFORM_BR", "1", 0); }
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
   std::string text;
   raw_string_ostream(text) << *M;
