@@ -134,7 +134,7 @@ static bool parseLdsm(CallInst *CI, Ldsm &L) {
 
 // is V (through bitcasts) used only as a B operand of an mma the pass will lower?
 static bool isMma(CallInst *C) { Function *F = C->getCalledFunction(); if (!F) return false; StringRef n = F->getName();
-  return n == "llvm.nvvm.mma.m16n8k16.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k16.row.col.f16.f16" || n == "llvm.nvvm.mma.m16n8k8.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k8.row.col.f16.f16"; }
+  return (loLaneMode && n == "llvm.nvvm.mma.m16n8k16.row.col.bf16") || n == "llvm.nvvm.mma.m16n8k16.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k16.row.col.f16.f16" || n == "llvm.nvvm.mma.m16n8k8.row.col.f32.f32" || n == "llvm.nvvm.mma.m16n8k8.row.col.f16.f16"; }
 // k-blocks of 8 in one mma: m16n8k16 = 2 (args a0..a3, b0, b1, c...), m16n8k8 = 1 (args a0, a1, b0, c...)
 static int mmaKb(CallInst *C) { return C->getCalledFunction()->getName().contains("m16n8k16") ? 2 : 1; }
 // An ldmatrix row offset: E = window mask of (L + C). The mask (shared window < 16 MB; row addresses are 16-byte aligned for
@@ -363,11 +363,11 @@ static void lowerLdsm(Function &F, Lanes &LN, std::set<Value *> &bPermuted) {
 }
 
 // ---- mma.sync -> WMMA ---------------------------------------------------------------------------------------------------
-struct Op { CallInst *CI; Value *A[4], *B[2]; SmallVector<Value *, 4> C; bool f16; int kb = 2; Op *prev = nullptr, *next = nullptr; bool used = false; int chainPos = 0; };
+struct Op { CallInst *CI; Value *A[4], *B[2]; SmallVector<Value *, 4> C; bool f16, bf16 = false; int kb = 2; Op *prev = nullptr, *next = nullptr; bool used = false; int chainPos = 0; };
 struct Group { std::vector<Op *> st[2]; int nn = 1, L = 1; };   // st[u][s]: n-half u, k-step s
 
 static void readOp(CallInst *C, Op &o) {
-  o.CI = C; o.f16 = C->getCalledFunction()->getName().ends_with("f16.f16"); o.kb = mmaKb(C);
+  o.CI = C; o.f16 = C->getCalledFunction()->getName().ends_with("f16.f16"); o.bf16 = C->getCalledFunction()->getName().ends_with(".bf16"); o.kb = mmaKb(C);
   for (int i = 0; i < 2 * o.kb; ++i) o.A[i] = peel(C->getArgOperand(i));
   for (int i = 0; i < o.kb; ++i) o.B[i] = peel(C->getArgOperand(2 * o.kb + i));
   for (unsigned i = 3 * o.kb; i < C->arg_size(); ++i) o.C.push_back(C->getArgOperand(i));
@@ -430,7 +430,7 @@ static void census(Function &F) {
 
 struct Lower {
   Function &F; Lanes &LN; std::set<Value *> &bPerm; Module *M; LLVMContext &Ctx; Type *I32, *F32, *H16, *V2H;
-  FunctionCallee W; DominatorTree *DTp = nullptr;
+  FunctionCallee W, Wb; DominatorTree *DTp = nullptr;
   unsigned nW = 0, nOps = 0;
   // f16 accumulators stay f32 values that are exactly f16 (fpext(fptrunc(x))): a packed register -> its two halves as floats
   std::map<Value *, std::pair<Value *, Value *>> wide; std::vector<std::tuple<PHINode *, PHINode *, PHINode *>> widePhis;
@@ -493,6 +493,7 @@ struct Lower {
     Type *RT = StructType::get(Ctx, SmallVector<Type *, 8>(8, F32));
     W = M->getOrInsertFunction("__lo_wmma", FunctionType::get(RT, pa, false));   // pseudo op, expanded by expandWmma
     if (auto *Fn = dyn_cast<Function>(W.getCallee())) { Fn->addFnAttr(Attribute::Convergent); Fn->setDoesNotAccessMemory(); Fn->setDoesNotThrow(); }
+    if (loLaneMode) { Wb = M->getOrInsertFunction("__lo_wmma_bf16", FunctionType::get(RT, pa, false)); if (auto *Fn = dyn_cast<Function>(Wb.getCallee())) { Fn->addFnAttr(Attribute::Convergent); Fn->setDoesNotAccessMemory(); Fn->setDoesNotThrow(); } }
   }
   // load the word again here when the epoch check allowed it (placeFrag): the fragment does not stay live between its ldmatrix and the WMMA.
   // volatile: otherwise GVN merges the loads and the live range is back
@@ -501,9 +502,10 @@ struct Lower {
   std::map<Value *, Value *> held, heldNext; Instruction *heldAt = nullptr;
   Value *frag(IRBuilder<> &Q, Value *v) {
     if (!remat.count(v)) return v;
-    if (loLaneMode) { auto it = held.find(v); if (it != held.end()) return heldNext[v] = it->second; }
+    static const bool reuse = envOn("LO_REUSE", true);
+    if (loLaneMode && reuse) { auto it = held.find(v); if (it != held.end()) return heldNext[v] = it->second; }
     Value *r = fragLoad(Q, v);
-    if (loLaneMode) heldNext[v] = r;
+    if (loLaneMode && reuse) heldNext[v] = r;
     return r;
   }
   Value *fragLoad(IRBuilder<> &Q, Value *v) {
@@ -549,7 +551,7 @@ struct Lower {
       cv[2 * u] = acc[u][0]; cv[2 * u + 1] = acc[u][1]; cv[4 + 2 * u] = acc[u][2]; cv[5 + 2 * u] = acc[u][3];
     }
     SmallVector<Value *, 24> args; for (int i = 0; i < 8; ++i) args.push_back(av[i]); for (int i = 0; i < 8; ++i) args.push_back(bv[i]); for (int i = 0; i < 8; ++i) args.push_back(cv[i]);
-    auto *C = Q.CreateCall(W, args, "lo.w"); C->addFnAttr(Attribute::Convergent);
+    auto *C = Q.CreateCall(G.st[0][s0]->bf16 ? Wb : W, args, "lo.w"); C->addFnAttr(Attribute::Convergent);
     for (int u = 0; u < G.nn; ++u) {
       out[u][0] = Q.CreateExtractValue(C, 2 * u); out[u][1] = Q.CreateExtractValue(C, 2 * u + 1);
       out[u][2] = Q.CreateExtractValue(C, 4 + 2 * u); out[u][3] = Q.CreateExtractValue(C, 5 + 2 * u);
@@ -687,7 +689,7 @@ static bool endsEpoch(Instruction *I) {
   if (auto *IA = dyn_cast<InlineAsm>(C->getCalledOperand())) { StringRef a = IA->getAsmString(); return !(a.starts_with("cp.async.c") || a.starts_with("cp.async.w") || a.starts_with("ldmatrix.sync") || a.starts_with("activemask")); }
   Function *F = C->getCalledFunction(); if (!F) return true;
   StringRef n = F->getName();
-  if (n.starts_with("llvm.nvvm.mma.") || n == "__lo_wmma" || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.bar.warp.sync") || n.starts_with("llvm.nvvm.ex2") ||
+  if (n.starts_with("llvm.nvvm.mma.") || n == "__lo_wmma" || n == "__lo_wmma_bf16" || n.starts_with("llvm.nvvm.shfl.sync") || n.starts_with("llvm.nvvm.read.ptx.sreg") || n.starts_with("llvm.nvvm.bar.warp.sync") || n.starts_with("llvm.nvvm.ex2") ||
       n.starts_with("llvm.fma") || n.starts_with("llvm.maxnum") || n.starts_with("llvm.minnum") || n.starts_with("llvm.abs") || n.starts_with("llvm.lifetime") || n.starts_with("llvm.umin") || n.starts_with("llvm.umax") || n.starts_with("llvm.smin") || n.starts_with("llvm.smax") || n.starts_with("llvm.fshl") || n.starts_with("llvm.fshr")) return false;
   return true;
 }
@@ -835,7 +837,7 @@ static void lowerMma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
     }
     for (auto &kv : at) { moved++; for (Value *v : ws[kv.first]) { Lw.remat.insert(v); words++; } }
   }
-  if (loLaneMode) orderForReuse(gs, R);
+  if (loLaneMode && envOn("LO_REUSE", true)) orderForReuse(gs, R);
   for (int i : R.order) { Group &g = gs[i]; Lw.emit(g, R.P[i]); groups++; int kbs = 0; for (Op *o : g.st[0]) kbs += o->kb; shapes[g.nn * 100 + kbs]++; }
   for (Group &g : gs) for (int u = 0; u < g.nn; ++u) for (int s = (int)g.st[u].size() - 1; s >= 0; --s) {
     Op *o = g.st[u][s];
@@ -1008,7 +1010,7 @@ static void hoistReductions(Function &F) {
 // Dependences: SSA in the block; memory: reads and writes of one alloca in order, everything else (shared, global, calls, asm)
 // in order against writers. Pure convergent ops (shuffles, the WMMA pseudo op) have no order among themselves: all lanes of a
 // warp run the same straight-line block.
-static bool isWmmaName(StringRef n) { return n == "__lo_wmma" || n == "lo.wmma"; }   // lo.wmma: the same op behind defineWmma, what lo-sched sees
+static bool isWmmaName(StringRef n) { return n == "__lo_wmma" || n == "lo.wmma" || n == "__lo_wmma_bf16" || n == "lo.wmma.bf16"; }   // lo.wmma: the same op behind defineWmma, what lo-sched sees
 static bool isPseudoW(Instruction *I) { auto *C = dyn_cast<CallInst>(I); return C && C->getCalledFunction() && isWmmaName(C->getCalledFunction()->getName()); }
 static bool isPureCall(CallInst *C) {
   Function *F = C->getCalledFunction();
@@ -1225,15 +1227,15 @@ static void splitWide(Function &F) {
 
 // ---- body of the WMMA op (one definition; call sites stay one line): @lo.wmma(a0..7, b0..7, c0..7) -> {d0..7}; fragment arrays + the runtime's
 // WMMA helper, always_inline here and inlined again by CuPBoP's LTO, the arrays become registers (fixed f0-f23 of the asm)
-static void defineWmma(Module &M) {
-  Function *L = M.getFunction("__lo_wmma");
+static void defineWmma(Module &M, const char *pseudo = "__lo_wmma", const char *body = "lo.wmma", const char *rt = "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32") {
+  Function *L = M.getFunction(pseudo);
   if (!L || !L->isDeclaration()) return;
   LLVMContext &Ctx = M.getContext(); Type *F32 = Type::getFloatTy(Ctx), *P = PointerType::getUnqual(Ctx);
   if (L->use_empty()) { L->eraseFromParent(); return; }
-  FunctionCallee W = M.getOrInsertFunction("__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32", FunctionType::get(Type::getVoidTy(Ctx), {P, P, P, P}, false));
+  FunctionCallee W = M.getOrInsertFunction(rt, FunctionType::get(Type::getVoidTy(Ctx), {P, P, P, P}, false));
   if (auto *Fn = dyn_cast<Function>(W.getCallee())) Fn->addFnAttr(Attribute::Convergent);
   SmallVector<Type *, 25> pa{P}; pa.append(24, F32);
-  auto *N = Function::Create(FunctionType::get(L->getReturnType(), pa, false), GlobalValue::InternalLinkage, "lo.wmma", &M);
+  auto *N = Function::Create(FunctionType::get(L->getReturnType(), pa, false), GlobalValue::InternalLinkage, body, &M);
   N->addFnAttr(Attribute::AlwaysInline); N->addFnAttr(Attribute::Convergent);
   // one fragment scratch per kernel (first argument): per-call-site arrays would survive into the frame when CuPBoP's LTO keeps a helper out of line
   BasicBlock *E = BasicBlock::Create(Ctx, "entry", N); IRBuilder<> Q(E);
@@ -1335,6 +1337,7 @@ struct LoMma : PassInfoMixin<LoMma> {
       if (fp && envOn("LO_FP", true)) F->addFnAttr("frame-pointer", "all");
     }
     defineWmma(M);
+    defineWmma(M, "__lo_wmma_bf16", "lo.wmma.bf16", "__vx_wmma_mma_m16n16k16_row_row_bf16_bf16_f32");
     return PreservedAnalyses::none();
   }
 };

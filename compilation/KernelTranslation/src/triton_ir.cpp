@@ -359,19 +359,21 @@ bool math_asm_to_intrinsic(CallInst *CI, const std::string &a) {
 // Triton's mma.sync (i32 registers, the accumulator tied to the result) -> the intrinsic a lifted module has, with its operand
 // order: a, b, c. Other shapes stay asm for lower_inline_mma_sync.
 bool mma_to_intrinsic(CallInst *CI, const std::string &a) {
-  static const std::regex form(R"(^\s*mma\.sync\.aligned\.m16n8k16\.row\.col\.f32\.f16\.f16\.f32\s*\{\s*\$0,\s*\$1,\s*\$2,\s*\$3\s*\},\s*\{\s*\$8,\s*\$9,\s*\$10,\s*\$11\s*\},\s*\{\s*\$12,\s*\$13\s*\},\s*\{\s*\$4,\s*\$5,\s*\$6,\s*\$7\s*\};?\s*$)");
-  if (!std::regex_match(a, form) || CI->arg_size() != 10) return false;
+  static const std::regex form(R"(^\s*mma\.sync\.aligned\.m16n8k16\.row\.col\.f32\.(b?f16)\.b?f16\.f32\s*\{\s*\$0,\s*\$1,\s*\$2,\s*\$3\s*\},\s*\{\s*\$8,\s*\$9,\s*\$10,\s*\$11\s*\},\s*\{\s*\$12,\s*\$13\s*\},\s*\{\s*\$4,\s*\$5,\s*\$6,\s*\$7\s*\};?\s*$)");
+  std::smatch m;
+  if (!std::regex_match(a, m, form) || CI->arg_size() != 10) return false;
+  const bool bf16 = m[1].str() == "bf16";   // the intrinsic of a lifted HMMA.16816.F32.BF16: i32 registers
   LLVMContext &C = CI->getContext();
   Type *F32 = Type::getFloatTy(C), *V2H = FixedVectorType::get(Type::getHalfTy(C), 2);
   IRBuilder<> B(CI);
   std::vector<Value *> args;
-  for (unsigned i = 4; i < 10; ++i) args.push_back(B.CreateBitCast(CI->getArgOperand(i), V2H));
+  for (unsigned i = 4; i < 10; ++i) args.push_back(bf16 ? CI->getArgOperand(i) : B.CreateBitCast(CI->getArgOperand(i), V2H));
   for (unsigned i = 0; i < 4; ++i) args.push_back(CI->getArgOperand(i));
   std::vector<Type *> tys;
   for (Value *V : args) tys.push_back(V->getType());
   Type *RT = StructType::get(C, {F32, F32, F32, F32});
   if (CI->getType() != RT) return false;
-  CI->replaceAllUsesWith(B.CreateCall(CI->getModule()->getOrInsertFunction("llvm.nvvm.mma.m16n8k16.row.col.f32.f32", FunctionType::get(RT, tys, false)), args));
+  CI->replaceAllUsesWith(B.CreateCall(CI->getModule()->getOrInsertFunction(bf16 ? "llvm.nvvm.mma.m16n8k16.row.col.bf16" : "llvm.nvvm.mma.m16n8k16.row.col.f32.f32", FunctionType::get(RT, tys, false)), args));
   CI->eraseFromParent();
   return true;
 }
@@ -482,7 +484,7 @@ void lower_ldmatrix(CallInst *CI, StringRef name) {
   const std::string text = "ldmatrix.sync.aligned.m8n8.x" + std::to_string(num) + (name.contains(".trans") ? ".trans" : "") +
                            ".shared.b16 {" + regs + "}, [$" + std::to_string(num) + "];";
   IRBuilder<> B(CI);
-  Value *A32 = smem_window(CI->getArgOperand(0), B);
+  Value *A32 = std::getenv("CUPBOP_TRITON_NO_WINDOW") ? nullptr : smem_window(CI->getArgOperand(0), B);
   if (!A32) A32 = B.CreatePtrToInt(CI->getArgOperand(0), I32, "smem.win");
   auto *FT = FunctionType::get(CI->getType(), {I32}, false);
   CI->replaceAllUsesWith(B.CreateCall(InlineAsm::get(FT, text, cons + "r", /*hasSideEffects=*/true), {A32}));
