@@ -313,12 +313,12 @@ Module *run_triton_lo_mma(Module *M) {
   const int sched = s ? std::atoi(s) : -1;
   const bool mma = sched == 2 && !narrow_warp() && tcu_lowering();
   // the SIMT passes (src/lift_opt/lotriton.cpp) skip a module with tl.dot. They do not need the tensor unit, and neither do lo-sched and lo-f16
-  const bool simt_here = simt_on && (sched == 2 || sched == 1);
+  const bool simt_here = simt_on && (sched == 2 || sched == 1) && !loTritonHasDot(*M);
   if (off || is_lifted_module(M) || (!mma && !simt_here)) { loTritonClearArcp(*M); return M; }
   fprintf(stderr, "[lift-opt] Triton input: lo-mma\n");
   // What a lifted module has by default (LIFT_OPT_DEFAULTS), for the same reasons: a barrier that is a call keeps every value live across it in the 12 callee-saved registers or on the stack, and a branch on
   // a kernel argument takes split/join. An existing value stays
-  if (simt_here && sched == 2 && !loTritonHasDot(*M)) { setenv("CUPBOP_BAR_INLINE", "1", 0); setenv("CUPBOP_UNIFORM_BR", "1", 0); }
+  if (simt_here && sched == 2) { setenv("CUPBOP_BAR_INLINE", "1", 0); setenv("CUPBOP_UNIFORM_BR", "1", 0); }
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
   std::string text;
   raw_string_ostream(text) << *M;

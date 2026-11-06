@@ -341,7 +341,8 @@ Value *anyLane(Module &M, IRBuilder<> &Q, Value *lane) {
 
 struct LoEx2 : PassInfoMixin<LoEx2> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    if (!envI("LO_EX2", 1) || hasDot(M)) return PreservedAnalyses::all();
+    // without CUPBOP_MUFU both forms are the same libm call: there is no scaling to save
+    if (!envI("LO_EX2", 1) || !envI("CUPBOP_MUFU", 0) || hasDot(M)) return PreservedAnalyses::all();
     const unsigned N = envI("LO_EX2_N", 8); const bool dbg = envI("LO_DEBUG", 0); unsigned total = 0, groups = 0;
     std::vector<Function *> fs; for (Function &F : M) if (!F.isDeclaration() && !F.getName().starts_with("lo.")) fs.push_back(&F);
     for (const Scaled &K : SCALED) {
