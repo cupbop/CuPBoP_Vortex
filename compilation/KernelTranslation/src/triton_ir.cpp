@@ -11,7 +11,15 @@
 //               llvm.nvvm.{ex2,lg2,rcp,rsqrt,sqrt,sin,cos}.*.f32 -> *.f, llvm.nvvm.ldmatrix.*.p3 -> the ldmatrix asm of a lifted module
 // An asm this file does not know and no later pass handles stops the translation. replace_asm_call would drop it with
 // a warning and leave undef, which is how a stock Triton vecadd became an empty kernel.
+//
+// TRITON_CUPBOP_WARP_SIZE=k (k < 32): the module was generated for k threads per warp, one per lane of a k-lane hardware
+// warp (schedule 2). Its layouts, lane ids and shuffle offsets are k-lane already, and the plugin has corrected what
+// Triton's NVIDIA stages keep at 32: tid / 32 in the warp id and nvvm.reqntid. That has to happen before Triton's O3, see
+// triton_vortex/narrow.py: this file sees the two divisions folded together, tid / 32 and tid / k, and cannot tell them
+// apart. What is left here is to keep such a module to what k-lane warps run: check_narrow_triton_warp, and the narrow-warp
+// refusal of warp_func.cpp, which lets its shuffles through and stops every other warp-collective operation.
 #include "triton_ir.h"
+#include "tool.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
@@ -400,7 +408,45 @@ void lower_ldmatrix(CallInst *CI, StringRef name) {
 
 } // namespace
 
+int triton_warp_size() {
+  static const int k = [] {
+    const char *e = std::getenv("TRITON_CUPBOP_WARP_SIZE");
+    return e && triton_cupbop_enabled() ? std::atoi(e) : 32;
+  }();
+  return k;
+}
+
+// A k-lane module on k-lane warps. Its shuffles are k-lane by construction. Triton 3.5 and 3.6 write shfl.up with an offset of
+// k in scans, for a result they discard: past the end of the warp PTX returns the lane's own value, and the hardware, which cuts
+// the offset to the lane-index width, must not see it.
+static void check_narrow_triton_warp(Module *M) {
+  const int k = triton_warp_size();
+  if (k == 32) return;
+  const VirtGeom g = getVirtGeom();
+  if (g.schedule != 2 || g.nt != k) {
+    fprintf(stderr, "kernelTranslator: error: Triton input for %d threads per warp needs schedule 2 on %d-lane warps, this is schedule %d on %d lanes\n", k, k, g.schedule, g.nt);
+    exit(1);
+  }
+  std::vector<CallInst *> past;
+  for (Function &F : *M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (Function *Fn = CI->getCalledFunction())
+            if (Fn->getName().starts_with("llvm.nvvm.shfl.sync.")) {
+              auto *off = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+              if (CI->getType() != CI->getArgOperand(1)->getType() || (!off && !Fn->getName().contains(".idx.")))
+                die("a form of shuffle a narrow warp does not take", Fn->getName().str());
+              if (off && off->getZExtValue() >= (uint64_t)k) past.push_back(CI);
+            }
+  for (CallInst *CI : past) {
+    CI->replaceAllUsesWith(CI->getArgOperand(1));
+    CI->eraseFromParent();
+  }
+}
+
 void lower_triton_input(Module *M) {
+  check_narrow_triton_warp(M);
   LLVMContext &C = M->getContext();
   std::vector<CallInst *> calls;
   for (auto &F : *M)
