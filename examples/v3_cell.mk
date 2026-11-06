@@ -69,4 +69,7 @@ VX_CFLAGS += -mllvm -structurizecfg-max-bbs=$(CUPBOP_STRUCT_MAX_BBS)
 # Extra kernel-compile flags from the environment (empty by default), e.g. CUPBOP_VX_EXTRA_CFLAGS="-mllvm
 # -split-spill-mode=size" works around an LLVM 20 RAGreedy crash (SplitEditor::deleteRematVictims) seen on the
 # lifted PyTorch reduce_kernel (global_avgpool).
+ifeq ($(CUPBOP_ASYNC_CHECKS),1)
+VX_CFLAGS += -DCUPBOP_ASYNC_CHECKS
+endif
 VX_CFLAGS += $(CUPBOP_VX_EXTRA_CFLAGS)

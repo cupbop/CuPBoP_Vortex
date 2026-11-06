@@ -18,6 +18,9 @@
 // not __builtin_trap(): the compiler would mark this function noreturn and put `unreachable` after every call,
 // and the Vortex back end inserts no split/join for a divergent branch whose post-dominator is unreachable, so
 // the warp would never reconverge. To the compiler this function returns.
+// CUPBOP_ASYNC_CHECKS=1 at the kernel build: a message instead of a wild access when a program uses an mbarrier before its init, or a
+// tensor map this runtime did not make. A correct program never gets there, and on the path of every transfer they cost tg sm90 a large part
+// of its cycles, so they are off.
 static __attribute__((noinline)) void cupbop_async_fail(const char *what, uint32_t a, uint32_t b) {
   (void)what; (void)a; (void)b; // (vx_printf from many lanes at once did not come out before the stop)
   __asm__ volatile("unimp" ::: "memory");
@@ -34,9 +37,11 @@ static __attribute__((always_inline)) inline uint32_t cupbop_bar_phase(uint32_t 
 }
 static __attribute__((always_inline)) inline uint32_t cupbop_mbar_rec(const void *bar) {
   uint32_t rec = *(volatile const uint32_t *)bar;
+#ifdef CUPBOP_ASYNC_CHECKS
   if ((rec >> 24) != CUPBOP_MBAR_MAGIC)
     cupbop_async_fail("mbarrier used before mbarrier.init (no record in its shared-memory word)",
                       (uint32_t)(uintptr_t)bar, rec);
+#endif
   return rec;
 }
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_mbar_init(void *bar, uint32_t count, uint32_t id) {
@@ -86,8 +91,10 @@ extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_elect_la
   const uint32_t m = (uint32_t)vx_active_threads() & membermask;
   return m ? (uint32_t)__builtin_ctz(m) : 0xFFFFFFFFu;
 }
+// The lowest bit of the mask against this lane's: no ctz, which is a table load on a core without Zbb
 extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_elect_sync(uint32_t membermask) {
-  return __cupbop_elect_lane(membermask) == (uint32_t)vx_thread_id() ? 1u : 0u;
+  const uint32_t m = (uint32_t)vx_active_threads() & membermask;
+  return (m & (0u - m)) == (1u << (uint32_t)vx_thread_id()) ? 1u : 0u;
 }
 // clusters of one CTA: a cluster rank other than 0 cannot occur
 extern "C" __attribute__((noinline)) void __cupbop_cluster_rank_fail(uint32_t rank) {
@@ -96,12 +103,16 @@ extern "C" __attribute__((noinline)) void __cupbop_cluster_rank_fail(uint32_t ra
 
 static __attribute__((always_inline)) inline const cupbop_tmap *cupbop_tmap_of(const void *desc, uint32_t rank) {
   const cupbop_tmap *t = *(const cupbop_tmap *const *)desc;
+#ifdef CUPBOP_ASYNC_CHECKS
   if (!t || t->magic != CUPBOP_TMAP_MAGIC)
     cupbop_async_fail("tensor map was not made by cuTensorMapEncodeTiled (CuPBoP shim)", (uint32_t)(uintptr_t)desc,
                       t ? t->magic : 0);
   if (t->rank != rank) cupbop_async_fail("tensor map rank differs from the instruction's", t->rank, rank);
   if (t->mode != CUPBOP_TMAP_MODE_SW && t->mode != CUPBOP_TMAP_MODE_DXA)
     cupbop_async_fail("unknown tensor map mode", t->mode, 0);
+#else
+  (void)rank;
+#endif
   return t;
 }
 // One DXA box transfer (async design stage 3): the operands are gathered from lane 0 into lanes 0-3 of x31 (x30
