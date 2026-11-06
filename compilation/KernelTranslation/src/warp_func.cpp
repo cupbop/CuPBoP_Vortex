@@ -2,6 +2,7 @@
 #include "warp_func.h"
 #include "flag.h"
 #include "tool.h"
+#include "triton_ir.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
@@ -185,7 +186,9 @@ static bool voteFeedsOnlyMasks(CallInst *ci, std::set<CallInst *> &local_syncs) 
 //    %laneid, and shuffles/votes whose lanes cross the 16-lane boundary (E12 stage 1: lifted CUTLASS GEMM NT16 s2
 //    FAIL with no error). Kept: votes/activemask that only feed masks (lifted reconvergence bookkeeping), and at
 //    NT < 32 shuffles that provably stay in one hardware warp (constant segment width <= NT, butterfly lane mask
-//    < NT, constant member mask within lanes [0, NT), or a constant / kernel-argument value).
+//    < NT, constant member mask within lanes [0, NT), or a constant / kernel-argument value). A Triton module generated
+//    for NT threads per warp (TRITON_CUPBOP_WARP_SIZE) is on NT-lane warps by construction: its shuffles are kept
+//    (check_narrow_triton_warp, triton_ir.cpp), the other kinds are not.
 //  - core mapping sub-pass form (S > 1): staged are shfl, vote/activemask, every mma.sync form replace_nvvm_mma_intrinsics
 //    lowers, movmatrix and (16 lanes) ldmatrix/stmatrix and redux.sync; the %laneid asm reads the logical lane. wmma, wgmma,
 //    match and anything else would run once per sub-pass with 32-lane semantics -> refused. The staged mma/movmatrix glue
@@ -294,7 +297,7 @@ static void rejectNarrowWarpOps1to1(Module &m, int nt) {
       if (!CI) continue;
       const char *kind = warpCollectiveKind(CI);
       if (!kind) continue;
-      if (!strcmp(kind, "shfl") && shflStaysInHardwareWarp(m, CI, nt)) continue;
+      if (!strcmp(kind, "shfl") && (triton_warp_size() == nt || shflStaysInHardwareWarp(m, CI, nt))) continue;
       if (!strcmp(kind, "vote")) {
         std::set<CallInst *> syncs;
         if (voteFeedsOnlyMasks(CI, syncs)) continue;
