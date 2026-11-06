@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stack_frames.py <kernel.dump> [--over N]: static stack frame of every kernel function in a Vortex kernel dump
 (llvm-objdump -d). Per function, the stack-pointer decrements of the prologue (addi sp,sp,-N; sub sp,sp,reg with reg
-from lui/addiw/li) are summed until the first increment. Runtime functions (kernel_main, vx_*, __*, memcpy, libm)
+from lui/addiw/li/slli) are summed until the first increment. Runtime functions (kernel_main, vx_*, __*, memcpy, libm)
 are skipped. Without --over: '<bytes> <function>' per function. With --over N: the names of the functions whose frame
 exceeds N bytes, comma-separated, on one line (empty if none). Used by common.mk's fixed-trips fallback
 (virt_trips_fallback.sh): the hardware thread's stack is 8 KB (VX_MEM_STACK_LOG2_SIZE=13)."""
@@ -37,6 +37,8 @@ def frames(path):
         if m and m.group(2) in regs and m.group(1) == m.group(2): regs[m.group(1)] += imm(m.group(3)); continue
         m = re.search(r'\tli\t(\w+), (-?(?:0x)?[0-9a-f]+)$', t)
         if m: regs[m.group(1)] = imm(m.group(2)); continue
+        m = re.search(r'\tslliw?\t(\w+), (\w+), (0x[0-9a-f]+|\d+)$', t)
+        if m and m.group(2) in regs and m.group(1) == m.group(2): regs[m.group(1)] <<= imm(m.group(3)); continue   # a size with few bits: li t0, 0x13; slli t0, t0, 0x9
         m = re.search(r'\tsub\tsp, sp, (\w+)$', t)
         if m and m.group(1) in regs: cur += regs[m.group(1)]; out[fn] = max(out[fn], cur); continue
         if re.search(r'\tadd\tsp, sp, (\w+)$', t): done = True
