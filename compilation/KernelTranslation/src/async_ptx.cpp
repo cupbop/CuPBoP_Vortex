@@ -1287,7 +1287,7 @@ void moveArrives(PassState &S, Function *F) {
         if ((!K || !K->isZero()) && !moveArriveOverCtaBarriers(S, F, A, why))
           fail_at(A, "mbarrier.arrive.expect_tx is not followed, in the same thread and before any wait, by the bulk / "
                      "TMA copies that complete its transaction: the synchronous copies cannot be ordered before the "
-                     "arrival (async design §5.3; over CTA barriers: " + why + "); refusing");
+                     "arrival (async design §5.3); refusing (over CTA barriers: " + why + ")");
       }
       continue;
     }
