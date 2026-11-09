@@ -5,6 +5,7 @@
 // sees plain loads, stores and the intrinsics it already handles:
 //   PTX asm     [@p] ld.{global,shared}[.vN].bK, [@p] st.{global,shared}[.vN].bK, mov (the "other" value of a masked
 //               load), [@p] atom.global.*, [@p] red.global.*: the small statement language Triton's LoadStoreOpToLLVM and TargetInfo print
+//               [@p] ld.global.<scope>.relaxed.b{32,64} (atomic_add(p, 0, sem="relaxed"): the flag reads of Inductor's split scan) -> an AMO
 //               { .reg .b32 ...; prmt.b32, and.b32, shr.b32, shl.b32, add.u32, lop3.b32 }: the fp8 -> fp16 conversions of
 //               ElementwiseOpToLLVM below capability 89
 //               {rcp,ex2,lg2,rsqrt,sqrt,sin,cos}.approx[.ftz].f32 (libdevice)
@@ -99,12 +100,16 @@ bool is_literal(const std::string &s) {
 struct MemOp {
   unsigned addrspace = 0, bits = 0, vec = 1;
   bool isVolatile = false, ok = false;
+  bool relaxed = false;   // .relaxed with a scope: see the relaxed load in AsmLowering::lower
 };
 
-// ".global.L1::evict_first.v4.b32" -> space, vector width, element bits. An ordering or scope (.acquire, .relaxed,
-// .gpu ...) is not a plain load or store: such a form stays unknown.
+// ".global.L1::evict_first.v4.b32" -> space, vector width, element bits. ".relaxed" with a scope (".gpu.relaxed": Triton's
+// atomic_add(p, 0, sem="relaxed"), which it prints as a load) is taken for one 32- or 64-bit global word; the caller lowers
+// only loads of that form. Another ordering (.acquire, .release), a scope without .relaxed, or .relaxed on another form
+// (vector, shared, volatile) stays unknown.
 MemOp parse_modifiers(const std::string &m) {
   MemOp r;
+  bool scope = false;
   size_t p = 0;
   while (p < m.size()) {
     size_t q = m.find('.', p + 1);
@@ -113,6 +118,8 @@ MemOp parse_modifiers(const std::string &m) {
     if (t == "global") r.addrspace = 1;
     else if (t == "shared" || t == "shared::cta") r.addrspace = 3;
     else if (t == "volatile") r.isVolatile = true;
+    else if (t == "relaxed") r.relaxed = true;
+    else if (t == "cta" || t == "gpu" || t == "sys") scope = true;
     else if (t == "v2") r.vec = 2;
     else if (t == "v4") r.vec = 4;
     else if (t.size() >= 2 && (t[0] == 'b' || t[0] == 'u' || t[0] == 's' || t[0] == 'f') && isdigit((unsigned char)t[1]))
@@ -124,6 +131,8 @@ MemOp parse_modifiers(const std::string &m) {
       return r;
   }
   r.ok = r.addrspace && r.bits;
+  if (r.relaxed || scope)
+    r.ok = r.ok && r.relaxed && scope && r.addrspace == 1 && r.vec == 1 && (r.bits == 32 || r.bits == 64) && !r.isVolatile;
   return r;
 }
 
@@ -335,7 +344,8 @@ public:
       if (std::regex_match(s, m, regdecl)) { if (!declare(m[1].str())) return false; continue; }
       if (std::regex_match(s, m, alu32)) { if (!is_alu(m) || !alu_statement(m[1].str(), comma_list(m[3].str()))) return false; continue; }
       if (std::regex_match(s, m, atom) || std::regex_match(s, m, red)) { if (!parse_atomic(m[3].str()).ok) return false; continue; }
-      if (std::regex_match(s, m, ld) || std::regex_match(s, m, st)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
+      if (std::regex_match(s, m, ld)) { if (!parse_modifiers(m[3].str()).ok) return false; continue; }
+      if (std::regex_match(s, m, st)) { const MemOp op = parse_modifiers(m[3].str()); if (!op.ok || op.relaxed) return false; continue; }
       return false;
     }
     IRBuilder<> B(CI);
@@ -395,6 +405,26 @@ public:
         // softmax store ran on every 4th thread and overwrote the next CTAs' shared memory).
         std::vector<Value *> old;
         for (int d : dst) old.push_back(regs[d] ? regs[d] : Constant::getNullValue(outTy[d]));
+        if (op.relaxed) {
+          // A word other CTAs change with atomics (the flags of a decoupled look-back scan). Vortex's L1 is per core and not
+          // coherent, so a plain load can keep reading a stale line and spin forever. An AMO commits at the last-level
+          // cache, where those atomics do: OR with 0 reads the word and leaves it. Volatile, so that no pass folds the
+          // idempotent RMW back into a load.
+          guarded(P, B, [&](IRBuilder<> &G, Instruction *T) {
+            Type *Ty = outTy[dst[0]];
+            if (Ty->getPrimitiveSizeInBits() != op.bits) die("ld result of another width", text);
+            AtomicRMWInst *R = G.CreateAtomicRMW(AtomicRMWInst::Or, A, G.getIntN(op.bits, 0), MaybeAlign(bytes), AtomicOrdering::Monotonic);
+            R->setVolatile(true);
+            Value *V = Ty->isIntegerTy() ? (Value *)R : G.CreateBitCast(R, Ty);
+            if (!T) { regs[dst[0]] = V; return; }
+            BasicBlock *Then = T->getParent(), *Cont = CI->getParent();
+            PHINode *Phi = PHINode::Create(Ty, 2, "", Cont->begin());
+            Phi->addIncoming(V, Then);
+            Phi->addIncoming(old[0], Then->getSinglePredecessor());
+            regs[dst[0]] = Phi;
+          });
+          continue;
+        }
         // two 32-bit words of a vector load in one 64-bit load: PTX aligns the vector to its size. pair_shared_stores finds them again at the store that takes them to shared memory.
         bool pairs = triton_has_dot() && op.bits == 32 && op.vec >= 2 && op.addrspace == 1 && !op.isVolatile && !std::getenv("CUPBOP_TRITON_NO_PAIR") && only_copied_to_shared(CI);
         for (int d : dst) pairs = pairs && outTy[d]->isIntegerTy(32);
