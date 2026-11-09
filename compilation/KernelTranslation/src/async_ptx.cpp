@@ -25,6 +25,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -375,9 +376,14 @@ struct AsmLowering {
   }
   Value *predOf(const Stmt &s) {
     if (s.pred.empty()) return nullptr;
-    auto it = regs.find(s.pred);
-    if (it == regs.end()) fail("predicate `" + s.pred + "` used before it is set");
-    Value *p = it->second;
+    Value *p = nullptr;
+    if (s.pred[0] == '$') { // an operand (Triton: `@$0 cp.async.bulk.tensor ...` with an i1 "b" operand)
+      p = val(s.pred, nullptr);
+    } else {
+      auto it = regs.find(s.pred);
+      if (it == regs.end()) fail("predicate `" + s.pred + "` used before it is set");
+      p = it->second;
+    }
     if (!p->getType()->isIntegerTy(1)) p = B.CreateICmpNE(p, ConstantInt::get(p->getType(), 0));
     if (s.neg) {
       if (auto *K = dyn_cast<ConstantInt>(p)) return ConstantInt::get(S.I1, K->isZero() ? 1 : 0);
@@ -890,6 +896,27 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     B.CreateCall(S.M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(S.Void, false)), {});
     return done(nullptr);
   }
+  if (n == "llvm.nvvm.elect.sync") {
+    // { i32 leader lane, i1 is this lane the leader } (Triton's TMA issue from capability 90): the helpers of the asm form,
+    // the lane only where a user reads it
+    S.needWarps.insert(F);
+    auto *ST = dyn_cast<StructType>(C->getType());
+    if (!ST || ST->getNumElements() != 2) fail_at(C, "llvm.nvvm.elect.sync of an unexpected type");
+    Value *mask = B.CreateZExtOrTrunc(C->getArgOperand(0), S.I32);
+    Value *p = B.CreateICmpNE(S.call(B, kElect, S.I32, {mask}), ConstantInt::get(S.I32, 0), "elected");
+    Value *lane = nullptr;
+    auto laneOf = [&]() { return lane ? lane : (lane = S.call(B, kElectLane, S.I32, {mask})); };
+    for (User *U : make_early_inc_range(C->users())) {
+      auto *E = dyn_cast<ExtractValueInst>(U);
+      if (!E || E->getNumIndices() != 1) continue;
+      E->replaceAllUsesWith(E->getIndices()[0] == 0 ? laneOf() : p);
+      E->eraseFromParent();
+    }
+    Value *r = nullptr;
+    if (!C->use_empty())
+      r = B.CreateInsertValue(B.CreateInsertValue(UndefValue::get(ST), laneOf(), {0}), p, {1});
+    return done(r);
+  }
   if (n.starts_with("llvm.nvvm.cp.async.bulk") || n.starts_with("llvm.nvvm.cp.reduce.async.bulk") ||
       n.starts_with("llvm.nvvm.mapa") || n.starts_with("llvm.nvvm.elect") || n.starts_with("llvm.nvvm.tensormap"))
     fail_at(C, "the NVVM intrinsic form " + n.str() +
@@ -925,6 +952,292 @@ bool isWaitLike(Instruction *I, std::set<Function *> &visiting) {
   if (n.starts_with("llvm.nvvm.barrier") || n.starts_with("__cupbop_bar_") || n.contains("syncthreads")) return true;
   if (n.starts_with("llvm.")) return false;
   return functionWaits(F, visiting);
+}
+
+// The per-function DXA issue queue of the moved arrives (see __cupbop_tma_load_q in cudaKernelImpl_async.inc).
+Value *txQueue(PassState &S, Function *F) {
+  Value *&Q = S.txq[F];
+  if (!Q) {
+    IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
+    AI->setAlignment(Align(8));
+    // n = 0 after the entry block's allocas (the core-mapping passes expect them contiguous at the top)
+    Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
+    while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
+    IRBuilder<>(firstNonAlloca).CreateStore(ConstantInt::get(S.I32, 0), AI);
+    Q = AI;
+  }
+  return Q;
+}
+
+// ---- which threads of the block can satisfy a predicate (the arrive of Triton's TMA issue and its copies)
+//
+// A value for one thread t of a 1-D block: a known integer, or `uniform` (the same, unknown, value for every thread of the block:
+// arguments, block ids, and what is computed from them). The thread id is t, the lane t % 32, and elect.sync of the whole warp lane 0:
+// PTX requires every lane of membermask to execute it together, and of a full warp the helper elects the lowest lane.
+struct ThreadValue {
+  bool known = false;
+  APInt v;
+};
+
+bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI) {
+  if (isa<Constant>(V) || isa<Argument>(V)) return true;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || !visiting.insert(V).second) return I != nullptr; // a cycle through loop-header phis: optimistic
+  if (auto *C = dyn_cast<CallInst>(I)) {
+    Function *Fn = C->getCalledFunction();
+    if (!Fn) return false;
+    StringRef n = Fn->getName();
+    return n.starts_with("llvm.nvvm.read.ptx.sreg.ctaid.") || n.starts_with("llvm.nvvm.read.ptx.sreg.nctaid.") ||
+           n.starts_with("llvm.nvvm.read.ptx.sreg.ntid.");
+  }
+  if (isa<LoadInst>(I) || isa<AllocaInst>(I) || I->mayHaveSideEffects()) return false;
+  if (auto *P = dyn_cast<PHINode>(I)) { // a loop header's: the iteration all threads of the block are in
+    Loop *L = LI.getLoopFor(P->getParent());
+    if (!L || L->getHeader() != P->getParent()) return false;
+  }
+  for (Value *O : I->operands())
+    if (!isa<BasicBlock>(O) && !isUniformValue(O, visiting, LI)) return false;
+  return true;
+}
+
+std::optional<ThreadValue> valueForThread(Value *V, unsigned t, LoopInfo &LI, int depth = 0) {
+  auto known = [](const APInt &x) { ThreadValue r; r.known = true; r.v = x; return std::optional<ThreadValue>(r); };
+  auto uniform = []() { ThreadValue r; return std::optional<ThreadValue>(r); };
+  if (depth > 48) return std::nullopt;
+  if (auto *K = dyn_cast<ConstantInt>(V)) return known(K->getValue());
+  if (isa<Argument>(V)) return uniform();
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || !V->getType()->isIntegerTy()) return std::nullopt;
+  const unsigned bits = V->getType()->getIntegerBitWidth();
+  if (auto *C = dyn_cast<CallInst>(I)) {
+    Function *Fn = C->getCalledFunction();
+    StringRef n = Fn ? Fn->getName() : "";
+    if (n == "llvm.nvvm.read.ptx.sreg.tid.x") return known(APInt(bits, t));
+    if (n == "llvm.nvvm.read.ptx.sreg.laneid") return known(APInt(bits, t % 32));
+    if (n == kElect && C->arg_size() == 1)
+      if (auto *M = dyn_cast<ConstantInt>(C->getArgOperand(0)))
+        if ((M->getZExtValue() & 0xFFFFFFFFull) == 0xFFFFFFFFull) return known(APInt(bits, t % 32 == 0 ? 1 : 0));
+  }
+  std::set<Value *> visiting;
+  if (!isa<PHINode>(I) && !isa<SelectInst>(I) && isUniformValue(V, visiting, LI)) return uniform();
+  if (auto *P = dyn_cast<PHINode>(I)) {
+    visiting.clear();
+    if (isUniformValue(P, visiting, LI)) return uniform();
+    return std::nullopt;
+  }
+  if (auto *Cst = dyn_cast<CastInst>(I)) {
+    auto a = valueForThread(Cst->getOperand(0), t, LI, depth + 1);
+    if (!a || !a->known) return a;
+    switch (Cst->getOpcode()) {
+    case Instruction::ZExt: return known(a->v.zext(bits));
+    case Instruction::SExt: return known(a->v.sext(bits));
+    case Instruction::Trunc: return known(a->v.trunc(bits));
+    default: return std::nullopt;
+    }
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(I)) {
+    auto c = valueForThread(Sel->getCondition(), t, LI, depth + 1);
+    auto a = valueForThread(Sel->getTrueValue(), t, LI, depth + 1), b = valueForThread(Sel->getFalseValue(), t, LI, depth + 1);
+    if (!c || !a || !b) return std::nullopt;
+    if (c->known) return c->v.isZero() ? b : a;
+    if (a->known && b->known && a->v == b->v) return a;
+    return uniform();
+  }
+  if (auto *Cmp = dyn_cast<ICmpInst>(I)) {
+    auto a = valueForThread(Cmp->getOperand(0), t, LI, depth + 1), b = valueForThread(Cmp->getOperand(1), t, LI, depth + 1);
+    if (!a || !b) return std::nullopt;
+    if (!a->known || !b->known) return uniform();
+    return known(APInt(1, ICmpInst::compare(a->v, b->v, Cmp->getPredicate()) ? 1 : 0));
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+    auto a = valueForThread(BO->getOperand(0), t, LI, depth + 1), b = valueForThread(BO->getOperand(1), t, LI, depth + 1);
+    if (!a || !b) return std::nullopt;
+    const auto op = BO->getOpcode();
+    if (op == Instruction::And && ((a->known && a->v.isZero()) || (b->known && b->v.isZero()))) return known(APInt(bits, 0));
+    if (op == Instruction::Or && bits == 1 && ((a->known && a->v.isOne()) || (b->known && b->v.isOne()))) return known(APInt(1, 1));
+    if (!a->known || !b->known) return uniform();
+    const APInt &x = a->v, &y = b->v;
+    switch (op) {
+    case Instruction::And: return known(x & y);
+    case Instruction::Or: return known(x | y);
+    case Instruction::Xor: return known(x ^ y);
+    case Instruction::Add: return known(x + y);
+    case Instruction::Sub: return known(x - y);
+    case Instruction::Mul: return known(x * y);
+    case Instruction::Shl: return y.uge(bits) ? std::nullopt : known(x.shl(y));
+    case Instruction::LShr: return y.uge(bits) ? std::nullopt : known(x.lshr(y));
+    case Instruction::AShr: return y.uge(bits) ? std::nullopt : known(x.ashr(y));
+    case Instruction::UDiv: return y.isZero() ? std::nullopt : known(x.udiv(y));
+    case Instruction::URem: return y.isZero() ? std::nullopt : known(x.urem(y));
+    default: return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+// Threads of the block (1-D, `nvvm.reqntid`) for which `pred` can hold; nullopt when the predicate or the block is not understood.
+std::optional<std::vector<unsigned>> threadsOf(Value *pred, Function *F, LoopInfo &LI) {
+  Attribute R = F->getFnAttribute("nvvm.reqntid");
+  if (!R.isStringAttribute()) return std::nullopt;
+  std::vector<std::string> dims = splitTop(R.getValueAsString().str(), ',');
+  unsigned n = dims.empty() ? 0 : (unsigned)std::atoi(dims[0].c_str());
+  for (size_t i = 1; i < dims.size(); ++i)
+    if (std::atoi(dims[i].c_str()) != 1) return std::nullopt;
+  if (n == 0 || n > 1024) return std::nullopt;
+  std::vector<unsigned> out;
+  for (unsigned t = 0; t < n; ++t) {
+    auto v = valueForThread(pred, t, LI);
+    if (!v) return std::nullopt;
+    if (!v->known || !v->v.isZero()) out.push_back(t);
+  }
+  return out;
+}
+
+// The condition under which the then-block of a lowered predicated asm (underPred) runs: its single predecessor's branch.
+Value *guardOf(BasicBlock *BB) {
+  BasicBlock *H = BB->getSinglePredecessor();
+  auto *Br = H ? dyn_cast<BranchInst>(H->getTerminator()) : nullptr;
+  if (!Br || !Br->isConditional() || Br->getSuccessor(0) != BB || Br->getSuccessor(1) == BB) return nullptr;
+  return Br->getCondition();
+}
+
+// Triton's TMA issue (capability 90): one thread arrives with expect_tx, then CTA barriers, then the same thread, elected by another
+// predicate, issues the copies:
+//   @(tid % 128 == 0 && c) mbarrier.arrive.expect_tx _, [bar], 8192;  bar.sync 0;
+//   @(tid < 32 && elect.sync(-1) && c) cp.async.bulk.tensor [a], [tmapA, ...], [bar];  bar.sync 0;  @(...) cp.async.bulk.tensor [b], ...
+// The arrive moves after the last copy on its mbarrier, under its own predicate. It may pass CTA barriers there: an arrive that comes
+// later can only make a waiter wait longer, and no mbarrier wait lies in between (checked), so no thread waits on it while its own
+// thread waits at a CTA barrier. That the arriving and the copying thread are one and the same is proved from the predicates
+// (threadsOf): the copies run synchronously, or their DXA issue is queued in that thread until the arrive.
+bool moveArriveOverCtaBarriers(PassState &S, Function *F, CallInst *A, std::string &why) {
+  DominatorTree DT(*F);
+  PostDominatorTree PDT(*F);
+  LoopInfo LI(DT);
+  BasicBlock *BA = A->getParent();
+  Value *bar = A->getArgOperand(0)->stripPointerCasts();
+  auto isMbarWait = [](CallInst *C) {
+    Function *Fn = C->getCalledFunction();
+    StringRef n = Fn ? Fn->getName() : "";
+    return n == kWaitPar || n == kTestPar || n == kWaitSt || n == kTestSt;
+  };
+  auto isArriveOn = [&](CallInst *C) {
+    Function *Fn = C->getCalledFunction();
+    StringRef n = Fn ? Fn->getName() : "";
+    return C != A && (n == kArrive || n == kArriveTx) && C->getArgOperand(0)->stripPointerCasts() == bar;
+  };
+  Value *pA = guardOf(BA);
+  if (!pA || BA->getTerminator()->getNumSuccessors() != 1) { why = "the arrive is not under a predicate of its own"; return false; }
+  // the TMA loads on this mbarrier from the arrive on, through CTA barriers, up to an mbarrier wait or another arrive on it
+  std::vector<CallInst *> copies;
+  std::set<BasicBlock *> seen{BA};
+  std::vector<std::pair<BasicBlock *, Instruction *>> work{{BA, A->getNextNode()}};
+  while (!work.empty()) {
+    auto [BB, from] = work.back();
+    work.pop_back();
+    bool stop = false;
+    for (Instruction *I = from; I && !stop; I = I->getNextNode()) {
+      auto *C = dyn_cast<CallInst>(I);
+      if (!C) continue;
+      Function *Fn = C->getCalledFunction();
+      if (Fn && Fn->getName() == kTmaLoad && C->getArgOperand(2)->stripPointerCasts() == bar && S.txCopies.count(C))
+        copies.push_back(C);
+      else if (isMbarWait(C) || isArriveOn(C)) stop = true;
+      else if (!C->isInlineAsm() && Fn && Fn->getName() == kBulk) stop = true; // a bulk copy names no mbarrier here
+    }
+    if (stop) continue;
+    for (BasicBlock *Sc : successors(BB)) {
+      if (DT.dominates(Sc, BB)) continue; // back edge
+      if (seen.insert(Sc).second) work.push_back({Sc, &Sc->front()});
+    }
+  }
+  if (copies.empty()) { why = "no TMA copy on its mbarrier follows before a wait on it"; return false; }
+  // the end of the copies: the join after the last one, which every other copy's join dominates
+  BasicBlock *end = nullptr;
+  for (CallInst *Cp : copies) {
+    BasicBlock *T = Cp->getParent()->getSingleSuccessor();
+    if (!guardOf(Cp->getParent()) || !T) { why = "a copy is not under a predicate of its own"; return false; }
+    if (!end || DT.dominates(end, T)) end = T;
+  }
+  for (CallInst *Cp : copies)
+    if (!DT.dominates(Cp->getParent()->getSingleSuccessor(), end) && Cp->getParent()->getSingleSuccessor() != end) {
+      why = "the copies are not in one sequence";
+      return false;
+    }
+  BasicBlock *head = BA->getSinglePredecessor();
+  if (!DT.dominates(head, end) || !PDT.dominates(end, BA) || LI.getLoopFor(end) != LI.getLoopFor(BA)) {
+    why = "the copies do not follow the arrive on every path, in its loop";
+    return false;
+  }
+  // no mbarrier wait from the arrive to the end of its copies
+  {
+    std::set<BasicBlock *> rs{BA};
+    std::vector<std::pair<BasicBlock *, Instruction *>> w{{BA, A->getNextNode()}};
+    while (!w.empty()) {
+      auto [BB, from] = w.back();
+      w.pop_back();
+      if (BB == end) continue;
+      for (Instruction *I = from; I; I = I->getNextNode())
+        if (auto *C = dyn_cast<CallInst>(I)) {
+          Function *Fn = C->getCalledFunction();
+          if (isMbarWait(C) || isArriveOn(C) || (!Fn && !C->isInlineAsm())) { why = "a wait lies between the arrive and its copies"; return false; }
+          if (Fn && !Fn->isDeclaration()) {
+            std::set<Function *> visiting;
+            if (functionWaits(Fn, visiting)) { why = "a call that may wait lies between the arrive and its copies"; return false; }
+          }
+        }
+      for (BasicBlock *Sc : successors(BB))
+        if (!DT.dominates(Sc, BB) && rs.insert(Sc).second) w.push_back({Sc, &Sc->front()});
+    }
+  }
+  // one thread: the arrive's, and every copy's
+  auto tA = threadsOf(pA, F, LI);
+  if (!tA || tA->size() != 1) { why = "the arrive's predicate does not select one thread of the block"; return false; }
+  for (CallInst *Cp : copies) {
+    auto tC = threadsOf(guardOf(Cp->getParent()), F, LI);
+    if (!tC || tC->size() > 1 || (tC->size() == 1 && (*tC)[0] != (*tA)[0])) {
+      why = "a copy's predicate does not select the arriving thread alone";
+      return false;
+    }
+  }
+  // the arrive's operands at its new place: the mbarrier from before the predicate (its generic cast was made in the arrive's block)
+  auto *barI = dyn_cast<Instruction>(bar), *bytesI = dyn_cast<Instruction>(A->getArgOperand(1));
+  if ((barI && barI->getParent() == BA) || (bytesI && bytesI->getParent() == BA) || !bar->getType()->isPointerTy()) {
+    why = "the arrive's operands are computed under its predicate";
+    return false;
+  }
+  // `_` as the state: the phi of the predicated arrive's result has no users
+  for (bool again = true; again;) {
+    again = false;
+    for (User *U : A->users())
+      if (auto *I = dyn_cast<Instruction>(U))
+        if (isInstructionTriviallyDead(I)) { I->eraseFromParent(); again = true; break; }
+  }
+  if (!A->use_empty()) { why = "the arrive's state is used"; return false; }
+  // the move: the copies queue their DXA issue, the arrive goes to the end of the copies under its own predicate
+  Value *Q = txQueue(S, F);
+  for (CallInst *&Cp : copies) {
+    IRBuilder<> CB(Cp);
+    std::vector<Value *> args{Q};
+    for (auto &U : Cp->args()) args.push_back(U.get());
+    CallInst *N = S.call(CB, "__cupbop_tma_load_q", S.Void, args, true);
+    S.txCopies.erase(Cp);
+    S.txCopies.insert(N);
+    S.orderedCopies.insert(N);
+    Cp->eraseFromParent();
+    Cp = N;
+  }
+  Instruction *thenT = SplitBlockAndInsertIfThen(pA, end->getFirstInsertionPt(), false);
+  thenT->getParent()->setName("mbar_arrive_after_copies");
+  IRBuilder<> IB(thenT);
+  Value *P = bar->getType()->getPointerAddressSpace() ? IB.CreateAddrSpaceCast(bar, S.Ptr, "async_gen") : bar;
+  const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+  S.call(IB, isTx ? "__cupbop_mbar_arrive_tx_q" : "__cupbop_mbar_arrive_q", S.I32, {Q, P, A->getArgOperand(1)});
+  fprintf(stderr, "[CuPBoP] %s: an mbarrier arrive of thread %u moved after its %zu TMA copies, over CTA barriers (§5.3)\n",
+          F->getName().str().c_str(), (*tA)[0], copies.size());
+  A->eraseFromParent();
+  S.n_moved++;
+  return true;
 }
 
 void moveArrives(PassState &S, Function *F) {
@@ -970,10 +1283,11 @@ void moveArrives(PassState &S, Function *F) {
     if (copies.empty()) {
       if (tx) {
         auto *K = dyn_cast<ConstantInt>(A->getArgOperand(1));
-        if (!K || !K->isZero())
+        std::string why;
+        if ((!K || !K->isZero()) && !moveArriveOverCtaBarriers(S, F, A, why))
           fail_at(A, "mbarrier.arrive.expect_tx is not followed, in the same thread and before any wait, by the bulk / "
                      "TMA copies that complete its transaction: the synchronous copies cannot be ordered before the "
-                     "arrival (async design §5.3); refusing");
+                     "arrival (async design §5.3; over CTA barriers: " + why + "); refusing");
       }
       continue;
     }
@@ -1057,17 +1371,7 @@ void moveArrives(PassState &S, Function *F) {
     for (CallInst *Cp : copies) anyTma |= Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoad;
     Value *Q = nullptr;
     if (anyTma) {
-      Q = S.txq[F];
-      if (!Q) {
-        IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
-        AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
-        AI->setAlignment(Align(8));
-        // n = 0 after the entry block's allocas (the core-mapping passes expect them contiguous at the top)
-        Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
-        while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
-        IRBuilder<>(firstNonAlloca).CreateStore(ConstantInt::get(S.I32, 0), AI);
-        S.txq[F] = Q = AI;
-      }
+      Q = txQueue(S, F);
       for (CallInst *Cp : copies) {
         if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
         IRBuilder<> CB(Cp);

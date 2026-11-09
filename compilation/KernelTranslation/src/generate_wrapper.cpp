@@ -526,6 +526,15 @@ static bool is_tensor_map_type(Type *T) {
   auto *ST = dyn_cast<StructType>(T);
   return ST && ST->hasName() && ST->getName().starts_with("struct.CUtensorMap");
 }
+// Triton's tensor map parameter (capability 90, a host TensorDescriptor): `ptr byval([128 x i8]) align 64 "nvvm.grid_constant"`,
+// read only through the TMA instructions. The host passes it as CUDA's CUtensorMap, one launch slot holding the device address of its
+// record (cuTensorMapEncodeTiled shim), whose first 8 bytes are that address again (cupbop_async.h). Without `byval` the parameter is
+// that address: no copy of the 128 bytes per thread at the kernel call, which CUDA's struct form still makes.
+static bool is_grid_constant_tensor_map(Argument &A) {
+  if (!A.hasByValAttr() || !A.getParent()->getAttributes().hasParamAttr(A.getArgNo(), "nvvm.grid_constant")) return false;
+  auto *AT = dyn_cast<ArrayType>(A.getParamByValType());
+  return AT && AT->getNumElements() == 128 && AT->getElementType()->isIntegerTy(8);
+}
 void prepare_byval_args(llvm::Module *M) {
   if (!cupbop_byval_on()) return;
   const DataLayout &DL = M->getDataLayout();
@@ -533,6 +542,15 @@ void prepare_byval_args(llvm::Module *M) {
   for (auto &F : *M) {
     if (F.isDeclaration() || !isKernelFunction(M, &F)) continue;
     for (auto &A : F.args()) {
+      if (is_grid_constant_tensor_map(A)) {
+        const unsigned i = A.getArgNo();
+        F.removeParamAttr(i, Attribute::ByVal);
+        F.removeParamAttr(i, Attribute::Alignment);
+        F.addParamAttr(i, Attribute::ReadOnly);
+        if (cupbop_debug())
+          fprintf(stderr, "[CuPBoP] %s: parameter %u is a tensor map: one launch slot, its record's address\n", F.getName().str().c_str(), i);
+        continue;
+      }
       if (!A.hasByValAttr() || is_tensor_map_type(A.getParamByValType())) continue;
       Type *T = A.getParamByValType();
       const uint64_t bytes = DL.getTypeAllocSize(T);
