@@ -1742,6 +1742,33 @@ static void cupbop_read_device_ranges(DeviceContext *DC, const std::vector<std::
   for (size_t i = 0; i < ranges.size(); ++i) { memcpy(dsts[i], host.data() + off, ranges[i].second); off += (ranges[i].second + 7) & ~size_t(7); }
 }
 
+// ─── Vortex libraries on this runtime's device (libvxblas, Vortex sw/blas) ───────────────────────────────────────────────
+// A library with kernels of its own (its own module, at its own address) shares this runtime's device, memory and queue:
+// cupbopVortexContext hands over the device and queue handles, cupbopVortexLaunch runs one vx_launch_info_t on that queue
+// to completion and writes the same CUPBOP_PERF_KERNEL_FILE record as a kernel launched here (kernel_idx -3, the record's
+// "kernel" = name). Nothing else of the runtime is involved: a program that calls neither runs as before.
+extern "C" int cupbopVortexContext(void **device, void **queue) {
+  auto DC = DeviceContext::instance();
+  if (device) *device = DC->device();
+  if (queue) *queue = DC->queue();
+  return DC->device() && DC->queue() ? 0 : 1;
+}
+
+extern "C" int cupbopVortexLaunch(const void *launch_info, const char *name) {
+  auto DC = DeviceContext::instance();
+  const vx_launch_info_t *li = static_cast<const vx_launch_info_t *>(launch_info);
+  if (!li || !li->kernel) return 1;
+  cupbop_perf_pre(DC);
+  vx_event_h ev = nullptr;
+  if ((int)vx_enqueue_launch(DC->queue(), li, 0, nullptr, &ev) != 0) return 1;
+  const int rc = (int)vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE);
+  vx_event_release(ev);
+  if (rc != 0) return rc;
+  const dim3 grid(li->grid_dim[0], li->grid_dim[1], li->grid_dim[2]), block(li->block_dim[0], li->block_dim[1], li->block_dim[2]);
+  cupbop_perf_post(DC, name ? name : "library", -3, 0, li->grid_dim, li->block_dim, li->ndim, li->lmem_size, grid, block, 0);
+  return 0;
+}
+
 
 extern "C" {
 

@@ -123,6 +123,19 @@ LD_LIB_PATH = ../../build/runtime/threadPool:$(VORTEX_PATH)/runtime:$(VORTEX_PAT
 HOST_VX_LIBDIRS = -L$(VORTEX_PATH)/runtime/ -L$(VORTEX_PATH)/runtime/lib/
 endif
 
+# ─── libvxblas (Vortex sw/blas): programs that call cuBLAS ──────────────────
+# A program whose sources mention cublas compiles with libvxblas's cublas_v2.h ahead of the CUDA toolkit's and links
+# libvxblas, which runs its kernels on this runtime's device (cupbopVortexContext / cupbopVortexLaunch). VXBLAS_PATH: a
+# libvxblas build for the same hardware configuration (libvxblas.so, vxblas.vxbin, include/). CUPBOP_BLAS=0|1 overrides
+# the detection. Any other program is built exactly as before.
+VXBLAS_PATH ?= $(VORTEX_PATH)/sw/blas
+CUPBOP_BLAS ?= $(if $(shell grep -l cublas $(KERNEL_CU) $(EXTRA_C_SRCS) 2>/dev/null),1,0)
+ifeq ($(CUPBOP_BLAS),1)
+  EXTRA_CLANG_FLAGS += -I$(VXBLAS_PATH)/include
+  HOST_BLAS_LIBS = -L$(VXBLAS_PATH) -lvxblas -Wl,-rpath,$(VXBLAS_PATH)
+  LD_LIB_PATH := $(LD_LIB_PATH):$(VXBLAS_PATH)
+endif
+
 # ─── Top-level targets ────────────────────────────────────────────────────────
 all: build run
 
@@ -157,7 +170,7 @@ NVCC ?= nvcc
 
 EXTRA_NVCC_FLAGS ?=
 cuda-build: $(KERNEL_CU)
-	$(NVCC) -O2 -ccbin g++-11 $(EXTRA_NVCC_FLAGS) -o cuda_$(KERNEL).out $(KERNEL_CU) $(EXTRA_C_SRCS)
+	$(NVCC) -O2 -ccbin g++-11 $(EXTRA_NVCC_FLAGS) -o cuda_$(KERNEL).out $(KERNEL_CU) $(EXTRA_C_SRCS) $(if $(filter 1,$(CUPBOP_BLAS)),-lcublas)
 
 cuda-run: cuda-build
 	./cuda_$(KERNEL).out $(CI_RUN_ARGS) | tee golden_output.txt
@@ -314,6 +327,6 @@ host.out: host.o $(EXTRA_OBJS) kernel.vxbin lookup_global_symbols.txt
 		-L../../build/runtime -L../../build/runtime/threadPool \
 		$(HOST_VX_LIBDIRS) -I$(VORTEX_PATH)/kernel/include \
 		-o $@ -fPIE -pie \
-		host.o $(EXTRA_OBJS) \
+		host.o $(EXTRA_OBJS) $(HOST_BLAS_LIBS) \
 		-lc -lvortexRuntime -lvortex -lThreadPool -lpthread
 	@echo "--- Host compilation completed!"
