@@ -787,8 +787,8 @@ const std::map<std::string, std::vector<unsigned>> &helperArgs() {
       {"__cupbop_ldmatrix_m8n8_b16", {0}},  {"__cupbop_stmatrix_m8n8_b16", {0}}, // window address; rows of all lanes
       {"__cupbop_mbar_init", {0}},          {"__cupbop_mbar_arrive", {0}},       {"__cupbop_mbar_arrive_tx", {0}},
       {"__cupbop_mbar_wait_parity", {0}},   {"__cupbop_mbar_test_parity", {0}},  {"__cupbop_mbar_wait_state", {0}},
-      {"__cupbop_mbar_test_state", {0}},    {"__cupbop_mbar_arrive_q", {1}},     {"__cupbop_mbar_arrive_tx_q", {1}},
-      {"__cupbop_tma_load", {0, 2}},        {"__cupbop_tma_load_q", {1, 3}},     {"__cupbop_tma_store", {1}},
+      {"__cupbop_mbar_test_state", {0}},    {"__cupbop_mbar_arrive_qi", {3}},    {"__cupbop_mbar_arrive_tx_qi", {3}},
+      {"__cupbop_tma_load", {0, 2}},        {"__cupbop_tma_load_qi", {4, 6}},    {"__cupbop_tma_store", {1}},
       {"__cupbop_bulk_copy", {0, 1}},
   };
   return m;

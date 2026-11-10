@@ -39,7 +39,8 @@ const char *kInit = "__cupbop_mbar_init", *kArrive = "__cupbop_mbar_arrive", *kA
            *kWaitSt = "__cupbop_mbar_wait_state", *kTestSt = "__cupbop_mbar_test_state",
            *kElect = "__cupbop_elect_sync", *kElectLane = "__cupbop_elect_lane", *kTmaLoad = "__cupbop_tma_load",
            *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy", *kRankFail = "__cupbop_cluster_rank_fail",
-           *kActive = "__cupbop_activemask";
+           *kActive = "__cupbop_activemask", *kTmaLoadQi = "__cupbop_tma_load_qi",
+           *kArriveQi = "__cupbop_mbar_arrive_qi", *kArriveTxQi = "__cupbop_mbar_arrive_tx_qi", *kTmaSlot = "__cupbop_tma_slot";
 const uint32_t kIdPlaceholder = 0xFFFFFFFFu;
 
 int schedule() {
@@ -226,6 +227,7 @@ struct PassState {
   std::set<CallInst *> txCopies;                          // copies that complete on an mbarrier
   std::set<Function *> needWarps;                         // functions with ops that need real warps
   std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
+  std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
   std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
   unsigned n_asm = 0, n_intr = 0, n_moved = 0;
@@ -954,20 +956,80 @@ bool isWaitLike(Instruction *I, std::set<Function *> &visiting) {
   return functionWaits(F, visiting);
 }
 
-// The per-function DXA issue queue of the moved arrives (see __cupbop_tma_load_q in cudaKernelImpl_async.inc).
+// The per-function DXA issue queue of the moved arrives (see __cupbop_tma_load_qi in cudaKernelImpl_async.inc).
 Value *txQueue(PassState &S, Function *F) {
   Value *&Q = S.txq[F];
   if (!Q) {
     IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
     AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
     AI->setAlignment(Align(8));
-    // n = 0 after the entry block's allocas (the core-mapping passes expect them contiguous at the top)
+    // every entry invalid, after the entry block's allocas (the core-mapping passes expect them contiguous at the top): the
+    // valid word of each entry (cupbop_txq in cudaKernelImpl_async.inc: 4 entries of 40 bytes, valid at byte 16), the rest
+    // is written before it is read. On the core mapping the queue is per-thread context memory, where a memset of the whole
+    // queue was 24 stores per thread.
     Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
     while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
-    IRBuilder<>(firstNonAlloca).CreateStore(ConstantInt::get(S.I32, 0), AI);
+    IRBuilder<> IB(firstNonAlloca);
+    for (unsigned j = 0; j < 4; ++j)
+      IB.CreateAlignedStore(ConstantInt::get(S.I32, 0), IB.CreateConstGEP1_32(Type::getInt8Ty(S.ctx), AI, 40 * j + 16), Align(8));
     Q = AI;
   }
   return Q;
+}
+
+// CUPBOP_TMA_STATIC=0: no slot read at the entry and no barrier number from the translator (the queued loads read both
+// from their records at the copy, as the first indexed-queue form did)
+bool tmaStatic() {
+  const char *e = std::getenv("CUPBOP_TMA_STATIC");
+  return !e || std::atoi(e) != 0;
+}
+
+// The DXA slot of a TMA load's tensor map: on the 1:1 schedule read once at the function's entry when the tensor map is a
+// parameter (the host sets the slot before the launch, the record does not change during it), else right before the copy.
+// The core mapping would carry the entry's value through every thread's context.
+Value *tmaSlot(PassState &S, CallInst *Cp) {
+  Function *F = Cp->getFunction();
+  Value *desc = Cp->getArgOperand(1), *rank = Cp->getArgOperand(3);
+  if (tmaStatic() && schedule() == 2 && isa<Argument>(desc) && isa<ConstantInt>(rank)) {
+    Value *&V = S.slots[{F, desc}];
+    if (!V) {
+      txQueue(S, F); // the queue's initialization first, so that the entry's allocas stay contiguous
+      Instruction *IP = &*F->getEntryBlock().getFirstInsertionPt();
+      while (isa<AllocaInst>(IP)) IP = IP->getNextNode();
+      IRBuilder<> EB(IP);
+      V = S.call(EB, kTmaSlot, S.I32, {desc, rank}, false);
+    }
+    return V;
+  }
+  IRBuilder<> CB(Cp);
+  return S.call(CB, kTmaSlot, S.I32, {desc, rank}, false);
+}
+
+// The TMA loads among the copies of one moved arrive queue their DXA issue: the j-th becomes __cupbop_tma_load_qi(Q, j, ...).
+// Returns K, one past the highest entry these copies use, which the arrive issues. A copy already queued for another arrive (whose
+// copies these are too) keeps its entry. Constant entries: after inlining, SROA keeps the queue in registers.
+unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies, Value *&Q) {
+  unsigned K = 0;
+  for (CallInst *Cp : copies)
+    if (Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoadQi)
+      K = std::max<unsigned>(K, cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue() + 1);
+  for (CallInst *&Cp : copies) {
+    if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
+    if (!Q) Q = txQueue(S, F);
+    Value *slot = tmaSlot(S, Cp);
+    IRBuilder<> CB(Cp);
+    // the barrier number: kIdPlaceholder until finalize_mbarrier_ids knows it
+    std::vector<Value *> args{Q, ConstantInt::get(S.I32, K++), ConstantInt::get(S.I32, kIdPlaceholder), slot};
+    for (auto &U : Cp->args()) args.push_back(U.get());
+    CallInst *N = S.call(CB, kTmaLoadQi, S.Void, args, true);
+    S.txCopies.erase(Cp);
+    S.txCopies.insert(N);
+    S.orderedCopies.erase(Cp);
+    S.orderedCopies.insert(N);
+    Cp->eraseFromParent();
+    Cp = N;
+  }
+  return K;
 }
 
 // ---- which threads of the block can satisfy a predicate (the arrive of Triton's TMA issue and its copies)
@@ -1214,25 +1276,19 @@ bool moveArriveOverCtaBarriers(PassState &S, Function *F, CallInst *A, std::stri
         if (isInstructionTriviallyDead(I)) { I->eraseFromParent(); again = true; break; }
   }
   if (!A->use_empty()) { why = "the arrive's state is used"; return false; }
-  // the move: the copies queue their DXA issue, the arrive goes to the end of the copies under its own predicate
-  Value *Q = txQueue(S, F);
-  for (CallInst *&Cp : copies) {
-    IRBuilder<> CB(Cp);
-    std::vector<Value *> args{Q};
-    for (auto &U : Cp->args()) args.push_back(U.get());
-    CallInst *N = S.call(CB, "__cupbop_tma_load_q", S.Void, args, true);
-    S.txCopies.erase(Cp);
-    S.txCopies.insert(N);
-    S.orderedCopies.insert(N);
-    Cp->eraseFromParent();
-    Cp = N;
-  }
+  // the move: the copies queue their DXA issue, the arrive goes to the end of the copies under its own predicate; one thread
+  // (proved above) arrives, which the arrive's helper takes without counting the warp's active threads
+  Value *Q = nullptr;
+  for (CallInst *Cp : copies) S.orderedCopies.insert(Cp);
+  const unsigned K = queueCopies(S, F, copies, Q);
+  if (!Q) Q = txQueue(S, F);
   Instruction *thenT = SplitBlockAndInsertIfThen(pA, end->getFirstInsertionPt(), false);
   thenT->getParent()->setName("mbar_arrive_after_copies");
   IRBuilder<> IB(thenT);
   Value *P = bar->getType()->getPointerAddressSpace() ? IB.CreateAddrSpaceCast(bar, S.Ptr, "async_gen") : bar;
   const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
-  S.call(IB, isTx ? "__cupbop_mbar_arrive_tx_q" : "__cupbop_mbar_arrive_q", S.I32, {Q, P, A->getArgOperand(1)});
+  S.call(IB, isTx ? kArriveTxQi : kArriveQi, S.I32,
+         {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, 1), P, A->getArgOperand(1)});
   fprintf(stderr, "[CuPBoP] %s: an mbarrier arrive of thread %u moved after its %zu TMA copies, over CTA barriers (§5.3)\n",
           F->getName().str().c_str(), (*tA)[0], copies.size());
   A->eraseFromParent();
@@ -1366,31 +1422,25 @@ void moveArrives(PassState &S, Function *F) {
       }
     }
     // TMA loads among the copies queue their DXA issue (DXA mode) until the moved arrive has arrived: see
-    // __cupbop_tma_load_q in cudaKernelImpl_async.inc (a DXA completion must not overtake the arrival)
+    // __cupbop_tma_load_qi in cudaKernelImpl_async.inc (a DXA completion must not overtake the arrival). The arriving
+    // threads are not proved here: the helper looks at the warp's active threads.
     bool anyTma = false;
-    for (CallInst *Cp : copies) anyTma |= Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoad;
+    for (CallInst *Cp : copies) {
+      StringRef n = Cp->getCalledFunction() ? Cp->getCalledFunction()->getName() : "";
+      anyTma |= n == kTmaLoad || n == kTmaLoadQi;
+    }
     Value *Q = nullptr;
+    unsigned K = 0;
     if (anyTma) {
-      Q = txQueue(S, F);
-      for (CallInst *Cp : copies) {
-        if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
-        IRBuilder<> CB(Cp);
-        std::vector<Value *> args{Q};
-        for (auto &U : Cp->args()) args.push_back(U.get());
-        CallInst *N = S.call(CB, "__cupbop_tma_load_q", S.Void, args, true);
-        S.txCopies.erase(Cp);
-        S.txCopies.insert(N);
-        S.orderedCopies.erase(Cp);
-        S.orderedCopies.insert(N);
-        Cp->eraseFromParent();
-      }
+      K = queueCopies(S, F, copies, Q);
+      if (!Q) Q = txQueue(S, F);
     }
     for (Instruction *IP : IPs) {
       if (Q) {
         IRBuilder<> IB(IP);
         const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
-        S.call(IB, isTx ? "__cupbop_mbar_arrive_tx_q" : "__cupbop_mbar_arrive_q", S.I32,
-               {Q, A->getArgOperand(0), A->getArgOperand(1)});
+        S.call(IB, isTx ? kArriveTxQi : kArriveQi, S.I32,
+               {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, 0), A->getArgOperand(0), A->getArgOperand(1)});
       } else {
         Instruction *Cl = A->clone();
         Cl->insertBefore(IP);
@@ -1625,9 +1675,8 @@ void finalize_mbarrier_ids(Module *M) {
                       "allocate distinct Vortex barrier numbers");
   const DataLayout &DL = M->getDataLayout();
   struct Obj { GlobalVariable *G; int64_t off; bool dyn; };
-  std::vector<Obj> objs;
-  for (auto *C : inits) {
-    Value *P = C->getArgOperand(0);
+  // the __shared__ variable an mbarrier address points into, and the offset (dyn: a computed one); G null when not found
+  auto objOf = [&](Value *P) -> Obj {
     int64_t off = 0;
     bool dyn = false;
     GlobalVariable *G = nullptr;
@@ -1645,11 +1694,18 @@ void finalize_mbarrier_ids(Module *M) {
       if (auto *ITP = dyn_cast<IntToPtrInst>(P)) { P = cupbop_trace_pointer(ITP->getOperand(0)); continue; }
       break;
     }
-    if (!G || G->getAddressSpace() != 3)
+    if (G && G->getAddressSpace() != 3) G = nullptr;
+    return {G, off, dyn};
+  };
+  std::vector<Obj> objs;
+  for (auto *C : inits) {
+    Obj o = objOf(C->getArgOperand(0));
+    if (!o.G)
       fail_at(C, "mbarrier.init on an address that is not a constant or computed offset into a __shared__ variable: "
                  "cannot assign it a Vortex barrier number");
-    objs.push_back({G, off, dyn});
+    objs.push_back(o);
   }
+  std::map<std::tuple<Function *, GlobalVariable *, int64_t>, uint64_t> idOf; // constant mbarriers of each kernel
   // allocation: a variable with a computed-offset init gets one number per 8-byte word; otherwise one per offset
   std::map<GlobalVariable *, bool> anyDyn;
   for (auto &o : objs) anyDyn[o.G] = anyDyn[o.G] || o.dyn;
@@ -1719,6 +1775,19 @@ void finalize_mbarrier_ids(Module *M) {
       id = ConstantInt::get(I32, constId[key]);
     }
     C->setArgOperand(2, id);
+    if (!anyDyn[o.G]) idOf[{C->getFunction(), o.G, o.off}] = cast<ConstantInt>(id)->getZExtValue();
   }
+  // a queued TMA load on a constant mbarrier of its own kernel learns the number, so that it does not read the record for it
+  unsigned nKnown = 0;
+  for (auto &F : *M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *C = dyn_cast<CallInst>(&I))
+          if (tmaStatic() && C->getCalledFunction() && C->getCalledFunction()->getName() == kTmaLoadQi) {
+            Obj o = objOf(C->getArgOperand(6));
+            auto it = o.G && !o.dyn ? idOf.find({&F, o.G, o.off}) : idOf.end();
+            if (it != idOf.end()) { C->setArgOperand(2, ConstantInt::get(I32, it->second)); nKnown++; }
+          }
+  if (nKnown) summary += " (" + std::to_string(nKnown) + " queued TMA loads with a known number)";
   fprintf(stderr, "[CuPBoP] mbarrier Vortex barrier numbers:%s\n", summary.c_str());
 }

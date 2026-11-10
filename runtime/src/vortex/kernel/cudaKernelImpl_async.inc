@@ -118,10 +118,10 @@ static __attribute__((always_inline)) inline const cupbop_tmap *cupbop_tmap_of(c
 // One DXA box transfer (async design stage 3): the operands are gathered from lane 0 into lanes 0-3 of x31 (x30
 // for rank > 2) whatever the thread mask (vortex vx_dxa.h), so lane 0 issues; completion releases one event on
 // the barrier. Unlike __vx_dxa_issue_* (a CTA-collective call) this is the calling thread's own transfer.
-static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t slot, uint32_t bar, void *smem,
-                                                                      uint32_t rank, uint32_t c0, uint32_t c1,
-                                                                      uint32_t c2, uint32_t c3, uint32_t c4) {
-  const uint32_t meta = (bar << 4) | slot;
+// meta: (hardware barrier << 4) | DXA slot.
+static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue_meta(uint32_t meta, void *smem, uint32_t rank,
+                                                                           uint32_t c0, uint32_t c1, uint32_t c2,
+                                                                           uint32_t c3, uint32_t c4) {
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem, (size_t)meta, (size_t)c0, (size_t)c1);
   if (rank <= 2) {
     register uint32_t rs1 __asm__("x31") = a0;
@@ -133,6 +133,11 @@ static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t 
     __asm__ volatile(".insn r %0, 0, %1, x0, %2, %3\n\t" : : "i"(RISCV_CUSTOM0), "i"(0x3), "r"(rs1), "r"(rs2)
                      : "memory");
   }
+}
+static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t slot, uint32_t bar, void *smem,
+                                                                      uint32_t rank, uint32_t c0, uint32_t c1,
+                                                                      uint32_t c2, uint32_t c3, uint32_t c4) {
+  cupbop_tma_dxa_issue_meta((bar << 4) | slot, smem, rank, c0, c1, c2, c3, c4);
 }
 static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, const void *s, uint32_t e) {
   switch (e) {
@@ -191,6 +196,13 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
           }
         }
 }
+// The DXA path of a TMA load: the host gives a DXA slot (< 16) at launch to DXA-mode tensor maps only (a software-mode
+// map keeps 0xFFFFFFFF), the DXA gathers its operands from lane 0, and it takes unsigned coordinates. Bitwise, not
+// short-circuit: one branch.
+static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok(uint32_t slot, int32_t c0, int32_t c1, int32_t c2,
+                                                                   int32_t c3, int32_t c4) {
+  return (slot < 16u) & (vx_thread_id() == 0) & ((c0 | c1 | c2 | c3 | c4) >= 0);
+}
 // cp.async.bulk.tensor.<rank>d global -> shared: one copy by each calling thread (the elected one). DXA mode
 // (the host gave the tensor map a DXA slot at launch): an asynchronous DXA transfer completing on the mbarrier's
 // hardware barrier, when the caller is lane 0 and no coordinate is negative (the DXA takes unsigned coordinates);
@@ -201,11 +213,11 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load(voi
                                                                            int32_t c4) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
-  if (t->mode == CUPBOP_TMAP_MODE_DXA && t->dxa_slot < 16 && vx_thread_id() == 0 && (c0 | c1 | c2 | c3 | c4) >= 0) {
+  const uint32_t slot = t->dxa_slot;
+  if (cupbop_tma_dxa_ok(slot, c0, c1, c2, c3, c4)) {
     const uint32_t hw = cupbop_mbar_hw(cupbop_mbar_rec(mbar));
     vx_barrier_expect_tx((int)hw, 1);
-    cupbop_tma_dxa_issue(t->dxa_slot, hw, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3,
-                         (uint32_t)c4);
+    cupbop_tma_dxa_issue(slot, hw, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3, (uint32_t)c4);
     return;
   }
 #endif
@@ -217,54 +229,100 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load(voi
 // mbarrier record from shared memory): with no arrival yet the release flips the phase, the arrive flips it
 // back, and the waiters hang. A copy the translator knows is followed by a moved arrive (async design §5.3)
 // therefore only registers its event here and queues the issue; that arrive arrives first and then issues the
-// queue (__cupbop_mbar_arrive*_q): every expect_tx, then the arrival, then the transfers. The queue is a
-// per-thread stack object the translator allocates; a full queue falls back to the synchronous copy.
+// queue (__cupbop_mbar_arrive*_qi): every expect_tx, then the arrival, then the transfers.
+// The queue is a per-thread stack object the translator allocates (192 bytes) and whose valid words it zeroes at function
+// entry (async_ptx.cpp txQueue: the layout below, valid at byte 16 of each 40-byte entry). The translator numbers
+// the TMA loads of one moved arrive 0..K-1 (async_ptx.cpp, queueCopies): load j fills entry j, and the arrive issues
+// the valid entries among 0..K-1 and clears them. Every access has a constant offset, so after inlining SROA keeps the
+// queue in registers: no stack traffic and no loop on the path of a transfer. An entry past the queue, or a load the
+// DXA cannot take, copies synchronously.
 #define CUPBOP_TXQ_N 4
 typedef struct cupbop_txq {
-  uint32_t n, pad;
-  struct { void *smem; uint32_t slot, bar, rank; int32_t c[5]; } e[CUPBOP_TXQ_N];
+  struct { void *smem; uint32_t meta, rank, valid; int32_t c[5]; } e[CUPBOP_TXQ_N];
 } cupbop_txq;
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_q(void *q_, void *smem, const void *desc,
-                                                                             void *mbar, uint32_t rank, int32_t c0,
-                                                                             int32_t c1, int32_t c2, int32_t c3,
-                                                                             int32_t c4) {
+static_assert(__builtin_offsetof(cupbop_txq, e[0].valid) == 16 && sizeof(cupbop_txq) == 160,
+              "cupbop_txq: the translator's queue layout (async_ptx.cpp txQueue)");
+// The DXA slot of a tensor map (0xFFFFFFFF: none), which the host sets at launch: the translator reads it once, at the
+// kernel's entry, when the tensor map is a kernel parameter, so that a transfer does not wait on the loads of the record.
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_tma_slot(const void *desc, uint32_t rank) {
+#if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
+  return cupbop_tmap_of(desc, rank)->dxa_slot;
+#else
+  (void)desc; (void)rank;
+  return 0xFFFFFFFFu;
+#endif
+}
+// j: the queue entry; id: the mbarrier's Vortex barrier number when the translator knows it (finalize_mbarrier_ids), else
+// 0xFFFFFFFF and the record holds it; slot: __cupbop_tma_slot of desc.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(void *q_, uint32_t j, uint32_t id,
+                                                                              uint32_t slot, void *smem,
+                                                                              const void *desc, void *mbar,
+                                                                              uint32_t rank, int32_t c0, int32_t c1,
+                                                                              int32_t c2, int32_t c3, int32_t c4) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   cupbop_txq *q = (cupbop_txq *)q_;
-  const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
-  if (t->mode == CUPBOP_TMAP_MODE_DXA && t->dxa_slot < 16 && vx_thread_id() == 0 && (c0 | c1 | c2 | c3 | c4) >= 0 &&
-      q->n < CUPBOP_TXQ_N) {
-    const uint32_t hw = cupbop_mbar_hw(cupbop_mbar_rec(mbar));
+  if ((j < CUPBOP_TXQ_N) & cupbop_tma_dxa_ok(slot, c0, c1, c2, c3, c4)) {
+    const uint32_t hw = id != 0xFFFFFFFFu ? (id << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID) : cupbop_mbar_hw(cupbop_mbar_rec(mbar));
     vx_barrier_expect_tx((int)hw, 1);
-    const uint32_t k = q->n;
-    q->e[k].smem = smem; q->e[k].slot = t->dxa_slot; q->e[k].bar = hw; q->e[k].rank = rank;
-    q->e[k].c[0] = c0; q->e[k].c[1] = c1; q->e[k].c[2] = c2; q->e[k].c[3] = c3; q->e[k].c[4] = c4;
-    q->n = k + 1;
+    auto &e = q->e[j < CUPBOP_TXQ_N ? j : 0];
+    e.smem = smem; e.meta = (hw << 4) | slot; e.rank = rank; e.valid = 1;
+    e.c[0] = c0; e.c[1] = c1; e.c[2] = c2; e.c[3] = c3; e.c[4] = c4;
     return;
   }
 #endif
-  (void)q_; (void)mbar;
+  (void)q_; (void)j; (void)id; (void)slot; (void)mbar;
   cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
 }
-static __attribute__((always_inline)) inline void cupbop_txq_flush(void *q_) {
+static __attribute__((always_inline)) inline void cupbop_txq_flush(void *q_, uint32_t K) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   cupbop_txq *q = (cupbop_txq *)q_;
-  for (uint32_t k = 0; k < q->n; ++k)
-    cupbop_tma_dxa_issue(q->e[k].slot, q->e[k].bar, q->e[k].smem, q->e[k].rank, (uint32_t)q->e[k].c[0],
-                         (uint32_t)q->e[k].c[1], (uint32_t)q->e[k].c[2], (uint32_t)q->e[k].c[3], (uint32_t)q->e[k].c[4]);
-  q->n = 0;
+  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)   // unrolled, K is a constant
+    if (j < K && q->e[j].valid) {
+      cupbop_tma_dxa_issue_meta(q->e[j].meta, q->e[j].smem, q->e[j].rank, (uint32_t)q->e[j].c[0], (uint32_t)q->e[j].c[1],
+                                (uint32_t)q->e[j].c[2], (uint32_t)q->e[j].c[3], (uint32_t)q->e[j].c[4]);
+      q->e[j].valid = 0;
+    }
 #else
-  (void)q_;
+  (void)q_; (void)K;
 #endif
 }
-extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_q(void *q, void *bar, uint32_t cnt) {
-  const uint32_t r = __cupbop_mbar_arrive(bar, cnt);
-  cupbop_txq_flush(q);
+// p active threads arriving cnt times each, of a warp: the general case of __cupbop_mbar_arrive (popcount, which is a
+// sequence of ALU operations on a core without Zbb), out of line so that the one-thread path does not compute it
+static __attribute__((noinline)) uint32_t cupbop_mbar_arrivals(uint32_t m, uint32_t cnt) {
+  return (uint32_t)__builtin_popcount(m) * cnt;
+}
+// The moved arrive (cnt thread arrivals by each active thread). single: the translator proved that one thread of the
+// block executes it (Triton's TMA issue), so p = cnt; otherwise a warp of one active thread is found at run time. For
+// p = 1 the warp arrivals are the expected count n itself: no division.
+static __attribute__((always_inline)) inline uint32_t cupbop_mbar_arrive_moved(void *bar, uint32_t cnt, uint32_t single) {
+  const uint32_t rec = cupbop_mbar_rec(bar);
+  const uint32_t n = (rec >> 4) & 0xFFFFFu;
+  uint32_t p = cnt;
+  if (!single) {
+    const uint32_t m = (uint32_t)vx_active_threads();
+    if (m & (m - 1u)) p = cupbop_mbar_arrivals(m, cnt);
+  }
+  uint32_t w = n;
+  if (p != 1u) {
+    if (p == 0 || n % p) cupbop_async_fail("mbarrier arrivals of a warp do not divide the expected count", n, p);
+    w = n / p;
+  }
+  return (uint32_t)vx_barrier_arrive((int)cupbop_mbar_hw(rec), (int)w) & 1u;
+}
+// K: the queue entries of this arrive's copies (the translator's numbering)
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_qi(void *q, uint32_t K, uint32_t single,
+                                                                                      void *bar, uint32_t cnt) {
+  const uint32_t r = cupbop_mbar_arrive_moved(bar, cnt, single);
+  cupbop_txq_flush(q, K);
   return r;
 }
-extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_tx_q(void *q, void *bar,
-                                                                                        uint32_t bytes) {
-  const uint32_t r = __cupbop_mbar_arrive_tx(bar, bytes);
-  cupbop_txq_flush(q);
+// arrive.expect_tx: one arrival per thread; the transaction is the queued copies (or synchronous ones, done already)
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_tx_qi(void *q, uint32_t K,
+                                                                                         uint32_t single, void *bar,
+                                                                                         uint32_t bytes) {
+  (void)bytes;
+  const uint32_t r = cupbop_mbar_arrive_moved(bar, 1, single);
+  cupbop_txq_flush(q, K);
   return r;
 }
 // cp.async.bulk.tensor.<rank>d shared -> global
