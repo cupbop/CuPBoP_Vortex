@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
   // the program's own kernel prepares A on the device before the library reads it: A = 0.5 A + 0.25
   float* dA = to_dev(A);
   affine<<<(A.size() + 127) / 128, 128>>>(dA, (int)A.size(), 0.5f, 0.25f);
+  CHECK_CUDA(cudaGetLastError());  // a launch that did not happen (no kernel image for this GPU, ...)
   CHECK_CUDA(cudaDeviceSynchronize());
   for (auto& x : A) x = 0.5f * x + 0.25f;
   float* dB = to_dev(B);
