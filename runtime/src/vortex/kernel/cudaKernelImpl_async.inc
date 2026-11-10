@@ -291,19 +291,27 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(
 // transfer (cupbop_tma_dxa_ok), so a vote tells the whole warp whether lane 0 holds entry j, and lane 0 is WGATHER's
 // source lane. Every branch here is uniform: the vote, and wide (bit j: entry j's rank > 2, a constant of the
 // translator), so that no lane takes another path to the issue.
+// The back end cannot see through a vote's inline asm that the result is the same in every lane, and would put a split/join
+// around each branch on it. llvm.riscv.vx.uniform (the intrinsic translator mark_uniform_branches puts on uniform branch
+// conditions) tells it. (An __UNIFORM__ variable did the same but kept a stack slot written at every vote: async_tg3 +7.6%
+// instead of +2.7% against the issue under the elected thread's mask; with split/join, +4.8%.)
+extern "C" bool cupbop_vx_uniform(bool) __asm__("llvm.riscv.vx.uniform.i1.i1");
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_issue(void *q_, uint32_t K, uint32_t wide) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   cupbop_txq *q = (cupbop_txq *)q_;
-  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)   // unrolled, K and wide are constants
-    if (j < K) {
-      const uint32_t __UNIFORM__ any = (uint32_t)vx_vote_any((int)q->e[j].valid);
-      if (any) {
+  // one vote for the warps that queued nothing (all but the issuing one), then one per entry (unrolled, K and wide are
+  // constants)
+  uint32_t v = 0;
+  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)
+    if (j < K) v |= q->e[j].valid;
+  if (K == 1 || cupbop_vx_uniform(vx_vote_any((int)v) != 0))
+    for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)
+      if (j < K && cupbop_vx_uniform(vx_vote_any((int)q->e[j].valid) != 0))
         cupbop_tma_dxa_issue_meta(q->e[j].meta, q->e[j].smem, (wide >> j) & 1u ? 3u : 2u, (uint32_t)q->e[j].c[0],
                                   (uint32_t)q->e[j].c[1], (uint32_t)q->e[j].c[2], (uint32_t)q->e[j].c[3],
                                   (uint32_t)q->e[j].c[4]);
-        q->e[j].valid = 0;
-      }
-    }
+  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)
+    if (j < K) q->e[j].valid = 0; // by every lane: after inlining a constant, not a value carried to the next issue
 #else
   (void)q_; (void)K; (void)wide;
 #endif

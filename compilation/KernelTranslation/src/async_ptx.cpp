@@ -1346,9 +1346,19 @@ void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, V
             why.c_str());
     return;
   }
+  // The entries' data die at the issue. The queue is memory: without these stores, on a path without a fill SROA (schedule 2)
+  // carries the last fill's values around the loop to the next issue, and a GEMM loop holds them in registers (async_tg3
+  // +8.9% cycles). Poison stores are free: SROA drops them, and InstCombine the context-memory stores of the core mapping.
+  // valid stays meaningful (the issue clears it).
+  Type *I8 = Type::getInt8Ty(S.ctx);
   for (Instruction *IP : IPs) {
     IRBuilder<> IB(IP);
     S.call(IB, kTxqIssue, S.Void, {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, wide)});
+    for (unsigned j = 0; j < K && j < kTxqN; ++j) {
+      IB.CreateAlignedStore(PoisonValue::get(S.Ptr), IB.CreateConstGEP1_32(I8, Q, 40 * j), Align(8));
+      for (unsigned off : {8u, 20u, 24u, 28u, 32u, 36u})
+        IB.CreateAlignedStore(PoisonValue::get(S.I32), IB.CreateConstGEP1_32(I8, Q, 40 * j + off), Align(4));
+    }
   }
   S.n_issue += IPs.size();
 }
