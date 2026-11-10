@@ -193,6 +193,9 @@ private:
 // points every lane passes (around the call and around each divergent region holding it) keeps such values in other
 // registers; no instruction is added. -ffixed-x30/x31 is no way out: LTO's fastcc helpers take those as argument
 // registers. Runs with CUPBOP_BAR_INLINE or CUPBOP_DXA_CLOBBER, schedule 2.
+// The queued copies of a moved arrive (__cupbop_tma_load_qi) no longer issue under the elected thread's mask: the
+// converged warp issues them after the region (__cupbop_txq_issue, async_ptx.cpp placeIssue), which needs no clobber. Only
+// the unqueued load, which issues in place (no arrive moved after it: CUPBOP_ASYNC_NO_MOVE), is left here.
 void protect_dxa_operand_registers(Module *M) {
   auto on = [](const char *n) { const char *e = std::getenv(n); return e && std::atoi(e) != 0; };
   if (!bar_inline_on() && !on("CUPBOP_DXA_CLOBBER")) return;
@@ -208,9 +211,7 @@ void protect_dxa_operand_registers(Module *M) {
       for (Instruction &I : BB)
         if (auto *C = dyn_cast<CallInst>(&I))
           if (Function *G = C->getCalledFunction())
-            if (G->getName().starts_with("__cupbop_tma_load") || G->getName().starts_with("__cupbop_mbar_arrive_q") ||
-                G->getName().starts_with("__cupbop_mbar_arrive_tx_q"))
-              calls.push_back(C);
+            if (G->getName() == "__cupbop_tma_load") calls.push_back(C);
     if (calls.empty()) continue;
     Divergence A(*F);
     A.run();

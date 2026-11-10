@@ -119,9 +119,20 @@ static __attribute__((always_inline)) inline const cupbop_tmap *cupbop_tmap_of(c
 // for rank > 2) whatever the thread mask (vortex vx_dxa.h), so lane 0 issues; completion releases one event on
 // the barrier. Unlike __vx_dxa_issue_* (a CTA-collective call) this is the calling thread's own transfer.
 // meta: (hardware barrier << 4) | DXA slot.
+// WGATHER writes every non-source lane of x31 (x30), active or not, and the compiler, which reserves neither register
+// once these helpers are inlined into a kernel, keeps other values there: under a partial thread mask it would clobber
+// the inactive lanes' values. So the queued path (__cupbop_txq_issue) runs it where the whole warp is converged and
+// executes it, which matches the compiler's model (an instruction changes the lanes that execute it).
+// CUPBOP_ASYNC_CHECKS=1: stop when the thread mask is not the full warp here.
 static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue_meta(uint32_t meta, void *smem, uint32_t rank,
                                                                            uint32_t c0, uint32_t c1, uint32_t c2,
                                                                            uint32_t c3, uint32_t c4) {
+#ifdef CUPBOP_ASYNC_CHECKS
+  {
+    const uint32_t m = (uint32_t)vx_active_threads(), full = (uint32_t)((1ull << vx_num_threads()) - 1u);
+    if (m != full) cupbop_async_fail("WGATHER / DXA issue with a partial thread mask (x31/x30 of the inactive lanes)", m, full);
+  }
+#endif
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem, (size_t)meta, (size_t)c0, (size_t)c1);
   if (rank <= 2) {
     register uint32_t rs1 __asm__("x31") = a0;
@@ -228,17 +239,19 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load(voi
 // the LMEM port first, so a transfer can complete before the issuing thread's following arrive (which reads the
 // mbarrier record from shared memory): with no arrival yet the release flips the phase, the arrive flips it
 // back, and the waiters hang. A copy the translator knows is followed by a moved arrive (async design §5.3)
-// therefore only registers its event here and queues the issue; that arrive arrives first and then issues the
-// queue (__cupbop_mbar_arrive*_qi): every expect_tx, then the arrival, then the transfers.
+// therefore only registers its event here and queues the issue; that arrive arrives first (__cupbop_mbar_arrive*_m),
+// and then the whole warp, converged again after the arrive's region, issues the queue (__cupbop_txq_issue, placed by
+// the translator: async_ptx.cpp, placeIssue): every expect_tx, then the arrival, then the transfers.
 // The queue is a per-thread stack object the translator allocates (192 bytes) and whose valid words it zeroes at function
 // entry (async_ptx.cpp txQueue: the layout below, valid at byte 16 of each 40-byte entry). The translator numbers
-// the TMA loads of one moved arrive 0..K-1 (async_ptx.cpp, queueCopies): load j fills entry j, and the arrive issues
-// the valid entries among 0..K-1 and clears them. Every access has a constant offset, so after inlining SROA keeps the
-// queue in registers: no stack traffic and no loop on the path of a transfer. An entry past the queue, or a load the
-// DXA cannot take, copies synchronously.
+// the TMA loads of one moved arrive 0..K-1 (async_ptx.cpp, queueCopies): load j fills entry j, and the issue after the
+// arrive issues the valid entries among 0..K-1 and clears them. Every access has a constant offset, so after inlining SROA
+// keeps the queue in registers: no stack traffic and no loop on the path of a transfer. An entry past the queue (also
+// async_ptx.cpp kTxqSync, when the translator finds no converged issue point), or a load the DXA cannot take, copies
+// synchronously.
 #define CUPBOP_TXQ_N 4
 typedef struct cupbop_txq {
-  struct { void *smem; uint32_t meta, rank, valid; int32_t c[5]; } e[CUPBOP_TXQ_N];
+  struct { void *smem; uint32_t meta, rank_unused, valid; int32_t c[5]; } e[CUPBOP_TXQ_N]; // rank: the issue's `wide`
 } cupbop_txq;
 static_assert(__builtin_offsetof(cupbop_txq, e[0].valid) == 16 && sizeof(cupbop_txq) == 160,
               "cupbop_txq: the translator's queue layout (async_ptx.cpp txQueue)");
@@ -265,7 +278,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(
     const uint32_t hw = id != 0xFFFFFFFFu ? (id << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID) : cupbop_mbar_hw(cupbop_mbar_rec(mbar));
     vx_barrier_expect_tx((int)hw, 1);
     auto &e = q->e[j < CUPBOP_TXQ_N ? j : 0];
-    e.smem = smem; e.meta = (hw << 4) | slot; e.rank = rank; e.valid = 1;
+    e.smem = smem; e.meta = (hw << 4) | slot; e.valid = 1;
     e.c[0] = c0; e.c[1] = c1; e.c[2] = c2; e.c[3] = c3; e.c[4] = c4;
     return;
   }
@@ -273,17 +286,26 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(
   (void)q_; (void)j; (void)id; (void)slot; (void)mbar;
   cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
 }
-static __attribute__((always_inline)) inline void cupbop_txq_flush(void *q_, uint32_t K) {
+// The DXA issue of a moved arrive's queued copies (entries 0..K-1), by every lane of a converged warp: the translator
+// calls it where the warp is converged after the arrive's region (async_ptx.cpp, placeIssue). Only lane 0 queues a DXA
+// transfer (cupbop_tma_dxa_ok), so a vote tells the whole warp whether lane 0 holds entry j, and lane 0 is WGATHER's
+// source lane. Every branch here is uniform: the vote, and wide (bit j: entry j's rank > 2, a constant of the
+// translator), so that no lane takes another path to the issue.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_issue(void *q_, uint32_t K, uint32_t wide) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   cupbop_txq *q = (cupbop_txq *)q_;
-  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)   // unrolled, K is a constant
-    if (j < K && q->e[j].valid) {
-      cupbop_tma_dxa_issue_meta(q->e[j].meta, q->e[j].smem, q->e[j].rank, (uint32_t)q->e[j].c[0], (uint32_t)q->e[j].c[1],
-                                (uint32_t)q->e[j].c[2], (uint32_t)q->e[j].c[3], (uint32_t)q->e[j].c[4]);
-      q->e[j].valid = 0;
+  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j)   // unrolled, K and wide are constants
+    if (j < K) {
+      const uint32_t __UNIFORM__ any = (uint32_t)vx_vote_any((int)q->e[j].valid);
+      if (any) {
+        cupbop_tma_dxa_issue_meta(q->e[j].meta, q->e[j].smem, (wide >> j) & 1u ? 3u : 2u, (uint32_t)q->e[j].c[0],
+                                  (uint32_t)q->e[j].c[1], (uint32_t)q->e[j].c[2], (uint32_t)q->e[j].c[3],
+                                  (uint32_t)q->e[j].c[4]);
+        q->e[j].valid = 0;
+      }
     }
 #else
-  (void)q_; (void)K;
+  (void)q_; (void)K; (void)wide;
 #endif
 }
 // p active threads arriving cnt times each, of a warp: the general case of __cupbop_mbar_arrive (popcount, which is a
@@ -309,21 +331,15 @@ static __attribute__((always_inline)) inline uint32_t cupbop_mbar_arrive_moved(v
   }
   return (uint32_t)vx_barrier_arrive((int)cupbop_mbar_hw(rec), (int)w) & 1u;
 }
-// K: the queue entries of this arrive's copies (the translator's numbering)
-extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_qi(void *q, uint32_t K, uint32_t single,
-                                                                                      void *bar, uint32_t cnt) {
-  const uint32_t r = cupbop_mbar_arrive_moved(bar, cnt, single);
-  cupbop_txq_flush(q, K);
-  return r;
+// The moved arrive of queued copies; their issue follows, by the converged warp (__cupbop_txq_issue)
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_m(uint32_t single, void *bar, uint32_t cnt) {
+  return cupbop_mbar_arrive_moved(bar, cnt, single);
 }
 // arrive.expect_tx: one arrival per thread; the transaction is the queued copies (or synchronous ones, done already)
-extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_tx_qi(void *q, uint32_t K,
-                                                                                         uint32_t single, void *bar,
-                                                                                         uint32_t bytes) {
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_mbar_arrive_tx_m(uint32_t single, void *bar,
+                                                                                        uint32_t bytes) {
   (void)bytes;
-  const uint32_t r = cupbop_mbar_arrive_moved(bar, 1, single);
-  cupbop_txq_flush(q, K);
-  return r;
+  return cupbop_mbar_arrive_moved(bar, 1, single);
 }
 // cp.async.bulk.tensor.<rank>d shared -> global
 extern "C" __attribute__((always_inline)) void __cupbop_tma_store(const void *desc, void *smem, uint32_t rank,

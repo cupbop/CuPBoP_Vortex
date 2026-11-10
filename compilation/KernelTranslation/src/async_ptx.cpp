@@ -40,8 +40,12 @@ const char *kInit = "__cupbop_mbar_init", *kArrive = "__cupbop_mbar_arrive", *kA
            *kElect = "__cupbop_elect_sync", *kElectLane = "__cupbop_elect_lane", *kTmaLoad = "__cupbop_tma_load",
            *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy", *kRankFail = "__cupbop_cluster_rank_fail",
            *kActive = "__cupbop_activemask", *kTmaLoadQi = "__cupbop_tma_load_qi",
-           *kArriveQi = "__cupbop_mbar_arrive_qi", *kArriveTxQi = "__cupbop_mbar_arrive_tx_qi", *kTmaSlot = "__cupbop_tma_slot";
+           *kArriveM = "__cupbop_mbar_arrive_m", *kArriveTxM = "__cupbop_mbar_arrive_tx_m", *kTmaSlot = "__cupbop_tma_slot",
+           *kTxqIssue = "__cupbop_txq_issue";
 const uint32_t kIdPlaceholder = 0xFFFFFFFFu;
+// the runtime's queue entries (CUPBOP_TXQ_N), and an entry past them: the TMA load copies synchronously (no converged DXA
+// issue point)
+const uint32_t kTxqN = 4, kTxqSync = 0xFFu;
 
 int schedule() {
   const char *e = std::getenv("VORTEX_SCHEDULE_FLAG");
@@ -230,7 +234,7 @@ struct PassState {
   std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
   std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
-  unsigned n_asm = 0, n_intr = 0, n_moved = 0;
+  unsigned n_asm = 0, n_intr = 0, n_moved = 0, n_issue = 0;
   explicit PassState(Module *m)
       : M(m), ctx(m->getContext()), I1(Type::getInt1Ty(ctx)), I32(Type::getInt32Ty(ctx)), I64(Type::getInt64Ty(ctx)),
         Void(Type::getVoidTy(ctx)), Ptr(PointerType::get(ctx, 0)) {}
@@ -1011,8 +1015,10 @@ Value *tmaSlot(PassState &S, CallInst *Cp) {
 unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies, Value *&Q) {
   unsigned K = 0;
   for (CallInst *Cp : copies)
-    if (Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoadQi)
-      K = std::max<unsigned>(K, cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue() + 1);
+    if (Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoadQi) {
+      const uint64_t j = cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue();
+      if (j != kTxqSync) K = std::max<unsigned>(K, j + 1);
+    }
   for (CallInst *&Cp : copies) {
     if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
     if (!Q) Q = txQueue(S, F);
@@ -1042,7 +1048,8 @@ struct ThreadValue {
   APInt v;
 };
 
-bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI) {
+// UA: allocas known to hold the same value in every thread (uniformAllocas); a load from one is uniform.
+bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI, const std::set<AllocaInst *> *UA = nullptr) {
   if (isa<Constant>(V) || isa<Argument>(V)) return true;
   auto *I = dyn_cast<Instruction>(V);
   if (!I || !visiting.insert(V).second) return I != nullptr; // a cycle through loop-header phis: optimistic
@@ -1053,13 +1060,16 @@ bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI) {
     return n.starts_with("llvm.nvvm.read.ptx.sreg.ctaid.") || n.starts_with("llvm.nvvm.read.ptx.sreg.nctaid.") ||
            n.starts_with("llvm.nvvm.read.ptx.sreg.ntid.");
   }
+  if (auto *L = dyn_cast<LoadInst>(I))
+    if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()))
+      if (UA && UA->count(A) && !L->isVolatile()) return true;
   if (isa<LoadInst>(I) || isa<AllocaInst>(I) || I->mayHaveSideEffects()) return false;
   if (auto *P = dyn_cast<PHINode>(I)) { // a loop header's: the iteration all threads of the block are in
     Loop *L = LI.getLoopFor(P->getParent());
     if (!L || L->getHeader() != P->getParent()) return false;
   }
   for (Value *O : I->operands())
-    if (!isa<BasicBlock>(O) && !isUniformValue(O, visiting, LI)) return false;
+    if (!isa<BasicBlock>(O) && !isUniformValue(O, visiting, LI, UA)) return false;
   return true;
 }
 
@@ -1162,6 +1172,185 @@ Value *guardOf(BasicBlock *BB) {
   auto *Br = H ? dyn_cast<BranchInst>(H->getTerminator()) : nullptr;
   if (!Br || !Br->isConditional() || Br->getSuccessor(0) != BB || Br->getSuccessor(1) == BB) return nullptr;
   return Br->getCondition();
+}
+
+// ---- where the DXA issue of a moved arrive's queued copies runs
+//
+// The DXA takes its operands packed in lanes 0-3 of x31 (x30), which WGATHER writes in every non-source lane whether the
+// lane is active or not (vortex vx_intrinsics.h, SimX alu_unit). The compiler reserves neither register once the runtime
+// helpers are inlined into a kernel, and keeps other values there; under the partial thread mask of the elected thread's
+// region, a WGATHER would clobber the inactive lanes' copies (schedule 1 + DXA + num_stages >= 2: a misaligned store,
+// experiments/s1dxa). So the issue (__cupbop_txq_issue) runs after the region, where the warp is converged and every lane
+// executes it, as the compiler's per-lane model assumes. The point: out of every region whose branch is not uniform
+// (isUniformValue), in the arrive's loop, with no wait and no other queue access (a TMA load, an arrive, an issue) on the
+// way from the arrive. nullptr (why) when there is none.
+Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
+  // a device function may be called under a partial mask: only a kernel's entry has the whole warp
+  if (!isKernelFunction(F->getParent(), F)) { why = "the arrive is in a device function, not a kernel"; return nullptr; }
+  DominatorTree DT(*F);
+  PostDominatorTree PDT(*F);
+  LoopInfo LI(DT);
+  // the branches a block is control dependent on: the block post-dominates one of the branch's successors, not the branch
+  std::map<BasicBlock *, std::vector<BasicBlock *>> cdMemo;
+  auto cd = [&](BasicBlock *B) -> const std::vector<BasicBlock *> & {
+    auto it = cdMemo.find(B);
+    if (it != cdMemo.end()) return it->second;
+    std::vector<BasicBlock *> &v = cdMemo[B];
+    for (BasicBlock &X : *F) {
+      Instruction *T = X.getTerminator();
+      if (!T || T->getNumSuccessors() < 2 || PDT.dominates(B, &X)) continue;
+      for (BasicBlock *Sc : successors(&X))
+        if (PDT.dominates(B, Sc)) { v.push_back(&X); break; }
+    }
+    return v;
+  };
+  // CUDA input is unoptimized IR: loop counters and parameters live in allocas. An alloca that does not escape, and whose
+  // stores all store a uniform value at a point where no non-uniform branch decides (optimistic fixpoint), is uniform.
+  std::set<AllocaInst *> UA;
+  for (Instruction &I : F->getEntryBlock()) {
+    auto *A = dyn_cast<AllocaInst>(&I);
+    if (!A) continue;
+    bool ok = true;
+    for (User *U : A->users()) {
+      if (auto *L = dyn_cast<LoadInst>(U)) ok &= L->getPointerOperand() == A;
+      else if (auto *St = dyn_cast<StoreInst>(U)) ok &= St->getPointerOperand() == A && St->getValueOperand() != A;
+      else if (auto *II = dyn_cast<IntrinsicInst>(U)) ok &= II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II);
+      else ok = false;
+    }
+    if (ok) UA.insert(A);
+  }
+  auto branchUniform = [&](BasicBlock *X) {
+    Instruction *T = X->getTerminator();
+    Value *c = nullptr;
+    if (auto *Br = dyn_cast<BranchInst>(T)) c = Br->getCondition();
+    else if (auto *Sw = dyn_cast<SwitchInst>(T)) c = Sw->getCondition();
+    std::set<Value *> visiting;
+    return c && isUniformValue(c, visiting, LI, &UA);
+  };
+  // a non-uniform branch B is control dependent on, directly or through uniform branches (whose blocks may themselves lie
+  // in a non-uniform region: `if (tid == 0 && c)` is a uniform `c` under `tid == 0`)
+  auto divergentBranch = [&](BasicBlock *B) -> BasicBlock * {
+    std::set<BasicBlock *> seenX;
+    std::vector<BasicBlock *> st{B};
+    while (!st.empty()) {
+      BasicBlock *Y = st.back();
+      st.pop_back();
+      for (BasicBlock *X : cd(Y)) {
+        if (!seenX.insert(X).second) continue;
+        if (!branchUniform(X)) return X;
+        st.push_back(X);
+      }
+    }
+    return nullptr;
+  };
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto it = UA.begin(); it != UA.end();) {
+      bool ok = true;
+      for (User *U : (*it)->users())
+        if (auto *St = dyn_cast<StoreInst>(U)) {
+          std::set<Value *> visiting;
+          if (St->isVolatile() || !isUniformValue(St->getValueOperand(), visiting, LI, &UA) || divergentBranch(St->getParent())) {
+            ok = false;
+            break;
+          }
+        }
+      if (ok) { ++it; continue; }
+      it = UA.erase(it);
+      changed = true;
+    }
+  }
+  Loop *L0 = LI.getLoopFor(Ar->getParent());
+  BasicBlock *P = Ar->getParent();
+  bool moved = false;
+  for (int guard = 0;; ++guard) {
+    if (guard > 1024) { why = "internal: no fixpoint"; return nullptr; }
+    // a branch whose condition may differ between the lanes decides whether P runs: some lanes may be off at P
+    BasicBlock *D = divergentBranch(P);
+    if (!D) break;
+    if (std::getenv("CUPBOP_TMA_ISSUE_DEBUG")) {
+      std::string t;
+      raw_string_ostream os(t);
+      os << "[CuPBoP] issue point: " << P->getName() << " depends on " << D->getName() << ": " << *D->getTerminator();
+      fprintf(stderr, "%s\n", os.str().c_str());
+    }
+    DomTreeNode *N = PDT.getNode(D);
+    BasicBlock *J = N && N->getIDom() ? N->getIDom()->getBlock() : nullptr;
+    if (!J) { why = "a non-uniform region around the arrive does not join before the function's end"; return nullptr; }
+    if (LI.getLoopFor(J) != L0) { why = "a non-uniform region around the arrive ends outside the arrive's loop"; return nullptr; }
+    P = J;
+    moved = true;
+  }
+  Instruction *IP = moved ? &*P->getFirstInsertionPt() : Ar->getNextNode();
+  std::set<Function *> visiting;
+  std::set<BasicBlock *> seen;
+  std::vector<std::pair<BasicBlock *, Instruction *>> w{{Ar->getParent(), Ar->getNextNode()}};
+  while (!w.empty()) {
+    auto [BB, from] = w.back();
+    w.pop_back();
+    bool stop = false;
+    for (Instruction *I = from; I; I = I->getNextNode()) {
+      if (I == IP) { stop = true; break; }
+      auto *C = dyn_cast<CallInst>(I);
+      if (!C) continue;
+      visiting.clear();
+      if (isWaitLike(C, visiting)) { why = "a wait lies between the arrive and the end of its region"; return nullptr; }
+      StringRef n = C->getCalledFunction() ? C->getCalledFunction()->getName() : "";
+      if (n == kTmaLoad || n == kTmaLoadQi || n == kArriveM || n == kArriveTxM || n == kTxqIssue) {
+        why = "another TMA load or moved arrive lies between the arrive and the end of its region";
+        return nullptr;
+      }
+    }
+    if (stop) continue;
+    for (BasicBlock *Sc : successors(BB))
+      if (seen.insert(Sc).second) w.push_back({Sc, &Sc->front()});
+  }
+  return IP;
+}
+
+bool tmaIssueForcedSync() {
+  const char *e = std::getenv("CUPBOP_TMA_ISSUE");
+  return e && std::string(e) == "sync";
+}
+
+// The issue of the K queued copies of a moved arrive Ars (one call, or one per insertion point): one
+// __cupbop_txq_issue(Q, K, wide) at each call's converged point (deduplicated). Without such a point for every call, the
+// copies of these entries copy synchronously (kTxqSync) and nothing is issued: correct, slower, and warned.
+// CUPBOP_TMA_ISSUE=sync forces that (tests).
+void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, Value *Q, unsigned K,
+                const std::vector<CallInst *> &copies) {
+  if (!K) return;
+  uint32_t wide = 0;
+  std::vector<CallInst *> mine;
+  std::string why;
+  for (CallInst *Cp : copies) {
+    if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoadQi) continue;
+    const uint64_t j = cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue();
+    if (j >= K || j >= kTxqN) continue; // past the queue: synchronous anyway
+    mine.push_back(Cp);
+    auto *R = dyn_cast<ConstantInt>(Cp->getArgOperand(7));
+    if (!R) why = "a TMA load's rank is not a constant";
+    else if (R->getZExtValue() > 2) wide |= 1u << j;
+  }
+  std::vector<Instruction *> IPs;
+  if (why.empty() && tmaIssueForcedSync()) why = "CUPBOP_TMA_ISSUE=sync";
+  for (CallInst *Ar : Ars) {
+    if (!why.empty()) break;
+    Instruction *IP = convergedIssuePoint(F, Ar, why);
+    if (IP && std::find(IPs.begin(), IPs.end(), IP) == IPs.end()) IPs.push_back(IP);
+  }
+  if (!why.empty()) {
+    for (CallInst *Cp : mine) Cp->setArgOperand(1, ConstantInt::get(S.I32, kTxqSync));
+    fprintf(stderr, "[CuPBoP] warning: %s: no point where the warp is converged after an mbarrier arrive for the DXA issue "
+                    "of its %zu TMA copies (%s): they copy synchronously\n", F->getName().str().c_str(), mine.size(),
+            why.c_str());
+    return;
+  }
+  for (Instruction *IP : IPs) {
+    IRBuilder<> IB(IP);
+    S.call(IB, kTxqIssue, S.Void, {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, wide)});
+  }
+  S.n_issue += IPs.size();
 }
 
 // Triton's TMA issue (capability 90): one thread arrives with expect_tx, then CTA barriers, then the same thread, elected by another
@@ -1287,12 +1476,16 @@ bool moveArriveOverCtaBarriers(PassState &S, Function *F, CallInst *A, std::stri
   IRBuilder<> IB(thenT);
   Value *P = bar->getType()->getPointerAddressSpace() ? IB.CreateAddrSpaceCast(bar, S.Ptr, "async_gen") : bar;
   const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
-  S.call(IB, isTx ? kArriveTxQi : kArriveQi, S.I32,
-         {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, 1), P, A->getArgOperand(1)});
+  CallInst *Ar = S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32, {ConstantInt::get(S.I32, 1), P, A->getArgOperand(1)});
   fprintf(stderr, "[CuPBoP] %s: an mbarrier arrive of thread %u moved after its %zu TMA copies, over CTA barriers (§5.3)\n",
           F->getName().str().c_str(), (*tA)[0], copies.size());
+  // the DXA takes its operands from lane 0 (cupbop_tma_dxa_ok): another thread's copies are synchronous
+  if ((*tA)[0] % 32 != 0)
+    fprintf(stderr, "[CuPBoP] warning: %s: the TMA copies of thread %u (not lane 0 of its warp) copy synchronously\n",
+            F->getName().str().c_str(), (*tA)[0]);
   A->eraseFromParent();
   S.n_moved++;
+  placeIssue(S, F, {Ar}, Q, K, copies);
   return true;
 }
 
@@ -1435,12 +1628,13 @@ void moveArrives(PassState &S, Function *F) {
       K = queueCopies(S, F, copies, Q);
       if (!Q) Q = txQueue(S, F);
     }
+    std::vector<CallInst *> moved;
     for (Instruction *IP : IPs) {
       if (Q) {
         IRBuilder<> IB(IP);
         const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
-        S.call(IB, isTx ? kArriveTxQi : kArriveQi, S.I32,
-               {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, 0), A->getArgOperand(0), A->getArgOperand(1)});
+        moved.push_back(S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32,
+                               {ConstantInt::get(S.I32, 0), A->getArgOperand(0), A->getArgOperand(1)}));
       } else {
         Instruction *Cl = A->clone();
         Cl->insertBefore(IP);
@@ -1448,6 +1642,7 @@ void moveArrives(PassState &S, Function *F) {
     }
     A->eraseFromParent();
     S.n_moved++;
+    if (Q) placeIssue(S, F, moved, Q, K, copies);
   }
 }
 
@@ -1644,7 +1839,7 @@ void lower_async_ptx(Module *M) {
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
   narrowWideKernelArgs(M, S.paramAddrArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "
-                  "copies\n", S.n_asm, S.n_intr, S.n_moved);
+                  "copies, %u converged DXA issue point(s)\n", S.n_asm, S.n_intr, S.n_moved, S.n_issue);
 }
 
 // ---------------------------------------------------------------------------------------------------------
