@@ -733,6 +733,17 @@ static void check_narrow_triton_warp(Module *M) {
   }
 }
 
+// CUPBOP_TRITON_DOT_HELPER=1 (default off; experiments/vxdot32): a module that calls __vx_tcu_mma_f16_f32 is a tl.dot module,
+// as one with mma.sync asm is. The call is the triton-vortex vxdot route (TRITON_VORTEX_VXDOT=1): the plugin lowers tl.dot to
+// the runtime's TCU op on fragment registers, and no mma.sync is left. Without the switch the tl.dot settings stay off for
+// such a module (triton_has_dot: the 64-bit tile copy, lo-saddr, the schedule-2 conditional barriers, CUPBOP_BAR_INLINE;
+// lotriton.cpp hasDot: the SIMT passes stay on), and on NT32 it ran 1.37-1.84x the cycles of the lo-mma route of the same dot.
+// CUDA input does not call the helper. Off, nothing changes.
+bool triton_dot_helper_counts() {
+  static const bool on = [] { const char *e = std::getenv("CUPBOP_TRITON_DOT_HELPER"); return e && std::atoi(e) != 0; }();
+  return on;
+}
+
 void lower_triton_input(Module *M) {
   check_narrow_triton_warp(M);
   LLVMContext &C = M->getContext();
@@ -744,7 +755,9 @@ void lower_triton_input(Module *M) {
   static const std::regex nvvm_f32(R"(^llvm\.nvvm\.(ex2|lg2|rcp|rsqrt|sqrt|sin|cos)\.[a-z]+(\.ftz)?\.f32$)");
   unsigned nAsm = 0, nIntr = 0;
   for (CallInst *CI : calls)
-    if (CI->isInlineAsm() && cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("mma.sync") != std::string::npos) triton_set_has_dot(true);
+    if (CI->isInlineAsm() ? cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("mma.sync") != std::string::npos
+                          : triton_dot_helper_counts() && CI->getCalledFunction() && CI->getCalledFunction()->getName() == "__vx_tcu_mma_f16_f32")
+      triton_set_has_dot(true);
   for (CallInst *CI : calls) {
     if (CI->isInlineAsm()) {
       const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
