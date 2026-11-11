@@ -1325,6 +1325,19 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_movmatrix_m8
   }
 }
 #endif // NT=32 helpers / NT=16 glue
+// One TCU tile operation on fragments the caller already holds in <vx_tensor.h>'s own register order for this build's warp
+// (wmma_context<VX_CFG_NUM_THREADS, fp16, fp32>; NT=16: tile m16n8k16, a 8, b 4, c and d 8 registers per lane): d = a*b + c.
+// a, b: two fp16 per 32-bit word, the lower k in the low half; c, d: fp32; d may be c. No shuffles, no layout change: for
+// code generated for this warp width, such as the Triton plugin's tl.dot on schedule 2 (vortex-triton vx-dot,
+// TRITON_VORTEX_VXDOT=1). Nothing the translator emits for CUDA input calls it.
+extern "C" __attribute__((always_inline, convergent)) void __vx_tcu_mma_f16_f32(float *d, const uint32_t *a, const uint32_t *b, const float *c) {
+  tcu_ctx::fragment_a fa; tcu_ctx::fragment_b fb; tcu_ctx::fragment_acc fc, fd;
+  for (uint32_t r = 0; r < tcu_ctx::fragment_a::NR; r++) fa.data[r] = __cupbop_u32_as_f32(a[r]);
+  for (uint32_t r = 0; r < tcu_ctx::fragment_b::NR; r++) fb.data[r] = __cupbop_u32_as_f32(b[r]);
+  for (uint32_t r = 0; r < tcu_ctx::fragment_acc::NR; r++) fc.data[r] = c[r];
+  tcu_ctx::mma_sync(fd, fa, fb, fc);
+  for (uint32_t r = 0; r < tcu_ctx::fragment_acc::NR; r++) d[r] = fd.data[r];
+}
 #endif // TCU-backed variant
 
 // ---- dispatch symbols (what kernelTranslator emits for CUPBOP_MMA_LOWERING=auto) ----------------
