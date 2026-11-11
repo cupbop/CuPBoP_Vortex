@@ -765,7 +765,9 @@ void lower_triton_input(Module *M) {
       CI->eraseFromParent();
     } else if (n == "llvm.nvvm.div.full") {
       Value *D = B.CreateFDiv(CI->getArgOperand(0), CI->getArgOperand(1));
-      if (arcp_div()) cast<Instruction>(D)->setHasAllowReciprocal(true);   // div.full allows 2 ulp: lo-fdiv reads the flag
+      // div.full allows 2 ulp: lo-fdiv reads the flag. Constant operands (Inductor's 1.0 / 1.0 of a one-element mean) fold to a
+      // constant, which has no flag and needs none
+      if (auto *DI = dyn_cast<Instruction>(D); DI && arcp_div()) DI->setHasAllowReciprocal(true);
       CI->replaceAllUsesWith(D);
       CI->eraseFromParent();
     } else if (n.starts_with("llvm.nvvm.redux.sync.") && redux_butterfly(CI, n.drop_front(strlen("llvm.nvvm.redux.sync.")))) {
