@@ -38,15 +38,15 @@
 using namespace llvm;
 
 unsigned triton_warp_mask();   // triton_ir.cpp
-bool triton_dot_helper_counts();   // triton_ir.cpp: CUPBOP_TRITON_DOT_HELPER
+bool triton_dot_helper_in_lift();   // triton_ir.cpp: CUPBOP_TRITON_DOT_HELPER other than 2
 
 namespace {
 int envI(const char *n, int d) { const char *e = getenv(n); return e && *e ? atoi(e) : d; }
 
-// tl.dot kernels stay as they are: lo-mma reads their shape. With CUPBOP_TRITON_DOT_HELPER the vxdot route's TCU call counts too
+// tl.dot kernels stay as they are: lo-mma reads their shape. With CUPBOP_TRITON_DOT_HELPER (not =2) the vxdot route's TCU call counts too
 bool hasDot(Module &M) {
   for (Function &F : M) {
-    if (F.isDeclaration()) { if (F.getName().starts_with("llvm.nvvm.mma.") || F.getName().starts_with("llvm.nvvm.ldmatrix") || (triton_dot_helper_counts() && F.getName() == "__vx_tcu_mma_f16_f32")) if (!F.use_empty()) return true; continue; }
+    if (F.isDeclaration()) { if (F.getName().starts_with("llvm.nvvm.mma.") || F.getName().starts_with("llvm.nvvm.ldmatrix") || (triton_dot_helper_in_lift() && F.getName() == "__vx_tcu_mma_f16_f32")) if (!F.use_empty()) return true; continue; }
     for (BasicBlock &B : F) for (Instruction &I : B) if (auto *C = dyn_cast<CallInst>(&I)) if (C->isInlineAsm()) { const std::string &a = cast<InlineAsm>(C->getCalledOperand())->getAsmString(); if (a.find("ldmatrix") != std::string::npos || a.find("mma.") != std::string::npos) return true; }
   }
   return false;

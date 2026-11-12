@@ -739,10 +739,16 @@ static void check_narrow_triton_warp(Module *M) {
 // such a module (triton_has_dot: the 64-bit tile copy, lo-saddr, the schedule-2 conditional barriers, CUPBOP_BAR_INLINE;
 // lotriton.cpp hasDot: the SIMT passes stay on), and on NT32 it ran 1.37-1.84x the cycles of the lo-mma route of the same dot.
 // CUDA input does not call the helper. Off, nothing changes.
-bool triton_dot_helper_counts() {
-  static const bool on = [] { const char *e = std::getenv("CUPBOP_TRITON_DOT_HELPER"); return e && std::atoi(e) != 0; }();
-  return on;
+// CUPBOP_TRITON_DOT_HELPER=2 (experiments/vxdot3): the call is a tl.dot for the settings above (triton_has_dot) only, not for
+// lotriton.cpp's hasDot, so the SIMT passes, CUPBOP_UNIFORM_BR and, on a narrow warp where lo-mma does not run, lo-sched and
+// lo-f16 stay on as without the switch. With =1 a 16-lane build lost them all (run_triton_lo_mma returns early when neither
+// lo-mma nor the SIMT passes apply) and 4-warp vxdot kernels took 5-6% more cycles than without the switch.
+static int triton_dot_helper_mode() {
+  static const int v = [] { const char *e = std::getenv("CUPBOP_TRITON_DOT_HELPER"); return e ? std::atoi(e) : 0; }();
+  return v;
 }
+bool triton_dot_helper_counts() { return triton_dot_helper_mode() != 0; }
+bool triton_dot_helper_in_lift() { return triton_dot_helper_mode() != 0 && triton_dot_helper_mode() != 2; }
 
 void lower_triton_input(Module *M) {
   check_narrow_triton_warp(M);
