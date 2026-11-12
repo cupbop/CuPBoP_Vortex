@@ -390,6 +390,45 @@ void fold_bitreverse_i1(Module *M) {
   for (CallInst *CI : calls) { CI->replaceAllUsesWith(CI->getArgOperand(0)); CI->eraseFromParent(); }
 }
 
+// bitcast <N x i1> <-> iN (or another type of N bits) -> extract / insert element by element, element k as bit k (the
+// little-endian layout of a vector of i1). Triton's NVIDIA back end writes the OR of the N booleans one thread holds as
+// icmp ne (bitcast <N x i1> to iN), 0 (tl.any / tl.all, the _any_combine of Inductor's _safe_softmax); NVPTX selects it,
+// the RISC-V back end of llvm-vortex goes through a stack slot and fails ("Cannot select: store ... trunc to v8i1").
+// A module without such a bitcast is left as it is.
+void scalarize_i1_vector_bitcasts(Module *M) {
+  auto isI1Vec = [](Type *T) { auto *V = dyn_cast<FixedVectorType>(T); return V && V->getElementType()->isIntegerTy(1); };
+  std::vector<BitCastInst *> casts;
+  for (auto &F : M->functions())
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *C = dyn_cast<BitCastInst>(&I))
+          if (isI1Vec(C->getSrcTy()) != isI1Vec(C->getDestTy())) casts.push_back(C);
+  for (BitCastInst *C : casts) {
+    IRBuilder<> B(C);
+    Value *V = C->getOperand(0), *R;
+    if (isI1Vec(C->getSrcTy())) {
+      const unsigned n = cast<FixedVectorType>(C->getSrcTy())->getNumElements();
+      IntegerType *IT = B.getIntNTy(n);
+      Value *X = ConstantInt::get(IT, 0);
+      for (unsigned k = 0; k < n; ++k) {
+        Value *E = B.CreateZExt(B.CreateExtractElement(V, k), IT);
+        X = B.CreateOr(X, k ? B.CreateShl(E, k) : E);
+      }
+      R = C->getDestTy() == IT ? X : B.CreateBitCast(X, C->getDestTy());
+    } else {
+      auto *DT = cast<FixedVectorType>(C->getDestTy());
+      const unsigned n = DT->getNumElements();
+      IntegerType *IT = B.getIntNTy(n);
+      Value *X = V->getType() == IT ? V : B.CreateBitCast(V, IT);
+      R = PoisonValue::get(DT);
+      for (unsigned k = 0; k < n; ++k) R = B.CreateInsertElement(R, B.CreateTrunc(k ? B.CreateLShr(X, k) : X, B.getInt1Ty()), k);
+    }
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+  }
+  if (!casts.empty()) fprintf(stderr, "[CuPBoP] i1 vector bitcasts scalarized: %zu\n", casts.size());
+}
+
 // llvm.nvvm.read.ptx.sreg.lanemask.{eq,le,lt,ge,gt} -> masks of llvm.nvvm.read.ptx.sreg.laneid (lowered later with
 // the other special registers). Left in place they reach the RISC-V back end, which crashed in
 // lowerGetVectorLength on the unknown intrinsic id (CUTLASS 41_fused_multi_head_attention_backward).

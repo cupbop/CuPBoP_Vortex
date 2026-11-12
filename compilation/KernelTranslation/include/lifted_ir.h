@@ -30,6 +30,10 @@ void lower_redux_sync(llvm::Module *M);
 // llvm.bitreverse.i1(x) -> x (the RISC-V back end cannot legalize it)
 void fold_bitreverse_i1(llvm::Module *M);
 
+// bitcast between a vector of i1 and an integer (or any other type) -> element by element through an integer of the
+// same width (the RISC-V back end cannot select it)
+void scalarize_i1_vector_bitcasts(llvm::Module *M);
+
 // llvm.nvvm.read.ptx.sreg.lanemask.* -> masks of %laneid
 void lower_lanemask(llvm::Module *M);
 
