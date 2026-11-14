@@ -559,6 +559,19 @@ extern "C" void __vx_wmma_load_b_m16n16k16_col_f16(void *frag, const void *p, in
 extern "C" void __vx_wmma_load_c_m16n16k16_row_f32(void *frag, const void *p, int32_t ldm) {
   tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_acc *>(frag), p, (size_t)ldm);
 }
+// CUPBOP_WMMA_FUSE: the k32 loads of two fused k16 steps (tool.cpp fuse_wmma_k16_pairs), upper k-columns kept
+extern "C" void __vx_wmma_load_a_m16n16k32_row_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_a_m16n16k32_col_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_a *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_b_m16n16k32_row_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+}
+extern "C" void __vx_wmma_load_b_m16n16k32_col_f16(void *frag, const void *p, int32_t ldm) {
+  tcu_ctx::load_matrix_sync<vt::col_major>(*reinterpret_cast<tcu_ctx::fragment_b *>(frag), p, (size_t)ldm);
+}
 extern "C" void __vx_wmma_store_d_m16n16k16_f32(float *p, const float *frag, int32_t ldm, WmmaLayout layout) {
   const auto &acc = *reinterpret_cast<const tcu_ctx::fragment_acc *>(frag);
   if (layout == WMMA_LAYOUT_ROW)

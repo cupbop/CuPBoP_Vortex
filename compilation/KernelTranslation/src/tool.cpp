@@ -5353,6 +5353,257 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
 }
 
 
+// CUPBOP_WMMA_FUSE=1 (default 0; 2026-11-08, experiments/wmmafuse): two CUDA wmma k16 steps -> one k32 op of the TCU.
+// CUDA's wmma has no k32 for half, and the NT=32 TCU tile is m16n16k32: each k16 mma_sync runs as a k32 op whose upper 16
+// k-columns the loads zero (cudaKernelImpl.cpp). A kernel that walks K in steps of 16 then does twice the TCU work, reads
+// the upper k-columns it throws away, and zeroes them. Here, after -O3 (the k-steps are unrolled), on the runtime calls:
+//   mma(D1 <- A1(p), B1(q), C);  ...  mma(D2 <- A2(p + 16 k), B2(q + 16 k), D1)
+// becomes one mma on k32 loads at p and q, which read those 16 k-columns too, when
+//   - all of it is in one block, D1 feeds only the second mma, A1/A2 and B1/B2 are the same load with the same ldm,
+//   - the second pointer is the first plus 16 elements along k (A row, B col: 32 bytes; A col, B row: 16 * ldm halves),
+//   - nothing between a first load and its second writes memory other than a private alloca (no store, no barrier).
+// The k32 op sums k 0..31 in one pass: the fp32 rounding of the sum may differ from two passes, as in the Triton path.
+// An mma left alone keeps its k16 loads. CUPBOP_WMMA_FUSE_DEBUG=1 prints every decision.
+void fuse_wmma_k16_pairs(llvm::Module *M) {
+  const char *e = std::getenv("CUPBOP_WMMA_FUSE");
+  if (!e || std::atoi(e) == 0) return;
+  for (const char *n : {"VORTEX_NUM_THREADS", "CUPBOP_VIRT_LANES"})
+    if (const char *v = std::getenv(n); v && std::atoi(v) > 0 && std::atoi(v) < 32) return;
+  const bool dbg = std::getenv("CUPBOP_WMMA_FUSE_DEBUG") != nullptr;
+  const DataLayout &DL = M->getDataLayout();
+  const std::string MMA = "__vx_wmma_mma_m16n16k16_row_row_f16_f16_f32", LD = "__vx_wmma_load_";
+  auto calleeName = [](const Instruction *I) -> StringRef {
+    auto *C = dyn_cast<CallInst>(I);
+    Function *F = C ? C->getCalledFunction() : nullptr;
+    return F ? F->getName() : StringRef();
+  };
+  auto isK16Load = [&](const Instruction *I) {
+    StringRef n = calleeName(I);
+    return n.starts_with(LD) && n.contains("_m16n16k16_") && n.ends_with("_f16") && (n.contains("load_a_") || n.contains("load_b_"));
+  };
+  auto isMma = [&](const Instruction *I) { return calleeName(I) == MMA; };
+  // (alloca, 4-byte slot) of a pointer, or null
+  auto slotOf = [&](Value *P, int &slot) -> AllocaInst * {
+    int64_t off = 0;
+    Value *Bs = GetPointerBaseWithConstantOffset(P, off, DL);
+    auto *A = dyn_cast<AllocaInst>(Bs);
+    if (!A || off < 0 || off % 4) return nullptr;
+    slot = (int)(off / 4);
+    return slot < 8 ? A : nullptr;
+  };
+  auto privateWrite = [&](Instruction &I) {
+    if (!I.mayWriteToMemory()) return true;
+    if (auto *S = dyn_cast<StoreInst>(&I)) return isa<AllocaInst>(getUnderlyingObject(S->getPointerOperand()));
+    if (calleeName(&I).starts_with(LD) || isMma(&I)) return true; // they write their own fragment alloca, k32 copies included
+    if (auto *II = dyn_cast<IntrinsicInst>(&I)) return II->isAssumeLikeIntrinsic() || II->isLifetimeStartOrEnd();
+    return false;
+  };
+  auto loadsOnlyIn = [](AllocaInst *A, BasicBlock *BB) {
+    SmallVector<Value *, 8> work{A};
+    while (!work.empty()) {
+      Value *V = work.pop_back_val();
+      for (User *U : V->users()) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(U)) work.push_back(G);
+        else if (auto *L = dyn_cast<LoadInst>(U)) { if (L->getParent() != BB) return false; }
+        else if (auto *S = dyn_cast<StoreInst>(U)) { if (S->getValueOperand() == V) return false; }
+        else if (!isa<CallInst>(U) && !isa<IntrinsicInst>(U)) return false;
+      }
+    }
+    return true;
+  };
+  struct Mma {
+    CallInst *call = nullptr;
+    CallInst *la = nullptr, *lb = nullptr; // the k16 loads feeding A and B
+    int prev = -1;                         // the mma whose D is this one's C
+    StoreInst *sa[8] = {}, *sb[8] = {}, *sc[8] = {};
+    std::vector<LoadInst *> d;             // loads of its D
+    bool used = false;
+  };
+  unsigned fused = 0, tried = 0;
+  for (Function &F : *M) {
+    for (BasicBlock &BB : F) {
+      std::map<std::pair<AllocaInst *, int>, StoreInst *> lastStore;
+      std::map<AllocaInst *, CallInst *> lastLoadCall; // frag alloca -> k16 load that wrote it last
+      std::map<AllocaInst *, int> lastMma;             // d alloca -> mma that wrote it last
+      std::map<LoadInst *, std::pair<CallInst *, int>> fromLoad;
+      std::map<LoadInst *, std::pair<int, int>> fromMma;
+      std::map<Instruction *, unsigned> pos;
+      std::vector<Mma> mmas;
+      unsigned n = 0;
+      for (Instruction &I : BB) {
+        pos[&I] = n++;
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          int sl; if (AllocaInst *A = slotOf(S->getPointerOperand(), sl)) lastStore[{A, sl}] = S;
+          continue;
+        }
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          int sl; AllocaInst *A = slotOf(L->getPointerOperand(), sl);
+          if (!A) continue;
+          if (lastLoadCall.count(A) && lastLoadCall[A]) fromLoad[L] = {lastLoadCall[A], sl};
+          else if (lastMma.count(A) && lastMma[A] >= 0) { fromMma[L] = {lastMma[A], sl}; mmas[lastMma[A]].d.push_back(L); }
+          continue;
+        }
+        auto *C = dyn_cast<CallInst>(&I);
+        if (!C) continue;
+        if (isK16Load(C)) {
+          int sl; if (AllocaInst *A = slotOf(C->getArgOperand(0), sl)) { lastLoadCall[A] = C; lastMma[A] = -1; for (int i = 0; i < 8; i++) lastStore.erase({A, i}); }
+          continue;
+        }
+        if (isMma(C)) {
+          Mma m; m.call = C;
+          int sl; AllocaInst *Ad = slotOf(C->getArgOperand(0), sl), *Aa = slotOf(C->getArgOperand(1), sl),
+                             *Ab = slotOf(C->getArgOperand(2), sl), *Ac = slotOf(C->getArgOperand(3), sl);
+          bool ok = Ad && Aa && Ab && Ac;
+          CallInst *la = nullptr, *lb = nullptr; int prev = -2;
+          for (int i = 0; ok && i < 8; i++) {
+            StoreInst *a = lastStore.count({Aa, i}) ? lastStore[{Aa, i}] : nullptr, *b = lastStore.count({Ab, i}) ? lastStore[{Ab, i}] : nullptr,
+                      *c = lastStore.count({Ac, i}) ? lastStore[{Ac, i}] : nullptr;
+            if (!a || !b || !c) { ok = false; break; }
+            m.sa[i] = a; m.sb[i] = b; m.sc[i] = c;
+            auto *va = dyn_cast<LoadInst>(a->getValueOperand()), *vb = dyn_cast<LoadInst>(b->getValueOperand()), *vc = dyn_cast<LoadInst>(c->getValueOperand());
+            if (!va || !vb || !fromLoad.count(va) || !fromLoad.count(vb) || fromLoad[va].second != i || fromLoad[vb].second != i) { ok = false; break; }
+            if (la && la != fromLoad[va].first) ok = false;
+            if (lb && lb != fromLoad[vb].first) ok = false;
+            la = fromLoad[va].first; lb = fromLoad[vb].first;
+            int pc = (vc && fromMma.count(vc) && fromMma[vc].second == i) ? fromMma[vc].first : -1;
+            if (prev == -2) prev = pc; else if (prev != pc) prev = -1;
+          }
+          if (ok) { m.la = la; m.lb = lb; m.prev = prev < 0 ? -1 : prev; }
+          else m.la = m.lb = nullptr;
+          mmas.push_back(m);
+          if (Ad) { lastMma[Ad] = (int)mmas.size() - 1; lastLoadCall[Ad] = nullptr; for (int i = 0; i < 8; i++) lastStore.erase({Ad, i}); }
+          continue;
+        }
+        // any other call that may write memory forgets what it may have written
+        if (C->mayWriteToMemory()) { lastStore.clear(); lastLoadCall.clear(); lastMma.clear(); }
+      }
+      // the pairs. A block with an mma whose operands were not traced is left alone: it may read stores of the others
+      bool allTraced = !mmas.empty();
+      for (Mma &m : mmas) if (!m.la) allTraced = false;
+      if (!allTraced) { if (dbg && !mmas.empty()) errs() << "[wmma-fuse] " << F.getName() << ": a block with an untraced mma\n"; continue; }
+      std::map<CallInst *, CallInst *> k32; // k16 load -> its k32 copy
+      std::vector<Instruction *> dead;
+      for (size_t j = 0; j < mmas.size(); j++) {
+        Mma &m2 = mmas[j];
+        if (!m2.la || m2.prev < 0) continue;
+        Mma &m1 = mmas[m2.prev];
+        if (!m1.la || m1.used || m2.used) continue;
+        ++tried;
+        auto why = [&](const char *w) { if (dbg) errs() << "[wmma-fuse] " << F.getName() << ": pair refused: " << w << "\n"; };
+        bool okd = true;
+        for (LoadInst *L : m1.d) for (User *U : L->users()) {
+          auto *S = dyn_cast<StoreInst>(U);
+          if (!S || std::find(std::begin(m2.sc), std::end(m2.sc), S) == std::end(m2.sc)) okd = false;
+        }
+        if (!okd) { why("D of the first mma has other users"); continue; }
+        { int sl; AllocaInst *D1 = slotOf(m1.call->getArgOperand(0), sl), *D2 = slotOf(m2.call->getArgOperand(0), sl);
+          if (!loadsOnlyIn(D1, &BB) || !loadsOnlyIn(D2, &BB)) { why("a D fragment is read in another block"); continue; } }
+        auto stepOK = [&](CallInst *L1, CallInst *L2) {
+          if (calleeName(L1) != calleeName(L2) || L1->getArgOperand(2) != L2->getArgOperand(2)) return false;
+          StringRef nm = calleeName(L1);
+          const bool kContig = nm.contains("load_a_m16n16k16_row") || nm.contains("load_b_m16n16k16_col");
+          int64_t want;
+          if (kContig) want = 32;
+          else if (auto *CI = dyn_cast<ConstantInt>(L1->getArgOperand(2))) want = 16 * 2 * CI->getSExtValue();
+          else return false;
+          // base + variable terms + constant: the two pointers differ only in the constant
+          struct Dec { Value *base = nullptr; std::map<Value *, int64_t> var; int64_t c = 0; bool ok = true; };
+          auto decompose = [&](Value *P) {
+            Dec d;
+            while (true) {
+              P = P->stripPointerCasts();
+              auto *G = dyn_cast<GEPOperator>(P);
+              if (!G) break;
+              SmallMapVector<Value *, APInt, 4> vo;
+              APInt co(64, 0);
+              if (!G->collectOffset(DL, 64, vo, co)) { d.ok = false; break; }
+              d.c += co.getSExtValue();
+              for (auto &kv : vo) d.var[kv.first] += kv.second.getSExtValue();
+              P = G->getPointerOperand();
+            }
+            d.base = P;
+            for (auto It = d.var.begin(); It != d.var.end();) It = It->second == 0 ? d.var.erase(It) : std::next(It);
+            return d;
+          };
+          Dec d1 = decompose(L1->getArgOperand(1)), d2 = decompose(L2->getArgOperand(1));
+          if (!d1.ok || !d2.ok || d1.base != d2.base || d1.var != d2.var || d2.c - d1.c != want || pos[L1] > pos[L2]) return false;
+          for (Instruction *I = L1->getNextNode(); I && I != L2; I = I->getNextNode())
+            if (!privateWrite(*I)) return false;
+          return true;
+        };
+        if (!stepOK(m1.la, m2.la)) { why("A loads are not k and k+16 of one tile, or memory is written between them"); continue; }
+        if (!stepOK(m1.lb, m2.lb)) { why("B loads are not k and k+16 of one tile, or memory is written between them"); continue; }
+        // rewrite: k32 loads after the first loads (one per first load), one mma where the first one was
+        auto copyK32 = [&](CallInst *L) -> CallInst * {
+          if (k32.count(L)) return k32[L];
+          std::string nm = calleeName(L).str();
+          nm.replace(nm.find("_m16n16k16_"), 11, "_m16n16k32_");
+          IRBuilder<> EB(&F.getEntryBlock().front());
+          Value *Fr = EB.CreateAlloca(ArrayType::get(Type::getInt32Ty(M->getContext()), 8), nullptr, "wmma.k32");
+          IRBuilder<> B(L->getNextNode());
+          FunctionCallee FC = M->getOrInsertFunction(nm, L->getFunctionType());
+          CallInst *N = B.CreateCall(FC, {Fr, L->getArgOperand(1), L->getArgOperand(2)});
+          N->setAttributes(L->getAttributes());
+          N->copyMetadata(*L);
+          return k32[L] = N;
+        };
+        CallInst *A32 = copyK32(m1.la), *B32 = copyK32(m1.lb);
+        IRBuilder<> EB(&F.getEntryBlock().front());
+        Value *Dn = EB.CreateAlloca(ArrayType::get(Type::getInt32Ty(M->getContext()), 8), nullptr, "wmma.d32");
+        IRBuilder<> B(m1.call);
+        CallInst *Nm = B.CreateCall(m1.call->getFunctionType(), m1.call->getCalledOperand(), {Dn, A32->getArgOperand(0), B32->getArgOperand(0), m1.call->getArgOperand(3)});
+        Nm->setAttributes(m1.call->getAttributes());
+        Nm->copyMetadata(*m1.call);
+        for (LoadInst *L : m2.d) {
+          int sl; slotOf(L->getPointerOperand(), sl);
+          Value *P = B.CreateConstInBoundsGEP2_32(ArrayType::get(Type::getInt32Ty(M->getContext()), 8), Dn, 0, sl);
+          LoadInst *NL = B.CreateLoad(L->getType(), P);
+          L->replaceAllUsesWith(NL);
+          dead.push_back(L);
+        }
+        for (int i = 0; i < 8; i++) { dead.push_back(m2.sa[i]); dead.push_back(m2.sb[i]); dead.push_back(m2.sc[i]); dead.push_back(m1.sa[i]); dead.push_back(m1.sb[i]); }
+        for (LoadInst *L : m1.d) dead.push_back(L);
+        dead.push_back(m2.call);
+        dead.push_back(m1.call);
+        m1.used = m2.used = true;
+        ++fused;
+        if (dbg) errs() << "[wmma-fuse] " << F.getName() << ": fused a pair\n";
+      }
+      if (dead.empty()) continue;
+      // stores a kept mma reads stay: m1's C stores (the fused op reads them) and every store of an mma left alone
+      std::set<Instruction *> keep;
+      for (Mma &m : mmas) {
+        if (m.used) { for (int i = 0; i < 8; i++) keep.insert(m.sc[i]); continue; }
+        for (int i = 0; i < 8; i++) { keep.insert(m.sa[i]); keep.insert(m.sb[i]); keep.insert(m.sc[i]); }
+      }
+      std::set<Instruction *> gone;
+      for (Instruction *I : dead) if (!gone.count(I) && !keep.count(I) && isa<StoreInst>(I)) { gone.insert(I); I->eraseFromParent(); }
+      for (Instruction *I : dead) if (!gone.count(I) && isa<LoadInst>(I) && I->use_empty()) { gone.insert(I); I->eraseFromParent(); }
+      for (Instruction *I : dead) if (!gone.count(I) && isa<CallInst>(I)) { gone.insert(I); I->eraseFromParent(); }
+      // fragment loads nothing uses any more
+      std::set<CallInst *> stillRead;
+      for (auto It = BB.begin(); It != BB.end();) {
+        Instruction &I = *It++;
+        auto *L = dyn_cast<LoadInst>(&I);
+        if (!L || !fromLoad.count(L)) continue;
+        if (L->use_empty() && !L->isVolatile()) { fromLoad.erase(L); L->eraseFromParent(); }
+        else stillRead.insert(fromLoad[L].first);
+      }
+      // a k16 load nothing reads any more, and whose fragment no other block reads
+      for (auto &kv : fromLoad) stillRead.insert(kv.second.first);
+      std::set<CallInst *> cands;
+      for (Mma &m : mmas) if (m.used) { cands.insert(m.la); cands.insert(m.lb); }
+      for (CallInst *L : cands) {
+        if (stillRead.count(L)) continue;
+        int sl; AllocaInst *A = slotOf(L->getArgOperand(0), sl);
+        if (!A || !loadsOnlyIn(A, &BB)) continue;
+        L->eraseFromParent();
+      }
+    }
+  }
+  if (fused || dbg) fprintf(stderr, "[wmma-fuse] %u of %u candidate pairs fused\n", fused, tried);
+}
+
 // Core mapping (virt, schedule 1): lanes are hardware, so every value derived from
 // the intra-warp index is lane-divergent. Mark the loads of the lane index (global
 // intra_warp_index / per-function local_intra_warp_idx alloca) with the "divergence"
