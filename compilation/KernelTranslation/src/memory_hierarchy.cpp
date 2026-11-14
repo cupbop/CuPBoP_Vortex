@@ -2,6 +2,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -544,6 +545,36 @@ static uint32_t smem_reserve_drop_bytes(llvm::Function &F, const Items &layout,
   return drop;
 }
 
+// kernel_lmem.log: "<kernel> <bytes>" lines, the per-CTA local memory of each kernel. The host takes the largest entry
+// per kernel as the launch's lmem_size (cudaRuntimeImpl.cpp cupbop_static_lmem_bytes), which under the KMU launch is the
+// stride of the CTA windows (VX_CSR_CTA_LMEM_ADDR). One stream for every writer of a translator run, truncated on first
+// use: a second stream opened later in truncating mode dropped what the first had written.
+static std::ofstream &kernel_lmem_log() {
+  static std::ofstream f("kernel_lmem.log");
+  return f;
+}
+
+// Shared memory a kernel takes through the Vortex API __vx_local_mem_offset(size) instead of __shared__ variables (the
+// hand-written DXA example sgemm_dxa). The legacy launch carved base + group_id * size from that argument; under the KMU
+// launch the call returns the CTA's window (cudaKernelImpl.cpp), whose size the host reads from kernel_lmem.log, with
+// LOCALMEM 1 or 0 (the DXA writes local memory either way). Without an entry the window was 0 bytes and the CTAs that
+// share a core overwrote each other's tiles (sgemm_dxa 127/256 wrong since launch2 e360b89). Logs the largest constant
+// size per function; a size known only at run time cannot be logged and is reported. Called for every schedule (init.cpp).
+void log_vx_local_mem_requests(llvm::Module *M) {
+  using namespace llvm;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    uint64_t want = 0;
+    for (Instruction &I : instructions(F))
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (Function *G = CI->getCalledFunction(); G && G->getName() == "_Z21__vx_local_mem_offsetj" && CI->arg_size() == 1) {
+          if (auto *K = dyn_cast<ConstantInt>(CI->getArgOperand(0))) want = std::max<uint64_t>(want, K->getZExtValue());
+          else errs() << "log_vx_local_mem_requests: " << F.getName() << ": __vx_local_mem_offset with a run-time size, not in kernel_lmem.log\n";
+        }
+    if (want) { kernel_lmem_log() << F.getName().str() << " " << want << "\n"; kernel_lmem_log().flush(); }
+  }
+}
+
 void mem_share2local(llvm::Module *M) {
   using namespace llvm;
 
@@ -674,9 +705,8 @@ void mem_share2local(llvm::Module *M) {
         // then subsequent writes append via the same stream. Across
         // re-invocations of the compiler, the static is reinitialized and the
         // file is truncated fresh.
-        static std::ofstream lmem_log("kernel_lmem.log");
-        lmem_log << F.getName().str() << " " << staticAligned - drop << "\n";
-        lmem_log.flush();
+        kernel_lmem_log() << F.getName().str() << " " << staticAligned - drop << "\n";
+        kernel_lmem_log().flush();
       }
 
       Value *dynBytes = ConstantInt::get(I32, 0);
@@ -787,9 +817,8 @@ void mem_share2local(llvm::Module *M) {
     // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
     // lmem size. See no-barrier branch above for context.
     {
-      static std::ofstream lmem_log("kernel_lmem.log", std::ios::app);
-      lmem_log << F.getName().str() << " " << staticAligned - drop << "\n";
-      lmem_log.flush();
+      kernel_lmem_log() << F.getName().str() << " " << staticAligned - drop << "\n";
+      kernel_lmem_log().flush();
     }
 
     Value *dynBytes = ConstantInt::get(I32, 0);

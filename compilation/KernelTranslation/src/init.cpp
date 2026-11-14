@@ -994,6 +994,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     local_mem_use = std::stoi(std::string(env));
   }
 
+  log_vx_local_mem_requests(M); // the window of __vx_local_mem_offset(size) (memory_hierarchy.cpp)
   if (schedule == 0)
   {
     mem_share2global(M);
