@@ -327,6 +327,19 @@ Module *run_triton_lo_mma(Module *M) {
   if (simt_here) pipe += "lo-gep,lo-tmask,lo-fdiv,lo-ex2,lo-fpext,lo-fma,";
   if (mma) pipe += triton_has_dot() ? "lo-mma<no-hoist;no-sched;no-f16;no-fp;lane-eval>,lo-saddr," : "lo-mma<no-hoist;no-sched;no-f16;no-fp>,";
   pipe += sched == 2 ? "lo-sched,lo-f16" : "verify";   // schedule 1 keeps what lo-mma's measurements found there
+  // Measurement only (experiments/ablation): CUPBOP_TRITON_SKIP=<pass,...> drops those passes (by name, before any <...>) from the pipeline above.
+  if (const char *k = std::getenv("CUPBOP_TRITON_SKIP"); k && *k) {
+    const std::string skip = std::string(",") + k + ",";
+    std::string out, item;
+    for (size_t i = 0; i <= pipe.size(); ++i) {
+      if (i < pipe.size() && pipe[i] != ',') { item += pipe[i]; continue; }
+      const std::string name = item.substr(0, item.find('<'));
+      if (!item.empty() && skip.find("," + name + ",") == std::string::npos) out += (out.empty() ? "" : ",") + item;
+      item.clear();
+    }
+    fprintf(stderr, "[lift-opt] CUPBOP_TRITON_SKIP=%s: %s -> %s\n", k, pipe.c_str(), out.empty() ? "verify" : out.c_str());
+    pipe = out.empty() ? "verify" : out;
+  }
   run_pipeline(M, pipe, nullptr);
   loTritonClearArcp(*M);
   VerifyModule(M);
