@@ -16,6 +16,15 @@
 // Kernel arguments and the CTA CSRs (block id, block size, grid size, CTA id and size) are uniform. The condition of
 // each conditional branch left uniform is wrapped in llvm.riscv.vx.uniform.i1.i1; nothing else changes.
 //
+// Warp votes (CUPBOP_UNIFORM_VOTE, default 1 under CUPBOP_UNIFORM_BR; 2026-11-16, experiments/llm_main): __any_sync,
+// __all_sync and __uniform_sync end in vx_vote, which hands one value to every active lane of the warp
+// (cudaKernelImpl.cpp), so their results are uniform whatever their operands; __ballot_sync too when its mask is a
+// constant (the result is the vote's bit mask ANDed with it). lo-ex2 / lo-fpext branch on such a vote
+// (lotriton.cpp anyLane). Left divergent, each of those branches got split/join, and where lo-tmask's copy made the
+// vote's operand a constant both sides were dead MUFU asm: the backend removed them, the empty split/join stayed and
+// the next branch merged into that block, and VortexBranchDivergence2 aborted ("unsupported divergent branch!",
+// Qwen3.5-0.8B conv1d+silu kernel, autotune config XBLOCK 1 YBLOCK 1024). CUPBOP_UNIFORM_VOTE=0: the analysis before.
+//
 // At the end of the translation: the optimizer has run, only the kernel compile sees the wrappers.
 #include "tool.h"
 #include "llvm/ADT/DenseSet.h"
@@ -44,6 +53,20 @@ namespace {
 int level() {
   static const int l = [] { const char *e = std::getenv("CUPBOP_UNIFORM_BR"); return e ? std::atoi(e) : 0; }();
   return l;
+}
+
+// a warp vote whose result every active lane of the warp shares (see the header)
+bool uniformVote(const CallBase &C) {
+  static const bool on = [] { const char *e = std::getenv("CUPBOP_UNIFORM_VOTE"); return !e || std::atoi(e) != 0; }();
+  if (!on) return false;
+  const Function *G = C.getCalledFunction();
+  if (!G) return false;
+  const StringRef n = G->getName();
+  if (n == "_Z10__any_syncib" || n == "_Z10__all_syncib" || n == "_Z14__uniform_syncib" ||
+      n == "llvm.nvvm.vote.any.sync" || n == "llvm.nvvm.vote.all.sync" || n == "llvm.nvvm.vote.uni.sync")
+    return true;
+  if (n == "_Z13__ballot_syncib" || n == "llvm.nvvm.vote.ballot.sync") return isa<Constant>(C.getArgOperand(0));
+  return false;
 }
 
 // the CSR number of a `csrr $0, 0x...` asm call, -1 for anything else
@@ -88,6 +111,8 @@ public:
         if (!I) continue;
         if (auto *II = dyn_cast<IntrinsicInst>(I))
           if (II->getIntrinsicID() == Intrinsic::riscv_vx_uniform) continue;
+        if (auto *C = dyn_cast<CallBase>(I))
+          if (uniformVote(*C)) continue;
         if (I->isTerminator()) { branch(I->getParent()); continue; }
         if (!I->getType()->isVoidTy()) mark(I);
       }
@@ -135,6 +160,7 @@ private:
     if (auto *L = dyn_cast<LoadInst>(&I)) return L->isAtomic() || privatePointer(L->getPointerOperand());
     if (auto *C = dyn_cast<CallBase>(&I)) {
       if (C->getType()->isVoidTy()) return false;
+      if (uniformVote(*C)) return false;
       if (C->isInlineAsm()) {
         const int c = csrOf(*C);
         return !ctaUniformCsr(c);
