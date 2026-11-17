@@ -1,0 +1,13 @@
+name: Clean runner logs
+on:
+  schedule:
+    - cron: "0 8 * * 0"   # Sundays 08:00 UTC
+  workflow_dispatch:
+jobs:
+  clean:
+    runs-on: [self-hosted]
+    steps:
+      - run: |
+          du -sh /projects/ci-runners/CuPBoP-Vortex/logs
+          rm -rf /projects/ci-runners/CuPBoP-Vortex/logs/*
+          du -sh /projects/ci-runners/CuPBoP-Vortex/logs
