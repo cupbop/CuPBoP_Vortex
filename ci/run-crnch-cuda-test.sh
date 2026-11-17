@@ -9,7 +9,7 @@
 # GPU not needed: Vortex simx is a pure CPU emulator. Removing --gres=gpu:1
 # lets multiple matrix jobs share a node (allocated by CPU/memory only)
 # instead of serializing on the 1 GPU per node.
-#SBATCH -o /tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-%j.out   # default only: ci.yml passes -o $CI_LOG_DIR/... (dir writable by the runner account)
+#SBATCH -o /projects/ci-runners/CuPBoP-Vortex/logs/CuPBoP-cuda-test-%j.out   # default only: ci.yml passes -o $CI_LOG_DIR/... (dir writable by the runner account)
 #SBATCH -W                                       # Do not exit until the submitted job terminates.
 
 # ci.yml "tests" job on Vortex 3.0: one matrix entry (TEST_NAME, VORTEX_SCHEDULE_FLAG, VORTEX_LOCALMEM_FLAG).
@@ -19,7 +19,7 @@
 cd $GITHUB_WORKSPACE
 hostname
 
-CI_LOG_DIR=${CI_LOG_DIR:-/tools/ci-reports/CuPBoP_logs}
+CI_LOG_DIR=${CI_LOG_DIR:-/projects/ci-runners/CuPBoP-Vortex/logs}
 export FINAL_OUTPUT_PATH="$CI_LOG_DIR/CuPBoP-cuda-test-${SLURM_JOB_ID}.out"
 apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBoP-Vortex/ ${CI_EXTRA_BINDS:+-B $CI_EXTRA_BINDS} /projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif /bin/bash << 'EOF_IN'
     set -e

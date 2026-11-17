@@ -101,7 +101,7 @@ A dry run of the exact workflow scripts from a fresh clone (`GITHUB_WORKSPACE=<c
 * Supporting libraries (Vortex 3.0 and its toolchain) can be reinstalled with the regular Vortex instructions; `tools/vortex_v3.0` is a plain git checkout and the toolchain is the v3.0.1 tarball set. Rebuilding SimX must happen in the Apptainer environment (the build job does it automatically when `VORTEX_CONFIGS` changes).
 * **CI needs to run at least once every 2 weeks or the self-hosted runner will need to be reactivated** (`.github/workflows/heartbeat.yml`).
 ## Troubleshooting
-* Log output can be found at `/tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-SLURM_NUMBER.out` for tests and builds (`<name>.out` links to the latest run of that example)
+* Log output can be found at `/projects/ci-runners/CuPBoP-Vortex/logs/CuPBoP-cuda-test-SLURM_NUMBER.out` for tests and builds (`<name>.out` links to the latest run of that example). If the runner account cannot write that directory, ci.yml falls back to `$GITHUB_WORKSPACE/ci/logs_runner/`, and the pass/fail check reads the log from the same directory it was written to
     * SLURM_NUMBER can be found in the GitHub Actions console log
 * `[VXDRV] Warning: CP has not retired a command in 10s` is SimX's poll warning on long kernels, not the failure
 * A kernel that aborts on the first atomic, hangs in `atomicCAS` or gets wrong counts across cores means the SimX was built without the A / Zacas / L2 flags — check `<build>/.cupbop_simx_configs`
