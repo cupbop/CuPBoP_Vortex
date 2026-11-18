@@ -1244,7 +1244,8 @@ void fast_entry_csr_runtime_calls(llvm::Module *M) {
 }
 
 // CUPBOP_MUFU: lower the approximate NVVM math intrinsics to the Vortex MUFU, the special-function unit of the SFU
-// (custom-2, vortex sw/kernel/include/vx_mufu.h, hardware key VX_CFG_EXT_MUFU_ENABLE).
+// (custom-2, vortex sw/kernel/include/vx_mufu.h, hardware key VX_CFG_EXT_MUFU_ENABLE; vx_tfu.h and VX_CFG_EXT_TFU_ENABLE
+// since upstream e6fd1c31f).
 //   unset/0  the translator's old path: libm exp2f/log2f calls, an fdiv for rcp, sqrt + fdiv for rsqrt.
 //   1        llvm.nvvm.{ex2,lg2}.approx[.ftz].f, llvm.nvvm.rcp.approx.ftz.f, llvm.nvvm.rsqrt.approx[.ftz].f -> MUFU.
 //   2        1, and llvm.exp2.f32 / llvm.log2.f32 too, as if they were the .ftz forms. llvm.exp2 means libm accuracy and
@@ -1260,8 +1261,9 @@ static int mufu_level() {
     const char *e = std::getenv("CUPBOP_MUFU");
     int l = e ? std::atoi(e) : 0;
     const char *cfg = std::getenv("VORTEX_CONFIGS");
-    if (l > 0 && cfg && !std::strstr(cfg, "-DVX_CFG_EXT_MUFU_ENABLE")) {
-      fprintf(stderr, "error: CUPBOP_MUFU=%d needs a Vortex build with -DVX_CFG_EXT_MUFU_ENABLE (VORTEX_CONFIGS: %s)\n", l, cfg);
+    // upstream Vortex e6fd1c31f (#469) renamed the MUFU to TFU (-DVX_CFG_EXT_TFU_ENABLE): same custom-2 encoding
+    if (l > 0 && cfg && !std::strstr(cfg, "-DVX_CFG_EXT_MUFU_ENABLE") && !std::strstr(cfg, "-DVX_CFG_EXT_TFU_ENABLE")) {
+      fprintf(stderr, "error: CUPBOP_MUFU=%d needs a Vortex build with -DVX_CFG_EXT_MUFU_ENABLE or -DVX_CFG_EXT_TFU_ENABLE (VORTEX_CONFIGS: %s)\n", l, cfg);
       exit(1);
     }
     return l;
