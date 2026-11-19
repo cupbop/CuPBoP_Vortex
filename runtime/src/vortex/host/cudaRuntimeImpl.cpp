@@ -2563,7 +2563,29 @@ cudaError_t cudaLaunchKernel_vortex(
   // ── DXA descriptor programming (before kernel launch) ──────────────────
   // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
   // for this kernel (resolved against this launch's arguments).
+  const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
+  if (coalesced_cp_async) {
+    uint64_t isa = 0, threads = 0, vm = 0;
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &threads));
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
+    if (threads != 8 || !(isa & VX_ISA_EXT_DXA) || vm) {
+      fprintf(stderr, "cudaLaunchKernel: coalesced cp.async requires an 8-lane DXA device with flat global memory\n");
+      std::abort();
+    }
+    DxaDescEntry descriptor{};
+    descriptor.slot = CUPBOP_CP_ASYNC_DXA_SLOT;
+    descriptor.rank = 1;
+    descriptor.elem_bytes = sizeof(uint32_t);
+    descriptor.size[0] = 1u << 30;
+    descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
+    dxa_program(DC->device(), descriptor);
+  }
   for (auto &desc : dxa_descriptors) {
+    if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", desc.slot);
+      std::abort();
+    }
     DBG_PRINT("[DXA] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
               desc.slot, desc.base_addr, desc.rank, desc.size[0], desc.size[1], desc.size[2], desc.stride[0],
               desc.stride[1], desc.box[0], desc.box[1], desc.box[2], desc.elem_bytes, desc.layout, desc.fill);
@@ -2594,6 +2616,10 @@ cudaError_t cudaLaunchKernel_vortex(
         memcpy(&d.size[1], args[adesc.dim1_arg_idx], sizeof(uint32_t));
       d.stride[0] = d.size[0] * adesc.elem_bytes;
       d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
+    }
+    if (coalesced_cp_async && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", d.slot);
+      std::abort();
     }
     DBG_PRINT("[DXA-auto] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
               d.slot, d.base_addr, d.rank, d.size[0], d.size[1], d.size[2], d.stride[0], d.stride[1],
@@ -2658,11 +2684,6 @@ cudaError_t cudaLaunchKernel_vortex(
       block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
       ndim = 3;
       lmem = cupbop_lmem_touched(table_name, cupbop_static_lmem_bytes(table_name) + (uint32_t)sharedMem, blockDim);
-      uint64_t lmem_cap = 0;
-      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
-        printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
-        std::abort();
-      }
     } else if (schedule == 1) {
       // core mapping (virt): CTA == CUDA block, but only P physical warps
       // (CUPBOP_VIRT_WARPS, default = all block warps). The kernel loops over
@@ -2739,6 +2760,13 @@ cudaError_t cudaLaunchKernel_vortex(
     if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
       cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, grid, block, lmem);
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
+    if (schedule == 1 || schedule == 2) {
+      uint64_t lmem_cap = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
+        printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
+        std::abort();
+      }
+    }
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch

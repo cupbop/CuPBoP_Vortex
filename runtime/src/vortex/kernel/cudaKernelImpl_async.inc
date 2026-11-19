@@ -150,6 +150,38 @@ static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t 
                                                                       uint32_t c2, uint32_t c3, uint32_t c4) {
   cupbop_tma_dxa_issue_meta((bar << 4) | slot, smem, rank, c0, c1, c2, c3, c4);
 }
+#if defined(VX_CFG_EXT_DXA_ENABLE) && VX_CFG_NUM_THREADS == 8
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_cp_async_dxa16(
+    void *dst, const void *src, uint32_t read_source) {
+  const unsigned cta_warps = csr_read_nv(VX_CSR_CTA_SIZE);
+  const unsigned barriers = vx_num_barriers();
+  if (vx_active_threads() == 0xff && cta_warps < barriers) {
+    const uintptr_t source = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t destination = reinterpret_cast<uintptr_t>(dst);
+    const uintptr_t source_base = vx_shfl_idx(source, 0, 7, 0);
+    const uintptr_t destination_base = vx_shfl_idx(destination, 0, 7, 0);
+    constexpr unsigned copy_bytes = CUPBOP_CP_ASYNC_DXA_WORDS * sizeof(uint32_t);
+    const unsigned lane_offset = vx_thread_id() * 16;
+    const bool contiguous = (read_source != 0) & (source == source_base + lane_offset) &
+                            (destination == destination_base + lane_offset);
+    if (((source_base | destination_base) % 16 == 0) && source_base <= UINT32_MAX - (copy_bytes - 1) &&
+        vx_vote_all(contiguous)) {
+      const unsigned barrier_number = barriers - cta_warps + csr_read_nv(VX_CSR_CTA_RANK);
+      const unsigned barrier = (barrier_number << 8) + csr_read_nv(VX_CSR_CTA_ID);
+      vx_fence();
+      vx_barrier_expect_tx(barrier, 1);
+      cupbop_tma_dxa_issue(CUPBOP_CP_ASYNC_DXA_SLOT, barrier, reinterpret_cast<void *>(destination_base),
+                           1, source_base / sizeof(uint32_t), 0, 0, 0, 0);
+      vx_barrier(barrier, 1);
+      return;
+    }
+  }
+  const auto *input = static_cast<const volatile uint32_t *>(src);
+  auto *output = static_cast<volatile uint32_t *>(dst);
+  for (int word = 0; word < 4; ++word)
+    output[word] = read_source ? input[word] : 0;
+}
+#endif
 static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, const void *s, uint32_t e) {
   switch (e) {
   case 1: *(uint8_t *)d = *(const uint8_t *)s; break;

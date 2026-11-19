@@ -1337,7 +1337,68 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_movmatrix_m8
     out[j] = ((x >> sh) & 0xffffu) | (((y >> sh) & 0xffffu) << 16);
   }
 }
-#endif // NT=32 helpers / NT=16 glue
+#elif VX_CFG_NUM_THREADS == 8
+template <class CTX>
+static inline void __cupbop_mma_m16n8k16_glue8_impl(const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  static_assert(CTX::tileM == 8 && CTX::tileN == 8 && CTX::tileK == 16);
+  const int lane = vx_thread_id();
+  const int native_row = lane / 2;
+  const int parity = lane % 2;
+  typename CTX::fragment_b frag_b;
+  for (int reg = 0; reg < CTX::fragment_b::NR; ++reg) {
+    const int word = 2 * (reg / 2) + parity;
+    const int source = 4 * native_row + word % 4;
+    const int first_pass = 2 * (reg % 2);
+    const uint32_t low = vx_shfl_idx(b[2 * first_pass + word / 4], source % 8, 7, 0);
+    const uint32_t high = vx_shfl_idx(b[2 * (first_pass + 1) + word / 4], source % 8, 7, 0);
+    frag_b.data[reg] = __cupbop_u32_as_f32(source < 8 ? low : high);
+  }
+  for (int row_half = 0; row_half < 2; ++row_half) {
+    typename CTX::fragment_a frag_a;
+    typename CTX::fragment_acc frag_c, frag_d;
+    for (int reg = 0; reg < CTX::fragment_a::NR; ++reg) {
+      const int word = 2 * (reg % 4) + parity;
+      const int source = 4 * native_row + word % 4;
+      const int first_pass = 2 * (reg / 4);
+      const int source_reg = 2 * (word / 4) + row_half;
+      const uint32_t low = vx_shfl_idx(a[4 * first_pass + source_reg], source % 8, 7, 0);
+      const uint32_t high = vx_shfl_idx(a[4 * (first_pass + 1) + source_reg], source % 8, 7, 0);
+      frag_a.data[reg] = __cupbop_u32_as_f32(source < 8 ? low : high);
+    }
+    for (int reg = 0; reg < CTX::fragment_acc::NR; ++reg) {
+      const int source = 4 * native_row + reg % 4;
+      const int first_pass = 2 * (reg / 4);
+      const int source_reg = 2 * row_half;
+      const float low_even = __cupbop_shflf(c[4 * first_pass + source_reg], source % 8);
+      const float low_odd = __cupbop_shflf(c[4 * first_pass + source_reg + 1], source % 8);
+      const float high_even = __cupbop_shflf(c[4 * (first_pass + 1) + source_reg], source % 8);
+      const float high_odd = __cupbop_shflf(c[4 * (first_pass + 1) + source_reg + 1], source % 8);
+      frag_c.data[reg] = source < 8 ? (parity ? low_odd : low_even) : (parity ? high_odd : high_even);
+    }
+    CTX::mma_sync(frag_d, frag_a, frag_b, frag_c);
+    for (int pass = 0; pass < 4; ++pass) {
+      const int source_row = (lane + 8 * pass) / 4;
+      for (int column = 0; column < 2; ++column) {
+        const int source = 2 * (source_row % 4) + column;
+        float result = 0.0f;
+        for (int pair = 0; pair < 4; ++pair) {
+          const float value = __cupbop_shflf(frag_d.data[4 * (pass / 2) + pair], source);
+          if (pair == lane % 4) result = value;
+        }
+        d[4 * pass + 2 * row_half + column] = result;
+      }
+    }
+  }
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f32_glue8(
+    const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  __cupbop_mma_m16n8k16_glue8_impl<tcu_ctx>(a, b, c, d);
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_bf16f32_glue8(
+    const uint32_t *a, const uint32_t *b, const float *c, float *d) {
+  __cupbop_mma_m16n8k16_glue8_impl<tcu_ctx_bf16>(a, b, c, d);
+}
+#endif // TCU helpers by warp width
 // One TCU tile operation on fragments the caller already holds in <vx_tensor.h>'s own register order for this build's warp
 // (wmma_context<VX_CFG_NUM_THREADS, fp16, fp32>; NT=16: tile m16n8k16, a 8, b 4, c and d 8 registers per lane): d = a*b + c.
 // a, b: two fp16 per 32-bit word, the lower k in the low half; c, d: fp32; d may be c. No shuffles, no layout change: for

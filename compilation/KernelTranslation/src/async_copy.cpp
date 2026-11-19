@@ -191,7 +191,7 @@ static Value *zfillReadAddress(IRBuilder<> &B, Module *M, Value *dst) {
 
 // Emit the synchronous copy of one cp.async in front of S.call.
 void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> &DTs, unsigned &n_traced,
-              unsigned &n_inttoptr) {
+              unsigned &n_inttoptr, bool coalescedDxa, unsigned &nDxa) {
   LLVMContext &ctx = S.call->getContext();
   IRBuilder<> B(S.call);
   Type *I8 = Type::getInt8Ty(ctx), *I32 = Type::getInt32Ty(ctx), *I64 = Type::getInt64Ty(ctx);
@@ -254,6 +254,17 @@ void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> 
     }
   }
 
+  if (coalescedDxa && S.cp == 16 && (is_const ? const_size == 16 : !partial_possible)) {
+    auto *module = S.call->getModule();
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto helper = module->getOrInsertFunction("__cupbop_cp_async_dxa16",
+        FunctionType::get(Type::getVoidTy(ctx), {ptr, ptr, I32}, false));
+    cast<Function>(helper.getCallee())->addFnAttr(Attribute::Convergent);
+    Value *readSource = is_const ? ConstantInt::get(I32, 1) : B.CreateZExt(full, I32);
+    B.CreateCall(helper, {toGeneric(B, dst), src, readSource})->addFnAttr(Attribute::Convergent);
+    ++nDxa;
+    return;
+  }
   if (is_const) {
     if (const_size == 0) {
       B.CreateAlignedStore(zero, dst, al);
@@ -327,6 +338,26 @@ bool mentionsAsync(const std::string &s) {
 } // namespace
 
 void lower_cp_async(Module *M) {
+  std::remove("cupbop_cp_async_dxa.txt");
+  const char *requested = std::getenv("CUPBOP_CP_ASYNC_COALESCED_DXA");
+  const char *configs = std::getenv("VORTEX_CONFIGS");
+  const char *localMemory = std::getenv("VORTEX_LOCALMEM_FLAG");
+  const VirtGeom geometry = getVirtGeom();
+  bool coalescedDxa = requested && std::atoi(requested) && geometry.schedule == 1 &&
+      geometry.nt == 8 && geometry.lanes == 8 && (!localMemory || std::atoi(localMemory) == 1) && configs &&
+      vortexConfigHasFlag("-DVX_CFG_EXT_DXA_ENABLE") &&
+      !vortexConfigHasFlag("-DVX_CFG_VM_ENABLE") &&
+      !M->getNamedMetadata("vx.dxa.desc") && !cupbop_dxa_sidecar_written;
+  if (coalescedDxa) {
+    for (const Function &function : *M) {
+      StringRef name = function.getName();
+      if (!function.use_empty() && (name.starts_with("__cupbop_bar_") || name.starts_with("__cupbop_mbar_") ||
+          name.starts_with("__cupbop_tma_") || name.contains("__vx_dxa_") || name.contains("__vx_barrier_"))) {
+        coalescedDxa = false;
+        break;
+      }
+    }
+  }
   std::map<Function *, std::unique_ptr<DominatorTree>> DTs;
   std::vector<CopySite> copies;
   std::vector<CallInst *> commits, waits;
@@ -428,9 +459,9 @@ void lower_cp_async(Module *M) {
       }
 
   if (copies.empty() && commits.empty() && waits.empty()) return;
-  unsigned n_traced = 0, n_i2p = 0;
+  unsigned n_traced = 0, n_i2p = 0, nDxa = 0;
   for (auto &S : copies) {
-    emitCopy(S, DTs, n_traced, n_i2p);
+    emitCopy(S, DTs, n_traced, n_i2p, coalescedDxa, nDxa);
     S.call->eraseFromParent();
   }
   for (auto *C : commits) C->eraseFromParent();
@@ -440,9 +471,19 @@ void lower_cp_async(Module *M) {
     B.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
     C->eraseFromParent();
   }
-  fprintf(stderr, "[CuPBoP] cp.async lowered to synchronous copies: %zu copies (%u pointer operands traced, %u "
+  fprintf(stderr, "[CuPBoP] cp.async lowered%s: %zu copies (%u pointer operands traced, %u "
                   "integer addresses), %zu commit_group, %zu wait_group/wait_all\n",
-          copies.size(), n_traced, n_i2p, commits.size(), waits.size());
+          nDxa ? "" : " to synchronous copies", copies.size(), n_traced, n_i2p, commits.size(), waits.size());
+  if (nDxa) {
+    std::ofstream marker("cupbop_cp_async_dxa.txt");
+    marker << "8\n";
+    marker.close();
+    if (!marker) {
+      fprintf(stderr, "error: could not write cupbop_cp_async_dxa.txt\n");
+      exit(1);
+    }
+    fprintf(stderr, "[CuPBoP] cp.async: %u sites can use coalesced DXA\n", nDxa);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------

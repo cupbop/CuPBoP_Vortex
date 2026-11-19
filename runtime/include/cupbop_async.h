@@ -5,6 +5,9 @@
 
 #include <stdint.h>
 
+#define CUPBOP_CP_ASYNC_DXA_SLOT 7u
+#define CUPBOP_CP_ASYNC_DXA_WORDS 32u
+
 // ---- tensor map (CUtensorMap, 128 bytes) -------------------------------------------------------
 // cuTensorMapEncodeTiled (host shim, cudaRuntimeImpl.cpp) writes this record into the user's 128-byte
 // CUtensorMap and uploads a copy to device memory. `self` is the device address of that copy and is the

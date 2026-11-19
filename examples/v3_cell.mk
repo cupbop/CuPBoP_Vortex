@@ -65,7 +65,12 @@ VX_CFLAGS += -mllvm -vortex-divergence-max-bbs=$(CUPBOP_DIV_MAX_BBS)
 # token that was never pushed ("IPDOM stack is empty!"): lifted cuDNN ctc_loss compute_grads_deterministic and the
 # CUTLASS 00_basic_gemm SIMT sgemm (2026-10-29; both PASS with the limit raised).
 CUPBOP_STRUCT_MAX_BBS ?= 1000000
+# vortexgpgpu/llvm vortex_3.x from 2188e6640727 (2026-10-13) has no -structurizecfg-max-bbs: StructurizeCFG there skips exactly
+# the functions VortexBranchDivergence0 skips, which -vortex-divergence-max-bbs above already raises. Pass the flag only to an
+# LLVM that still has it (an unknown -mllvm option aborts the compile).
+ifneq ($(shell $(LLVM_PATH)/bin/llc -help-hidden 2>/dev/null | grep -c -- '-structurizecfg-max-bbs='),0)
 VX_CFLAGS += -mllvm -structurizecfg-max-bbs=$(CUPBOP_STRUCT_MAX_BBS)
+endif
 # Extra kernel-compile flags from the environment (empty by default), e.g. CUPBOP_VX_EXTRA_CFLAGS="-mllvm
 # -split-spill-mode=size" works around an LLVM 20 RAGreedy crash (SplitEditor::deleteRematVictims) seen on the
 # lifted PyTorch reduce_kernel (global_avgpool).

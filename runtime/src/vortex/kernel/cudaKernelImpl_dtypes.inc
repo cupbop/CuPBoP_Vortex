@@ -644,21 +644,33 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_
   __cupbop_mma_m16n8k8_f16f32_sw(a0, a1, b0, e0, e1, e2, e3, dd);
   CUPBOP_F16ACC_PACK;
 }
-#if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE) && VX_CFG_NUM_THREADS == 16
-// NT=16 sub-pass form: f16 accumulators through the f32 glue, same model as the f32 helper above. Slots per pass:
-// c / d[2 * pass + i] = the two f16x2 registers of logical lane L = h + 16 pass.
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
-  float fc[8], fd[8];
-  for (int p = 0; p < 2; p++) {
-    fc[4 * p + 0] = __cupbop_f16_to_f32(c[2 * p]);     fc[4 * p + 1] = __cupbop_f16_to_f32(c[2 * p] >> 16);
-    fc[4 * p + 2] = __cupbop_f16_to_f32(c[2 * p + 1]); fc[4 * p + 3] = __cupbop_f16_to_f32(c[2 * p + 1] >> 16);
+#if defined(VX_CFG_EXT_TCU_ENABLE) && (VX_CFG_NUM_THREADS == 8 || VX_CFG_NUM_THREADS == 16)
+template <int Lanes, class Compute>
+static inline void __cupbop_staged_f16acc(const uint32_t *c, uint32_t *d, Compute compute) {
+  constexpr int Passes = 32 / Lanes;
+  float fc[4 * Passes], fd[4 * Passes];
+  for (int pass = 0; pass < Passes; ++pass) {
+    for (int word = 0; word < 2; ++word) {
+      const uint32_t packed = c[2 * pass + word];
+      fc[4 * pass + 2 * word] = __cupbop_f16_to_f32(packed);
+      fc[4 * pass + 2 * word + 1] = __cupbop_f16_to_f32(packed >> 16);
+    }
   }
-  __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx>(a, b, fc, fd);
-  for (int p = 0; p < 2; p++) {
-    d[2 * p] = __cupbop_pack_f16x2_rne(fd[4 * p], fd[4 * p + 1]);
-    d[2 * p + 1] = __cupbop_pack_f16x2_rne(fd[4 * p + 2], fd[4 * p + 3]);
-  }
+  compute(fc, fd);
+  for (int pass = 0; pass < Passes; ++pass)
+    for (int word = 0; word < 2; ++word)
+      d[2 * pass + word] = __cupbop_pack_f16x2_rne(fd[4 * pass + 2 * word], fd[4 * pass + 2 * word + 1]);
 }
+#if VX_CFG_NUM_THREADS == 16
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  __cupbop_staged_f16acc<16>(c, d, [&](float *fc, float *fd) { __cupbop_mma_m16n8k16_glue16_impl<tcu_ctx>(a, b, fc, fd); });
+}
+#else
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_glue8(
+    const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  __cupbop_staged_f16acc<8>(c, d, [&](float *fc, float *fd) { __cupbop_mma_m16n8k16_glue8_impl<tcu_ctx>(a, b, fc, fd); });
+}
+#endif
 #endif
 #if defined(CUPBOP_MMA_TCU_AVAILABLE)
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_tcu(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -815,49 +827,68 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n
     }
   }
 }
-// 16-lane sub-pass form (S = 2): st[pass] holds each lane's address, out / v[4 * pass + j] the registers of logical lane
-// L = h + 16 pass (replaceLdStMatrixStaged). Matrix j's row r comes from logical lane 8j + r: hardware lane 8(j&1) + r of
-// slot j>>1. Runs once per CUDA warp on all 16 hardware lanes, num and trans are constants after inlining.
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, uint32_t *out) {
-  const int h = vx_thread_id(), t = h & 3;
-  for (int j = 0; j < num; ++j) {
-    const uint32_t as = st[j >> 1];
-    const int base = 8 * (j & 1);
+// Matrix j's row r is supplied by logical lane 8*j+r. All eight row addresses
+// of the matrix come from the same sub-pass.
+template <int Lanes>
+static inline void __cupbop_ldmatrix_staged(const uint32_t *addresses, int num, int trans, uint32_t *out) {
+  const int lane = vx_thread_id(), column_pair = lane & 3;
+  for (int matrix = 0; matrix < num; ++matrix) {
+    const uint32_t address = addresses[8 * matrix / Lanes];
+    const int first_lane = (8 * matrix) % Lanes;
     if (!trans) {
-      for (int p = 0; p < 2; ++p) {
-        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
-        out[4 * p + j] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t);
+      for (int pass = 0; pass < 32 / Lanes; ++pass) {
+        const int row_lane = first_lane + (lane + Lanes * pass) / 4;
+        const uint32_t row = vx_shfl_idx(address, row_lane, Lanes - 1, 0);
+        out[4 * pass + matrix] = *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * column_pair);
       }
     } else {
-      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
-      for (int p = 0; p < 2; ++p) {
-        const int g = (h >> 2) + 4 * p;
-        const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g), hi = *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g);
-        out[4 * p + j] = lo | (hi << 16);
+      const uint32_t row_lo = vx_shfl_idx(address, first_lane + 2 * column_pair, Lanes - 1, 0);
+      const uint32_t row_hi = vx_shfl_idx(address, first_lane + 2 * column_pair + 1, Lanes - 1, 0);
+      for (int pass = 0; pass < 32 / Lanes; ++pass) {
+        const int column = (lane + Lanes * pass) / 4;
+        const uint32_t lo = *(volatile uint16_t *)(__cupbop_smem_ptr(row_lo) + 2 * column);
+        const uint32_t hi = *(volatile uint16_t *)(__cupbop_smem_ptr(row_hi) + 2 * column);
+        out[4 * pass + matrix] = lo | (hi << 16);
       }
     }
   }
 }
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16_glue16(const uint32_t *st, int num, int trans, const uint32_t *v) {
-  const int h = vx_thread_id(), t = h & 3;
-  for (int j = 0; j < num; ++j) {
-    const uint32_t as = st[j >> 1];
-    const int base = 8 * (j & 1);
+template <int Lanes>
+static inline void __cupbop_stmatrix_staged(const uint32_t *addresses, int num, int trans, const uint32_t *values) {
+  const int lane = vx_thread_id(), column_pair = lane & 3;
+  for (int matrix = 0; matrix < num; ++matrix) {
+    const uint32_t address = addresses[8 * matrix / Lanes];
+    const int first_lane = (8 * matrix) % Lanes;
     if (!trans) {
-      for (int p = 0; p < 2; ++p) {
-        const uint32_t row = (uint32_t)vx_shfl_idx((size_t)as, base + (h >> 2) + 4 * p, 15, 0);
-        *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * t) = v[4 * p + j];
+      for (int pass = 0; pass < 32 / Lanes; ++pass) {
+        const int row_lane = first_lane + (lane + Lanes * pass) / 4;
+        const uint32_t row = vx_shfl_idx(address, row_lane, Lanes - 1, 0);
+        *(volatile uint32_t *)(__cupbop_smem_ptr(row) + 4 * column_pair) = values[4 * pass + matrix];
       }
     } else {
-      const uint32_t r0 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t, 15, 0), r1 = (uint32_t)vx_shfl_idx((size_t)as, base + 2 * t + 1, 15, 0);
-      for (int p = 0; p < 2; ++p) {
-        const int g = (h >> 2) + 4 * p;
-        *(volatile uint16_t *)(__cupbop_smem_ptr(r0) + 2 * g) = (uint16_t)v[4 * p + j];
-        *(volatile uint16_t *)(__cupbop_smem_ptr(r1) + 2 * g) = (uint16_t)(v[4 * p + j] >> 16);
+      const uint32_t row_lo = vx_shfl_idx(address, first_lane + 2 * column_pair, Lanes - 1, 0);
+      const uint32_t row_hi = vx_shfl_idx(address, first_lane + 2 * column_pair + 1, Lanes - 1, 0);
+      for (int pass = 0; pass < 32 / Lanes; ++pass) {
+        const int column = (lane + Lanes * pass) / 4;
+        const uint32_t word = values[4 * pass + matrix];
+        *(volatile uint16_t *)(__cupbop_smem_ptr(row_lo) + 2 * column) = word;
+        *(volatile uint16_t *)(__cupbop_smem_ptr(row_hi) + 2 * column) = word >> 16;
       }
     }
   }
 }
+#define CUPBOP_MATRIX_GLUE(LANES) \
+  extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16_glue##LANES( \
+      const uint32_t *addresses, int num, int trans, uint32_t *out) { \
+    __cupbop_ldmatrix_staged<LANES>(addresses, num, trans, out); \
+  } \
+  extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16_glue##LANES( \
+      const uint32_t *addresses, int num, int trans, const uint32_t *values) { \
+    __cupbop_stmatrix_staged<LANES>(addresses, num, trans, values); \
+  }
+CUPBOP_MATRIX_GLUE(8)
+CUPBOP_MATRIX_GLUE(16)
+#undef CUPBOP_MATRIX_GLUE
 
 
 // ---- redux.sync.<op>.b32 v, membermask (sm_80+): reduction over the mask's lanes (index shuffles, any mask) ----------
@@ -1092,27 +1123,31 @@ CUPBOP_MMAF_K8(f16f16, uint32_t, __cupbop_mmaf_seq_k8h, __cupbop_mmaf_tcu_f16acc
 #undef CUPBOP_MMAF_TCU
 #undef CUPBOP_MMAF_PICK
 
-// ---- NT=16 sub-pass form (S = 2): software glue --------------------------------------------------------------------
-// The CUDA warp's 32 lanes are two passes of a 16-lane hardware warp. The translator stages every pass's registers in
-// per-thread slots (replaceMmaStaged, replaceReduxStaged: A stride 4 words, B 2, C/D the form's register count) and every
-// hardware lane runs the glue once per CUDA warp, for both logical lanes L = h + 16 pass. Same arithmetic as the 32-lane
-// _sw helpers above; only the source of a lane's register differs: __cupbop_g16 reads word r of logical lane src, hardware
-// lane src & 15, slot src >> 4. Any NT=16 build (no TCU needed). Numerics as the _sw helpers.
-#if VX_CFG_NUM_THREADS == 16
-static inline uint32_t __cupbop_g16(const uint32_t *st, int stride, int r, int src) {
-  const uint32_t x0 = (uint32_t)vx_shfl_idx((size_t)st[r], src & 15, 15, 0), x1 = (uint32_t)vx_shfl_idx((size_t)st[stride + r], src & 15, 15, 0);
-#ifdef CUPBOP_GLUE16_SWAP_PASSES // negative control of the tests only (wrong results)
-  return (src >> 4) ? x0 : x1;
+// The software implementation gathers each CUDA lane's operand from its saved sub-pass.
+#if VX_CFG_NUM_THREADS == 8 || VX_CFG_NUM_THREADS == 16
+static constexpr int StagedPasses = 32 / VX_CFG_NUM_THREADS;
+#define CUPBOP_SW_GLUE_NAME_(NAME, LANES) NAME##_sw_glue##LANES
+#define CUPBOP_SW_GLUE_NAME(NAME, LANES) CUPBOP_SW_GLUE_NAME_(NAME, LANES)
+#define CUPBOP_SW_GLUE(NAME) CUPBOP_SW_GLUE_NAME(NAME, VX_CFG_NUM_THREADS)
+static inline uint32_t __cupbop_staged_word(const uint32_t *st, int stride, int word, int src) {
+  const int source_lane = src % VX_CFG_NUM_THREADS;
+  int source_pass = src / VX_CFG_NUM_THREADS;
+#if VX_CFG_NUM_THREADS == 16 && defined(CUPBOP_GLUE16_SWAP_PASSES)
+  source_pass ^= 1;
 #endif
-  return (src >> 4) ? x1 : x0;
+  uint32_t result = 0;
+  for (int pass = 0; pass < StagedPasses; ++pass) {
+    const uint32_t value = vx_shfl_idx(st[pass * stride + word], source_lane, VX_CFG_NUM_THREADS - 1, 0);
+    if (pass == source_pass) result = value;
+  }
+  return result;
 }
-// mma.sync m16n8kK: __cupbop_mma16n8_sw for the two logical lanes of this hardware lane
 template <class EA, class EB, int KW, bool SAT>
-static inline void __cupbop_mma16n8_sw16(const uint32_t *stA, const uint32_t *stB, const uint32_t *stC, uint32_t *stD) {
+static inline void __cupbop_mma16n8_staged_sw(const uint32_t *stA, const uint32_t *stB, const uint32_t *stC, uint32_t *stD) {
   static_assert(EA::is_int == EB::is_int && EA::n == EB::n, "mixed int/float operands");
   const int h = vx_thread_id();
-  for (int p = 0; p < 2; ++p) {
-    const int lane = h + 16 * p, g = lane >> 2, t = lane & 3;
+  for (int p = 0; p < StagedPasses; ++p) {
+    const int lane = h + VX_CFG_NUM_THREADS * p, g = lane >> 2, t = lane & 3;
     const int la = g << 2, lb0 = (2 * t) << 2, lb1 = (2 * t + 1) << 2;
     const uint32_t *C = stC + 4 * p;
     uint32_t *D = stD + 4 * p;
@@ -1124,8 +1159,8 @@ static inline void __cupbop_mma16n8_sw16(const uint32_t *stA, const uint32_t *st
         // .satfinite: the hardware saturates after every 4 words of K (A100, experiments/nt16cov/cases/mma_forms), not only at the end
         if (SAT && kk == 4) { s0 = clamp(s0); s1 = clamp(s1); s2 = clamp(s2); s3 = clamp(s3); }
         const int q = kk & 3, hiA = kk < 4 ? 0 : 2, hiB = kk < 4 ? 0 : 1;
-        const uint32_t xa = __cupbop_g16(stA, 4, hiA, la | q), ya = __cupbop_g16(stA, 4, hiA + 1, la | q);
-        const uint32_t ub = __cupbop_g16(stB, 2, hiB, lb0 | q), vb = __cupbop_g16(stB, 2, hiB, lb1 | q);
+        const uint32_t xa = __cupbop_staged_word(stA, 4, hiA, la | q), ya = __cupbop_staged_word(stA, 4, hiA + 1, la | q);
+        const uint32_t ub = __cupbop_staged_word(stB, 2, hiB, lb0 | q), vb = __cupbop_staged_word(stB, 2, hiB, lb1 | q);
         for (int i = 0; i < EA::n; ++i) {
           const int32_t ag = EA::get(xa, i), ag8 = EA::get(ya, i), b0 = EB::get(ub, i), b1 = EB::get(vb, i);
           if constexpr (SAT) { s0 += ag * b0; s1 += ag * b1; s2 += ag8 * b0; s3 += ag8 * b1; }
@@ -1141,8 +1176,8 @@ static inline void __cupbop_mma16n8_sw16(const uint32_t *stA, const uint32_t *st
       float d0 = __cupbop_bits_f32(C[0]), d1 = __cupbop_bits_f32(C[1]), d2 = __cupbop_bits_f32(C[2]), d3 = __cupbop_bits_f32(C[3]);
       for (int kk = 0; kk < KW; ++kk) {
         const int q = kk & 3, hiA = kk < 4 ? 0 : 2, hiB = kk < 4 ? 0 : 1;
-        const uint32_t xa = __cupbop_g16(stA, 4, hiA, la | q), ya = __cupbop_g16(stA, 4, hiA + 1, la | q);
-        const uint32_t ub = __cupbop_g16(stB, 2, hiB, lb0 | q), vb = __cupbop_g16(stB, 2, hiB, lb1 | q);
+        const uint32_t xa = __cupbop_staged_word(stA, 4, hiA, la | q), ya = __cupbop_staged_word(stA, 4, hiA + 1, la | q);
+        const uint32_t ub = __cupbop_staged_word(stB, 2, hiB, lb0 | q), vb = __cupbop_staged_word(stB, 2, hiB, lb1 | q);
         for (int i = 0; i < EA::n; ++i) {
           const float ag = EA::get(xa, i), ag8 = EA::get(ya, i), b0 = EB::get(ub, i), b1 = EB::get(vb, i);
           d0 += ag * b0; d1 += ag * b1; d2 += ag8 * b0; d3 += ag8 * b1;
@@ -1153,8 +1188,8 @@ static inline void __cupbop_mma16n8_sw16(const uint32_t *stA, const uint32_t *st
   }
 }
 #define CUPBOP_GLUE16_SW(NAME, EA, EB, KW, SAT)                                                                          \
-  extern "C" __attribute__((always_inline, convergent)) void NAME##_sw_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) { \
-    __cupbop_mma16n8_sw16<EA, EB, KW, SAT>(a, b, c, d);                                                                  \
+  extern "C" __attribute__((always_inline, convergent)) void CUPBOP_SW_GLUE(NAME)(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) { \
+    __cupbop_mma16n8_staged_sw<EA, EB, KW, SAT>(a, b, c, d);                                                             \
   }
 CUPBOP_GLUE16_SW(__cupbop_mma_m16n8k16_f16f32,  __cupbop_el_f16,  __cupbop_el_f16,  8, false)
 CUPBOP_GLUE16_SW(__cupbop_mma_m16n8k8_f16f32,   __cupbop_el_f16,  __cupbop_el_f16,  4, false)
@@ -1181,33 +1216,33 @@ CUPBOP_GLUE16_SW(__cupbop_mma_m16n8k32_e5m2e4m3f32, __cupbop_el_e5m2, __cupbop_e
 #undef CUPBOP_GLUE16_SW
 // f16 accumulators: c / d[2 * pass + i] = the two f16x2 registers, the model of the f32-accumulator helper (one rounding)
 template <int KW>
-static inline void __cupbop_mma16n8_f16acc_sw16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
-  uint32_t fc[8], fd[8];
-  for (int p = 0; p < 2; p++) {
+static inline void __cupbop_mma16n8_f16acc_staged_sw(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  uint32_t fc[4 * StagedPasses], fd[4 * StagedPasses];
+  for (int p = 0; p < StagedPasses; p++) {
     fc[4 * p + 0] = __cupbop_f32_bits(__cupbop_f16_to_f32(c[2 * p]));     fc[4 * p + 1] = __cupbop_f32_bits(__cupbop_f16_to_f32(c[2 * p] >> 16));
     fc[4 * p + 2] = __cupbop_f32_bits(__cupbop_f16_to_f32(c[2 * p + 1])); fc[4 * p + 3] = __cupbop_f32_bits(__cupbop_f16_to_f32(c[2 * p + 1] >> 16));
   }
-  __cupbop_mma16n8_sw16<__cupbop_el_f16, __cupbop_el_f16, KW, false>(a, b, fc, fd);
-  for (int p = 0; p < 2; p++) {
+  __cupbop_mma16n8_staged_sw<__cupbop_el_f16, __cupbop_el_f16, KW, false>(a, b, fc, fd);
+  for (int p = 0; p < StagedPasses; p++) {
     d[2 * p] = __cupbop_pack_f16x2_rne(__cupbop_bits_f32(fd[4 * p]), __cupbop_bits_f32(fd[4 * p + 1]));
     d[2 * p + 1] = __cupbop_pack_f16x2_rne(__cupbop_bits_f32(fd[4 * p + 2]), __cupbop_bits_f32(fd[4 * p + 3]));
   }
 }
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k16_f16f16_sw_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
-  __cupbop_mma16n8_f16acc_sw16<8>(a, b, c, d);
+extern "C" __attribute__((always_inline, convergent)) void CUPBOP_SW_GLUE(__cupbop_mma_m16n8k16_f16f16)(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  __cupbop_mma16n8_f16acc_staged_sw<8>(a, b, c, d);
 }
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m16n8k8_f16f16_sw_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
-  __cupbop_mma16n8_f16acc_sw16<4>(a, b, c, d);
+extern "C" __attribute__((always_inline, convergent)) void CUPBOP_SW_GLUE(__cupbop_mma_m16n8k8_f16f16)(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+  __cupbop_mma16n8_f16acc_staged_sw<4>(a, b, c, d);
 }
 // m8n8k4 f64 (DMMA.884): a double is two words of its slot (A word 0,1 of stride 4; B of stride 2; C/D two doubles)
 static inline double __cupbop_g16_f64(const uint32_t *st, int stride, int src) {
-  const uint64_t u = ((uint64_t)__cupbop_g16(st, stride, 1, src) << 32) | __cupbop_g16(st, stride, 0, src);
+  const uint64_t u = ((uint64_t)__cupbop_staged_word(st, stride, 1, src) << 32) | __cupbop_staged_word(st, stride, 0, src);
   double r; __builtin_memcpy(&r, &u, 8); return r;
 }
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f64f64_sw_glue16(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
+extern "C" __attribute__((always_inline, convergent)) void CUPBOP_SW_GLUE(__cupbop_mma_m8n8k4_f64f64)(const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {
   const int h = vx_thread_id();
-  for (int p = 0; p < 2; ++p) {
-    const int lane = h + 16 * p, g = lane >> 2, t = lane & 3;
+  for (int p = 0; p < StagedPasses; ++p) {
+    const int lane = h + VX_CFG_NUM_THREADS * p, g = lane >> 2, t = lane & 3;
     double acc[2];
     __builtin_memcpy(acc, c + 4 * p, 16);
     for (int k = 0; k < 4; ++k) {
@@ -1221,22 +1256,22 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f
 }
 // m8n8k4 f16 -> f32 (Volta HMMA.884): __cupbop_mma_m8n8k4_f16f32_impl for both logical lanes; C/D 8 registers per pass
 template <int A_ROW, int B_ROW>
-static inline void __cupbop_mma884_sw16(const uint32_t *stA, const uint32_t *stB, const uint32_t *stC, uint32_t *stD) {
+static inline void __cupbop_mma884_staged_sw(const uint32_t *stA, const uint32_t *stB, const uint32_t *stC, uint32_t *stD) {
   const int h = vx_thread_id();
-  for (int p = 0; p < 2; ++p) {
-    const int l = h + 16 * p, q4 = l & 12, hi16 = l & 16, x = l & 1, y = l & 2;
+  for (int p = 0; p < StagedPasses; ++p) {
+    const int l = h + VX_CFG_NUM_THREADS * p, q4 = l & 12, hi16 = l & 16, x = l & 1, y = l & 2;
     float A[2][4], B[4][4]; // A[j][k]: row x + 2j (+4hi); B[cc][k]: column 4 * (cc >> 1) + y + (cc & 1)
     if (A_ROW) {
       for (int j = 0; j < 2; ++j) {
         const int src = q4 + x + 2 * j + hi16;
-        const uint32_t u0 = __cupbop_g16(stA, 4, 0, src), u1 = __cupbop_g16(stA, 4, 1, src);
+        const uint32_t u0 = __cupbop_staged_word(stA, 4, 0, src), u1 = __cupbop_staged_word(stA, 4, 1, src);
         A[j][0] = __cupbop_f16_to_f32(u0); A[j][1] = __cupbop_f16_to_f32(u0 >> 16);
         A[j][2] = __cupbop_f16_to_f32(u1); A[j][3] = __cupbop_f16_to_f32(u1 >> 16);
       }
     } else {
       for (int k = 0; k < 4; ++k) {
         const int src = q4 + k + hi16;
-        const uint32_t u0 = __cupbop_g16(stA, 4, 0, src), u1 = __cupbop_g16(stA, 4, 1, src);
+        const uint32_t u0 = __cupbop_staged_word(stA, 4, 0, src), u1 = __cupbop_staged_word(stA, 4, 1, src);
         A[0][k] = __cupbop_f16_to_f32(x ? u0 >> 16 : u0); A[1][k] = __cupbop_f16_to_f32(x ? u1 >> 16 : u1);
       }
     }
@@ -1244,13 +1279,13 @@ static inline void __cupbop_mma884_sw16(const uint32_t *stA, const uint32_t *stB
       for (int k = 0; k < 4; ++k)
         for (int hh = 0; hh < 2; ++hh) {
           const int src = q4 + k + 16 * hh;
-          const uint32_t u0 = __cupbop_g16(stB, 2, 0, src), u1 = __cupbop_g16(stB, 2, 1, src), u = y ? u1 : u0;
+          const uint32_t u0 = __cupbop_staged_word(stB, 2, 0, src), u1 = __cupbop_staged_word(stB, 2, 1, src), u = y ? u1 : u0;
           B[2 * hh][k] = __cupbop_f16_to_f32(u); B[2 * hh + 1][k] = __cupbop_f16_to_f32(u >> 16);
         }
     } else {
       for (int cc = 0; cc < 4; ++cc) {
         const int src = q4 + y + (cc & 1) + 16 * (cc >> 1);
-        const uint32_t u0 = __cupbop_g16(stB, 2, 0, src), u1 = __cupbop_g16(stB, 2, 1, src);
+        const uint32_t u0 = __cupbop_staged_word(stB, 2, 0, src), u1 = __cupbop_staged_word(stB, 2, 1, src);
         B[cc][0] = __cupbop_f16_to_f32(u0); B[cc][1] = __cupbop_f16_to_f32(u0 >> 16);
         B[cc][2] = __cupbop_f16_to_f32(u1); B[cc][3] = __cupbop_f16_to_f32(u1 >> 16);
       }
@@ -1264,15 +1299,20 @@ static inline void __cupbop_mma884_sw16(const uint32_t *stA, const uint32_t *stB
   }
 }
 #define CUPBOP_MMA884_GLUE16(LA, LB, AR, BR)                                                                             \
-  extern "C" __attribute__((always_inline, convergent)) void __cupbop_mma_m8n8k4_f16f32_##LA##_##LB##_sw_glue16(       \
+  extern "C" __attribute__((always_inline, convergent)) void CUPBOP_SW_GLUE(__cupbop_mma_m8n8k4_f16f32_##LA##_##LB)(   \
       const uint32_t *a, const uint32_t *b, const uint32_t *c, uint32_t *d) {                                            \
-    __cupbop_mma884_sw16<AR, BR>(a, b, c, d);                                                                            \
+    __cupbop_mma884_staged_sw<AR, BR>(a, b, c, d);                                                                        \
   }
 CUPBOP_MMA884_GLUE16(row, col, 1, 0)
 CUPBOP_MMA884_GLUE16(row, row, 1, 1)
 CUPBOP_MMA884_GLUE16(col, row, 0, 1)
 CUPBOP_MMA884_GLUE16(col, col, 0, 0)
 #undef CUPBOP_MMA884_GLUE16
+#undef CUPBOP_SW_GLUE
+#undef CUPBOP_SW_GLUE_NAME
+#undef CUPBOP_SW_GLUE_NAME_
+#endif
+#if VX_CFG_NUM_THREADS == 16
 // redux.sync: one result per pass, each from its lane's own mask (__cupbop_redux_sync)
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_redux_sync_glue16(const uint32_t *v, const uint32_t *mask, int op, uint32_t *out) {
   const uint32_t init = (op == 1 || op == 5) ? 0xffffffffu : (op == 3) ? 0x7fffffffu : (op == 4) ? 0x80000000u : 0u;
@@ -1297,6 +1337,6 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_redux_sync_g
   }
   out[0] = r[0]; out[1] = r[1];
 }
-#endif // NT=16 software glue
+#endif // NT=16 redux glue
 
 #endif // VX_CFG_NUM_THREADS (Vortex 3.0)

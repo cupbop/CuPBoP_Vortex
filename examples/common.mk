@@ -1,3 +1,4 @@
+KERNEL_TRANSLATOR ?= $(CuPBoP_PATH)/build/compilation/kernelTranslator
 # common.mk — Shared CuPBoP build pipeline for Vortex examples
 #
 # Usage in per-example Makefile:
@@ -200,7 +201,7 @@ clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:
@@ -243,7 +244,7 @@ endif
 
 kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC)
 	@echo "--- Translate kernel bitcode"
-	$(CuPBoP_PATH)/build/compilation/kernelTranslator $< kernel.bc
+	$(KERNEL_TRANSLATOR) $< kernel.bc
 	llvm-dis kernel.bc
 
 # ─── Step 3: hostTranslator -> host.bc -> host.o ─────────────────────────────
@@ -276,7 +277,7 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS) \
 	|| MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh --build-failed \
-		$(CuPBoP_PATH)/build/compilation/kernelTranslator $(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" \
+		$(KERNEL_TRANSLATOR) $(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" \
 		VORTEX_HOME=$(VORTEX_HOME) CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
@@ -284,7 +285,7 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 	@# 8 KB hardware stack is rebuilt with the dynamic trip count (core mapping with fixed trips) or run on a software
 	@# stack; every schedule, the sp skew modulus is lowered to fit the frame (CUPBOP_SP_SKEW) and the kernel ABI calls
 	@# are checked (CUPBOP_KABI, examples/abi_check.py; UNSAFE fails the build). No-op when nothing applies.
-	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(CuPBoP_PATH)/build/compilation/kernelTranslator \
+	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(KERNEL_TRANSLATOR) \
 		$(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)

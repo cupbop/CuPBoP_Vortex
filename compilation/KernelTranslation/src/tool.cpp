@@ -2270,7 +2270,7 @@ static bool classify_mma_form(const std::string &geom, const std::string &ta, co
 // VORTEX_CONFIGS (exported by examples/common.mk callers: ci/rg-ci-setup-v3.sh, the coadapt harness) holds the
 // -DVX_CFG_* flags of the SimX build the kernel is compiled for. Unset: unknown build (the link then decides).
 static bool tensor_cfg_known() { return std::getenv("VORTEX_CONFIGS") != nullptr; }
-static bool tensor_cfg_has(const char *flag) {
+bool vortexConfigHasFlag(const char *flag) {
   const char *e = std::getenv("VORTEX_CONFIGS");
   if (!e) return true;
   std::string s(e), f(flag);
@@ -2290,13 +2290,13 @@ static const char *tensor_type_flag(const std::string &t) {
   return "?";
 }
 static bool tensor_build_enables(const std::string &t, std::string &why) {
-  if (!tensor_cfg_has("-DVX_CFG_EXT_TCU_ENABLE")) { why = "VORTEX_CONFIGS has no -DVX_CFG_EXT_TCU_ENABLE"; return false; }
+  if (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE")) { why = "VORTEX_CONFIGS has no -DVX_CFG_EXT_TCU_ENABLE"; return false; }
   if (tensor_is_f16ish(t)) {
-    if (tensor_cfg_known() && tensor_cfg_has("-DVX_CFG_TCU_FP16_DISABLE")) { why = "VORTEX_CONFIGS has -DVX_CFG_TCU_FP16_DISABLE"; return false; }
+    if (tensor_cfg_known() && vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")) { why = "VORTEX_CONFIGS has -DVX_CFG_TCU_FP16_DISABLE"; return false; }
     return true;
   }
   const char *f = tensor_type_flag(t);
-  if (!tensor_cfg_has(f)) { why = std::string("VORTEX_CONFIGS has no ") + f; return false; }
+  if (!vortexConfigHasFlag(f)) { why = std::string("VORTEX_CONFIGS has no ") + f; return false; }
   return true;
 }
 static std::string tensor_lowering_mode() {
@@ -3223,7 +3223,40 @@ void replace_asm_call(llvm::Module *M) {
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
               need_remove.push_back(Call);
-            } else if (asm_str.find(".f32.u32") != std::string::npos &&
+            } else if (asm_str.rfind("ld.volatile.global.", 0) == 0 ||
+                       asm_str.rfind("ld.volatile.v", 0) == 0 ||
+                       asm_str.rfind("ld.volatile.b", 0) == 0) {
+              // CuLifter keeps SASS strong global reads visible across blocks.
+              // Vector inline PTX returns a struct of register lanes.
+              IRBuilder<> b(Call);
+              StructType *lanes = dyn_cast<StructType>(Call->getType());
+              const unsigned count = lanes ? lanes->getNumElements() : 1;
+              const std::string prefix = asm_str.rfind("ld.volatile.global.", 0) == 0
+                                         ? "ld.volatile.global." : "ld.volatile.";
+              const bool vectorForm = lanes && (count == 2 || count == 4) &&
+                  asm_str.rfind(prefix + "v" + std::to_string(count) + ".b32 ", 0) == 0;
+              const bool scalarForm = !lanes && Call->getType()->isIntegerTy() &&
+                  asm_str.rfind(prefix + "b" +
+                      std::to_string(Call->getType()->getIntegerBitWidth()) + " ",0) == 0;
+              if (Call->arg_size() != 1 || (!scalarForm && !vectorForm))
+                report_fatal_error("unsupported volatile load signature");
+              Type *valueTy = vectorForm ? static_cast<Type*>(FixedVectorType::get(I32,count)) : Call->getType();
+              Value *ptr = b.CreateIntToPtr(Call->getArgOperand(0),PointerType::getUnqual(valueTy));
+              LoadInst *load = b.CreateLoad(valueTy,ptr,"ld.global");
+              load->setVolatile(true);
+              Value *result = load;
+              if (lanes) {
+                result = UndefValue::get(lanes);
+                for (unsigned i=0; i<count; ++i) {
+                  if (lanes->getElementType(i) != I32)
+                    report_fatal_error("volatile global load expects b32 lanes");
+                  result = b.CreateInsertValue(result,b.CreateExtractElement(load,i),{i});
+                }
+              }
+              Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else if ((asm_str.find(".f32.u32") != std::string::npos ||
+                        asm_str.find(".f32.s32") != std::string::npos) &&
                        (asm_str.find("cvt.rn.") != std::string::npos ||
                         asm_str.find("cvt.rz.") != std::string::npos ||
                         asm_str.find("cvt.rm.") != std::string::npos ||
@@ -3238,19 +3271,23 @@ void replace_asm_call(llvm::Module *M) {
               Value *x = Call->getArgOperand(0);
               if (!x->getType()->isIntegerTy(32))
                 x = builder.CreateBitCast(x, I32);
-              Value *f = builder.CreateUIToFP(x, F32, "cvt.u32.f32");
-              bool up = asm_str.find("cvt.rp.") != std::string::npos;
+              const bool signedInput = asm_str.find(".f32.s32") != std::string::npos;
+              Value *f = signedInput ? builder.CreateSIToFP(x,F32) : builder.CreateUIToFP(x,F32);
               if (asm_str.find("cvt.rn.") == std::string::npos) {
-                Value *back = builder.CreateFPToUI(f, I64);
-                Value *x64 = builder.CreateZExt(x, I64);
-                Value *wrong = up ? builder.CreateICmpULT(back, x64)
-                                  : builder.CreateICmpUGT(back, x64);
-                Value *bits = builder.CreateBitCast(f, I32);
-                Value *step = builder.CreateBitCast(
-                    up ? builder.CreateAdd(bits, ConstantInt::get(I32, 1))
-                       : builder.CreateSub(bits, ConstantInt::get(I32, 1)),
-                    F32);
-                f = builder.CreateSelect(wrong, step, f, "cvt.u32.f32.dir");
+                Value *back = signedInput ? builder.CreateFPToSI(f,I64) : builder.CreateFPToUI(f,I64);
+                Value *wide = signedInput ? builder.CreateSExt(x,I64) : builder.CreateZExt(x,I64);
+                Value *neg = signedInput ? builder.CreateICmpSLT(x,ConstantInt::get(I32,0))
+                                         : ConstantInt::getFalse(context);
+                Value *up = asm_str.find("cvt.rz.") != std::string::npos
+                            ? neg : ConstantInt::get(Type::getInt1Ty(context),asm_str.find("cvt.rp.") != std::string::npos);
+                // All u32 and s32 inputs fit in i64. FP bit ordering reverses at negative values.
+                Value *wrong = builder.CreateSelect(up,builder.CreateICmpSLT(back,wide),
+                                                        builder.CreateICmpSGT(back,wide));
+                Value *bits = builder.CreateBitCast(f,I32);
+                Value *one = ConstantInt::get(I32,1);
+                Value *step = builder.CreateSelect(builder.CreateXor(up,neg),builder.CreateAdd(bits,one),
+                                                                              builder.CreateSub(bits,one));
+                f = builder.CreateSelect(wrong,builder.CreateBitCast(step,F32),f);
               }
               if (Call->getType() != F32)
                 f = builder.CreateBitCast(f, Call->getType());
