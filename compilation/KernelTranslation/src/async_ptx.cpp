@@ -748,35 +748,44 @@ struct AsmLowering {
 
   void lowerTcgen(const Stmt &s, Value *pred) {
     needWarps();
+    const bool pair = s.has("cta_group::2");
+    if (pair && (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+                 !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_ENABLE")))
+      fail("TCGEN CTA pairs require -DVX_CFG_EXT_TCU_ENABLE and -DVX_CFG_TCU_TMEM_ENABLE");
     auto taddr = [&](const std::string &op) -> Value * {
       if (op.size() < 3 || op.front() != '[' || op.back() != ']') fail("expected [tmem address]");
       return val(op.substr(1, op.size() - 2), S.I32);
     };
     if (s.op == "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32" ||
-        s.op == "tcgen05.dealloc.cta_group::1.sync.aligned.b32") {
+        s.op == "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32" ||
+        s.op == "tcgen05.dealloc.cta_group::1.sync.aligned.b32" ||
+        s.op == "tcgen05.dealloc.cta_group::2.sync.aligned.b32") {
       if (pred || s.ops.size() != 2) fail("unsupported predicated or malformed TCGEN allocation");
       auto *cols = dyn_cast<ConstantInt>(val(s.ops[1], S.I32));
       if (!cols || cols->getZExtValue() != 512) fail("only full 512-column TMEM allocations are supported");
       if (s.tok[1] == "alloc")
-        S.call(B, "__cupbop_tmem_alloc512", S.Void, {addr(s.ops[0], "TMEM allocation result")});
+        S.call(B, pair ? "__cupbop_tmem_alloc512_pair" : "__cupbop_tmem_alloc512", S.Void,
+               {addr(s.ops[0], "TMEM allocation result")});
       else
-        S.call(B, "__cupbop_tmem_free512", S.Void, {val(s.ops[0], S.I32)});
+        S.call(B, pair ? "__cupbop_tmem_free512_pair" : "__cupbop_tmem_free512", S.Void, {val(s.ops[0], S.I32)});
       return;
     }
     if (s.op == "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned" ||
+        s.op == "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned" ||
         s.op == "tcgen05.wait::ld.sync.aligned" || s.op == "tcgen05.fence::before_thread_sync" ||
         s.op == "tcgen05.fence::after_thread_sync") {
       if (pred || !s.ops.empty()) fail("malformed TCGEN synchronization");
-      // Each CTA has its own full allocation; loads retire synchronously.
+      // Each CTA occupies a full slot; loads retire synchronously.
       B.CreateFence(AtomicOrdering::SequentiallyConsistent);
       return;
     }
-    if (s.op == "tcgen05.mma.cta_group::1.kind::i8") {
+    if (s.op == "tcgen05.mma.cta_group::1.kind::i8" || s.op == "tcgen05.mma.cta_group::2.kind::i8") {
       if (s.ops.size() != 5) fail("expected dense SMEM/SMEM i8 MMA");
       auto *desc = dyn_cast<ConstantInt>(val(s.ops[3], S.I32));
-      if (!desc || desc->getZExtValue() != 0x084004a0) fail("unsupported i8 MMA instruction descriptor");
+      if (!desc || desc->getZExtValue() != (pair ? 0x104004a0u : 0x084004a0u))
+        fail("unsupported i8 MMA instruction descriptor");
       underPred(pred, [&]() -> Value * {
-        return S.call(B, "__cupbop_tmem_mma_s8_128x256x32", S.Void,
+        return S.call(B, pair ? "__cupbop_tmem_mma_s8_256x256x32" : "__cupbop_tmem_mma_s8_128x256x32", S.Void,
                       {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64), val(s.ops[4], S.I32)});
       });
       return;
@@ -791,13 +800,16 @@ struct AsmLowering {
         setReg(dst[i], S.call(B, "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
       return;
     }
-    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64") {
+    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64" ||
+        s.op == "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64") {
+      if (s.ops.size() != 2) fail("expected TCGEN completion barrier and CTA mask");
       underPred(pred,[&]() -> Value * {
         return S.call(B,"__cupbop_cluster_commit",S.Void,{addr(s.ops[0],"barrier"),val(s.ops[1],S.I32)});
       });
       return;
     }
-    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64" && s.ops.size() == 1) {
+    if ((s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64" ||
+         s.op == "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64") && s.ops.size() == 1) {
       underPred(pred, [&]() -> Value * {
         B.CreateFence(AtomicOrdering::Release);
         return S.call(B, "__cupbop_tcgen_arrive", S.I64,

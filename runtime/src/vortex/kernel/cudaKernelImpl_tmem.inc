@@ -1,14 +1,21 @@
-// Single-CTA TCGEN05, full (512-column) allocation and dense m128n256k32.s8.
+// Full 512-column TCGEN05 allocations and dense signed INT8 MMA.
+#if defined(VX_CFG_EXT_TCU_ENABLE) && defined(VX_CFG_TCU_TMEM_ENABLE)
+#include <vx_tmem.h>
+#define CUPBOP_NATIVE_TMEM
+#endif
+
 // Backing store is indexed by the hardware CTA slot, which the KMU retains
 // until the entire block retires. Columns are addressed in 32-bit words.
 #if defined(VX_CFG_NUM_THREADS) && VX_CFG_NUM_THREADS == 32
 namespace {
+#ifndef CUPBOP_NATIVE_TMEM
 struct TcgenStore {
   uint32_t word[128][512];
 };
 static TcgenStore tcgen_slots[VX_CFG_NUM_CLUSTERS * VX_CFG_NUM_CORES][VX_CFG_NUM_WARPS];
 
 static inline TcgenStore &tcgen_store() { return tcgen_slots[vx_core_id()][csr_read_nv(VX_CSR_CTA_ID)]; }
+#endif
 
 struct TcgenOperand {
   uintptr_t start;
@@ -33,6 +40,48 @@ static inline const int8_t *tcgen_chunk(const TcgenOperand &a, unsigned row, uns
   if (a.swizzle) return (const int8_t *)((a.start + offset + (row & 7) * 128 + half * 16) ^ ((row & 7) << 4));
   return (const int8_t *)(a.start + offset + (row & 7) * 16 + half * a.leading);
 }
+#ifdef CUPBOP_NATIVE_TMEM
+static unsigned tcgen_pair_peer() {
+  unsigned rank = cluster_rank();
+  unsigned peer = rank ^ 1u;
+  if (peer >= __cupbop_cluster_register(1, 0))
+    cupbop_async_fail("TCGEN needs a resident CTA pair", rank, peer);
+  return peer;
+}
+
+static unsigned tcgen_pair_slot() {
+  return csr_read_nv(VX_CSR_CTA_ID) - cluster_rank() + tcgen_pair_peer();
+}
+
+template <unsigned Ctas>
+static void tcgen_native_mma(uint32_t taddr, const TcgenOperand (&a)[Ctas],
+                             const TcgenOperand (&b)[Ctas], unsigned issuer, uint32_t use_d) {
+  constexpr unsigned columns_per_cta = 256 / Ctas;
+  for (unsigned col = 0; col < 256; ++col) {
+    const auto &local_b = b[col / columns_per_cta];
+    unsigned local_col = col % columns_per_cta;
+    uint64_t b_words[4];
+    __builtin_memcpy(b_words, __builtin_assume_aligned(tcgen_chunk(local_b, local_col, 0), 16), 16);
+    __builtin_memcpy(b_words + 2, __builtin_assume_aligned(tcgen_chunk(local_b, local_col, 1), 16), 16);
+    for (unsigned cta = 0; cta < Ctas; ++cta) {
+      uint64_t dest = uint64_t(cta != issuer) << 32;
+      for (unsigned row = 0; row < 128; ++row) {
+        uint64_t a_words[4];
+        __builtin_memcpy(a_words, __builtin_assume_aligned(tcgen_chunk(a[cta], row, 0), 16), 16);
+        __builtin_memcpy(a_words + 2, __builtin_assume_aligned(tcgen_chunk(a[cta], row, 1), 16), 16);
+        const uint64_t address = dest | (row << 16) | (taddr + col);
+        if (use_d)
+          vx_tmem_mma_s8_k8<true>(address, a_words[0], b_words[0]);
+        else
+          vx_tmem_mma_s8_k8<false>(address, a_words[0], b_words[0]);
+        for (unsigned k = 1; k < 4; ++k)
+          vx_tmem_mma_s8_k8<true>(address, a_words[k], b_words[k]);
+      }
+    }
+  }
+  vx_tmem_drain();
+}
+#endif
 } // namespace
 
 #endif
@@ -158,24 +207,73 @@ extern "C" void __cupbop_bulk_multicast(void *dst, const void *src, unsigned byt
 #if defined(VX_CFG_NUM_THREADS) && VX_CFG_NUM_THREADS == 32
 extern "C" void __cupbop_tmem_alloc512(uint32_t *dst) {
   // One full allocation per live CTA. Each slot's logical base is zero.
+#ifdef CUPBOP_NATIVE_TMEM
+  if (vx_thread_id() == 0) *dst = vx_tmem_alloc512();
+#else
   if (vx_thread_id() == 0) *dst = 0;
+#endif
 }
 
 extern "C" void __cupbop_tmem_free512(uint32_t taddr) {
   if (taddr != 0) cupbop_async_fail("invalid full TMEM allocation base", taddr, 512);
+#ifdef CUPBOP_NATIVE_TMEM
+  if (vx_thread_id() == 0) vx_tmem_dealloc512(taddr);
+#endif
 }
+
+#ifdef CUPBOP_NATIVE_TMEM
+extern "C" void __cupbop_tmem_alloc512_pair(uint32_t *dst) {
+  if (vx_thread_id() == 0) {
+    vx_tmem_pair_arrive<true>(tcgen_pair_slot());
+    *dst = 0;
+  }
+}
+
+extern "C" void __cupbop_tmem_free512_pair(uint32_t taddr) {
+  if (taddr != 0) cupbop_async_fail("invalid full TMEM pair allocation base", taddr, 512);
+  if (vx_thread_id() == 0)
+    vx_tmem_pair_arrive<false>(tcgen_pair_slot());
+}
+
+extern "C" void __cupbop_tmem_mma_s8_256x256x32(uint32_t taddr, uint64_t desc_a,
+                                               uint64_t desc_b, uint32_t use_d) {
+  if (taddr > 256) cupbop_async_fail("TMEM accumulator outside allocation", taddr, 256);
+  unsigned peer = tcgen_pair_peer();
+  unsigned issuer = cluster_rank() & 1;
+  TcgenOperand a[2], b[2];
+  a[issuer] = tcgen_operand(desc_a);
+  b[issuer] = tcgen_operand(desc_b);
+  a[1 - issuer] = a[issuer];
+  b[1 - issuer] = b[issuer];
+  a[1 - issuer].start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(a[issuer].start), peer));
+  b[1 - issuer].start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(b[issuer].start), peer));
+  tcgen_native_mma(taddr, a, b, issuer, use_d);
+}
+#endif
 
 extern "C" uint32_t __cupbop_tmem_ld32(uint32_t taddr, uint32_t displacement) {
   const uint32_t first_row = taddr >> 16;
   const uint32_t col = (taddr & 0xffff) + displacement;
-  if (first_row != ((csr_read_nv(VX_CSR_CTA_RANK) & 3) * 32) || col >= 512)
+  const uint32_t lane_base = (csr_read_nv(VX_CSR_CTA_RANK) & 3) * 32;
+#ifdef CUPBOP_NATIVE_TMEM
+  if (col >= 512 || (first_row != lane_base &&
+                    (first_row != lane_base + 128 || (cluster_rank() & 1) == 0)))
+    cupbop_async_fail("TMEM load outside warp datapath", taddr, displacement);
+  return vx_tmem_ld32((lane_base << 16) | col);
+#else
+  if (first_row != lane_base || col >= 512)
     cupbop_async_fail("TMEM load outside warp datapath", taddr, displacement);
   return tcgen_store().word[first_row + vx_thread_id()][col];
+#endif
 }
 
 extern "C" void __cupbop_tmem_mma_s8_128x256x32(uint32_t taddr, uint64_t desc_a, uint64_t desc_b, uint32_t use_d) {
   if (taddr > 256) cupbop_async_fail("TMEM accumulator outside allocation", taddr, 256);
   const auto a = tcgen_operand(desc_a), b = tcgen_operand(desc_b);
+#ifdef CUPBOP_NATIVE_TMEM
+  const TcgenOperand a_op[] = {a}, b_op[] = {b};
+  tcgen_native_mma(taddr, a_op, b_op, 0, use_d);
+#else
   auto &tile = tcgen_store();
   // A signed K=32 dot fits in 21 bits even for (-128)*(-128). Pack three
   // independent columns in radix 2^21. The per-digit bias prevents negative
@@ -207,5 +305,6 @@ extern "C" void __cupbop_tmem_mma_s8_128x256x32(uint32_t taddr, uint64_t desc_a,
       }
     }
   }
+#endif
 }
 #endif
