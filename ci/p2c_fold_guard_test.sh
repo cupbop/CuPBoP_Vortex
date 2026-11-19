@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise p2c-fold through kernelTranslator without a SimX build.
+# Exercise the default and opt-in copy ring handling through kernelTranslator.
 # Usage: ci/p2c_fold_guard_test.sh [kernelTranslator] [LLVM bin directory]
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -81,11 +81,13 @@ sed 's/%copy_src = add i64 %src, 64/%copy_src = load i64, ptr addrspace(1) %sour
 sed 's/%copy_size = select i1 %enabled, i32 16, i32 0/%copy_size = load i32, ptr addrspace(1) %source_ptr/' \
   "$work/ring.ll" > "$work/guarded-size.ll"
 
-run_fold() {
+run_lift_opt() {
   local variant=$1
+  shift
   "${llvm_bin:+$llvm_bin/}llvm-as" "$work/$variant.ll" -o "$work/$variant.bc"
-  if ! (cd "$work" && env -u P2C_DRY CUPBOP_LIFT_OPT=1 CUPBOP_LIFT_OPT_PIPE=p2c-fold CUPBOP_LIFT_OPT_P4=0 \
-    P2C_STAGES=1 P2C_BLOCK=32 CUPBOP_LIFT_OPT_DUMP="$variant.out.ll" CUPBOP_LIFT_OPT_DUMP_ONLY=1 \
+  if ! (cd "$work" && env -u P2C_DRY -u P2C_STAGES -u CUPBOP_LIFT_OPT_PIPE -u CUPBOP_LIFT_OPT_P2C \
+    VORTEX_NUM_THREADS=32 CUPBOP_VIRT_LANES=32 CUPBOP_LIFT_OPT=1 CUPBOP_LIFT_OPT_P4=0 \
+    P2C_BLOCK=32 CUPBOP_LIFT_OPT_DUMP="$variant.out.ll" CUPBOP_LIFT_OPT_DUMP_ONLY=1 "$@" \
     "$translator" "$variant.bc" unused.bc) > "$work/$variant.log" 2>&1; then
     cat "$work/$variant.log"
     return 1
@@ -93,13 +95,21 @@ run_fold() {
   "${llvm_bin:+$llvm_bin/}opt" -passes=verify -disable-output "$work/$variant.out.ll"
 }
 
+run_lift_opt ring CUPBOP_LIFT_OPT_WHY=1
+grep -qF '@shared_mem = external addrspace(3) global [1536 x i8]' "$work/ring.out.ll"
+[[ $(grep -c 'call void asm sideeffect "cp.async.cg.shared.global' "$work/ring.out.ll") == 3 ]]
+if grep -Eq 'p2c-fold|p2c-alias' "$work/ring.log"; then
+  cat "$work/ring.log"
+  exit 1
+fi
+
 for variant in guarded-source guarded-size; do
-  run_fold "$variant"
+  run_lift_opt "$variant" CUPBOP_LIFT_OPT_PIPE=p2c-fold P2C_STAGES=1
   grep -F 'left as it is: copy source or size is not available at the guard' "$work/$variant.log"
   grep -qF '@shared_mem = external addrspace(3) global [1536 x i8]' "$work/$variant.out.ll"
   sed -n '/^copy:/,/^latch:/p' "$work/$variant.out.ll" | grep -Eq 'load i(32|64), ptr addrspace\(1\) %source_ptr'
 done
 
-run_fold ring
+run_lift_opt ring P2C_STAGES=1
 grep -F 'ring S=3 -> 1' "$work/ring.log"
 grep -qF '@shared_mem = external addrspace(3) global [512 x i8]' "$work/ring.out.ll"

@@ -463,29 +463,14 @@ CUPBOP_EXPAND(CUPBOP_XWD(u8, CUPBOP_D_INT8))
 
 // ---- wgmma.mma_async (Hopper warpgroup MMA): software reference for every type, TCU for tf32/fp8/int8 ----
 // m64nNk{16 f16/bf16, 8 tf32, 32 e4m3/e5m2/s8/u8}: K is 32 bytes = 8 words per row for every type, so A (64xK)
-// and B (NxK) use the canonical no-swizzle K-major core-matrix layout with word w of row r at
-// (r>>3)*SBO + (w>>2)*LBO + (r&7)*16 + (w&3)*4 (the f16 __cupbop_core_ld in word units). Warp w of the
+// and B (NxK) use the same K-major descriptor as __cupbop_core_ld. Warp w of the
 // warpgroup owns rows 16w..16w+15; acc: N/2 32-bit accumulators per thread (f32 or s32), PTX layout
 //   acc[4j+0] = (g, 8j+2t)  acc[4j+1] = (g, 8j+2t+1)  acc[4j+2] = (g+8, 8j+2t)  acc[4j+3] = (g+8, 8j+2t+1)
-// scale_d = 0: D = A*B. Swizzled descriptors are not modelled: trap rather than compute from the wrong bytes.
-struct __cupbop_wg_desc { const char *base; uint32_t lbo, sbo, swz; };
-static inline __cupbop_wg_desc __cupbop_wg_decode(uint64_t d) {
-  __cupbop_wg_desc m;
-  const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
-  m.base = (const char *)(lmem + ((((d & 0x3FFFu) << 4) - (lmem & 0x3FFFFu)) & 0x3FFFFu)); // window addr -> pointer
-  m.lbo = (uint32_t)((d >> 16) & 0x3FFFu) << 4;
-  m.sbo = (uint32_t)((d >> 32) & 0x3FFFu) << 4;
-  m.swz = (uint32_t)(d >> 62);
-  if (m.swz) __builtin_trap();
-  return m;
-}
-static inline uint32_t __cupbop_wg_word(const __cupbop_wg_desc &m, int r, int w) {
-  return *(const uint32_t *)(m.base + (r >> 3) * m.sbo + (w >> 2) * m.lbo + (r & 7) * 16 + (w & 3) * 4);
-}
+// scale_d = 0: D = A*B.
 template <class EA, class EB, bool SAT>
 static inline void __cupbop_wgmma_sw(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, uint32_t *acc) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
-  const __cupbop_wg_desc A = __cupbop_wg_decode(desc_a), B = __cupbop_wg_decode(desc_b);
+  const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
   const int row0 = 16 * warp_in_wg;
   for (int j = 0; j < n_cols / 8; ++j)
     for (int s = 0; s < 4; ++s) {
@@ -517,7 +502,7 @@ template <class CTX, bool TF32>
 static inline void __cupbop_wgmma_tcu(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, uint32_t *acc) {
   auto in = [](uint32_t w) { return __cupbop_bits_f32(TF32 ? (w >> 13) : w); };
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
-  const __cupbop_wg_desc A = __cupbop_wg_decode(desc_a), B = __cupbop_wg_decode(desc_b);
+  const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
   const int row0 = 16 * warp_in_wg;
   typename CTX::fragment_a fa;
   fa.data = {{in(__cupbop_wg_word(A, row0 + g, t)), in(__cupbop_wg_word(A, row0 + g, 4 + t)), 0.f, 0.f,

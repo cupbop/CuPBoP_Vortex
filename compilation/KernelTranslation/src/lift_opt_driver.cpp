@@ -12,6 +12,8 @@
 // CUPBOP_LIFT_OPT_DETECT_ONLY=1  print lifted=0|1 and the reason, stop (corpus audits)
 // CUPBOP_LIFT_OPT_NOPAIR=1       without lo-pair (mkp3.sh P3_NOPAIR=1; comparison with CUPBOP_ADDR_CARRY)
 // CUPBOP_LIFT_OPT_PIPE=<p>       replaces the first stage (mkp3.sh P3_PIPE; measurements)
+// CUPBOP_LIFT_OPT_P2C=1          explicitly enables shared-memory compaction that can change copy stages
+//                                P2C_STAGES by itself opts in to the ring fold
 // CUPBOP_LIFT_OPT_P4=0           the pipeline of experiments/p3 alone: no row of schedule.inc, the queue of p2c-fold instead of lo-dq
 // CUPBOP_LIFT_OPT_STALE=0        without lo-stale (its default waits for a decision: tg sm75 -19.5%, dotproduct s2 +12.2%)
 // CUPBOP_TRITON_LOMMA (default 1)  lo-mma, lo-sched and lo-f16 on stock Triton input (TRITON_CUPBOP=1), schedule 2 only: run_triton_lo_mma. =0: Triton input goes on as lower_triton_input left it
@@ -120,6 +122,10 @@ static std::string pipeline_for(Module *M, const LiftOptRow *row, const char *&k
   const bool full = gate_full(M);
   kind = full ? "full" : "light";
   std::string s = full ? LIFT_OPT_FULL : LIFT_OPT_LIGHT;
+  const bool compact = env_on("CUPBOP_LIFT_OPT_P2C");
+  const char *stages = std::getenv("P2C_STAGES");
+  if (!compact && (!stages || !*stages)) replace_all(s, "p2c-fold,", "");
+  if (!compact) replace_all(s, "p2c-alias,", "");
   replace_all(s, "${LP}", env_on("CUPBOP_LIFT_OPT_NOPAIR") ? "" : LIFT_OPT_LP);
   replace_all(s, "${P4_PREHEXT:-}", row ? row->prehext : "");
   replace_all(s, "$IC", LIFT_OPT_IC);
@@ -235,6 +241,9 @@ Module *run_lift_opt(Module *M) {
   if (verbose) fprintf(stderr, "[lift-opt] %s\n", pipe.c_str());
   for (auto &e : LIFT_OPT_ENV) setenv(e.name, e.value, 0);
   for (auto &e : LIFT_OPT_DEFAULTS) setenv(e.name, e.value, 0);
+  const char *schedule = std::getenv("VORTEX_SCHEDULE_FLAG");
+  if ((!schedule || std::atoi(schedule) == 2) && vortexConfigHasFlag("-DVX_CFG_TCU_WGMMA_ENABLE"))
+    setenv("LO_WGMMA", "0", 0);
   if (row) { for (auto &e : row->env) if (e.name) setenv(e.name, e.value, 0); }
   else for (auto &e : LIFT_OPT_NO_P4_ENV) setenv(e.name, e.value, 0);
 

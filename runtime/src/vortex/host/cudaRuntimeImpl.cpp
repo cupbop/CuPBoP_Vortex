@@ -1,4 +1,5 @@
 #include "cudaRuntimeImpl.h"
+#include "cupbop_async.h"
 #include "base_address.h"
 #include "api.h"
 #include "cuda_runtime.h"
@@ -117,7 +118,7 @@ static void cupbop_switch_module(const std::string &from, const std::string &to)
 
 // ── DXA descriptors (programmed into the DXA DCRs before each kernel launch) ─────────────────────────
 // Field layout: vortex sw/runtime/include/dxa.h (VX_DCR_DXA_DESC_* offsets, META = rank | log2(elem)<<3 |
-// layout<<5). Rank 1-5; sizes in elements; strides in bytes for dims 1..rank-1; box = elements per dim of
+// layout<<5 | swizzle<<7). Rank 1-5; sizes in elements; strides in bytes for dims 1..rank-1; box = elements per dim of
 // one transfer; layout 0 = row-major box in shared memory, 1 = K-major (transposed, rank <= 2);
 // smem_stride = multicast shared-memory stride between CTAs; fill = 32-bit pattern written for
 // out-of-bounds elements (lane-replicated per 4 bytes).
@@ -130,6 +131,7 @@ struct DxaDescEntry {
   uint32_t box[5];
   uint32_t elem_bytes;
   uint32_t layout;
+  uint32_t swizzle;
   uint32_t smem_stride;
   uint32_t fill;
 };
@@ -142,6 +144,9 @@ static std::string dxa_desc_check(const DxaDescEntry &d) {
   if (d.elem_bytes != 1 && d.elem_bytes != 2 && d.elem_bytes != 4 && d.elem_bytes != 8) return "elem_bytes must be 1, 2, 4 or 8";
   if (d.layout > 1) return "layout must be 0 (row-major) or 1 (K-major)";
   if (d.layout == 1 && d.rank > 2) return "K-major layout needs rank <= 2";
+  if (d.swizzle && (d.swizzle != CUPBOP_TMAP_SWIZZLE_128B || d.layout != 0 ||
+                    uint64_t(d.box[0]) * d.elem_bytes != 128))
+    return "128B swizzle needs a row-major 128-byte innermost box";
   for (uint32_t i = 0; i < d.rank; ++i)
     if (d.box[i] < 1 || d.box[i] > 0xffff) return "box sizes must be 1..65535";
   return "";
@@ -176,7 +181,7 @@ static void dxa_program(vx_device_h dev, const DxaDescEntry &d) {
   const uint32_t dcr = 0x100 + d.slot * 24; // VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE
   uint32_t esz = 0;
   for (uint32_t b = d.elem_bytes; b > 1; b >>= 1) esz++;
-  const uint32_t meta = (d.rank & 7) | (esz << 3) | ((d.layout & 3) << 5);
+  const uint32_t meta = (d.rank & 7) | (esz << 3) | ((d.layout & 3) << 5) | ((d.swizzle & 3) << 7);
   vx_dcr_write(dev, dcr + 0, (uint32_t)(d.base_addr & 0xFFFFFFFF)); // BASE_LO
   vx_dcr_write(dev, dcr + 1, (uint32_t)(d.base_addr >> 32));        // BASE_HI
   for (uint32_t i = 0; i < d.rank; ++i) vx_dcr_write(dev, dcr + 2 + i, d.size[i]);       // SIZE0..4
@@ -249,7 +254,6 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 // The device helpers (cudaKernelImpl_async.inc) copy boxes in software. Refused with an error (returned
 // CUDA_ERROR_INVALID_VALUE = 1 and a message), never encoded approximately: swizzle, interleave, element
 // strides other than 1, misaligned addresses or strides. Signature as in cuda.h (enums are int-sized).
-#include "cupbop_async.h"
 // MPM counter ids for the per-launch record (CUPBOP_PERF_KERNEL_FILE): from the build's VX_types.h when the include
 // path has it ($VORTEX_PATH/sw), else these values (the same in Vortex v3.0 and upstream master 50cb17454).
 #if __has_include(<VX_types.h>)
@@ -487,6 +491,8 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 #define VX_DCR_MPM_CLASS_TCU 11
 #endif
 static_assert(sizeof(cupbop_tmap) <= 128, "cupbop_tmap must fit in a CUtensorMap");
+static std::map<uint64_t, cupbop_tmap> dxa_tensor_maps;
+
 extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint32_t tensorRank, void *globalAddress,
                                       const uint64_t *globalDim, const uint64_t *globalStrides,
                                       const uint32_t *boxDim, const uint32_t *elementStrides, int interleave,
@@ -537,7 +543,11 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
   // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
   r.dxa_slot = 0xFFFFFFFFu;
-  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e) && !r.swizzle) {
+  bool dxa_layout = r.swizzle == 0;
+#ifdef VX_DXA_SWIZZLE_128B
+  dxa_layout |= r.swizzle == VX_DXA_SWIZZLE_128B;
+#endif
+  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e) && dxa_layout) {
     bool ok = (r.gaddr % 64 == 0) && ((uint64_t)r.dim[0] * r.elem % 64 == 0);
     for (uint32_t i = 0; i + 1 < tensorRank; ++i) ok = ok && r.stride[i] % 64 == 0 && r.stride[i] <= 0xFFFFFFFFull;
     if (ok) r.mode = CUPBOP_TMAP_MODE_DXA;
@@ -551,7 +561,11 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   uint8_t img[128];
   memset(img, 0, sizeof(img));
   memcpy(img, &r, sizeof(r));
-  if (cudaMemcpy(dev, img, sizeof(img), cudaMemcpyHostToDevice) != cudaSuccess) return bad("upload of the record failed");
+  if (cudaMemcpy(dev, img, sizeof(img), cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(dev);
+    return bad("upload of the record failed");
+  }
+  if (r.mode == CUPBOP_TMAP_MODE_DXA) dxa_tensor_maps.emplace(r.self, r);
   memcpy(tensorMap, img, sizeof(img));
   return 0; // CUDA_SUCCESS
 }
@@ -1819,6 +1833,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 cudaError_t cudaFree(void *devPtr) {
   auto DC = DeviceContext::instance(); 
   uint64_t mem_addr = (uint64_t)devPtr;  
+  dxa_tensor_maps.erase(mem_addr);
   // vx_mem_free(DC->device(), mem_addr);
   DC->dev_mem_free(devPtr);
   
@@ -2567,6 +2582,7 @@ cudaError_t cudaLaunchKernel_vortex(
   // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
   // for this kernel (resolved against this launch's arguments).
   const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
+  std::set<uint32_t> dxa_slots;
   if (coalesced_cp_async) {
     uint64_t isa = 0, threads = 0, vm = 0;
     RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
@@ -2583,6 +2599,7 @@ cudaError_t cudaLaunchKernel_vortex(
     descriptor.size[0] = 1u << 30;
     descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
     dxa_program(DC->device(), descriptor);
+    dxa_slots.insert(descriptor.slot);
   }
   for (auto &desc : dxa_descriptors) {
     if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
@@ -2593,6 +2610,7 @@ cudaError_t cudaLaunchKernel_vortex(
               desc.slot, desc.base_addr, desc.rank, desc.size[0], desc.size[1], desc.size[2], desc.stride[0],
               desc.stride[1], desc.box[0], desc.box[1], desc.box[2], desc.elem_bytes, desc.layout, desc.fill);
     dxa_program(DC->device(), desc);
+    dxa_slots.insert(desc.slot);
   }
   dxa_descriptors.clear();
 
@@ -2628,35 +2646,34 @@ cudaError_t cudaLaunchKernel_vortex(
               d.slot, d.base_addr, d.rank, d.size[0], d.size[1], d.size[2], d.stride[0], d.stride[1],
               d.box[0], d.box[1], d.box[2], d.elem_bytes, d.layout, d.fill);
     dxa_program(DC->device(), d);
+    dxa_slots.insert(d.slot);
   }
 
 
-  // ── TMA tensor maps in DXA mode (cuTensorMapEncodeTiled with CUPBOP_TMA_DXA=1): a DXA slot per by-value
-  // CUtensorMap argument of this launch, from slot 15 down (explicit descriptors use the low slots); the device
-  // record learns its slot. A tensor map reached otherwise (e.g. through a pointer) keeps no slot and is copied
-  // in software by the device helper.
-  {
-    uint32_t next_slot = 15;
-    std::map<uint64_t, uint32_t> given;
-    for (int i = 0; i < nargs; ++i) {
-      cupbop_tmap r;
-      memcpy(&r, args[i], sizeof(r)); // args[i] points at the argument's host value (128 bytes for a CUtensorMap)
-      if (r.magic != CUPBOP_TMAP_MAGIC || r.mode != CUPBOP_TMAP_MODE_DXA || !r.self || given.count(r.self)) continue;
+  // A tensor map's first word is its registered device address, including maps inside a by-value parameter.
+  std::set<uint64_t> launch_tensor_maps;
+  if (!dxa_tensor_maps.empty()) {
+    int next_slot = 15;
+    for (int i = 0; i < num_slots; ++i) {
+      auto map = dxa_tensor_maps.find(abuf_ptr->args[i]);
+      if (map == dxa_tensor_maps.end() || launch_tensor_maps.count(map->first)) continue;
+      while (next_slot >= 8 && dxa_slots.count(next_slot)) --next_slot;
       if (next_slot < 8) {
-        fprintf(stderr, "cudaLaunchKernel: more than 8 DXA-mode tensor maps; the rest are copied in software\n");
+        fprintf(stderr, "cudaLaunchKernel: no free TMA descriptor slots; remaining tensor maps use software copies\n");
         break;
       }
+      const auto &r = map->second;
       DxaDescEntry d{};
-      d.slot = next_slot--; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem;
+      d.slot = next_slot; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem; d.swizzle = r.swizzle;
       for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
       for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
       d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
       std::string err = dxa_desc_check(d);
       if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
       dxa_program(DC->device(), d);
-      given[r.self] = d.slot;
-      cudaMemcpy((void *)(uintptr_t)(r.self + offsetof(cupbop_tmap, dxa_slot)), &d.slot, sizeof(uint32_t),
-                 cudaMemcpyHostToDevice);
+      DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
+      launch_tensor_maps.insert(r.self);
+      --next_slot;
       DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
     }
   }
@@ -2779,6 +2796,11 @@ cudaError_t cudaLaunchKernel_vortex(
     // dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
     cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem);
   }
+
+  // Descriptor DCRs are reused at the next launch, including launches that access a map indirectly.
+  uint32_t invalid_slot = UINT32_MAX;
+  for (uint64_t address : launch_tensor_maps)
+    DC->copy_to_dev(address + offsetof(cupbop_tmap, dxa_slot), &invalid_slot, sizeof(invalid_slot));
 
   // Read back __device__ variables from device memory after kernel execution.
   // These are registered as memcpy_symbol entries so they get restored

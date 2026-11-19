@@ -2563,6 +2563,86 @@ static Value *emit_cvt_rna_tf32(IRBuilder<> &B, Value *x, bool satfinite) {
   return B.CreateSelect(special, s, r, "cvt.rna.tf32");
 }
 
+void prepare_wgmma_scratch(llvm::Module *M) {
+  const VirtGeom geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32 || tensor_lowering_mode() == "sw" || !tensor_cfg_known() ||
+      !vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_EXT_A_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_TCU_WGMMA_ENABLE"))
+    return;
+
+  unsigned warps = 32;
+  if (const char *value = std::getenv("VORTEX_NUM_WARPS")) {
+    const int configured = std::atoi(value);
+    if (configured > 0 && configured <= 32) warps = configured;
+  }
+  auto &context = M->getContext();
+  const char *bundleName = "cupbop.wgmma.scratch";
+  const unsigned bundleID = context.getOrInsertBundleTag(bundleName)->getValue();
+  for (auto &F : *M) {
+    if (!isKernelFunction(M, &F)) continue;
+    SmallVector<CallInst *, 8> calls;
+    SmallVector<CallInst *, 8> controls;
+    for (auto &BB : F)
+      for (Instruction &I : BB)
+        if (auto *call = dyn_cast<CallInst>(&I))
+          if (auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand())) {
+            StringRef code = assembly->getAsmString();
+            if (code.contains("wgmma.mma_async") &&
+                (code.contains("k16.f32.f16.f16") || code.contains("k16.f32.bf16.bf16")))
+              calls.push_back(call);
+            else if (code.contains("wgmma.fence") || code.contains("wgmma.commit_group") ||
+                     code.contains("wgmma.wait_group"))
+              controls.push_back(call);
+          }
+    if (calls.empty()) continue;
+    calls.append(controls.begin(), controls.end());
+
+    unsigned scratchWarps = warps;
+    if (auto *annotations = M->getNamedMetadata("nvvm.annotations")) {
+      unsigned maxThreads[3] = {0, 1, 1};
+      for (auto *row : annotations->operands()) {
+        if (row->getNumOperands() < 3) continue;
+        const auto *function = dyn_cast_or_null<ValueAsMetadata>(row->getOperand(0));
+        if (!function || function->getValue() != &F) continue;
+        const auto *kind = dyn_cast_or_null<MDString>(row->getOperand(1));
+        const auto *count = mdconst::dyn_extract_or_null<ConstantInt>(row->getOperand(2));
+        if (!kind || !count) continue;
+        if (kind->getString() == "maxntidx") maxThreads[0] = count->getZExtValue();
+        if (kind->getString() == "maxntidy") maxThreads[1] = count->getZExtValue();
+        if (kind->getString() == "maxntidz") maxThreads[2] = count->getZExtValue();
+      }
+      const unsigned maxBlock = maxThreads[0] * maxThreads[1] * maxThreads[2];
+      if (maxBlock) scratchWarps = std::min(warps, (maxBlock + 31) / 32);
+    }
+    // A and B each need 16 x 16 half elements per physical warp. The array's
+    // ABI alignment keeps the staged word accesses aligned after shared relocation.
+    auto *scratchType = ArrayType::get(Type::getInt32Ty(context), scratchWarps * 256);
+    auto *scratch = new GlobalVariable(*M, scratchType, false, GlobalValue::InternalLinkage,
+                                       UndefValue::get(scratchType), "cupbop.wgmma.scratch", nullptr,
+                                       GlobalValue::NotThreadLocal, 3);
+    // Keep the additional CTA footprint a multiple of the swizzled TMA tile alignment.
+    auto *barrierType = ArrayType::get(Type::getInt32Ty(context), 128 / sizeof(uint32_t));
+    auto *barriers = new GlobalVariable(*M, barrierType, false, GlobalValue::InternalLinkage,
+                                        UndefValue::get(barrierType), "cupbop.wgmma.groups", nullptr,
+                                        GlobalValue::NotThreadLocal, 3);
+    Value *inputs[] = {scratch, barriers};
+    const OperandBundleDef bundle(bundleName, ArrayRef<Value *>(inputs));
+    for (auto *call : calls) {
+      auto *replacement = CallBase::addOperandBundle(call, bundleID, bundle, call->getIterator());
+      call->replaceAllUsesWith(replacement);
+      call->eraseFromParent();
+    }
+  }
+}
+
+static void emit_wgmma_group_call(IRBuilder<> &builder, Module *M, Value *groups, const char *name) {
+  auto *ptr = PointerType::get(builder.getContext(), 0);
+  auto *type = FunctionType::get(builder.getVoidTy(), {ptr}, false);
+  tensor_set_convergent(builder.CreateCall(M->getOrInsertFunction(name, type),
+                                          {builder.CreatePointerCast(groups, ptr)}));
+}
+
 void replace_asm_call(llvm::Module *M) {
   // clang (CUDA 12, sm_90) emits __activemask() as the llvm.nvvm.activemask intrinsic,
   // not the `activemask.b32` asm the lifter uses; lower it the same way here so the
@@ -2601,6 +2681,22 @@ void replace_asm_call(llvm::Module *M) {
   auto HalfTy = llvm::Type::getHalfTy(context);
   auto PtrTy = PointerType::getUnqual(context);
   std::vector<CallInst *> need_remove;
+  std::set<Function *> initializedWgmmaGroups;
+  auto wgmmaGroups = [&](CallInst *call) -> Value * {
+    auto scratch = call->getOperandBundle("cupbop.wgmma.scratch");
+    if (!scratch) return nullptr;
+    Value *groups = scratch->Inputs[1];
+    if (initializedWgmmaGroups.insert(call->getFunction()).second) {
+      auto *base = dyn_cast<Instruction>(groups);
+      if (!base || !base->getNextNode()) {
+        errs() << "error: missing WGMMA group state allocation in " << call->getFunction()->getName() << '\n';
+        exit(1);
+      }
+      IRBuilder<> entry(base->getNextNode());
+      emit_wgmma_group_call(entry, M, groups, "__cupbop_wgmma_group_init");
+    }
+    return groups;
+  };
 
   // TCU: Track ldmatrix results → shared memory pointers
   // Key: the ldmatrix CallInst result (struct {i32,i32,i32,i32})
@@ -3071,10 +3167,57 @@ void replace_asm_call(llvm::Module *M) {
               need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.fence") != std::string::npos ||
                        asm_str.find("wgmma.commit_group") != std::string::npos ||
-                       asm_str.find("wgmma.wait_group") != std::string::npos ||
-                       asm_str.find("fence.proxy.async") != std::string::npos) {
-              // the wgmma lowering below is synchronous and reads shared memory through the
-              // ordinary load path, so the async-proxy fences and group bookkeeping are no-ops
+                       asm_str.find("wgmma.wait_group") != std::string::npos) {
+              const StringRef code(asm_str);
+              if (!Call->getType()->isVoidTy() || code.contains("wgmma.mma_async")) {
+                errs() << "error: WGMMA control and MMA need separate inline asm calls: " << code << '\n';
+                exit(1);
+              }
+              if (Value *groups = wgmmaGroups(Call)) {
+                SmallVector<StringRef, 2> instructions;
+                code.split(instructions, ';', -1, false);
+                IRBuilder<> builder(Call);
+                for (StringRef instruction : instructions) {
+                  instruction = instruction.trim(" \t\n\r{}");
+                  if (instruction.empty()) continue;
+                  unsigned operation = 0, pending = 0;
+                  if (instruction == "wgmma.commit_group.sync.aligned") {
+                    operation = 1;
+                  } else if (instruction.consume_front("wgmma.wait_group.sync.aligned")) {
+                    operation = 2;
+                    instruction = instruction.trim();
+                    bool invalid = false;
+                    if (instruction.consume_front("$")) {
+                      if (instruction.consume_front("{"))
+                        instruction = instruction.rtrim("}").split(':').first;
+                      unsigned index = 0;
+                      const ConstantInt *value = nullptr;
+                      if (!instruction.getAsInteger(10, index) && index < Call->arg_size())
+                        value = dyn_cast<ConstantInt>(Call->getArgOperand(index));
+                      invalid = !value || value->getValue().ugt(7);
+                      if (!invalid) pending = value->getZExtValue();
+                    } else {
+                      invalid = instruction.getAsInteger(0, pending) || pending > 7;
+                    }
+                    if (invalid) {
+                      errs() << "error: unsupported wgmma.wait_group operand: " << code << '\n';
+                      exit(1);
+                    }
+                  } else if (instruction != "wgmma.fence.sync.aligned") {
+                    errs() << "error: unsupported WGMMA control inline asm: " << code << '\n';
+                    exit(1);
+                  }
+                  const std::string encoding = ".insn r 0x0b, 4, 2, x0, x" + std::to_string(operation) +
+                                               ", x" + std::to_string(pending);
+                  auto *type = FunctionType::get(Type::getVoidTy(context), false);
+                  auto *native = InlineAsm::get(type, encoding, "~{memory}", true);
+                  tensor_set_convergent(builder.CreateCall(type, native));
+                  emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
+                }
+              }
+              need_remove.push_back(Call);
+            } else if (asm_str.find("fence.proxy.async") != std::string::npos) {
+              // The operand adapter reads SMEM through ordinary loads.
               need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.mma_async") != std::string::npos) {
               // wgmma.mma_async.sync.aligned.m64n<N>k<K>[.satfinite].<d>.<a>.<b> {d0..d(N/2-1)}, desc-a, desc-b, <tail>
@@ -3118,11 +3261,13 @@ void replace_asm_call(llvm::Module *M) {
               bool ok = werr.empty() && N >= 16 && N <= 256 && (N % 16) == 0;
               if (werr.empty() && !ok) werr = "N must be a multiple of 16";
               unsigned nacc = ok ? (unsigned)N / 2 : 0;
-              unsigned firstAcc = Call->arg_size() >= nacc ? Call->arg_size() - nacc : 0;
+              const bool hasTiedAccumulator = Call->arg_size() != 2;
+              unsigned firstAcc = hasTiedAccumulator && Call->arg_size() >= nacc ? Call->arg_size() - nacc : 2;
               // operands before the accumulators: desc_a, desc_b and, when scale-d is a register ("r" operand,
               // clang/CUTLASS form) rather than a literal in the string (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"),
               // the i32 scale-d
               ok = ok && (firstAcc == 2 || firstAcc == 3) &&
+                   Call->arg_size() == firstAcc + (hasTiedAccumulator ? nacc : 0) &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
                    Call->getArgOperand(1)->getType()->isIntegerTy(64);
               for (unsigned i = firstAcc; ok && i < Call->arg_size(); i++)
@@ -3166,6 +3311,11 @@ void replace_asm_call(llvm::Module *M) {
                   ok = false;
                 }
               }
+              if (ok) {
+                const auto *constantScale = dyn_cast_or_null<ConstantInt>(scaleD);
+                ok = scaleD && scaleD->getType()->isIntegerTy(32) &&
+                     (hasTiedAccumulator || (constantScale && constantScale->isZero()));
+              }
               if (!ok) {
                 fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
                         "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (K-major A and B, trans 0,0, scale 1,1), "
@@ -3173,9 +3323,12 @@ void replace_asm_call(llvm::Module *M) {
                         (unsigned)Call->arg_size(), asm_str.c_str(), werr.empty() ? "operands" : werr.c_str());
                 exit(1);
               }
+              auto scratch = Call->getOperandBundle("cupbop.wgmma.scratch");
               const std::string wbase = "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wtag;
               std::string wname;
-              if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
+              if (scratch)
+                wname = wbase + "_native";
+              else if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
                 wname = wbase; // f16/bf16: the TCU wrappers as before (TCU builds)
               else
                 wname = tensor_pick_symbol("wgmma " + opc, wbase, "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wa + "s32", wa, wb, wsat);
@@ -3197,15 +3350,24 @@ void replace_asm_call(llvm::Module *M) {
               Type *AccTy = ArrayType::get(AccT, nacc);
               IRBuilder<> AB(&Call->getFunction()->getEntryBlock().front());
               Value *Acc = AB.CreateAlloca(AccTy, nullptr, "wgmma.acc");
-              for (unsigned i = 0; i < nacc; i++) {
+              for (unsigned i = 0; hasTiedAccumulator && i < nacc; i++) {
                 Value *v = Call->getArgOperand(firstAcc + i);
                 if (v->getType() != AccT) v = builder.CreateBitCast(v, AccT);
                 builder.CreateStore(v, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
               }
+              SmallVector<Type *, 7> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
+              SmallVector<Value *, 7> arguments{ConstantInt::get(I32, N), Call->getArgOperand(0),
+                                                Call->getArgOperand(1), scaleD, wig, Acc};
+              if (scratch) {
+                argumentTypes.push_back(PtrTy);
+                arguments.push_back(builder.CreatePointerCast(scratch->Inputs[0], PtrTy));
+              }
               FunctionCallee FC = M->getOrInsertFunction(
-                  wname, FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
-              tensor_set_convergent(builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
-                                                            Call->getArgOperand(1), scaleD, wig, Acc}));
+                  wname, FunctionType::get(Type::getVoidTy(context), argumentTypes, false));
+              Value *groups = wgmmaGroups(Call);
+              if (groups) emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
+              tensor_set_convergent(builder.CreateCall(FC, arguments));
+              if (groups) emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
               Value *Res = UndefValue::get(Call->getType());
               auto *RST = dyn_cast<StructType>(Call->getType());
               for (unsigned i = 0; i < nacc; i++) {

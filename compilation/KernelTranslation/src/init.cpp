@@ -1005,6 +1005,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     // 1:1 and core mapping (virt): one CTA per CUDA block, __shared__ in the CTA's local memory
     if (local_mem_use == 1)
     {
+      prepare_wgmma_scratch(M);
       mem_share2local(M);
     }
     else

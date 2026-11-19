@@ -62,4 +62,33 @@ for sch in 2 1; do
   if grep -q '^PASSED!' $OUT/$tag.out 2>/dev/null && [ -n "$cyc" ] && [ "$cyc" -lt 1000000 ]; then echo "$tag: PASS (cycles=$cyc)"
   else echo "$tag: FAIL (unexpected; cycles=${cyc:-?}, see $OUT/$tag.log)"; fi
 done
+if grep -q '^#define VX_DXA_SWIZZLE_128B ' "$VORTEX_PATH_TCU/sw/VX_types.h"; then
+  results=$(realpath "$OUT")
+  tag=s2_tma_pipeline_swizzle
+  (
+    cd examples/async_tma2d
+    make clean >/dev/null 2>&1
+    env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" make build SCHEDULE=2 \
+        EXTRA_CLANG_FLAGS=-DASYNC_PIPELINE
+    for dxa in 0 1; do
+      env LD_LIBRARY_PATH="../../build/runtime/threadPool:$VORTEX_PATH_TCU/sw/runtime:../../build/runtime:$LD_LIBRARY_PATH" \
+          CUPBOP_TMA_DXA="$dxa" CUPBOP_PERF_KERNEL_FILE="$results/$tag-$dxa.jsonl" \
+          ./host.out -b 2 -t 4 -w 48 -s 1 > "$results/$tag-$dxa.out" 2>&1 || exit 1
+      grep -q '^PASSED!' "$results/$tag-$dxa.out" || exit 1
+    done
+  ) > "$results/$tag.log" 2>&1 && python3 - "$results" "$tag" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results, tag = sys.argv[1:]
+for offload, expected in enumerate((0, 8)):
+    log = Path(results) / f'{tag}-{offload}.jsonl'
+    record = json.loads(log.read_text().splitlines()[-1])
+    assert record['val']['dxa.transfers'] == expected, record['val']['dxa.transfers']
+PY
+  if [ "$?" -eq 0 ]; then echo "$tag: PASS"
+  else echo "$tag: FAIL (unexpected; see $results/$tag.log)"; exit 1
+  fi
+fi
 INNER

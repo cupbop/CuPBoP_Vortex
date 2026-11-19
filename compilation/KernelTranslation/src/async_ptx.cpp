@@ -15,6 +15,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -41,11 +42,9 @@ const char *kInit = "__cupbop_mbar_init", *kArrive = "__cupbop_mbar_arrive", *kA
            *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy", *kRankFail = "__cupbop_cluster_rank_fail",
            *kActive = "__cupbop_activemask", *kTmaLoadQi = "__cupbop_tma_load_qi",
            *kArriveM = "__cupbop_mbar_arrive_m", *kArriveTxM = "__cupbop_mbar_arrive_tx_m", *kTmaSlot = "__cupbop_tma_slot",
-           *kTxqIssue = "__cupbop_txq_issue";
+           *kTxqIssue = "__cupbop_txq_issue", *kTxqCheck = "__cupbop_txq_check";
 const uint32_t kIdPlaceholder = 0xFFFFFFFFu;
-// the runtime's queue entries (CUPBOP_TXQ_N), and an entry past them: the TMA load copies synchronously (no converged DXA
-// issue point)
-const uint32_t kTxqN = 4, kTxqSync = 0xFFu;
+const uint32_t kTxqN = 4, kTxqEntrySize = 48;
 
 int schedule() {
   const char *e = std::getenv("VORTEX_SCHEDULE_FLAG");
@@ -232,10 +231,11 @@ struct PassState {
   std::set<CallInst *> txCopies;                          // copies that complete on an mbarrier
   std::set<Function *> tcgenFunctions;                    // use a byte-counted software barrier for TCGEN/TMA kernels
   std::set<Function *> needWarps;                         // functions with ops that need real warps
-  std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
+  std::map<BasicBlock *, WeakTrackingVH> txqIssueAnchors;
   std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
   std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
+  std::map<Function *, std::pair<AllocaInst *, unsigned>> paramImages;
   unsigned n_asm = 0, n_intr = 0, n_moved = 0, n_issue = 0;
   explicit PassState(Module *m)
       : M(m), ctx(m->getContext()), I1(Type::getInt1Ty(ctx)), I32(Type::getInt32Ty(ctx)), I64(Type::getInt64Ty(ctx)),
@@ -941,8 +941,8 @@ struct AsmLowering {
     fail("unsupported bulk copy `" + s.op + "`");
   }
 
-  // `<fn>_param_N`: the address of kernel parameter N in the CUDA parameter image. CuLifter keeps that image
-  // in the `param_local` alloca, indexed by constant-bank offset (argument `arg_<offset>`).
+  // `cvta.param` exposes a position in the CUDA parameter bank. NVCC can reach other arguments by
+  // adding an offset to that position, even if the lifted program has no explicit loads from param_local.
   Value *paramAddress(const std::string &sym) {
     size_t p = sym.rfind("_param_");
     std::string fname = sym.substr(0, p);
@@ -952,33 +952,39 @@ struct AsmLowering {
     if (n >= F->arg_size()) fail("cvta.param of a parameter the function does not have (" + sym + ")");
     S.paramAddrArgs.insert({F, n});
     Argument *A = F->getArg(n);
-    AllocaInst *img = nullptr;
-    for (auto &I : F->getEntryBlock())
-      if (auto *AI = dyn_cast<AllocaInst>(&I))
-        if (AI->getName() == "param_local") img = AI;
-    unsigned off = 0;
-    if (img && A->getName().starts_with("arg_")) {
-      off = std::atoi(A->getName().str().c_str() + 4);
-      // the image must hold this argument at that offset
-      bool stored = false;
-      for (User *U : A->users())
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          APInt o(64, 0);
-          Value *base = SI->getPointerOperand()->stripAndAccumulateConstantOffsets(S.M->getDataLayout(), o, true);
-          if (base == img && o.getZExtValue() == off) stored = true;
-        }
-      if (!stored) img = nullptr;
-    } else {
-      img = nullptr;
-    }
     IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
-    if (!img) { // a private image of this one argument
+    StringRef name = A->getName();
+    unsigned off;
+    if (!name.consume_front("arg_") || name.getAsInteger(10, off)) {
       AllocaInst *one = EB.CreateAlloca(A->getType(), nullptr, "param_img");
       one->setAlignment(Align(64));
       EB.CreateStore(A, one);
       return one;
     }
-    return B.CreateGEP(Type::getInt8Ty(S.ctx), img, ConstantInt::get(S.I64, off), "param_addr");
+    auto &[img, base] = S.paramImages[F];
+    if (!img) {
+      const DataLayout &DL = S.M->getDataLayout();
+      std::vector<unsigned> offsets;
+      unsigned first = UINT32_MAX;
+      uint64_t end = 0;
+      for (Argument &arg : F->args()) {
+        StringRef word = arg.getName();
+        unsigned offset;
+        if (!word.consume_front("arg_") || word.getAsInteger(10, offset))
+          fail("cvta.param requires an offset for every lifted kernel parameter");
+        first = std::min(first, offset);
+        end = std::max(end, offset + DL.getTypeStoreSize(arg.getType()).getFixedValue());
+        offsets.push_back(offset);
+      }
+      base = first & ~63u;
+      img = EB.CreateAlloca(ArrayType::get(EB.getInt8Ty(), end - base), nullptr, "param_bank");
+      img->setAlignment(Align(64));
+      for (Argument &arg : F->args()) {
+        Value *dst = EB.CreateConstGEP1_64(EB.getInt8Ty(), img, offsets[arg.getArgNo()] - base);
+        EB.CreateAlignedStore(&arg, dst, Align(1));
+      }
+    }
+    return B.CreateConstGEP1_64(B.getInt8Ty(), img, off - base, "param_addr");
   }
 };
 
@@ -1131,25 +1137,21 @@ bool isWaitLike(Instruction *I, std::set<Function *> &visiting) {
   return functionWaits(F, visiting);
 }
 
-// The per-function DXA issue queue of the moved arrives (see __cupbop_tma_load_qi in cudaKernelImpl_async.inc).
+// Separate transaction queues let multiple stages register copies in the
+// same elected-lane region before the warp reconverges and submits them.
 Value *txQueue(PassState &S, Function *F) {
-  Value *&Q = S.txq[F];
-  if (!Q) {
-    IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
-    AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
-    AI->setAlignment(Align(8));
-    // every entry invalid, after the entry block's allocas (the core-mapping passes expect them contiguous at the top): the
-    // valid word of each entry (cupbop_txq in cudaKernelImpl_async.inc: 4 entries of 40 bytes, valid at byte 16), the rest
-    // is written before it is read. On the core mapping the queue is per-thread context memory, where a memset of the whole
-    // queue was 24 stores per thread.
-    Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
-    while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
-    IRBuilder<> IB(firstNonAlloca);
-    for (unsigned j = 0; j < 4; ++j)
-      IB.CreateAlignedStore(ConstantInt::get(S.I32, 0), IB.CreateConstGEP1_32(Type::getInt8Ty(S.ctx), AI, 40 * j + 16), Align(8));
-    Q = AI;
-  }
-  return Q;
+  IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+  AllocaInst *AI = EB.CreateAlloca(ArrayType::get(EB.getInt8Ty(), kTxqN * kTxqEntrySize), nullptr, "cupbop_txq");
+  AI->setAlignment(Align(8));
+  // The core-mapping passes expect the entry block's allocas contiguous. Initialize
+  // each entry's byte count and valid flag after them; the copy writes the rest.
+  Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
+  while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
+  IRBuilder<> IB(firstNonAlloca);
+  for (unsigned j = 0; j < kTxqN; ++j)
+    for (unsigned off : {12u, 16u})
+      IB.CreateAlignedStore(IB.getInt32(0), IB.CreateConstGEP1_32(IB.getInt8Ty(), AI, kTxqEntrySize * j + off), Align(4));
+  return AI;
 }
 
 // CUPBOP_TMA_STATIC=0: no slot read at the entry and no barrier number from the translator (the queued loads read both
@@ -1168,7 +1170,6 @@ Value *tmaSlot(PassState &S, CallInst *Cp) {
   if (tmaStatic() && schedule() == 2 && isa<Argument>(desc) && isa<ConstantInt>(rank)) {
     Value *&V = S.slots[{F, desc}];
     if (!V) {
-      txQueue(S, F); // the queue's initialization first, so that the entry's allocas stay contiguous
       Instruction *IP = &*F->getEntryBlock().getFirstInsertionPt();
       while (isa<AllocaInst>(IP)) IP = IP->getNextNode();
       IRBuilder<> EB(IP);
@@ -1187,8 +1188,11 @@ unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies,
   unsigned K = 0;
   for (CallInst *Cp : copies)
     if (Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoadQi) {
+      Value *oldQueue = Cp->getArgOperand(0);
+      if (Q && Q != oldQueue) fail_at(Cp, "TMA copies shared by disjoint mbarrier transactions");
+      Q = oldQueue;
       const uint64_t j = cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue();
-      if (j != kTxqSync) K = std::max<unsigned>(K, j + 1);
+      K = std::max<unsigned>(K, j + 1);
     }
   for (CallInst *&Cp : copies) {
     if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
@@ -1207,6 +1211,16 @@ unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies,
     Cp = N;
   }
   return K;
+}
+
+void checkTmaBytes(PassState &S, IRBuilder<> &B, Value *Q, unsigned K, Value *bar, Value *bytes,
+                   const std::vector<CallInst *> &copies) {
+  const bool counted = bytes && K <= kTxqN &&
+      std::all_of(copies.begin(), copies.end(), [](CallInst *C) {
+        return C->getCalledFunction() && C->getCalledFunction()->getName() == kTmaLoadQi;
+      });
+  S.call(B, kTxqCheck, S.Void,
+         {Q, B.getInt32(std::min<unsigned>(K, kTxqN)), bar, counted ? bytes : B.getInt32(0), B.getInt32(counted)});
 }
 
 // ---- which threads of the block can satisfy a predicate (the arrive of Triton's TMA issue and its copies)
@@ -1355,7 +1369,7 @@ Value *guardOf(BasicBlock *BB) {
 // executes it, as the compiler's per-lane model assumes. The point: out of every region whose branch is not uniform
 // (isUniformValue), in the arrive's loop, with no wait and no other queue access (a TMA load, an arrive, an issue) on the
 // way from the arrive. nullptr (why) when there is none.
-Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
+Instruction *convergedIssuePoint(PassState &S, Function *F, CallInst *Ar, std::string &why) {
   // a device function may be called under a partial mask: only a kernel's entry has the whole warp
   if (!isKernelFunction(F->getParent(), F)) { why = "the arrive is in a device function, not a kernel"; return nullptr; }
   DominatorTree DT(*F);
@@ -1453,6 +1467,11 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
     moved = true;
   }
   Instruction *IP = moved ? &*P->getFirstInsertionPt() : Ar->getNextNode();
+  if (moved) {
+    auto &anchor = S.txqIssueAnchors[P];
+    if (Value *original = anchor) IP = cast<Instruction>(original);
+    else anchor = IP;
+  }
   std::set<Function *> visiting;
   std::set<BasicBlock *> seen;
   std::vector<std::pair<BasicBlock *, Instruction *>> w{{Ar->getParent(), Ar->getNextNode()}};
@@ -1466,11 +1485,6 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
       if (!C) continue;
       visiting.clear();
       if (isWaitLike(C, visiting)) { why = "a wait lies between the arrive and the end of its region"; return nullptr; }
-      StringRef n = C->getCalledFunction() ? C->getCalledFunction()->getName() : "";
-      if (n == kTmaLoad || n == kTmaLoadQi || n == kArriveM || n == kArriveTxM || n == kTxqIssue) {
-        why = "another TMA load or moved arrive lies between the arrive and the end of its region";
-        return nullptr;
-      }
     }
     if (stop) continue;
     for (BasicBlock *Sc : successors(BB))
@@ -1486,7 +1500,7 @@ bool tmaIssueForcedSync() {
 
 // The issue of the K queued copies of a moved arrive Ars (one call, or one per insertion point): one
 // __cupbop_txq_issue(Q, K, wide) at each call's converged point (deduplicated). Without such a point for every call, the
-// copies of these entries copy synchronously (kTxqSync) and nothing is issued: correct, slower, and warned.
+// copies of these entries copy synchronously and count their bytes, but do not issue DXA.
 // CUPBOP_TMA_ISSUE=sync forces that (tests).
 void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, Value *Q, unsigned K,
                 const std::vector<CallInst *> &copies) {
@@ -1507,11 +1521,11 @@ void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, V
   if (why.empty() && tmaIssueForcedSync()) why = "CUPBOP_TMA_ISSUE=sync";
   for (CallInst *Ar : Ars) {
     if (!why.empty()) break;
-    Instruction *IP = convergedIssuePoint(F, Ar, why);
+    Instruction *IP = convergedIssuePoint(S, F, Ar, why);
     if (IP && std::find(IPs.begin(), IPs.end(), IP) == IPs.end()) IPs.push_back(IP);
   }
   if (!why.empty()) {
-    for (CallInst *Cp : mine) Cp->setArgOperand(1, ConstantInt::get(S.I32, kTxqSync));
+    for (CallInst *Cp : mine) Cp->setArgOperand(3, ConstantInt::get(S.I32, UINT32_MAX));
     fprintf(stderr, "[CuPBoP] warning: %s: no point where the warp is converged after an mbarrier arrive for the DXA issue "
                     "of its %zu TMA copies (%s): they copy synchronously\n", F->getName().str().c_str(), mine.size(),
             why.c_str());
@@ -1526,9 +1540,9 @@ void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, V
     IRBuilder<> IB(IP);
     S.call(IB, kTxqIssue, S.Void, {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, wide)});
     for (unsigned j = 0; j < K && j < kTxqN; ++j) {
-      IB.CreateAlignedStore(PoisonValue::get(S.Ptr), IB.CreateConstGEP1_32(I8, Q, 40 * j), Align(8));
+      IB.CreateAlignedStore(PoisonValue::get(S.Ptr), IB.CreateConstGEP1_32(I8, Q, kTxqEntrySize * j), Align(8));
       for (unsigned off : {8u, 20u, 24u, 28u, 32u, 36u})
-        IB.CreateAlignedStore(PoisonValue::get(S.I32), IB.CreateConstGEP1_32(I8, Q, 40 * j + off), Align(4));
+        IB.CreateAlignedStore(PoisonValue::get(S.I32), IB.CreateConstGEP1_32(I8, Q, kTxqEntrySize * j + off), Align(4));
     }
   }
   S.n_issue += IPs.size();
@@ -1657,6 +1671,7 @@ bool moveArriveOverCtaBarriers(PassState &S, Function *F, CallInst *A, std::stri
   IRBuilder<> IB(thenT);
   Value *P = bar->getType()->getPointerAddressSpace() ? IB.CreateAddrSpaceCast(bar, S.Ptr, "async_gen") : bar;
   const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+  checkTmaBytes(S, IB, Q, K, P, isTx ? A->getArgOperand(1) : nullptr, copies);
   CallInst *Ar = S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32, {ConstantInt::get(S.I32, 1), P, A->getArgOperand(1)});
   fprintf(stderr, "[CuPBoP] %s: an mbarrier arrive of thread %u moved after its %zu TMA copies, over CTA barriers (§5.3)\n",
           F->getName().str().c_str(), (*tA)[0], copies.size());
@@ -1697,8 +1712,13 @@ void moveArrives(PassState &S, Function *F) {
       work.pop_back();
       bool stop = false;
       for (Instruction *I = from; I; I = I->getNextNode()) {
-        if (auto *CI = dyn_cast<CallInst>(I))
+        if (auto *CI = dyn_cast<CallInst>(I)) {
+          Function *callee = CI->getCalledFunction();
+          // Another producer phase owns its own TMA sites. A pipeline's
+          // prologue can reach the next tile's issue before the first wait.
+          if (callee && callee->getName() == kArriveTx) { stop = true; break; }
           if (S.txCopies.count(CI)) copies.push_back(CI);
+        }
         if (waits(I)) { stop = true; break; }
       }
       if (stop) continue;
@@ -1814,6 +1834,7 @@ void moveArrives(PassState &S, Function *F) {
       if (Q) {
         IRBuilder<> IB(IP);
         const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+        checkTmaBytes(S, IB, Q, K, A->getArgOperand(0), isTx ? A->getArgOperand(1) : nullptr, copies);
         moved.push_back(S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32,
                                {ConstantInt::get(S.I32, 0), A->getArgOperand(0), A->getArgOperand(1)}));
       } else {
@@ -1863,6 +1884,59 @@ static bool hasVectorType(Type *T) {
     for (Type *E : ST->elements()) if (hasVectorType(E)) return true;
   return false;
 }
+
+static std::optional<uint64_t> paramBankOffset(Value *V, AllocaInst *bank, const DataLayout &DL) {
+  if (V == bank) return 0;
+  if (isa<PtrToIntInst, IntToPtrInst>(V))
+    return paramBankOffset(cast<Instruction>(V)->getOperand(0), bank, DL);
+  if (auto *op = dyn_cast<BinaryOperator>(V)) {
+    if (op->getOpcode() != Instruction::Add && op->getOpcode() != Instruction::Sub) return {};
+    if (auto *amount = dyn_cast<ConstantInt>(op->getOperand(1)))
+      if (auto base = paramBankOffset(op->getOperand(0), bank, DL))
+        return op->getOpcode() == Instruction::Add ? *base + amount->getZExtValue() : *base - amount->getZExtValue();
+  }
+  if (V->getType()->isPointerTy()) {
+    APInt offset(64, 0);
+    Value *base = V->stripAndAccumulateConstantOffsets(DL, offset, true);
+    if (base != V)
+      if (auto start = paramBankOffset(base, bank, DL)) return *start + offset.getZExtValue();
+  }
+  return {};
+}
+
+// The host passes a CUDA tensor map as one device-address slot, even when NVCC derived
+// its parameter address by adding an offset to another tensor map's cvta.param.
+static void markTensorMapParameters(PassState &S) {
+  const DataLayout &DL = S.M->getDataLayout();
+  for (const auto &[F, image] : S.paramImages) {
+    auto [bank, bankBase] = image;
+    std::map<uint64_t, unsigned> tensorMaps;
+    for (Argument &arg : F->args()) {
+      unsigned off;
+      StringRef name = arg.getName();
+      if (hasVectorType(arg.getType()) && DL.getTypeStoreSize(arg.getType()) == 128 &&
+          name.consume_front("arg_") && !name.getAsInteger(10, off))
+        tensorMaps.emplace(off - bankBase, arg.getArgNo());
+    }
+    if (tensorMaps.empty()) continue;
+    for (BasicBlock &bb : *F)
+      for (Instruction &I : bb) {
+        auto *call = dyn_cast<CallInst>(&I);
+        if (!call || !call->getCalledFunction()) continue;
+        StringRef callee = call->getCalledFunction()->getName();
+        Value *descriptor = nullptr;
+        if (callee == kTmaLoad || callee == "__cupbop_tcgen_tma_load") descriptor = call->getArgOperand(1);
+        else if (callee == kTmaLoadQi) descriptor = call->getArgOperand(5);
+        else if (callee == kTmaStore) descriptor = call->getArgOperand(0);
+        if (!descriptor) continue;
+        if (auto off = paramBankOffset(descriptor, bank, DL)) {
+          auto map = tensorMaps.find(*off);
+          if (map != tensorMaps.end()) S.paramAddrArgs.insert({F, map->second});
+        }
+      }
+  }
+}
+
 static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &paramAddrArgs) {
   const DataLayout &DL = M->getDataLayout();
   const bool all = std::getenv("CUPBOP_NARROW_VECTOR_ARGS") != nullptr;
@@ -2056,6 +2130,7 @@ void lower_async_ptx(Module *M) {
     std::remove("cupbop_async_kernels.txt");
   }
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
+  markTensorMapParameters(S);
   narrowWideKernelArgs(M, S.paramAddrArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "
                   "copies, %u converged DXA issue point(s)\n", S.n_asm, S.n_intr, S.n_moved, S.n_issue);
