@@ -102,6 +102,10 @@ ifeq ($(VORTEX_VER),3)
   VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(notdir $(CURDIR))_s$(SCHEDULE)_l$(LOCALMEM)
   VX3_RT_DIR = $(VORTEX_PATH)/sw/runtime
   export VORTEX_DRIVER ?= simx
+  # Older SimX builds and other drivers use the fixed-count CTA barrier.
+  export CUPBOP_SIMX_LIVE_CTA_BARRIER ?= $(strip $(if $(filter simx,$(VORTEX_DRIVER)),\
+    $(shell grep -q '^\#define VX_BAR_LIVE_CTA ' "$(VORTEX_PATH)/sw/VX_types.h" 2>/dev/null && echo 1)))
+  LIVE_CTA_SETTING := .cupbop-live-cta-barrier
 endif
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
@@ -199,6 +203,7 @@ rebuild-ir:
 
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
+	rm -f .cupbop-live-cta-barrier
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
 	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
@@ -242,7 +247,14 @@ $(HOST_BC): $(DEVICE_BC)
 # ─── Step 2: kernelTranslator -> kernel.bc + kernel_wrapper.cpp ──────────────
 endif
 
-kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC)
+ifneq ($(LIVE_CTA_SETTING),)
+.PHONY: check-live-cta-setting
+$(LIVE_CTA_SETTING): check-live-cta-setting
+	@setting='$(if $(filter simx:1,$(VORTEX_DRIVER):$(strip $(CUPBOP_SIMX_LIVE_CTA_BARRIER))),1,0)'; \
+	if [ "$$setting" != "$$(cat $@ 2>/dev/null)" ]; then printf '%s\n' "$$setting" > $@; fi
+endif
+
+kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC) $(LIVE_CTA_SETTING)
 	@echo "--- Translate kernel bitcode"
 	$(KERNEL_TRANSLATOR) $< kernel.bc
 	llvm-dis kernel.bc

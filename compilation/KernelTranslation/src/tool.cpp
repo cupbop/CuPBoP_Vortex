@@ -1343,6 +1343,11 @@ void replace_built_in_function(llvm::Module *M) {
     schedule = std::stoi(std::string(env));
   }
 
+  const char *driver = std::getenv("VORTEX_DRIVER");
+  const char *liveCtaBarrier = std::getenv("CUPBOP_SIMX_LIVE_CTA_BARRIER");
+  const bool useLiveCtaBarrier = driver && std::strcmp(driver, "simx") == 0 &&
+                                liveCtaBarrier && std::strcmp(liveCtaBarrier, "1") == 0;
+
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
   std::vector<llvm::Instruction *> need_remove;
@@ -1760,6 +1765,11 @@ void replace_built_in_function(llvm::Module *M) {
                   warpsPerGroup = builder.CreateLoad(warpsPerGroupGV->getValueType(), warpsPerGroupGV);
                 }
 
+                if (useLiveCtaBarrier) {
+                  // SimX VX_BAR_LIVE_CTA selects a full CTA barrier over warps that have not exited.
+                  localGroupId = builder.CreateOr(localGroupId, ConstantInt::get(I32, 0x40000000),
+                                                  "live_cta_barrier_id");
+                }
                 CallInst *syncThreads = builder.CreateCall(
                     threadIdxFunc, {localGroupId, warpsPerGroup});
                 // convergent like the llvm.nvvm.barrier0 it replaces: without it LLVM may copy the barrier into
