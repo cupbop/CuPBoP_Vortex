@@ -30,6 +30,10 @@ if ! bash ci/tma_self_arrive_test.sh build/compilation/kernelTranslator "$LLVM_P
   cat "$OUT/tma_self_arrive.log"
   exit 1
 fi
+if ! bash ci/dxa_layout_metadata_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/dxa_layout_metadata.log" 2>&1; then
+  cat "$OUT/dxa_layout_metadata.log"
+  exit 1
+fi
 run() { # tag example sched [make vars...]
   local tag=$1 ex=$2 sched=$3; shift 3
   ( cd examples/$ex && make clean > /dev/null 2>&1; rm -f ci_output.txt cupbop_async_kernels.txt
@@ -65,6 +69,12 @@ expect_fail    s2_control_no_move async_tma2d 2 CUPBOP_ASYNC_NO_MOVE=1
 # stage 3: TMA in DXA mode (CUPBOP_TMA_DXA=1, a 64-byte-row tensor) on the TCU+DXA SimX build; must PASS and be
 # far faster than the software copies (about 3.6M cycles), i.e. the DXA really carried the boxes
 cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU" > /dev/null || { echo "SIMX (TCU/DXA) BUILD FAILED"; exit 1; }
+if ! env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" \
+    bash ci/tma_dxa_layouts_test.sh > "$OUT/tma_dxa_layouts.log" 2>&1; then
+  cat "$OUT/tma_dxa_layouts.log"
+  exit 1
+fi
+echo "tma_dxa_layouts: PASS"
 for sch in 2 1; do
   tag=s${sch}_async_tma2d_dxa
   ( cd examples/async_tma2d && make clean > /dev/null 2>&1; rm -f ci_output.txt

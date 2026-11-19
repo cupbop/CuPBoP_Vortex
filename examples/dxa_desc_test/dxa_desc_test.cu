@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <cupbop_dxa.h>
 
 extern "C" int cudaDxaProgramDescNd(unsigned int slot, unsigned long long base_addr, unsigned int rank,
                                     const unsigned int *sizes, const unsigned int *strides_bytes,
@@ -59,6 +60,54 @@ __global__ void dxakmaj(float *__restrict__ dst, int width, int height) {
   const int tid = threadIdx.y * 16 + threadIdx.x, yo = tid % 16, xo = tid / 16;
   const int xg = blockIdx.x * 16 + xo, yg = blockIdx.y * 16 + yo;
   if (xg < width && yg < height) dst[yg + xg * height] = tile[tid]; // = src(xg, yg) = tile[xo * 16 + yo]
+}
+
+// Expose the SMEM image in element order; each transfer reuses descriptor slot 2.
+constexpr unsigned tile_n = 32, tile_k = 64, tile_elems = tile_n * tile_k;
+__global__ void dump_b_tile(uint16_t *out) {
+  __shared__ __align__(64) uint16_t tile[tile_elems];
+  const unsigned bar = __vx_dxa_barrier_id(0);
+  __vx_dxa_issue_2d(2, bar, tile, 0, 0);
+  __vx_dxa_wait(bar);
+  __syncthreads();
+  for (unsigned i = threadIdx.x; i < tile_elems; i += blockDim.x) out[i] = tile[i];
+}
+
+static int check_b_layouts() {
+  constexpr unsigned tc_n = 8, block_k = 16, ratio = 2;
+  const unsigned size[] = {tile_n, tile_k};
+  uint16_t input[tile_elems], output[tile_elems];
+  for (unsigned i = 0; i < tile_elems; ++i) input[i] = uint16_t(i + 1);
+  uint16_t *src, *dst;
+  if (cudaMalloc(&src, sizeof(input)) != cudaSuccess || cudaMalloc(&dst, sizeof(output)) != cudaSuccess ||
+      cudaMemcpy(src, input, sizeof(input), cudaMemcpyHostToDevice) != cudaSuccess) return 1;
+  int errors = 0;
+  for (unsigned layout = CUPBOP_DXA_LAYOUT_FLAT; layout <= CUPBOP_DXA_LAYOUT_BLOCK_MAJOR; ++layout) {
+    if (cudaDxaProgramDescNdTiled(2, (uintptr_t)src, 2, size, nullptr, size, sizeof(uint16_t),
+                                  layout, 0, 0, tc_n, layout == CUPBOP_DXA_LAYOUT_BLOCK_MAJOR ? block_k : 0)) return 1;
+    dump_b_tile<<<1, 32>>>(dst);
+    if (cudaMemcpy(output, dst, sizeof(output), cudaMemcpyDeviceToHost) != cudaSuccess) return 1;
+    unsigned pos = 0;
+    const unsigned k_span = layout == CUPBOP_DXA_LAYOUT_FLAT ? 2 * tc_n * ratio : block_k;
+    for (unsigned k = 0; k < tile_k; k += k_span) {
+      for (unsigned n = 0; n < tile_n; n += tc_n) {
+        if (layout == CUPBOP_DXA_LAYOUT_FLAT) {
+          for (unsigned word = 0; word < k_span / ratio; ++word)
+            for (unsigned col = 0; col < tc_n; ++col)
+              for (unsigned lane = 0; lane < ratio; ++lane)
+                errors += output[pos++] != input[(k + word * ratio + lane) * tile_n + n + col];
+        } else {
+          for (unsigned col = 0; col < tc_n; ++col)
+            for (unsigned row = 0; row < k_span; ++row)
+              errors += output[pos++] != input[(k + row) * tile_n + n + col];
+        }
+      }
+    }
+  }
+  cudaFree(dst);
+  cudaFree(src);
+  printf("Flat and block-major B tiles: %d errors\n", errors);
+  return errors;
 }
 
 int main(int argc, char **argv) {
@@ -143,7 +192,7 @@ int main(int argc, char **argv) {
         }
     printf("K-major: %d errors\n", ek);
   }
-  errors = e1 + e3 + ek;
+  errors = e1 + e3 + ek + check_b_layouts();
   printf("%s\n", errors ? "FAILED!" : "PASSED!");
   return errors ? 1 : 0;
 }

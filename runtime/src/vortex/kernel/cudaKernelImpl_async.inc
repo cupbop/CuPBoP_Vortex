@@ -211,6 +211,26 @@ static __attribute__((always_inline)) inline void cupbop_fill_elem(void *d, uint
   default: *(uint64_t *)d = nan ? 0x7FFFFFFFFFFFFFFFull : 0; break;
   }
 }
+
+static inline uint32_t cupbop_tma_permuted_index(const cupbop_tmap &t, uint32_t n, uint32_t k) {
+  if (t.layout == CUPBOP_DXA_LAYOUT_K_MAJOR) return n * (t.rank > 1 ? t.box[1] : 1u) + k;
+
+  const uint32_t tc_n = t.geometry & 0xffffu;
+  const uint32_t n_blocks = t.box[0] / tc_n;
+  const uint32_t n_block = n / tc_n;
+  const uint32_t n_in = n % tc_n;
+  if (t.layout == CUPBOP_DXA_LAYOUT_FLAT) {
+    const uint32_t ratio = t.elem < 4 ? 4 / t.elem : 1;
+    const uint32_t k_words = 2 * tc_n;
+    const uint32_t k_word = k / ratio;
+    const uint32_t block = (k_word / k_words) * n_blocks + n_block;
+    return ((block * k_words + k_word % k_words) * tc_n + n_in) * ratio + k % ratio;
+  }
+  const uint32_t block_k = t.geometry >> 16;
+  const uint32_t block = (k / block_k) * n_blocks + n_block;
+  return (block * tc_n + n_in) * block_k + k % block_k;
+}
+
 // One box of the tensor <-> a box in shared memory (innermost dimension first). Load: out-of-
 // bounds elements are filled (0, or NaN); store: out-of-bounds elements are not written.
 static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *desc, uint32_t rank, int32_t c0,
@@ -225,6 +245,7 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
     dm[i] = i < (int)rank ? t->dim[i] : 1u;
   }
   const uint32_t e = t->elem;
+  const bool row_major = t->layout == CUPBOP_DXA_LAYOUT_ROW_MAJOR;
   char *s = (char *)smem;
   for (uint32_t j4 = 0; j4 < b[4]; ++j4)
     for (uint32_t j3 = 0; j3 < b[3]; ++j3)
@@ -244,13 +265,14 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
           // For a 128-byte row the absolute row address supplies the swizzle phase.
           uintptr_t flip = t->swizzle ? (((uintptr_t)s >> 7) & 7u) << 4 : 0;
           const unsigned row_bytes = b[0] * e;
-          if (!store && row_in && c0 >= 0 && uint64_t(c0) + b[0] <= dm[0] &&
+          if (row_major && !store && row_in && c0 >= 0 && uint64_t(c0) + b[0] <= dm[0] &&
               cupbop_copy_tma_sectors(uintptr_t(s), uintptr_t(row + uint64_t(c0) * e), row_bytes, flip, 0)) {
             s += row_bytes;
             continue;
           }
           for (uint32_t j0 = 0; j0 < b[0]; ++j0, s += e) {
-            char *shared = (char *)((uintptr_t)s ^ flip);
+            char *shared = row_major ? (char *)((uintptr_t)s ^ flip)
+                : static_cast<char *>(smem) + size_t(cupbop_tma_permuted_index(*t, j0, j1)) * e;
             const int64_t g0 = (int64_t)c[0] + j0;
             const bool in = row_in && g0 >= 0 && g0 < (int64_t)dm[0];
             if (store) {

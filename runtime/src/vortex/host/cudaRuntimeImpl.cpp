@@ -1,5 +1,6 @@
 #include "cudaRuntimeImpl.h"
 #include "cupbop_async.h"
+#include "cupbop_dxa_layout.h"
 #include "cupbop_launch_context.h"
 #include "base_address.h"
 #include "api.h"
@@ -120,7 +121,7 @@ static void cupbop_switch_module(const std::string &from, const std::string &to)
 // ── DXA descriptors (programmed into the DXA DCRs before each kernel launch) ─────────────────────────
 // Field layout: vortex sw/runtime/include/dxa.h (VX_DCR_DXA_DESC_* offsets, META = rank | log2(elem)<<3 |
 // layout<<5 | swizzle<<7). Rank 1-5; sizes in elements; strides in bytes for dims 1..rank-1; box = elements per dim of
-// one transfer; layout 0 = row-major box in shared memory, 1 = K-major (transposed, rank <= 2);
+// one transfer; destination layouts 0..3 are row-major, K-major, flat and block-major.
 // smem_stride = multicast shared-memory stride between CTAs; fill = 32-bit pattern written for
 // out-of-bounds elements (lane-replicated per 4 bytes).
 struct DxaDescEntry {
@@ -132,6 +133,7 @@ struct DxaDescEntry {
   uint32_t box[5];
   uint32_t elem_bytes;
   uint32_t layout;
+  uint32_t tc_n, block_k;
   uint32_t swizzle;
   uint32_t smem_stride;
   uint32_t fill;
@@ -143,8 +145,8 @@ static std::string dxa_desc_check(const DxaDescEntry &d) {
   if (d.slot >= 16) return "slot must be 0..15";
   if (d.rank < 1 || d.rank > 5) return "rank must be 1..5";
   if (d.elem_bytes != 1 && d.elem_bytes != 2 && d.elem_bytes != 4 && d.elem_bytes != 8) return "elem_bytes must be 1, 2, 4 or 8";
-  if (d.layout > 1) return "layout must be 0 (row-major) or 1 (K-major)";
-  if (d.layout == 1 && d.rank > 2) return "K-major layout needs rank <= 2";
+  if (const char *why = cupbop_dxa_check_layout(d.layout, d.rank, d.elem_bytes, d.box[0], d.box[1],
+                                                 d.tc_n, d.block_k)) return why;
   if (d.swizzle && (d.swizzle != CUPBOP_TMAP_SWIZZLE_128B || d.layout != 0 ||
                     uint64_t(d.box[0]) * d.elem_bytes != 128))
     return "128B swizzle needs a row-major 128-byte innermost box";
@@ -189,6 +191,8 @@ static void dxa_program(vx_device_h dev, const DxaDescEntry &d) {
   for (uint32_t i = 0; i + 1 < d.rank; ++i) vx_dcr_write(dev, dcr + 7 + i, d.stride[i]); // STRIDE0..3
   vx_dcr_write(dev, dcr + 11, meta);                                                     // META
   for (uint32_t i = 0; i < d.rank; ++i) vx_dcr_write(dev, dcr + 12 + i, 1);              // ESTRIDE0..4
+  if (d.layout == CUPBOP_DXA_LAYOUT_FLAT || d.layout == CUPBOP_DXA_LAYOUT_BLOCK_MAJOR)
+    vx_dcr_write(dev, dcr + 14, (d.block_k << 16) | d.tc_n); // ESTRIDE2 is unused by rank-2 source addressing
   vx_dcr_write(dev, dcr + 17, (d.box[0] & 0xFFFF) | ((d.rank > 1 ? d.box[1] & 0xFFFF : 0) << 16)); // TILESIZE01
   if (d.rank > 2)
     vx_dcr_write(dev, dcr + 18, (d.box[2] & 0xFFFF) | ((d.rank > 3 ? d.box[3] & 0xFFFF : 0) << 16)); // TILESIZE23
@@ -219,21 +223,30 @@ extern "C" void cudaDxaProgramDesc2D(uint32_t slot, uint64_t base_addr,
 }
 
 // General form: rank 1-5. strides_bytes (rank-1 entries) may be NULL for a dense tensor.
-extern "C" int cudaDxaProgramDescNd(uint32_t slot, uint64_t base_addr, uint32_t rank,
+extern "C" int cudaDxaProgramDescNdTiled(uint32_t slot, uint64_t base_addr, uint32_t rank,
                                     const uint32_t *sizes, const uint32_t *strides_bytes,
                                     const uint32_t *box, uint32_t elem_bytes, uint32_t layout,
-                                    uint32_t smem_stride_bytes, uint32_t fill) {
+                                    uint32_t smem_stride_bytes, uint32_t fill, uint32_t tc_n, uint32_t block_k) {
   DxaDescEntry d{};
   d.slot = slot; d.base_addr = base_addr; d.rank = rank;
   d.elem_bytes = elem_bytes; d.layout = layout; d.smem_stride = smem_stride_bytes; d.fill = fill;
+  d.tc_n = tc_n; d.block_k = block_k;
   if (rank < 1 || rank > 5 || !sizes || !box) {
-    fprintf(stderr, "cudaDxaProgramDescNd: rank must be 1..5 and sizes/box non-NULL\n");
+    fprintf(stderr, "cudaDxaProgramDescNdTiled: rank must be 1..5 and sizes/box non-NULL\n");
     return 1;
   }
   for (uint32_t i = 0; i < rank; ++i) { d.size[i] = sizes[i]; d.box[i] = box[i]; }
   if (strides_bytes) for (uint32_t i = 0; i + 1 < rank; ++i) d.stride[i] = strides_bytes[i];
   else dxa_fill_dense_strides(d);
-  return dxa_queue(d, "cudaDxaProgramDescNd");
+  return dxa_queue(d, "cudaDxaProgramDescNdTiled");
+}
+
+extern "C" int cudaDxaProgramDescNd(uint32_t slot, uint64_t base_addr, uint32_t rank,
+                                    const uint32_t *sizes, const uint32_t *strides_bytes,
+                                    const uint32_t *box, uint32_t elem_bytes, uint32_t layout,
+                                    uint32_t smem_stride_bytes, uint32_t fill) {
+  return cudaDxaProgramDescNdTiled(slot, base_addr, rank, sizes, strides_bytes, box, elem_bytes,
+                                   layout, smem_stride_bytes, fill, 0, 0);
 }
 
 extern "C" int cudaDxaProgramDesc1D(uint32_t slot, uint64_t base_addr, uint32_t size0, uint32_t tile0,
@@ -491,8 +504,23 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 #ifndef VX_DCR_MPM_CLASS_TCU
 #define VX_DCR_MPM_CLASS_TCU 11
 #endif
-static_assert(sizeof(cupbop_tmap) <= 128, "cupbop_tmap must fit in a CUtensorMap");
+static_assert(sizeof(cupbop_tmap) == 128, "cupbop_tmap must match the CUtensorMap image");
 static std::map<uint64_t, cupbop_tmap> dxa_tensor_maps;
+
+static const char *upload_tensor_map(void *tensor_map, cupbop_tmap &record) {
+  void *device_record = nullptr;
+  if (cudaMalloc(&device_record, sizeof(record)) != cudaSuccess || !device_record)
+    return "cudaMalloc of the device record failed";
+  record.self = reinterpret_cast<uintptr_t>(device_record);
+  record.dxa_slot = UINT32_MAX;
+  if (cudaMemcpy(device_record, &record, sizeof(record), cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(device_record);
+    return "upload of the device record failed";
+  }
+  if (record.mode == CUPBOP_TMAP_MODE_DXA) dxa_tensor_maps.emplace(record.self, record);
+  memcpy(tensor_map, &record, sizeof(record));
+  return nullptr;
+}
 
 extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint32_t tensorRank, void *globalAddress,
                                       const uint64_t *globalDim, const uint64_t *globalStrides,
@@ -543,7 +571,6 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   }
   // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
   // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
-  r.dxa_slot = 0xFFFFFFFFu;
   bool dxa_layout = r.swizzle == 0;
 #ifdef VX_DXA_SWIZZLE_128B
   dxa_layout |= r.swizzle == VX_DXA_SWIZZLE_128B;
@@ -556,19 +583,32 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
       fprintf(stderr, "cuTensorMapEncodeTiled (CuPBoP): DXA mode needs 64-byte aligned rows (base, dim0 * element "
                       "size and strides multiples of 64); software copies for this tensor map\n");
   }
-  void *dev = nullptr;
-  if (cudaMalloc(&dev, 128) != cudaSuccess || !dev) return bad("cudaMalloc of the device record failed");
-  r.self = (uint64_t)(uintptr_t)dev;
-  uint8_t img[128];
-  memset(img, 0, sizeof(img));
-  memcpy(img, &r, sizeof(r));
-  if (cudaMemcpy(dev, img, sizeof(img), cudaMemcpyHostToDevice) != cudaSuccess) {
-    cudaFree(dev);
-    return bad("upload of the record failed");
-  }
-  if (r.mode == CUPBOP_TMAP_MODE_DXA) dxa_tensor_maps.emplace(r.self, r);
-  memcpy(tensorMap, img, sizeof(img));
+  if (const char *why = upload_tensor_map(tensorMap, r)) return bad(why);
   return 0; // CUDA_SUCCESS
+}
+
+extern "C" int cudaDxaSetTensorMapLayout(void *tensor_map, uint32_t layout, uint32_t tc_n, uint32_t block_k) {
+  const auto bad = [](const char *why) {
+    fprintf(stderr, "cudaDxaSetTensorMapLayout (CuPBoP): %s\n", why);
+    return 1;
+  };
+  if (!tensor_map || (reinterpret_cast<uintptr_t>(tensor_map) & 63u))
+    return bad("tensor map must be a 64-byte aligned CUtensorMap");
+  cupbop_tmap r;
+  memcpy(&r, tensor_map, sizeof(r));
+  if (r.magic != CUPBOP_TMAP_MAGIC || !r.self)
+    return bad("tensor map was not encoded by CuPBoP's cuTensorMapEncodeTiled");
+  if (layout != CUPBOP_DXA_LAYOUT_ROW_MAJOR && r.swizzle)
+    return bad("non-row-major tensor maps need swizzle none");
+  if (const char *why = cupbop_dxa_check_layout(layout, r.rank, r.elem, r.box[0], r.box[1], tc_n, block_k))
+    return bad(why);
+  const uint32_t geometry = tc_n | (block_k << 16);
+  if (r.layout == layout && r.geometry == geometry) return 0;
+  r.layout = layout;
+  r.geometry = geometry;
+  // Copies of the original opaque tensor map still refer to its previous device record.
+  if (const char *why = upload_tensor_map(tensor_map, r)) return bad(why);
+  return 0;
 }
 extern "C" int cuTensorMapEncodeIm2col(void *, int, uint32_t, void *, const uint64_t *, const uint64_t *, const int *,
                                        const int *, uint32_t, uint32_t, const uint32_t *, int, int, int, int) {
@@ -597,7 +637,7 @@ static bool cupbop_async_kernel(const std::string &kname) {
 // Legacy line (the automatic cp.async conversion): kernel slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes
 //   -> rank 2, sizes from the integer arguments, dense row stride.
 // v2 line (kernelTranslator from !vx.dxa.desc, or by hand):
-//   desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R] [layout=row|kmajor]
+//   desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R] [layout=row|kmajor|flat|blockmajor] [tc_n=T] [block_k=K]
 //        [smem_stride=B] [fill=P | fillf=F]
 //   v = integer literal, argK (kernel argument K, read as 32 bits) or a '*' product of those;
 //   base = argK (64-bit pointer argument) plus an optional byte offset.
@@ -719,10 +759,23 @@ static bool dxa_v2_resolve(const DxaAutoDescEntry &e, void **args, int num_args,
     dxa_fill_dense_strides(d);
   }
   if (const std::string *l = get("layout")) {
-    if (*l == "row") d.layout = 0;
-    else if (*l == "kmajor") d.layout = 1;
-    else { err = "layout must be row or kmajor"; return false; }
+    int layout = cupbop_dxa_parse_layout(l->c_str());
+    if (layout < 0) { err = "layout must be row, kmajor, flat or blockmajor"; return false; }
+    d.layout = static_cast<uint32_t>(layout);
   }
+  auto geometry = [&](const char *key, uint32_t &value) {
+    const std::string *v = get(key);
+    if (!v) return true;
+    char *end = nullptr;
+    unsigned long number = std::strtoul(v->c_str(), &end, 0);
+    if (end == v->c_str() || *end || number > 0xffffu) {
+      err = std::string(key) + " must be an unsigned 16-bit literal";
+      return false;
+    }
+    value = static_cast<uint32_t>(number);
+    return true;
+  };
+  if (!geometry("tc_n", d.tc_n) || !geometry("block_k", d.block_k)) return false;
   if (const std::string *v = get("smem_stride")) d.smem_stride = (uint32_t)std::strtoul(v->c_str(), nullptr, 0);
   if (const std::string *v = get("fill")) d.fill = (uint32_t)std::strtoll(v->c_str(), nullptr, 0);
   if (const std::string *v = get("fillf")) { float f = std::strtof(v->c_str(), nullptr); memcpy(&d.fill, &f, 4); }
@@ -2673,6 +2726,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       const auto &r = map->second;
       DxaDescEntry d{};
       d.slot = next_slot; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem; d.swizzle = r.swizzle;
+      d.layout = r.layout; d.tc_n = r.geometry & 0xffffu; d.block_k = r.geometry >> 16;
       for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
       for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
       d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;

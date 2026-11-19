@@ -4,6 +4,7 @@
 #define CUPBOP_ASYNC_H
 
 #include <stdint.h>
+#include "cupbop_dxa.h"
 
 #define CUPBOP_CP_ASYNC_DXA_SLOT 7u
 #define CUPBOP_CP_ASYNC_DXA_WORDS 32u
@@ -33,6 +34,8 @@ typedef struct cupbop_tmap {
   uint32_t dxa_slot;   // DXA descriptor slot (mode DXA)
   uint32_t dtype;      // CUtensorMapDataType (informational)
   uint32_t swizzle;    // CUtensorMapSwizzle (NONE, or 128B with a full-width inner box)
+  uint32_t layout;     // cupbop_dxa_layout; non-row-major layouts are a Vortex extension
+  uint32_t geometry;   // low 16 bits: tc_n; high 16 bits: block_k
 } cupbop_tmap;
 
 // ---- mbarrier record (the 8-byte mbarrier word in shared memory) -------------------------------------
