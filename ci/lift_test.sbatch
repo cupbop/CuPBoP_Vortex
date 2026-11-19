@@ -24,5 +24,6 @@ if [ ! -x build/compilation/kernelTranslator ]; then
   mkdir -p build && ( cd build && cmake .. -DLLVM_CONFIG_PATH=$LLVM_CONFIG_PATH -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$XCFG" > cmake.log 2>&1 ) || { echo "CMAKE FAILED"; exit 1; }
 fi
 make -C build kernelTranslator hostTranslator vortexRuntime ThreadPool -j${SLURM_CPUS_PER_TASK:-8} > ci/logs_v3/lift_test_build_${SLURM_JOB_ID:-manual}.log 2>&1 || { echo "BUILD FAILED"; grep -n error ci/logs_v3/lift_test_build_${SLURM_JOB_ID:-manual}.log | head; exit 1; }
+./ci/p2c_fold_guard_test.sh || exit 1
 PAR=${PAR:-${SLURM_CPUS_PER_TASK:-8}} ./ci/lift_test.sh "${ROWS:-.}"
 INNER

@@ -220,25 +220,31 @@ static bool pureOp(Instruction *I) {
 }
 
 // clone the slice of V in front of At; subst replaces values (ring phis); nullptr when a leaf is not available there
-static Value *cloneSlice(Value *V, Instruction *At, DenseMap<Value *, Value *> &subst, DominatorTree &DT, int depth = 0) {
+// In check-only mode, use a fresh subst map to cache the available values without changing the IR.
+static Value *cloneSlice(Value *V, Instruction *At, DenseMap<Value *, Value *> &subst, DominatorTree &DT,
+                         bool checkOnly = false, int depth = 0) {
   auto it = subst.find(V);
   if (it != subst.end()) return it->second;
   auto *I = dyn_cast<Instruction>(V);
   if (!I) return V;
   if (DT.dominates(I, At)) return I;
   if (depth > 200 || !pureOp(I)) return nullptr;
-  Instruction *C = I->clone();
-  for (unsigned i = 0; i < C->getNumOperands(); ++i) {
+  Instruction *C = checkOnly ? nullptr : I->clone();
+  for (unsigned i = 0; i < I->getNumOperands(); ++i) {
     Value *O = I->getOperand(i);
     if (isa<Function>(O) || isa<BasicBlock>(O)) continue;
-    Value *N = cloneSlice(O, At, subst, DT, depth + 1);
-    if (!N) { C->deleteValue(); return nullptr; }
-    C->setOperand(i, N);
+    Value *N = cloneSlice(O, At, subst, DT, checkOnly, depth + 1);
+    if (!N) {
+      if (C) C->deleteValue();
+      return nullptr;
+    }
+    if (C) C->setOperand(i, N);
   }
-  C->dropPoisonGeneratingFlags();
-  C->insertBefore(At->getIterator());
-  subst[V] = C;
-  return C;
+  if (C) {
+    C->dropPoisonGeneratingFlags();
+    C->insertBefore(At->getIterator());
+  }
+  return subst[V] = C ? C : I;
 }
 
 // ---- model ----------------------------------------------------------------------------------------------------------------------
@@ -819,6 +825,18 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
   Plan P; bool ok = false;
   for (unsigned n : ns) { X.why.clear(); if (analyse(X, A, P, n, Sn)) { ok = true; break; } }
   if (!ok) { errs() << "[p2c-fold] " << nm << ": left as it is: " << X.why << "\n"; return false; }
+  // The push into the copy queue runs at the guard. Check its operands before changing the IR.
+  for (const Site &st : P.sites) {
+    if (!st.guardPred) continue;
+    Instruction *At = st.guardPred->getTerminator();
+    CallInst *C = st.C;
+    DenseMap<Value *, Value *> available;
+    if (!cloneSlice(C->getArgOperand(1), At, available, X.DT, /*checkOnly=*/true) ||
+        (C->arg_size() == 3 && !cloneSlice(C->getArgOperand(2), At, available, X.DT, /*checkOnly=*/true))) {
+      errs() << "[p2c-fold] " << nm << ": left as it is: copy source or size is not available at the guard\n";
+      return false;
+    }
+  }
   { std::string s; raw_string_ostream os(s);
     os << "[p2c-fold] " << nm << ": ring S=" << P.S << " -> " << Sn << ", block " << P.n << ", sites " << P.sites.size() << ", prologue events " << P.events.size() << " loop-sites " << P.ploop.size() << ", guarded " << P.needG << ", classes:";
     for (Class &c : P.cls) os << " (a=" << c.a << " P=" << c.P << " base=" << c.base << " rows=" << c.rows << " -> " << c.basen << ")";
