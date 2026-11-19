@@ -57,6 +57,35 @@ __global__ void reduce_test(unsigned *out, const __grid_constant__ CUtensorMap m
   asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
+// All four CTAs update the same destinations. These inputs distinguish signed
+// minimum, XOR, bounded decrement, a 64-bit carry, and a subnormal FP16 add.
+__global__ void reduce_types(unsigned *out) {
+  __shared__ __align__(16) unsigned src[20];
+  auto rank = blockIdx.x;
+  auto i = threadIdx.x;
+  if (i < 4) {
+    src[i] = unsigned(-int(rank + i + 1));
+    src[4+i] = (1u << rank) << i;
+    src[8+i] = 6;
+    src[12+i] = i % 2 ? 0 : 0xffffffffu;
+    src[16+i] = 0x00010001u;
+  }
+  __syncthreads();
+  if (i == 0) {
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.min.s32 [%0], [%1], 16;"
+                 :: "l"(out), "r"(smem_u32(src)) : "memory");
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.xor.b32 [%0], [%1], 16;"
+                 :: "l"(out + 4), "r"(smem_u32(src + 4)) : "memory");
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.dec.u32 [%0], [%1], 16;"
+                 :: "l"(out + 8), "r"(smem_u32(src + 8)) : "memory");
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u64 [%0], [%1], 16;"
+                 :: "l"(out + 12), "r"(smem_u32(src + 12)) : "memory");
+    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [%0], [%1], 16;"
+                 :: "l"(out + 16), "r"(smem_u32(src + 16)) : "memory");
+    asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
+  }
+}
+
 int main() {
   unsigned *out;
   unsigned result[12] = {};
@@ -89,7 +118,26 @@ int main() {
       return 1;
     }
   }
-  cudaFree(out);
+  ASYNC_CHECK(cudaFree(out));
+  unsigned typed[20];
+  ASYNC_CHECK(cudaMalloc(&out, sizeof(typed)));
+  ASYNC_CHECK(cudaMemset(out, 0, sizeof(typed)));
+  attr.val.clusterDim = {4,1,1};
+  cfg.gridDim = dim3(4);
+  void *type_args[] = {&out};
+  ASYNC_CHECK(cudaLaunchKernelExC(&cfg, (const void *)reduce_types, type_args));
+  ASYNC_CHECK(cudaDeviceSynchronize());
+  ASYNC_CHECK(cudaMemcpy(typed, out, sizeof(typed), cudaMemcpyDeviceToHost));
+  for (unsigned i = 0; i < 4; ++i) {
+    if (typed[i] != unsigned(-int(i + 4)) || typed[4+i] != (15u << i) ||
+        typed[8+i] != 3 || typed[12+i] != (i % 2 ? 3u : 0xfffffffcu) ||
+        typed[16+i] != 0x00040004u) {
+      printf("FAIL typed word %u min=%x xor=%x dec=%x add64=%x add16=%x\n",
+             i, typed[i], typed[4+i], typed[8+i], typed[12+i], typed[16+i]);
+      return 1;
+    }
+  }
+  ASYNC_CHECK(cudaFree(out));
   puts("PASSED! bulk reduction: global, out-of-bounds tensor box, remote DSM and byte-counted completion");
   return 0;
 }
