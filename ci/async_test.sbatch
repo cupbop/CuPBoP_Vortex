@@ -40,6 +40,11 @@ expect_refused() { # tag pattern example sched [make vars...]
 for ex in async_mbar_ws async_tma2d async_bulk1d async_tma_store async_cpasync_mbar async_misc; do
   expect_pass s2_$ex $ex 2
 done
+for ex in cluster_group cluster_async cluster_reduce; do
+  run s2_$ex $ex 2 LOCALMEM=1
+  grep -q '^PASSED!' "$OUT/s2_$ex.out" || { echo "s2_$ex: FAIL"; exit 1; }
+  echo "s2_$ex: PASS"
+done
 expect_pass    s2_async_mbar_ws_nolto async_mbar_ws 2 CUPBOP_LTO=0
 expect_pass    s1_async_mbar_ws  async_mbar_ws 1        # CUPBOP_VIRT_WARPS unset: one physical warp per CUDA warp
 expect_pass    s1_async_tma2d    async_tma2d 1
