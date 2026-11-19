@@ -16,6 +16,7 @@
 // &param, lifted: the cvta.param image) always holds `self` in its first 8 bytes. Device helpers read the
 // record through it.
 #define CUPBOP_TMAP_MAGIC 0x504D4154u /* 'TMAP' */
+#define CUPBOP_TMAP_SWIZZLE_128B 3u  // CU_TENSOR_MAP_SWIZZLE_128B with 16-byte atoms
 #define CUPBOP_TMAP_MODE_SW 0u
 #define CUPBOP_TMAP_MODE_DXA 1u
 typedef struct cupbop_tmap {
@@ -31,7 +32,7 @@ typedef struct cupbop_tmap {
   uint32_t oob_nan;    // 1: out-of-bounds elements read as NaN (floating types, OOB_FILL_NAN_REQUEST_ZERO_FMA)
   uint32_t dxa_slot;   // DXA descriptor slot (mode DXA)
   uint32_t dtype;      // CUtensorMapDataType (informational)
-  uint32_t swizzle;    // CUtensorMapSwizzle (only NONE is accepted)
+  uint32_t swizzle;    // CUtensorMapSwizzle (NONE, or 128B with a full-width inner box)
 } cupbop_tmap;
 
 // ---- mbarrier record (the 8-byte mbarrier word in shared memory) -------------------------------------

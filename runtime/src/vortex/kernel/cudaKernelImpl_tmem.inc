@@ -1,0 +1,164 @@
+// Single-CTA TCGEN05, full (512-column) allocation and dense m128n256k32.s8.
+// Backing store is indexed by the hardware CTA slot, which the KMU retains
+// until the entire block retires. Columns are addressed in 32-bit words.
+#if defined(VX_CFG_NUM_THREADS) && VX_CFG_NUM_THREADS == 32
+namespace {
+struct TcgenStore {
+  uint32_t word[128][512];
+};
+static TcgenStore tcgen_slots[VX_CFG_NUM_CLUSTERS * VX_CFG_NUM_CORES][VX_CFG_NUM_WARPS];
+
+static inline TcgenStore &tcgen_store() { return tcgen_slots[vx_core_id()][csr_read_nv(VX_CSR_CTA_ID)]; }
+
+struct TcgenOperand {
+  uintptr_t start;
+  uint32_t leading, stride, swizzle;
+};
+
+static inline TcgenOperand tcgen_operand(uint64_t desc) {
+  const unsigned mode = desc >> 61;
+  // Relative K-major, base-offset zero; version 1. The archived DGEMM
+  // uses 128B swizzling (mode 2). Reject absolute-stride and other layouts.
+  if (((desc >> 46) & 0x7fff) != 1 || (mode != 0 && mode != 2))
+    cupbop_async_fail("unsupported TCGEN SMEM descriptor", uint32_t(desc >> 32), uint32_t(desc));
+  const uintptr_t lmem = csr_read_nv(VX_CSR_LOCAL_MEM_BASE);
+  const uintptr_t start = lmem + ((((desc & 0x3fff) << 4) - lmem) & 0x3ffff);
+  return {start, uint32_t((desc >> 16) & 0x3fff) * 16, uint32_t((desc >> 32) & 0x3fff) * 16, mode};
+}
+
+static inline const int8_t *tcgen_chunk(const TcgenOperand &a, unsigned row, unsigned half) {
+  // PTX canonical K-major layout, in 16-byte core vectors. In swizzle
+  // mode 2 XOR row bits [2:0] into byte-address bits [6:4].
+  uintptr_t offset = (row >> 3) * a.stride;
+  if (a.swizzle) return (const int8_t *)((a.start + offset + (row & 7) * 128 + half * 16) ^ ((row & 7) << 4));
+  return (const int8_t *)(a.start + offset + (row & 7) * 16 + half * a.leading);
+}
+} // namespace
+
+// The hardware initializer in lifted Blackwell SASS uses a 20-bit biased
+// expected count at bit 1, a biased pending count at bit 43, and parity at
+// bit 63. The remaining 22 bits store our signed expected-minus-copied bytes.
+// Software copies can finish before the producer posts its expect_tx.
+constexpr uint64_t tcgen_count_mask = (1u << 20) - 1;
+constexpr uint64_t tcgen_tx_mask = (1u << 22) - 1;
+extern "C" void __cupbop_tcgen_mbar_init(uint64_t *bar, unsigned count) {
+  if (!count || count > tcgen_count_mask) cupbop_async_fail("invalid mbarrier count", count, 0);
+  uint64_t biased = (0u - count) & tcgen_count_mask;
+  __atomic_store_n(bar, (biased << 1) | (biased << 43), __ATOMIC_RELEASE);
+}
+
+extern "C" uint64_t __cupbop_tcgen_arrive(uint64_t *bar, unsigned arrivals, int32_t bytes) {
+  // Serialize participating lanes of this warp, even if they update different
+  // addresses. Other warps race normally using the atomic compare-exchange.
+  uint64_t token = 0;
+  unsigned mask = vx_active_threads();
+  while (mask) {
+    unsigned elected = mask & (0u - mask);
+    if (elected == (1u << vx_thread_id())) {
+      uint64_t old = __atomic_load_n(bar, __ATOMIC_ACQUIRE);
+      for (;;) {
+        unsigned expected = (old >> 1) & tcgen_count_mask;
+        unsigned pending = ((old >> 43) & tcgen_count_mask) + arrivals;
+        int32_t tx = int32_t((old >> 21) & tcgen_tx_mask);
+        if (tx & (1 << 21)) tx -= 1 << 22;
+        tx += bytes;
+        const uint64_t phase = old & (1ull << 63);
+        // Pending == 2^20 means no arrivals remain. A spare low bit
+        // distinguishes this state from a newly initialized count word.
+        if (old & 1) pending += 1u << 20;
+        if (pending > (1u << 20) || tx < -(1 << 21) || tx >= (1 << 21))
+          cupbop_async_fail("invalid mbarrier update", pending, tx);
+        bool done = pending == (1u << 20) && tx == 0;
+        uint64_t next = (done ? (phase ^ (1ull << 63)) : phase) | (uint64_t(expected) << 1) |
+                        (uint64_t(done ? expected : pending & tcgen_count_mask) << 43) |
+                        ((uint64_t(tx) & tcgen_tx_mask) << 21) | (!done && pending == (1u << 20));
+        if (__atomic_compare_exchange_n(bar, &old, next, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+          token = phase;
+          break;
+        }
+      }
+    }
+    mask ^= elected;
+  }
+  return token;
+}
+
+extern "C" void __cupbop_tcgen_decline_cancel(uint32_t *response, uint64_t *bar) {
+  // KMU runs every CTA in the grid. Declining each optional work-stealing
+  // request is valid; SM100's query checks bit 0 of the third response word.
+  // A completed unsuccessful request still supplies 16 bytes to mbarrier.
+  for (unsigned i = 0; i < 4; ++i)
+    response[i] = 0;
+  __cupbop_tcgen_arrive(bar, 0, -16);
+}
+
+extern "C" unsigned __cupbop_tcgen_wait(uint64_t *bar, unsigned parity, unsigned blocking) {
+  do {
+    if ((__atomic_load_n(bar, __ATOMIC_ACQUIRE) >> 63) != (parity & 1)) return 1;
+  } while (blocking);
+  return 0;
+}
+
+extern "C" void __cupbop_tcgen_tma_load(void *smem, const void *desc, uint64_t *bar, unsigned rank, int c0, int c1,
+                                        int c2, int c3, int c4) {
+  const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
+  unsigned bytes = t->elem;
+  for (unsigned i = 0; i < rank; ++i)
+    bytes *= t->box[i];
+  cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
+  __cupbop_tcgen_arrive(bar, 0, -int32_t(bytes));
+}
+
+extern "C" void __cupbop_tmem_alloc512(uint32_t *dst) {
+  // One full allocation per live CTA. Each slot's logical base is zero.
+  if (vx_thread_id() == 0) *dst = 0;
+}
+
+extern "C" void __cupbop_tmem_free512(uint32_t taddr) {
+  if (taddr != 0) cupbop_async_fail("invalid full TMEM allocation base", taddr, 512);
+}
+
+extern "C" uint32_t __cupbop_tmem_ld32(uint32_t taddr, uint32_t displacement) {
+  const uint32_t first_row = taddr >> 16;
+  const uint32_t col = (taddr & 0xffff) + displacement;
+  if (first_row != ((csr_read_nv(VX_CSR_CTA_RANK) & 3) * 32) || col >= 512)
+    cupbop_async_fail("TMEM load outside warp datapath", taddr, displacement);
+  return tcgen_store().word[first_row + vx_thread_id()][col];
+}
+
+extern "C" void __cupbop_tmem_mma_s8_128x256x32(uint32_t taddr, uint64_t desc_a, uint64_t desc_b, uint32_t use_d) {
+  if (taddr > 256) cupbop_async_fail("TMEM accumulator outside allocation", taddr, 256);
+  const auto a = tcgen_operand(desc_a), b = tcgen_operand(desc_b);
+  auto &tile = tcgen_store();
+  // A signed K=32 dot fits in 21 bits even for (-128)*(-128). Pack three
+  // independent columns in radix 2^21. The per-digit bias prevents negative
+  // final sums from borrowing from the next result. All packed arithmetic is
+  // unsigned modulo 2^64; each of the three biased results fits in 21 bits.
+  constexpr unsigned shift = 21, bias = 1 << (shift - 1), mask = (1 << shift) - 1;
+  constexpr uint64_t biases = uint64_t(bias) | (uint64_t(bias) << shift) | (uint64_t(bias) << (2 * shift));
+  for (unsigned col = 0; col < 256; col += 3) {
+    const unsigned count = col == 255 ? 1 : 3;
+    uint64_t packed[32] = {};
+    for (unsigned j = 0; j < count; ++j)
+      for (unsigned half = 0; half < 2; ++half) {
+        const int8_t *v = tcgen_chunk(b, col + j, half);
+        for (unsigned k = 0; k < 16; ++k)
+          packed[half * 16 + k] += uint64_t(v[k]) << (shift * j);
+      }
+    for (unsigned row = 0; row < 128; ++row) {
+      uint64_t sum = biases;
+      for (unsigned half = 0; half < 2; ++half) {
+        const int8_t *v = tcgen_chunk(a, row, half);
+#pragma clang loop unroll_count(4)
+        for (unsigned k = 0; k < 16; ++k)
+          sum += uint64_t(v[k]) * packed[half * 16 + k];
+      }
+      for (unsigned j = 0; j < count; ++j) {
+        auto &dst = tile.word[row][taddr + col + j];
+        const uint32_t dot = (uint32_t(sum >> (shift * j)) & mask) - bias;
+        dst = dot + (use_d ? dst : 0u);
+      }
+    }
+  }
+}
+#endif

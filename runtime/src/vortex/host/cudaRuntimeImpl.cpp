@@ -504,13 +504,16 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   if (!globalAddress || ((uintptr_t)globalAddress & 15)) return bad("globalAddress must be 16-byte aligned");
   if (!globalDim || !boxDim || (tensorRank > 1 && !globalStrides)) return bad("NULL globalDim / globalStrides / boxDim");
   if (interleave != 0) return bad("interleave other than CU_TENSOR_MAP_INTERLEAVE_NONE is not supported");
-  if (swizzle != 0)
-    return bad("swizzle other than CU_TENSOR_MAP_SWIZZLE_NONE is not supported yet (async design stage 4)");
+  if (swizzle != 0 && swizzle != CUPBOP_TMAP_SWIZZLE_128B)
+    return bad("supported tensor map swizzles are NONE and 128B");
+  if (swizzle && uint64_t(boxDim[0]) * elem_of[tensorDataType] != 128)
+    return bad("128B swizzle requires a 128-byte innermost box in CuPBoP");
   if (oobFill != 0 && oobFill != 1) return bad("unknown oobFill");
   cupbop_tmap r;
   memset(&r, 0, sizeof(r));
   r.magic = CUPBOP_TMAP_MAGIC;
   r.rank = tensorRank;
+  r.swizzle = swizzle;
   r.gaddr = (uint64_t)(uintptr_t)globalAddress;
   r.elem = elem_of[tensorDataType];
   r.dtype = (uint32_t)tensorDataType;
@@ -534,7 +537,7 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
   // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
   r.dxa_slot = 0xFFFFFFFFu;
-  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e)) {
+  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e) && !r.swizzle) {
     bool ok = (r.gaddr % 64 == 0) && ((uint64_t)r.dim[0] * r.elem % 64 == 0);
     for (uint32_t i = 0; i + 1 < tensorRank; ++i) ok = ok && r.stride[i] % 64 == 0 && r.stride[i] <= 0xFFFFFFFFull;
     if (ok) r.mode = CUPBOP_TMAP_MODE_DXA;

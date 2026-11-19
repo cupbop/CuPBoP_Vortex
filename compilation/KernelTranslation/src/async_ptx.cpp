@@ -190,10 +190,10 @@ bool parsePtx(const std::string &in, std::vector<Stmt> &out, std::string &err) {
 bool ownedOp(const Stmt &s) {
   const std::string &o = s.op;
   auto sw = [&](const char *p) { return o.rfind(p, 0) == 0; };
-  if (sw("mbarrier.") || sw("cp.async.bulk") || sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") ||
-      sw("elect.sync") || sw("fence.mbarrier_init") || sw("mapa") || sw("barrier.cluster.") ||
-      sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") || sw("cvta.param") ||
-      sw("multimem.") || sw("tensormap."))
+  if (sw("clusterlaunchcontrol.") || sw("tcgen05.") || sw("mbarrier.") || sw("cp.async.bulk") ||
+      sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
+      sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
+      sw("cvta.param") || sw("multimem.") || sw("tensormap."))
     return true;
   if ((sw("fence.") && o.find(".cluster") != std::string::npos)) return true;
   for (auto &x : s.ops)
@@ -204,8 +204,9 @@ bool ownedOp(const Stmt &s) {
 }
 
 bool mentionsAsyncText(const std::string &s) {
-  for (const char *k : {"mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
-                        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param"})
+  for (const char *k :
+       {"clusterlaunchcontrol.", "tcgen05.", "mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
+        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param"})
     if (s.find(k) != std::string::npos) return true;
   return false;
 }
@@ -229,6 +230,7 @@ struct PassState {
   PointerType *Ptr;
   std::map<Function *, std::vector<CallInst *>> arrives; // candidates for the §5.3 move
   std::set<CallInst *> txCopies;                          // copies that complete on an mbarrier
+  std::set<Function *> tcgenFunctions;                    // use a byte-counted software barrier for TCGEN/TMA kernels
   std::set<Function *> needWarps;                         // functions with ops that need real warps
   std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
   std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
@@ -490,6 +492,53 @@ struct AsmLowering {
           return IntegerType::get(S.ctx, std::atoi(t.c_str() + 1));
       return S.I32;
     };
+    if (sw("clusterlaunchcontrol.")) {
+      if (o != "clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128")
+        fail("unsupported cluster launch control operation: " + s.text);
+      nops(2, 2);
+      needWarps();
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, "__cupbop_tcgen_decline_cancel", S.Void,
+                      {addr(s.ops[0], "cancellation response"), addr(s.ops[1], "completion barrier")});
+      });
+      return;
+    }
+    if (sw("tcgen05.")) {
+      lowerTcgen(s, pred);
+      return;
+    }
+    // CuLifter emits these address calculations inside its tcgen05 allocation bundles.
+    if (o == "not.b32" || o == "brev.b32" || o == "clz.b32") {
+      nops(2, 2);
+      Value *src = val(s.ops[1], S.I32);
+      Value *v = o == "not.b32"    ? B.CreateNot(src)
+                 : o == "brev.b32" ? B.CreateUnaryIntrinsic(Intrinsic::bitreverse, src)
+                                   : B.CreateBinaryIntrinsic(Intrinsic::ctlz, src, B.getFalse());
+      setReg(s.ops[0], v, pred);
+      return;
+    }
+    if (o == "shr.u32" || o == "shl.b32") {
+      nops(3, 3);
+      Value *v = val(s.ops[1], S.I32), *shift = val(s.ops[2], S.I32);
+      Value *inRange = B.CreateICmpULT(shift, B.getInt32(32));
+      Value *bits = o == "shr.u32" ? B.CreateLShr(v, shift) : B.CreateShl(v, shift);
+      setReg(s.ops[0], B.CreateSelect(inRange, bits, B.getInt32(0)), pred);
+      return;
+    }
+    if (o == "bar.warp.sync") {
+      nops(1, 1);
+      needWarps();
+      if (pred || !isa<ConstantInt>(val(s.ops[0], S.I32)) || !cast<ConstantInt>(val(s.ops[0], S.I32))->isMinusOne())
+        fail("only unpredicated full-warp sync is supported in an async bundle");
+      B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+      return;
+    }
+    if (o == "ld.shared.b32") {
+      nops(2, 2);
+      Value *v = underPred(pred, [&]() -> Value * { return B.CreateLoad(S.I32, addr(s.ops[1], "shared")); });
+      if (v) setReg(s.ops[0], v, pred);
+      return;
+    }
     // --- plain data movement and predicates
     if (o == "mov" || sw("mov.")) {
       nops(2, 2);
@@ -620,6 +669,8 @@ struct AsmLowering {
         needWarps();
         underPred(pred, [&]() -> Value * {
           Value *P = addr(s.ops[0], "mbarrier");
+          if (S.tcgenFunctions.count(F))
+            return S.call(B, "__cupbop_tcgen_arrive", S.I64, {P, B.getInt32(1), B.getInt32(0)});
           CallInst *a = S.call(B, kArrive, S.I32, {P, ConstantInt::get(S.I32, 1)});
           S.arrives[F].push_back(a);
           return nullptr;
@@ -637,11 +688,106 @@ struct AsmLowering {
     fail("unsupported statement in async asm: `" + s.text + "`");
   }
 
+  void lowerTcgen(const Stmt &s, Value *pred) {
+    needWarps();
+    auto taddr = [&](const std::string &op) -> Value * {
+      if (op.size() < 3 || op.front() != '[' || op.back() != ']') fail("expected [tmem address]");
+      return val(op.substr(1, op.size() - 2), S.I32);
+    };
+    if (s.op == "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32" ||
+        s.op == "tcgen05.dealloc.cta_group::1.sync.aligned.b32") {
+      if (pred || s.ops.size() != 2) fail("unsupported predicated or malformed TCGEN allocation");
+      auto *cols = dyn_cast<ConstantInt>(val(s.ops[1], S.I32));
+      if (!cols || cols->getZExtValue() != 512) fail("only full 512-column TMEM allocations are supported");
+      if (s.tok[1] == "alloc")
+        S.call(B, "__cupbop_tmem_alloc512", S.Void, {addr(s.ops[0], "TMEM allocation result")});
+      else
+        S.call(B, "__cupbop_tmem_free512", S.Void, {val(s.ops[0], S.I32)});
+      return;
+    }
+    if (s.op == "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned" ||
+        s.op == "tcgen05.wait::ld.sync.aligned" || s.op == "tcgen05.fence::before_thread_sync" ||
+        s.op == "tcgen05.fence::after_thread_sync") {
+      if (pred || !s.ops.empty()) fail("malformed TCGEN synchronization");
+      // Each CTA has its own full allocation; loads retire synchronously.
+      B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+      return;
+    }
+    if (s.op == "tcgen05.mma.cta_group::1.kind::i8") {
+      if (s.ops.size() != 5) fail("expected dense SMEM/SMEM i8 MMA");
+      auto *desc = dyn_cast<ConstantInt>(val(s.ops[3], S.I32));
+      if (!desc || desc->getZExtValue() != 0x084004a0) fail("unsupported i8 MMA instruction descriptor");
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, "__cupbop_tmem_mma_s8_128x256x32", S.Void,
+                      {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64), val(s.ops[4], S.I32)});
+      });
+      return;
+    }
+    if (s.op == "tcgen05.ld.sync.aligned.32x32b.x2.b32" || s.op == "tcgen05.ld.sync.aligned.32x32b.x4.b32") {
+      if (pred || s.ops.size() != 2 || s.ops[0].front() != '{' || s.ops[0].back() != '}')
+        fail("expected unpredicated TCGEN register tuple load");
+      auto dst = splitTop(s.ops[0].substr(1, s.ops[0].size() - 2), ',');
+      if (dst.size() != (s.has("x2") ? 2u : 4u)) fail("TCGEN load tuple width mismatch");
+      Value *base = taddr(s.ops[1]);
+      for (size_t i = 0; i < dst.size(); ++i)
+        setReg(dst[i], S.call(B, "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
+      return;
+    }
+    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64" && s.ops.size() == 1) {
+      underPred(pred, [&]() -> Value * {
+        B.CreateFence(AtomicOrdering::Release);
+        return S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                      {addr(s.ops[0], "TCGEN completion barrier"), B.getInt32(1), B.getInt32(0)});
+      });
+      return;
+    }
+    fail("unsupported TCGEN form: " + s.text);
+  }
+
   void lowerMbarrier(size_t idx, Value *pred) {
     const Stmt &s = st[idx];
     const std::string what = s.tok.size() > 1 ? s.tok[1] : "";
     if (s.has("shared::cluster") && what != "arrive")
       fail("`" + s.op + "` on a shared::cluster address (clusters are not supported)");
+    if (S.tcgenFunctions.count(F)) {
+      if (what == "init" && s.ops.size() == 2) {
+        underPred(pred, [&]() -> Value * {
+          return S.call(B, "__cupbop_tcgen_mbar_init", S.Void, {addr(s.ops[0], "barrier"), val(s.ops[1], S.I32)});
+        });
+        return;
+      }
+      if ((what == "expect_tx" || what == "complete_tx") && s.ops.size() == 2) {
+        underPred(pred, [&]() -> Value * {
+          Value *bytes = val(s.ops[1], S.I32);
+          if (what == "complete_tx") bytes = B.CreateNeg(bytes);
+          return S.call(B, "__cupbop_tcgen_arrive", S.I64, {addr(s.ops[0], "barrier"), B.getInt32(0), bytes});
+        });
+        return;
+      }
+      if (what == "arrive" && !s.has("noComplete") &&
+          (s.ops.size() == 3 || (s.ops.size() == 2 && !s.has("expect_tx")))) {
+        Value *token = underPred(pred, [&]() -> Value * {
+          Value *arg = s.ops.size() == 3 ? val(s.ops[2], S.I32) : B.getInt32(1);
+          return S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                        {addr(s.ops[1], "barrier"), s.has("expect_tx") ? B.getInt32(1) : arg,
+                         s.has("expect_tx") ? arg : B.getInt32(0)});
+        });
+        if (token) setReg(s.ops[0], token, pred);
+        return;
+      }
+      if ((what == "try_wait" || what == "test_wait") && (s.ops.size() == 3 || s.ops.size() == 4)) {
+        Value *ok = underPred(pred, [&]() -> Value * {
+          Value *phase =
+              s.has("parity") ? val(s.ops[2], S.I32) : B.CreateTrunc(B.CreateLShr(val(s.ops[2], S.I64), 63), S.I32);
+          return S.call(B, "__cupbop_tcgen_wait", S.I32,
+                        {addr(s.ops[1], "barrier"), phase, B.getInt32(blocking.count(idx))});
+        });
+        if (ok) setReg(s.ops[0], B.CreateICmpNE(ok, B.getInt32(0)), pred);
+        return;
+      }
+      if (what == "inval") return;
+      fail("unsupported mbarrier form in TCGEN kernel: " + s.text);
+    }
     if (what == "init") {
       if (s.ops.size() != 2) fail("mbarrier.init needs [addr], count");
       underPred(pred, [&]() -> Value * {
@@ -735,9 +881,10 @@ struct AsmLowering {
           Value *desc = nullptr;
           std::vector<Value *> c = coords(ops[1], desc);
           Value *mb = addr(ops[2], "mbarrier"); // DXA mode completes the transfer there; software mode ignores it
-          CallInst *k = S.call(B, kTmaLoad, S.Void,
+          bool tcgen = S.tcgenFunctions.count(F);
+          CallInst *k = S.call(B, tcgen ? "__cupbop_tcgen_tma_load" : kTmaLoad, S.Void,
                                {dst, desc, mb, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
-          S.txCopies.insert(k);
+          if (!tcgen) S.txCopies.insert(k);
           return nullptr;
         });
         return;
@@ -770,7 +917,11 @@ struct AsmLowering {
         Value *src = addr(ops[1], "source");
         Value *n = val(ops[2], S.I32);
         CallInst *k = S.call(B, kBulk, S.Void, {dst, src, n}, false);
-        S.txCopies.insert(k);
+        if (S.tcgenFunctions.count(F))
+          S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                 {addr(ops[3], "completion barrier"), B.getInt32(0), B.CreateNeg(n)});
+        else
+          S.txCopies.insert(k);
         return nullptr;
       });
       return;
@@ -851,6 +1002,7 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
+  if (n == "llvm.nvvm.read.ptx.sreg.smid") return done(S.call(B, "__cupbop_smid", S.I32, {}));
   if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctarank") || n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctaid") ||
       n.starts_with("llvm.nvvm.read.ptx.sreg.is.explicit.cluster"))
     return done(ConstantInt::get(C->getType(), 0));
@@ -862,6 +1014,21 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     Function *G = S.M->getFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d);
     FunctionCallee GC = G ? FunctionCallee(G) : S.M->getOrInsertFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d, FunctionType::get(S.I32, false));
     return done(B.CreateCall(GC, {}));
+  }
+  if (S.tcgenFunctions.count(F) && n.starts_with("llvm.nvvm.mbarrier.")) {
+    auto *zero = B.getInt32(0);
+    if (n.starts_with("llvm.nvvm.mbarrier.init")) {
+      S.call(B, "__cupbop_tcgen_mbar_init", S.Void, {P(0), C->getArgOperand(1)});
+      return done(nullptr);
+    }
+    if (n.starts_with("llvm.nvvm.mbarrier.inval")) return done(nullptr);
+    if (n == "llvm.nvvm.mbarrier.arrive" || n == "llvm.nvvm.mbarrier.arrive.shared")
+      return done(S.call(B, "__cupbop_tcgen_arrive", S.I64, {P(0), B.getInt32(1), zero}));
+    if (n == "llvm.nvvm.mbarrier.test.wait" || n == "llvm.nvvm.mbarrier.test.wait.shared") {
+      Value *phase = B.CreateTrunc(B.CreateLShr(C->getArgOperand(1), 63), S.I32);
+      return done(B.CreateICmpNE(S.call(B, "__cupbop_tcgen_wait", S.I32, {P(0), phase, zero}), zero));
+    }
+    fail_at(C, "unsupported mbarrier intrinsic in a TCGEN kernel: " + n.str());
   }
   if (n.starts_with("llvm.nvvm.mbarrier.")) {
     if (n.starts_with("llvm.nvvm.mbarrier.init")) {
@@ -883,6 +1050,10 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     fail_at(C, "mbarrier intrinsic " + n.str() + " is not supported (noComplete / drop / pending_count)");
   }
   if (n.starts_with("llvm.nvvm.cp.async.mbarrier.arrive")) {
+    if (n.contains("noinc") && S.tcgenFunctions.count(F)) {
+      S.call(B, "__cupbop_tcgen_arrive", S.I64, {P(0), B.getInt32(1), B.getInt32(0)});
+      return done(nullptr);
+    }
     if (n.contains("noinc")) {
       S.needWarps.insert(F);
       CallInst *a = S.call(B, kArrive, S.I32, {P(0), ConstantInt::get(S.I32, 1)});
@@ -1754,12 +1925,50 @@ void lower_async_ptx(Module *M) {
   const int sched = schedule();
   // 1. NVVM intrinsics (cluster registers first: CuLifter mbarrier addresses fold to constants after that)
   std::vector<CallInst *> calls;
+  std::map<Function *, std::vector<Function *>> callers, callees;
+  std::set<Function *> barrierFunctions;
   for (auto &F : *M)
     for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *C = dyn_cast<CallInst>(&I))
-          if (!C->isInlineAsm() && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("llvm.nvvm."))
+      for (auto &I : BB) {
+        auto *C = dyn_cast<CallInst>(&I);
+        if (!C) continue;
+        if (C->isInlineAsm()) {
+          const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
+          if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
+          if (body.find("tcgen05.") != std::string::npos ||
+              body.find("clusterlaunchcontrol.try_cancel") != std::string::npos)
+            S.tcgenFunctions.insert(&F);
+        } else if (auto *callee = C->getCalledFunction()) {
+          if (callee->getName().starts_with("llvm.nvvm.")) {
             calls.push_back(C);
+            if (callee->getName().contains("mbarrier")) barrierFunctions.insert(&F);
+          } else if (!callee->isDeclaration()) {
+            callers[callee].push_back(&F);
+            callees[&F].push_back(callee);
+          }
+        }
+      }
+  if (!S.tcgenFunctions.empty()) {
+    // A noinline helper must agree with all callers on the 8-byte barrier ABI.
+    // Only follow edges into helpers that actually use a barrier (transitively).
+    barrierFunctions.insert(S.tcgenFunctions.begin(), S.tcgenFunctions.end());
+    std::vector<Function *> pending(barrierFunctions.begin(), barrierFunctions.end());
+    while (!pending.empty()) {
+      auto *f = pending.back();
+      pending.pop_back();
+      for (auto *caller : callers[f])
+        if (barrierFunctions.insert(caller).second) pending.push_back(caller);
+    }
+    pending.assign(S.tcgenFunctions.begin(), S.tcgenFunctions.end());
+    while (!pending.empty()) {
+      auto *f = pending.back();
+      pending.pop_back();
+      for (auto *caller : callers[f])
+        if (S.tcgenFunctions.insert(caller).second) pending.push_back(caller);
+      for (auto *callee : callees[f])
+        if (barrierFunctions.count(callee) && S.tcgenFunctions.insert(callee).second) pending.push_back(callee);
+    }
+  }
   for (auto *C : calls) lowerIntrinsic(S, C);
   // 2. inline asm
   std::vector<CallInst *> asms;

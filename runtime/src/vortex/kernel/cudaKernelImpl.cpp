@@ -313,6 +313,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_bar_arrive(u
 
 // mbarrier / TMA / bulk copy helpers (software mode)
 #include "cudaKernelImpl_async.inc"
+#include "cudaKernelImpl_tmem.inc"
 
 // Get packed barrier id for DXA
 __attribute__((always_inline)) unsigned int
@@ -1461,6 +1462,7 @@ extern "C" __attribute__((always_inline)) void __cupbop_mma_m16n8k8_bf16f32(uint
 // descriptors as (SASS descriptor) + ((&shared_mem >> 4) & 0x3FFF), i.e. the same thing, so
 // both the cvta path and lifted descriptors decode with one formula regardless of how the
 // local-memory base is aligned, as long as the local-memory region is below 256 KB.
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_smid() { return vx_core_id(); }
 extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const void *p) {
   return (uint32_t)((uintptr_t)p & 0x3FFFFu);
 }

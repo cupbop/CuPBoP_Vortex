@@ -198,7 +198,7 @@ static __attribute__((always_inline)) inline void cupbop_fill_elem(void *d, uint
   default: *(uint64_t *)d = nan ? 0x7FFFFFFFFFFFFFFFull : 0; break;
   }
 }
-// One box of the tensor <-> a dense box in shared memory (innermost dimension first, no swizzle). Load: out-of-
+// One box of the tensor <-> a box in shared memory (innermost dimension first). Load: out-of-
 // bounds elements are filled (0, or NaN); store: out-of-bounds elements are not written.
 static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *desc, uint32_t rank, int32_t c0,
                                                     int32_t c1, int32_t c2, int32_t c3, int32_t c4, int store) {
@@ -226,15 +226,18 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
             if (rank > 3) row += (uint64_t)g3 * t->stride[2];
             if (rank > 4) row += (uint64_t)g4 * t->stride[3];
           }
+          // For a 128-byte row the absolute row address supplies the swizzle phase.
+          uintptr_t flip = t->swizzle ? (((uintptr_t)s >> 7) & 7u) << 4 : 0;
           for (uint32_t j0 = 0; j0 < b[0]; ++j0, s += e) {
+            char *shared = (char *)((uintptr_t)s ^ flip);
             const int64_t g0 = (int64_t)c[0] + j0;
             const bool in = row_in && g0 >= 0 && g0 < (int64_t)dm[0];
             if (store) {
-              if (in) cupbop_copy_elem((void *)(row + (uint64_t)g0 * e), s, e);
+              if (in) cupbop_copy_elem((void *)(row + (uint64_t)g0 * e), shared, e);
             } else if (in) {
-              cupbop_copy_elem(s, row + (uint64_t)g0 * e, e);
+              cupbop_copy_elem(shared, row + (uint64_t)g0 * e, e);
             } else {
-              cupbop_fill_elem(s, e, t->oob_nan);
+              cupbop_fill_elem(shared, e, t->oob_nan);
             }
           }
         }

@@ -279,7 +279,7 @@ host.o: host.bc
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 ifeq ($(VORTEX_VER),3)
 # Vortex 3.0: delegate the kernel ELF to Vortex's own regression makefile (see examples/v3_cell.mk).
-kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
+kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc)
 	@echo "--- Building kernel ELF with Vortex 3.0 tests/regression/common.mk in $(VX3_CELL)"
 	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
 	printf 'int main(){return 0;}\n' > dummy_host.cpp

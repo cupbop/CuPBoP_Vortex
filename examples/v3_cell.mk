@@ -12,6 +12,7 @@ PROJECT := cupbop_kernel
 SRCS := $(CUPBOP_WORK)/dummy_host.cpp
 CUPBOP_RT_SRCS := $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp \
                   $(CuPBoP_PATH)/runtime/src/vortex/kernel/nv_libdevice_compat.cpp
+CUPBOP_RT_INCLUDES := $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc)
 CUPBOP_LTO ?= 0
 ifeq ($(CUPBOP_LTO),1)
 # Link-time inlining (lowering-recipe knob): the device runtime is compiled to bitcode with the
@@ -30,7 +31,7 @@ VX_SRCS := $(CUPBOP_WORK)/kernel_lto.bc $(CUPBOP_WORK)/kernel_wrapper.cpp
 # libvortex, libc/libm) defines __nv_*, so the ODR promise holds. CUPBOP_NV_COMPAT_NOINLINE=1 keeps
 # them weak (the old calls).
 CUPBOP_NV_COMPAT_NOINLINE ?= 0
-$(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS)
+$(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS) $(CUPBOP_RT_INCLUDES)
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 1,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/cudaKernelImpl.lto.bc
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 2,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc
 ifneq ($(CUPBOP_NV_COMPAT_NOINLINE),1)
@@ -40,6 +41,7 @@ ifneq ($(CUPBOP_NV_COMPAT_NOINLINE),1)
 endif
 	$(LLVM_PATH)/bin/llvm-link $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/cudaKernelImpl.lto.bc $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc -o $@
 else
+VX_HDRS += $(CUPBOP_RT_INCLUDES)
 VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CUPBOP_RT_SRCS)
 endif
 # Vortex 3.0 KMU launch path (CUPBOP_LAUNCH2): vx_start.S built with KMU_ENABLE (__vx_cta_entry), kernel_main entry
