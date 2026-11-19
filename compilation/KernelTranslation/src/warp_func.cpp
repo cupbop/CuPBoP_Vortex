@@ -1,9 +1,11 @@
 
 #include "warp_func.h"
+#include "cg_sync.h"
 #include "flag.h"
 #include "tool.h"
 #include "triton_ir.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
@@ -15,6 +17,8 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/IR/PassManager.h"
@@ -352,16 +356,6 @@ static void rejectUnstagedWarpOpsSubpass(Module &m) {
   if (!narrowWarpOpsAllowed()) exit(1);
 }
 
-// virt sub-pass form (S > 1): a hardware thread runs the logical lanes l, l+L, ... through ONE copy of the
-// control flow, so a loop whose trip count differs between those lanes runs on sub-pass 0's count and the
-// warp ops staged inside it see the other sub-passes on the wrong iteration (conformance div_loop_ballot:
-// lane t+16 copied lane t's ballot pattern). Until a per-sub-pass gate exists (decision 2A, 2026-10-24) the
-// translator refuses such kernels instead of producing wrong results: a warp op that may legally run with
-// part of the warp (activemask, or a vote/shfl/match whose mask is not the constant 0xffffffff) inside a loop
-// with an exit condition that depends on the thread or lane id. A full-mask op is exempt: CUDA requires all
-// 32 lanes to reach it together, so in a valid program the enclosing loops run the same trips on every lane
-// (jaccard's rounded bound, cc-cuda's warp-uniform worklist loop). mma/movmatrix are warp-wide by definition.
-// CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 translates anyway (warning only; the conformance test uses it).
 static bool isLaneSource(const Instruction *I) {
   auto *CI = dyn_cast<CallInst>(I);
   if (!CI) return false;
@@ -373,7 +367,8 @@ static bool isLaneSource(const Instruction *I) {
   if (!F) return false;
   StringRef n = F->getName();
   return n.starts_with("llvm.nvvm.read.ptx.sreg.tid.") || n == "llvm.nvvm.read.ptx.sreg.laneid" ||
-         n.starts_with("llvm.nvvm.shfl.") || n == "__cupbop_laneid"; // a shuffle result is per lane too
+         n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix") ||
+         n.starts_with("llvm.nvvm.match.") || n == "__cupbop_laneid";
 }
 static bool isStagedWarpOp(const CallInst *CI) {
   if (CI->isInlineAsm() || !CI->getCalledFunction()) return false;
@@ -415,9 +410,91 @@ static void markPartialMaskWarpOps(Module &m) {
         if (isStagedWarpOp(CI) && mayRunPartialWarp(CI))
           CI->setMetadata("cupbop.virt_partial_mask", MDNode::get(m.getContext(), {}));
 }
-static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
-  const bool allow = std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS") && std::atoi(std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS"));
-  int found = 0;
+static bool containsCtaBarrier(const Loop &L) {
+  for (auto *B : L.blocks())
+    for (auto &I : *B) {
+      auto *call = dyn_cast<CallInst>(&I);
+      if (!call || !call->getCalledFunction()) continue;
+      StringRef name = call->getCalledFunction()->getName();
+      if (name == "llvm.nvvm.barrier0" || name == "llvm.nvvm.barrier.sync" || isCGSync(name.str())) return true;
+    }
+  return false;
+}
+
+// One iteration of the source loop runs inside a forward gate. A logical lane
+// takes a backedge or parks at its own exit. Parked lanes retain their live-outs;
+// all sub-passes meet at the latch, where a staged vote chooses the next round.
+static void lowerLaneLoop(Loop &L) {
+  BasicBlock *header = L.getHeader();
+  Function &F = *header->getParent();
+  LLVMContext &C = F.getContext();
+  SmallVector<BasicBlock *, 4> exits;
+  L.getUniqueExitBlocks(exits);
+  SmallVector<BasicBlock *, 4> entries;
+  for (auto *P : predecessors(header))
+    if (!L.contains(P)) entries.push_back(P);
+
+  // The parked path bypasses definitions in the final source iteration.
+  // Spill just the values for which the new edges change SSA dominance.
+  SmallVector<Instruction *> liveOut;
+  for (auto *B : L.blocks())
+    for (Instruction &I : *B)
+      if (any_of(I.users(), [&](User *U) {
+            auto *use = dyn_cast<Instruction>(U);
+            return use && !L.contains(use->getParent());
+          }))
+        liveOut.push_back(&I);
+  for (auto *I : liveOut)
+    DemoteRegToStack(*I);
+  for (auto *E : exits)
+    while (!E->phis().empty()) DemotePHIToStack(&*E->phis().begin());
+  while (!header->phis().empty()) DemotePHIToStack(&*header->phis().begin());
+
+  IRBuilder<> entry(&*F.getEntryBlock().getFirstInsertionPt());
+  // Zero selects the next iteration. Positive values name the original exit.
+  auto *state = entry.CreateAlloca(entry.getInt32Ty(), nullptr, "lane.loop.exit");
+  auto block = [&](StringRef name) { return BasicBlock::Create(C, name, &F, header); };
+  auto *init = block("lane.loop.init");
+  auto *round = block("lane.loop.round");
+  auto *latch = block("lane.loop.vote");
+  for (auto *P : entries) P->getTerminator()->replaceSuccessorWith(header, init);
+  IRBuilder<> b(init);
+  b.CreateStore(b.getInt32(0), state);
+  b.CreateBr(round);
+  b.SetInsertPoint(round);
+  auto active = [&] { return b.CreateICmpEQ(b.CreateLoad(b.getInt32Ty(), state), b.getInt32(0)); };
+  b.CreateCondBr(active(), header, latch);
+
+  SmallVector<BasicBlock *, 4> parked;
+  for (unsigned i = 0; i < exits.size(); ++i) {
+    auto *park = block("lane.loop.park");
+    b.SetInsertPoint(park);
+    b.CreateStore(b.getInt32(i + 1), state);
+    b.CreateBr(latch);
+    parked.push_back(park);
+  }
+  for (auto *B : L.blocks()) {
+    Instruction *term = B->getTerminator();
+    term->replaceSuccessorWith(header, latch);
+    for (unsigned i = 0; i < exits.size(); ++i)
+      term->replaceSuccessorWith(exits[i], parked[i]);
+  }
+
+  // Outside the loop each lane resumes at its own original successor.
+  BasicBlock *resume = exits.back();
+  for (unsigned i = 0; i + 1 < exits.size(); ++i) {
+    auto *test = block("lane.loop.resume");
+    b.SetInsertPoint(test);
+    b.CreateCondBr(b.CreateICmpEQ(b.CreateLoad(b.getInt32Ty(), state), b.getInt32(i + 1)), exits[i], resume);
+    resume = test;
+  }
+  b.SetInsertPoint(latch);
+  FunctionCallee any = F.getParent()->getOrInsertFunction("llvm.nvvm.vote.any.sync",
+      FunctionType::get(b.getInt1Ty(), {b.getInt32Ty(), b.getInt1Ty()}, false));
+  b.CreateCondBr(b.CreateCall(any, {b.getInt32(-1), active()}), round, resume);
+}
+
+static void lowerLaneVariantLoopsAroundWarpOps(Module &m) {
   for (auto &F : m.functions()) {
     if (F.isDeclaration()) continue;
     std::vector<CallInst *> ops;
@@ -427,25 +504,38 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
     if (ops.empty()) continue;
     DominatorTree DT(F);
     LoopInfo LI(DT);
+    if (LI.empty()) continue;
+    PostDominatorTree PDT(F);
+    SmallPtrSet<const BasicBlock *, 16> divergentBranches, controlled;
     // lane-dependent values: SSA uses, memory written with one (by underlying object), loads at a
     // lane-dependent address, and phis joining a lane-dependent branch (fixpoint)
     std::set<const Value *> T, Tobj;
     auto divBranch = [&](const BasicBlock *B) {
-      auto *Br = dyn_cast<BranchInst>(B->getTerminator());
-      return Br && Br->isConditional() && T.count(Br->getCondition());
+      const Instruction *term = B->getTerminator();
+      if (auto *br = dyn_cast<BranchInst>(term))
+        return br->isConditional() && T.count(br->getCondition()) != 0;
+      auto *sw = dyn_cast<SwitchInst>(term);
+      return sw && T.count(sw->getCondition()) != 0;
     };
     for (bool changed = true; changed;) {
       changed = false;
       for (auto &I : instructions(F)) {
         if (auto *St = dyn_cast<StoreInst>(&I)) {
-          if (T.count(St->getValueOperand()) && Tobj.insert(getUnderlyingObject(St->getPointerOperand())).second) changed = true;
+          if (T.count(St->getValueOperand()) || controlled.contains(I.getParent()))
+            changed |= Tobj.insert(getUnderlyingObject(St->getPointerOperand())).second;
           continue;
         }
         if (T.count(&I)) continue;
         bool t = isLaneSource(&I);
         if (!t) {
           if (auto *Ld = dyn_cast<LoadInst>(&I)) t = T.count(Ld->getPointerOperand()) || Tobj.count(getUnderlyingObject(Ld->getPointerOperand()));
-          else if (auto *CI = dyn_cast<CallInst>(&I); CI && isStagedWarpOp(CI)) t = false; // vote/ballot results are warp-uniform
+          else if (auto *CI = dyn_cast<CallInst>(&I); CI && isStagedWarpOp(CI)) {
+            // The aggregate is uniform for one member mask. Disjoint groups
+            // can issue the same vote with different masks and get different results.
+            StringRef name = CI->getCalledFunction()->getName();
+            if (name.starts_with("llvm.nvvm.vote.")) t = T.count(CI->getArgOperand(0));
+            if (name == "__cupbop_redux_sync") t = T.count(CI->getArgOperand(1));
+          }
           else for (auto &U : I.operands()) if (T.count(U.get())) { t = true; break; }
           if (!t)
             if (auto *Phi = dyn_cast<PHINode>(&I)) {
@@ -456,29 +546,62 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
         }
         if (t) { T.insert(&I); changed = true; }
       }
+      // Different constants stored along a divergent branch also give the
+      // logical lanes different bounds after the paths meet.
+      for (auto &B : F) {
+        if (!divBranch(&B) || !divergentBranches.insert(&B).second) continue;
+        auto *node = PDT.getNode(&B);
+        auto *merge = node && node->getIDom() ? node->getIDom()->getBlock() : nullptr;
+        SmallVector<const BasicBlock *> work(successors(&B));
+        SmallPtrSet<const BasicBlock *, 16> seen;
+        while (!work.empty()) {
+          auto *arm = work.pop_back_val();
+          if (arm == merge || !seen.insert(arm).second) continue;
+          changed |= controlled.insert(arm).second;
+          append_range(work, successors(arm));
+        }
+      }
     }
-    for (auto *CI : ops)
-      for (Loop *L = CI->getMetadata("cupbop.virt_partial_mask") ? LI.getLoopFor(CI->getParent()) : nullptr; L; L = L->getParentLoop()) {
+    SmallPtrSet<BasicBlock *, 8> selected;
+    for (auto *CI : ops) {
+      for (Loop *L = LI.getLoopFor(CI->getParent()); L; L = L->getParentLoop()) {
+        if (selected.contains(L->getHeader())) continue;
         SmallVector<BasicBlock *, 4> exiting;
         L->getExitingBlocks(exiting);
-        bool lane = false;
-        for (auto *E : exiting) lane |= divBranch(E);
-        if (!lane) continue;
-        found++;
-        std::string ms;
-        if (CI->arg_size()) { raw_string_ostream os(ms); CI->getArgOperand(0)->print(os); }
-        fprintf(stderr, "[virt-stage] %s: %s in %s inside loop %s whose trip count depends on the lane (mask:%s)\n",
-                allow ? "WARNING" : "error", CI->getCalledFunction()->getName().str().c_str(), F.getName().str().c_str(),
-                L->getHeader()->getName().str().c_str(), ms.c_str());
-        break;
+        if (!any_of(exiting, divBranch)) continue;
+        if (!CI->getMetadata("cupbop.virt_partial_mask")) {
+          // In CTA-synchronized loops a full-warp operation supplies no
+          // evidence of partial participation (e.g. a lifted GEMM's MMA).
+          // Leave these loops to the CTA scheduler. In warp-only code, a
+          // full-mask op reached just on the first iteration permits the
+          // lanes to take different numbers of subsequent iterations.
+          SmallVector<BasicBlock *, 4> latches;
+          L->getLoopLatches(latches);
+          if (all_of(latches, [&](BasicBlock *B) { return DT.dominates(CI->getParent(), B); }) ||
+              containsCtaBarrier(*L)) continue;
+        } else if (containsCtaBarrier(*L)) {
+          report_fatal_error(Twine("lane-dependent loop in ") + F.getName() +
+                             " contains a CTA barrier; a warp vote cannot establish CTA convergence");
+        }
+        selected.insert(L->getHeader());
       }
-  }
-  if (found && !allow) {
-    fprintf(stderr, "error: virt sub-pass form (S=%d, %d lanes): %d warp op(s) in lane-dependent loops are unsupported at S>1 "
-                    "(per-sub-pass loop gate not implemented); use 32 lanes (NT32, no CUPBOP_VIRT_LANES) or set "
-                    "CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 to translate anyway\n",
-            getVirtGeom().subpasses, getVirtGeom().lanes, found);
-    exit(1);
+    }
+    if (selected.empty()) continue;
+    if (!isKernelFunction(&m, &F))
+      report_fatal_error(Twine("lane-dependent warp collective in uninlined device function ") + F.getName());
+    // Edge-specific PHI inputs must be saved on their own incoming edge.
+    SplitAllCriticalEdges(F, CriticalEdgeSplittingOptions(&DT, &LI));
+    SmallVector<BasicBlock *, 8> headers;
+    for (Loop *L : LI.getLoopsInReverseSiblingPreorder())
+      if (selected.contains(L->getHeader())) headers.push_back(L->getHeader());
+    // Lower children first and rediscover the enclosing loop after each CFG change.
+    for (auto *H : reverse(headers)) {
+      lowerLaneLoop(*LI.getLoopFor(H));
+      DT.recalculate(F);
+      LI.releaseMemory();
+      LI.analyze(DT);
+    }
+    errs() << "[virt-stage] lowered " << headers.size() << " lane-dependent loop(s) in " << F.getName() << "\n";
   }
 }
 
@@ -491,7 +614,7 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectUnstagedWarpOpsSubpass(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) markPartialMaskWarpOps(m);
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
-  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectLaneVariantLoopsAroundWarpOps(m);
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) lowerLaneVariantLoopsAroundWarpOps(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceLdStMatrixStaged(m);
@@ -501,7 +624,7 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ != MAPPING_FLAT)
     replaceWarpShfl(m);
   replaceWarpVote(m);
-  return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 
 bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {

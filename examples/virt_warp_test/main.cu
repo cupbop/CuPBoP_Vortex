@@ -57,7 +57,7 @@ __global__ void warp_test2(int *out) {
     if (wid == 0) v = (t < (int)(blockDim.x / 32)) ? s[lane] : 0;
   }
   if (wid == 0) v = wsum(v);
-  if (lane < 16) { f3 = t; for (int off = 8; off > 0; off >>= 1) f3 += __shfl_down_sync(full, f3, off); } // half-warp (jacobi shape)
+  if (lane < 16) { f3 = t; for (int off = 8; off > 0; off >>= 1) f3 += __shfl_down_sync(0x0000ffffu, f3, off, 16); } // half-warp (jacobi shape)
   unsigned m = __ballot_sync(full, true);
   if (t & 1) f4 = __ballot_sync(m, (t % 3) == 0);    // ballot inside a divergent if, mask from before
   if (t & 1) { f5 = __ballot_sync(full, t > 10); if (t & 2) f6 = __ballot_sync(full, t > 20); } // nested
@@ -70,7 +70,8 @@ __global__ void warp_test2(int *out) {
   out[o + 9] = (t == 0) ? 777 : 1;                   // final store under a thread-0 test
   int k1 = t, k2 = t;                                 // GEMM shape: uniform loop around staged ops, divergent if inside
   for (int a = 0; a < 3; a++) { k1 = wsum(k1) & 1023; if (lane < 8) k1 += a; }
-  for (int a = 0; a < (lane & 1) + 1; a++) k2 = wsum(k2) & 1023; // divergent trip count around staged ops
+  for (int a = 0; a < (lane & 1) + 1; a++)
+    k2 += __shfl_xor_sync(__activemask(), k2, 16); // the peer has the same trip count
   out[o + 10] = k1; out[o + 11] = k2;
   // 16-lane sub-pass shapes (nt16s1, 11/3): branches whose arm differs between the two halves of a CUDA warp
   int q = t * 3 + __shfl_xor_sync(full, t, 16);       // after a staged shuffle, store only in the lower half

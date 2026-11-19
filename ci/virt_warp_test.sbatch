@@ -26,15 +26,14 @@ run() { # tag sched vortex_path configs nt [env...]
 }
 run golden_s2_nt32 2 $VORTEX_PATH "$CFG32" 32
 run s1_nt32       1 $VORTEX_PATH "$CFG32" 32
-# S>1: kernel 2 has warp ops in lane-dependent loops (div_loop_ballot, divtrip_loop_glue), which the
-# translator refuses by default (no per-sub-pass loop gate yet) -> translate anyway to test the rest
-run s1_nt32_l16   1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-run s1_nt32_l16p1 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-run s1_nt16       1 $NT16B "$CFG16" 16 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-run s1_nt16_p1    1 $NT16B "$CFG16" 16 CUPBOP_VIRT_WARPS=1 CUPBOP_VIRT_ALLOW_LANE_LOOPS=1
-( cd examples/virt_warp_test && make clean > /dev/null 2>&1
-  env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/reject_nt16.log 2>&1 )
-echo "== reject_nt16 (default, no override): $(grep -q 'in lane-dependent loops are unsupported at S>1' $OUT/reject_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)'); $(grep -c 'trip count depends on the lane' $OUT/reject_nt16.log) sites"
+run s1_nt32_l16   1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16
+run s1_nt32_l16p1 1 $VORTEX_PATH "$CFG32" 32 CUPBOP_VIRT_LANES=16 CUPBOP_VIRT_WARPS=1
+run s1_nt16       1 $NT16B "$CFG16" 16
+run s1_nt16_p1    1 $NT16B "$CFG16" 16 CUPBOP_VIRT_WARPS=1
+# Parked lanes, nested loops, early exits and a fully reconverged final ballot.
+( cd examples/virt_lane_loop && make clean > /dev/null 2>&1 && rm -f ci_output.txt &&
+  env VORTEX_PATH=$VORTEX_PATH VORTEX_CONFIGS="$CFG32" VORTEX_NUM_THREADS=32 CUPBOP_VIRT_LANES=8 CUPBOP_VIRT_WARPS=1 \
+    make ci SCHEDULE=1 > "$OUT/lane_loop_l8.log" 2>&1 && grep -qx PASSED ci_output.txt ) || exit 1
 ( cd examples/virt_gate_refuse && make clean > /dev/null 2>&1
   env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/refuse_gate_nt16.log 2>&1 )
 echo "== refuse_gate_nt16 (arms that cannot be gated): $(grep -q 'would be decided by sub-pass 0 for the whole CUDA warp; refusing' $OUT/refuse_gate_nt16.log && echo 'REFUSED (expected)' || echo 'NOT REFUSED (unexpected)')"
@@ -66,9 +65,8 @@ mma16() { # example
   echo "== mma16_$t: $(grep -c PASSED $OUT/mma16_$t.out 2>/dev/null) PASSED, $(grep -c 'FAIL\|mismatch' $OUT/mma16_$t.out 2>/dev/null) FAIL/mismatch lines"
 }
 for t in tcu_dt_mma_tf32 tcu_dt_mma_int8 tcu_dt_mma_fp8 mma884_test; do mma16 $t; done
-cp -f $OUT/golden_s2_nt32.out examples/virt_warp_test/golden_output.txt
 python3 - $OUT <<'PY'
-import sys,glob,os
+import sys,os
 d=sys.argv[1]
 def load(p):
     rows={}
@@ -79,15 +77,22 @@ def load(p):
 g=load(d+'/golden_s2_nt32.out')
 names=["ballot","any","all","shfl5","down1","up3","xor16","fdown2","redsum","actmask","ballot_am","idx_w16","up1_w8","down8_v","popc_hi","t"]
 names2=["uniform_if_shfl","warpuni_if_shfl","welford","halfwarp_shfl","ballot_in_if_mask","nested_if_ballot","nested_if_ballot2","div_loop_ballot","syncwarp_smem","t0_store","loop_glue_if","divtrip_loop_glue","sp_store_half","sp_both_arms","sp_upper_loop","sp_nested_upper"]
-for f in sorted(glob.glob(d+'/s1_*.out')):
+expected = set(range(64)) | set(range(1000, 1064)) | set(range(2000, 2064))
+if set(g) != expected or any(len(v) != 16 for v in g.values()):
+    sys.exit("incomplete schedule 2 reference")
+failed = False
+for tag in ("s1_nt32", "s1_nt32_l16", "s1_nt32_l16p1", "s1_nt16", "s1_nt16_p1"):
+    f = os.path.join(d, tag + ".out")
     r=load(f); bad={}
     for t,gv in g.items():
         rv=r.get(t)
-        if rv is None: bad.setdefault('missing',[]).append(t); continue
+        if rv is None or len(rv) != len(gv): bad.setdefault('missing',[]).append(t); continue
         for i,(a,b) in enumerate(zip(gv,rv)):
             if a!=b: bad.setdefault(("k3_field%d"%i if t>=2000 else names2[i] if t>=1000 else names[i]),[]).append((t,a,b))
     print(f"== {os.path.basename(f)}: {'PASS' if not bad else 'FAIL'}")
+    failed |= bool(bad)
     for k,v in bad.items():
         print(f"   {k}: {len(v)} mismatches, e.g. {v[:4]}")
+sys.exit(int(failed))
 PY
 INNER

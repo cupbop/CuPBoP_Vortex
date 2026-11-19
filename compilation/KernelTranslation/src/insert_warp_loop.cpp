@@ -2871,7 +2871,7 @@ static int split_multi_entry_merges(llvm::Function &F, const std::vector<llvm::B
 //      runs for all lanes (a staged vote counts only lanes that stored; a shuffle from a lane that did not run is
 //      undefined in CUDA as well);
 //   3. branches between the lane loops inside a gated arm follow the same scheme (a loop branch, whose lanes must agree
-//      under the 2A rule of warp_func.cpp, without the tests: it must not read slot 0, which may not have run);
+//      after lowerLaneVariantLoopsAroundWarpOps, without the tests: slot 0 may not have run);
 //   4. what cannot be gated is refused: unstructured arms, thread-dependent loops without a boundary of the kernel that
 //      could not be absorbed. An area with a CTA barrier stays as it was (block-uniform by CUDA's rules).
 // CUPBOP_VIRT_NO_GATE=1: off (slot 0 decides, as before).
@@ -3142,7 +3142,7 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
     const bool cta = virt_area_holds(c.g.T, true, false) || virt_area_holds(c.g.E, true, false);
     if (cta) continue;                         // block-uniform by CUDA's rules: slot 0 is as good as any
     if (c.kind == 1) {
-      if (virt_area_holds(c.g.T, false, true)) continue;   // warp ops in the loop: the 2A rule in warp_func.cpp
+      if (virt_area_holds(c.g.T, false, true)) continue;   // partial-warp loop exits have already been lowered to a staged vote
       if (!virt_area_holds_region(c.g.T, wrapped)) continue;
       c.why = "thread-dependent loop that could not be absorbed";
     } else if (!virt_area_holds_region(c.g.T, wrapped) && !virt_area_holds_region(c.g.E, wrapped)) continue;
