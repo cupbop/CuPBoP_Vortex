@@ -190,6 +190,14 @@ bool parsePtx(const std::string &in, std::vector<Stmt> &out, std::string &err) {
   return true;
 }
 
+// Scoped scalar atomics emitted by libcudacxx's barrier and pipeline state.
+static bool isCtaAtomic(const Stmt &s) {
+  return s.op == "ld.acquire.cta.b64" || s.op == "ld.relaxed.cta.b32" ||
+         s.op == "st.relaxed.cta.b32" || s.op == "atom.add.acquire.cta.u32" ||
+         s.op == "atom.add.relaxed.cta.u32" || s.op == "atom.add.acq_rel.cta.u64" ||
+         s.op == "atom.add.relaxed.cta.u64";
+}
+
 // Is this statement one lower_async_ptx owns?
 bool ownedOp(const Stmt &s) {
   const std::string &o = s.op;
@@ -198,6 +206,8 @@ bool ownedOp(const Stmt &s) {
       sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
       sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
       sw("cvta.param") || sw("multimem.") || sw("tensormap."))
+    return true;
+  if (isCtaAtomic(s) || o == "fence.sc.cta")
     return true;
   if ((sw("fence.") && o.find(".cluster") != std::string::npos)) return true;
   for (auto &x : s.ops)
@@ -509,6 +519,33 @@ struct AsmLowering {
           return IntegerType::get(S.ctx, std::atoi(t.c_str() + 1));
       return S.I32;
     };
+    if (isCtaAtomic(s)) {
+      bool add = sw("atom."), store = sw("st.");
+      nops(add ? 3 : 2, add ? 3 : 2);
+      Type *ty = width();
+      auto align = Align(ty->getIntegerBitWidth() / 8);
+      Value *result = underPred(pred, [&]() -> Value * {
+        Value *ptr = addr(s.ops[store ? 0 : 1], "CTA atomic address");
+        if (add) {
+          auto order = s.has("acq_rel") ? AtomicOrdering::AcquireRelease :
+                       s.has("acquire") ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic;
+          return B.CreateAtomicRMW(AtomicRMWInst::Add, ptr, val(s.ops[2], ty), align, order);
+        }
+        if (store) {
+          B.CreateAlignedStore(val(s.ops[1], ty), ptr, align)->setAtomic(AtomicOrdering::Monotonic);
+          return nullptr;
+        }
+        auto *load = B.CreateAlignedLoad(ty, ptr, align);
+        load->setAtomic(s.has("acquire") ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic);
+        return load;
+      });
+      if (!store && result) setReg(s.ops[0], result, pred);
+      return;
+    }
+    if (o == "fence.sc.cta") {
+      underPred(pred, [&]() -> Value * { return B.CreateFence(AtomicOrdering::SequentiallyConsistent); });
+      return;
+    }
     if (sw("clusterlaunchcontrol.")) {
       if (o != "clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128")
         fail("unsupported cluster launch control operation: " + s.text);
@@ -1118,6 +1155,22 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
   if (n.starts_with("llvm.nvvm.mapa")) {
     Value *mapped = S.call(B,"__cupbop_cluster_map",S.Ptr,{P(0),C->getArgOperand(1)});
     return done(B.CreatePointerCast(mapped,C->getType()));
+  }
+  if (n == "llvm.nvvm.isspacep.shared" || n == "llvm.nvvm.isspacep.global") {
+    auto *object = getUnderlyingObject(C->getArgOperand(0));
+    if (isa<AllocaInst>(object)) return done(B.getFalse());
+    if (auto *global = dyn_cast<GlobalVariable>(object)) {
+      unsigned space = global->getAddressSpace();
+      if (space == 1 || space == 3 || space == 4)
+        return done(B.getInt1(n.ends_with(".shared") ? space == 3 : space == 1));
+    }
+    return done(S.call(B, n.ends_with(".shared") ? "__cupbop_is_cta_shared" : "__cupbop_is_global",
+                       S.I32, {P(0)}));
+  }
+  if (n == "llvm.nvvm.match.any.sync.i32" || n == "llvm.nvvm.match.any.sync.i64") {
+    S.needWarps.insert(F);
+    return done(S.call(B, "__cupbop_match_any", S.I32,
+                       {C->getArgOperand(0), B.CreateZExtOrTrunc(C->getArgOperand(1), S.I64)}));
   }
   if (n == "llvm.nvvm.isspacep.shared.cluster")
     return done(S.call(B,"__cupbop_cluster_contains",S.I32,{P(0)}));
@@ -2199,6 +2252,41 @@ static void simplifySelfClusterArrive(CallInst &call) {
                                        assembly->getConstraintString(), assembly->hasSideEffects()));
 }
 
+// Fixed SDK sequences that return a pointer, read a timer, or suspend/trap.
+// Leave mixed or otherwise different PTX bundles to the statement parser.
+static bool lowerSdkBuiltin(PassState &s, CallInst *call, ArrayRef<Stmt> statements) {
+  IRBuilder<> b(call);
+  Value *value = nullptr;
+  if (statements.size() == 3 && statements[0].op == "mov.u32" &&
+      statements[0].ops.size() == 2 && statements[0].ops[1] == "%reserved_smem_offset_1" &&
+      statements[1].op == "cvt.u64.u32" && statements[2].op == "cvta.shared.u64" &&
+      statements[1].ops.size() == 2 && statements[2].ops.size() == 2 &&
+      statements[1].ops[1] == statements[0].ops[0] && statements[2].ops[1] == statements[1].ops[0] &&
+      statements[2].ops[0] == "$0" && call->getType()->isPointerTy()) {
+    // cooperative_groups/details/memory.h specifies 288 bytes per CTA.
+    auto *scratch = s.M->getNamedGlobal("__cupbop_cg_reserved_shared");
+    if (!scratch) {
+      auto *type = ArrayType::get(b.getInt8Ty(), 288);
+      scratch = new GlobalVariable(*s.M, type, false, GlobalValue::InternalLinkage, UndefValue::get(type),
+                                   "__cupbop_cg_reserved_shared", nullptr, GlobalValue::NotThreadLocal, 3);
+      scratch->setAlignment(Align(16));
+    }
+    value = b.CreatePointerCast(scratch, call->getType());
+  } else if (statements.size() == 1 && statements[0].pred.empty()) {
+    const auto &st = statements[0];
+    if (st.op == "mov.u64" && st.ops == std::vector<std::string>{"$0", "%globaltimer"})
+      value = s.call(b, "__cupbop_time_ns", s.I64, {});
+    else if (st.op == "nanosleep.u32" && st.ops == std::vector<std::string>{"$0"} && call->arg_size() == 1)
+      s.call(b, "__cupbop_sleep_ns", s.Void, {call->getArgOperand(0)});
+    else if (st.op == "trap" && st.ops.empty())
+      s.call(b, "__cupbop_device_trap", s.Void, {});
+    else return false;
+  } else return false;
+  if (value) call->replaceAllUsesWith(value);
+  call->eraseFromParent();
+  return true;
+}
+
 void lower_async_ptx(Module *M) {
   PassState S(M);
   const int sched = schedule();
@@ -2274,6 +2362,7 @@ void lower_async_ptx(Module *M) {
       if (mentionsAsyncText(a)) fail_at(C, "cannot parse async asm (" + err + ")");
       continue;
     }
+    if (lowerSdkBuiltin(S, C, st)) continue;
     bool owned = false;
     for (auto &s : st) owned |= ownedOp(s);
     if (!owned) {

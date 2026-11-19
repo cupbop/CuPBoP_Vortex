@@ -204,6 +204,7 @@ rebuild-ir:
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
 	rm -f .cupbop-live-cta-barrier
+	rm -rf .cupbop-cuda-headers
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
 	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_cluster_dims.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
@@ -223,14 +224,17 @@ ifeq ($(VORTEX_VER),3)
 # With -nocudalib this clang no longer reports the SDK version, which would select the pre-CUDA-9
 # cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
 # DEVICE_BC_SRC: the examples/lift.mk examples have their device bitcode from a lifted IR file and use this one at most for the source kernels of the program.
-$(DEVICE_BC_SRC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h
+CUDA_OVERLAY := .cupbop-cuda-headers/overlay.json
+$(CUDA_OVERLAY): $(CuPBoP_PATH)/compilation/cuda_header_overlay.py $(wildcard $(CUDA_PATH)/include/cuda/std/barrier $(CUDA_PATH)/include/cuda.h)
+	python3 $< "$(CUDA_PATH)" "$@"
+$(DEVICE_BC_SRC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h $(CUDA_OVERLAY)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 -ivfsoverlay $(CUDA_OVERLAY) $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=$(CUDA_GPU_ARCH) --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
-$(HOST_BC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h
+$(HOST_BC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h $(CUDA_OVERLAY)
 	@echo "--- Generate host bitcode (clang --cuda-host-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 -ivfsoverlay $(CUDA_OVERLAY) $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only --sysroot=/ --target=x86_64-linux-gnu \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
 else

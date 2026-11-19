@@ -30,6 +30,7 @@
   #define cudaStreamDestroy          cudaStreamDestroy_vortex
   #define cudaStreamSynchronize      cudaStreamSynchronize_vortex
   #define cudaGetDeviceCount         cudaGetDeviceCount_vortex
+  #define cudaDeviceGetAttribute     cudaDeviceGetAttribute_vortex
   #define cudaGetDeviceProperties    cudaGetDeviceProperties_vortex
   #define cudaGetDeviceProperties_v2 cudaGetDeviceProperties_v2_vortex
   #define cudaGetErrorString         cudaGetErrorString_vortex

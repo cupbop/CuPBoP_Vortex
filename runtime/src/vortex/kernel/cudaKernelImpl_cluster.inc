@@ -59,6 +59,32 @@ extern "C" void *__cupbop_cluster_map(void *address, unsigned rank) {
 static inline uintptr_t cluster_base() {
   return csr_read_nv(VX_CSR_CTA_LMEM_ADDR) - cluster_rank() * cluster_context().cluster_stride;
 }
+extern "C" unsigned __cupbop_is_cta_shared(const void *ptr) {
+  return uintptr_t(ptr) - csr_read_nv(VX_CSR_CTA_LMEM_ADDR) < cluster_context().cluster_stride;
+}
+// KMU places per-hart stacks immediately below LMEM; device allocations and
+// the program image occupy the ordinary user address range below those stacks.
+extern "C" unsigned __cupbop_is_global(const void *ptr) {
+  constexpr unsigned sockets = (VX_CFG_NUM_CORES + VX_CFG_SOCKET_SIZE - 1) / VX_CFG_SOCKET_SIZE;
+  constexpr uintptr_t harts = uintptr_t(VX_CFG_NUM_CLUSTERS) * sockets * VX_CFG_SOCKET_SIZE *
+                              VX_CFG_NUM_WARPS * VX_CFG_NUM_THREADS;
+  const uintptr_t bottom = uintptr_t(VX_MEM_STACK_BASE_ADDR) - (harts << VX_MEM_STACK_LOG2_SIZE);
+  return uintptr_t(ptr) >= VX_MEM_USER_BASE_ADDR && uintptr_t(ptr) < bottom;
+}
+
+extern "C" __attribute__((convergent)) unsigned __cupbop_match_any(unsigned members, uint64_t value) {
+  unsigned active = uint32_t(vx_active_threads()) & members;
+  unsigned matches = 0;
+  while (active) {
+    unsigned lane = __builtin_ctz(active);
+    uint32_t lo = vx_shfl_idx(uint32_t(value), lane, 31, 0);
+    uint32_t hi = vx_shfl_idx(uint32_t(value >> 32), lane, 31, 0);
+    if (value == (uint64_t(hi) << 32 | lo))
+      matches |= 1u << lane;
+    active &= active - 1;
+  }
+  return matches;
+}
 extern "C" unsigned __cupbop_cluster_query_rank(const void *ptr) {
   return cluster_context().cluster_stride ? (uintptr_t(ptr) - cluster_base()) / cluster_context().cluster_stride : 0;
 }

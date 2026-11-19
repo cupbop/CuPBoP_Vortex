@@ -2205,10 +2205,33 @@ cudaError_t cudaGetDeviceCount(int *count) {
   return cudaSuccess;
 }
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+static bool cupbop_supports_cluster_launch() {
+  const char *lmem = getenv("VORTEX_LOCALMEM_FLAG");
+  if (cupbop_schedule_flag() != 2 || (lmem && atoi(lmem) != 1)) return false;
+  uint64_t capacity = 0;
+  return vx_dev_caps(DeviceContext::instance()->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity) == 0 && capacity != 0;
+}
+
+cudaError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
+  if (!value) return cudaErrorInvalidValue;
+  if (device != 0) return cudaErrorInvalidDevice;
+  if (attr != cudaDevAttrClusterLaunch) return cudaErrorNotSupported;
+  *value = cupbop_supports_cluster_launch();
+  return cudaSuccess;
+}
+#endif
+
 cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
 
-  // dummy values
-  if (device == 0) {
+  if (!deviceProp) return cudaErrorInvalidValue;
+  if (device != 0) return cudaErrorInvalidDevice;
+  // Legacy properties of this runtime.
+  {
+    *deviceProp = {};
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    deviceProp->clusterLaunch = cupbop_supports_cluster_launch();
+#endif
     strcpy(deviceProp->name, "pthread");
     deviceProp->totalGlobalMem = 0;
     deviceProp->sharedMemPerBlock = 0;
@@ -3042,7 +3065,15 @@ cudaError_t cupbopLaunchKernelEx(const cudaLaunchConfig_t *config, const char *f
   for (unsigned i = 0; i < config->numAttrs; ++i) {
     const auto &a = config->attrs[i];
     if (a.id == cudaLaunchAttributeIgnore) continue;
-    if (a.id != cudaLaunchAttributeClusterDimension || has_cluster) return cudaErrorNotSupported;
+    if (a.id == cudaLaunchAttributeClusterSchedulingPolicyPreference) {
+      // A preference is a hint. KMU always keeps a cluster resident on one core.
+      auto policy = a.val.clusterSchedulingPolicyPreference;
+      if (policy != cudaClusterSchedulingPolicyDefault && policy != cudaClusterSchedulingPolicySpread &&
+          policy != cudaClusterSchedulingPolicyLoadBalancing) return cudaErrorInvalidValue;
+      continue;
+    }
+    if (a.id != cudaLaunchAttributeClusterDimension) return cudaErrorNotSupported;
+    if (has_cluster) return cudaErrorInvalidValue;
     cluster = dim3(a.val.clusterDim.x, a.val.clusterDim.y, a.val.clusterDim.z);
     has_cluster = true;
   }

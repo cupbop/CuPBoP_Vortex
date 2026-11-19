@@ -283,40 +283,22 @@ void create_global_variable(llvm::Module *M) {
     // dim3_t = union { struct {uint32_t x,y,z}; uint32_t m[3]; }
     auto Dim3Type = llvm::StructType::create(M->getContext(), {I32, I32, I32}, "dim3_t");
 
-    // Remove CUDA's dummy declarations (non-TLS, addrspace(1), { i8 } types)
-    // so we can create proper globals matching vx_spawn's definitions.
-    if (auto *existing = M->getGlobalVariable("blockIdx")) {
-      existing->eraseFromParent();
+    // Clang's dummy builtin objects can still have users (including the
+    // 'this' pointer of an inlined operator dim3). Retarget those users before
+    // erasing the old addrspace(1) global; debug records also track the cast.
+    for (StringRef name : {"blockIdx", "threadIdx", "blockDim", "gridDim"}) {
+      auto *old = M->getNamedGlobal(name);
+      const bool perThread = name == "blockIdx" || name == "threadIdx";
+      auto *gv = new GlobalVariable(*M, Dim3Type, false, GlobalValue::ExternalLinkage, nullptr,
+                                    old ? "" : name, nullptr, perThread ? GlobalValue::GeneralDynamicTLSModel
+                                                                        : GlobalValue::NotThreadLocal);
+      gv->setDSOLocal(perThread);
+      if (old) {
+        gv->takeName(old);
+        old->replaceAllUsesWith(ConstantExpr::getPointerCast(gv, old->getType()));
+        old->eraseFromParent();
+      }
     }
-    if (auto *existing = M->getGlobalVariable("threadIdx")) {
-      existing->eraseFromParent();
-    }
-    if (auto *existing = M->getGlobalVariable("blockDim")) {
-      existing->eraseFromParent();
-    }
-    if (auto *existing = M->getGlobalVariable("gridDim")) {
-      existing->eraseFromParent();
-    }
-
-    // TLS: blockIdx, threadIdx (set by vx_spawn's process_threads)
-    auto blockIdxGV = new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
-                             NULL, "blockIdx", NULL,
-                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-    blockIdxGV->setDSOLocal(true);
-
-    auto threadIdxGV = new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
-                             NULL, "threadIdx", NULL,
-                             llvm::GlobalValue::GeneralDynamicTLSModel, 0, false);
-    threadIdxGV->setDSOLocal(true);
-
-    // Global structs: blockDim, gridDim (set by vx_spawn_threads before callback)
-    new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
-                             NULL, "blockDim", NULL,
-                             llvm::GlobalValue::NotThreadLocal, 0, false);
-    new llvm::GlobalVariable(*M, Dim3Type, false, llvm::GlobalValue::ExternalLinkage,
-                             NULL, "gridDim", NULL,
-                             llvm::GlobalValue::NotThreadLocal, 0, false);
-
   } else {
     // Schedule 0/1: use CuPBoP's individual i32 globals (populated by cuda_*_wrapper)
     // TLS seed for divergence tracking — value is always 0 but LLVM treats

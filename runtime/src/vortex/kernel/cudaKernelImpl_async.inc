@@ -25,6 +25,19 @@ static __attribute__((noinline)) void cupbop_async_fail(const char *what, uint32
   (void)what; (void)a; (void)b; // (vx_printf from many lanes at once did not come out before the stop)
   __asm__ volatile("unimp" ::: "memory");
 }
+extern "C" uint64_t __cupbop_time_ns() {
+  const uint64_t ticks = vx_rdcycle();
+  constexpr uint64_t mhz = VX_CFG_PLATFORM_CLOCK_RATE;
+  return ticks / mhz * 1000 + ticks % mhz * 1000 / mhz;
+}
+extern "C" void __cupbop_sleep_ns(uint32_t ns) {
+  uint64_t start = vx_rdcycle();
+  uint64_t delay = (uint64_t(ns) * VX_CFG_PLATFORM_CLOCK_RATE) / 1000;
+  while (vx_rdcycle() - start < delay) {}
+}
+extern "C" void __cupbop_device_trap() {
+  cupbop_async_fail("CUDA device trap", 0, 0);
+}
 #include "cudaKernelImpl_reduce.inc"
 
 static __attribute__((always_inline)) inline uint32_t cupbop_mbar_hw(uint32_t rec) {
