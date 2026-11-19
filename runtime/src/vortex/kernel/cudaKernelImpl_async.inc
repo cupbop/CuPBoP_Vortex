@@ -192,6 +192,17 @@ static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, cons
   default: *(uint64_t *)d = *(const uint64_t *)s; break;
   }
 }
+// A TMA swizzle permutes 16-byte sectors without changing the bytes in a sector.
+static inline bool cupbop_copy_tma_sectors(uintptr_t dst, uintptr_t src, unsigned bytes,
+                                         uintptr_t dst_phase, uintptr_t src_phase) {
+  if ((dst | src | bytes) & 15u) return false;
+  for (unsigned off = 0; off < bytes; off += 16) {
+    void *out = __builtin_assume_aligned(reinterpret_cast<void *>((dst + off) ^ dst_phase), 16);
+    const void *in = __builtin_assume_aligned(reinterpret_cast<const void *>((src + off) ^ src_phase), 16);
+    __builtin_memcpy(out, in, 16);
+  }
+  return true;
+}
 static __attribute__((always_inline)) inline void cupbop_fill_elem(void *d, uint32_t e, uint32_t nan) {
   switch (e) {
   case 1: *(uint8_t *)d = 0; break;
@@ -232,6 +243,12 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
           }
           // For a 128-byte row the absolute row address supplies the swizzle phase.
           uintptr_t flip = t->swizzle ? (((uintptr_t)s >> 7) & 7u) << 4 : 0;
+          const unsigned row_bytes = b[0] * e;
+          if (!store && row_in && c0 >= 0 && uint64_t(c0) + b[0] <= dm[0] &&
+              cupbop_copy_tma_sectors(uintptr_t(s), uintptr_t(row + uint64_t(c0) * e), row_bytes, flip, 0)) {
+            s += row_bytes;
+            continue;
+          }
           for (uint32_t j0 = 0; j0 < b[0]; ++j0, s += e) {
             char *shared = (char *)((uintptr_t)s ^ flip);
             const int64_t g0 = (int64_t)c[0] + j0;

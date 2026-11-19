@@ -131,11 +131,13 @@ extern "C" void __cupbop_tma_multicast(void *dst, const void *desc, void *bar, u
   cupbop_tma_box(first, desc, rank, c0,c1,c2,c3,c4,0);
   for (unsigned peers = mask & (mask - 1); peers; peers &= peers - 1) {
     auto *target = static_cast<char *>(__cupbop_cluster_map(dst, __builtin_ctz(peers)));
-    for (unsigned row = 0; row < bytes; row += t->box[0] * t->elem) {
+    const unsigned row_bytes = t->box[0] * t->elem;
+    for (unsigned row = 0; row < bytes; row += row_bytes) {
       const uintptr_t src = uintptr_t(first + row), dest = uintptr_t(target + row);
       const unsigned a = t->swizzle ? ((src >> 7) & 7) << 4 : 0;
       const unsigned b = t->swizzle ? ((dest >> 7) & 7) << 4 : 0;
-      for (unsigned col = 0; col < t->box[0] * t->elem; col += t->elem)
+      if (cupbop_copy_tma_sectors(dest, src, row_bytes, b, a)) continue;
+      for (unsigned col = 0; col < row_bytes; col += t->elem)
         cupbop_copy_elem(reinterpret_cast<void *>((dest+col)^b), reinterpret_cast<const void *>((src+col)^a), t->elem);
     }
   }
