@@ -47,11 +47,49 @@ exit:
   ret void
 }
 
-!nvvm.annotations = !{!0, !1}
+define void @grid_bytes128(ptr byval([128 x i8]) align 64 "nvvm.grid_constant" %record, ptr %out) {
+  %field = getelementptr inbounds i8, ptr %record, i64 120
+  %value = load i64, ptr %field, align 8
+  store i64 %value, ptr %out, align 8
+  ret void
+}
+
+define void @triton_map(ptr byval([128 x i8]) align 64 "nvvm.grid_constant" %record, ptr %out) {
+  %src = ptrtoint ptr addrspace(3) @shared_mem to i64
+  %map = getelementptr inbounds i8, ptr %record, i64 0
+  %map_addr = ptrtoint ptr %map to i64
+  call void asm sideeffect "cp.async.bulk.tensor.1d.global.shared::cta.bulk_group [$0, {0}], [$1];", "l,l,~{memory}"(i64 %map_addr, i64 %src)
+  store i64 1, ptr %out, align 8
+  ret void
+}
+
+define void @publish_map(ptr %dst) {
+  %src = ptrtoint ptr addrspace(3) @shared_mem to i32
+  %addr = ptrtoint ptr %dst to i64
+  call void asm sideeffect "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [$0], [$1], 128;", "l,r,~{memory}"(i64 %addr, i32 %src)
+  call void asm sideeffect "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;", "l,~{memory}"(i64 %addr)
+  ret void
+}
+
+declare void @llvm.nvvm.fence.proxy.tensormap_generic.release.gpu()
+declare void @llvm.nvvm.fence.proxy.tensormap_generic.acquire.gpu(ptr, i32 immarg)
+
+define void @nvvm_map_fences(ptr %map, ptr %signal) {
+  call void @llvm.nvvm.fence.proxy.tensormap_generic.release.gpu()
+  store volatile i32 1, ptr %signal, align 4
+  call void @llvm.nvvm.fence.proxy.tensormap_generic.acquire.gpu(ptr %map, i32 128)
+  ret void
+}
+
+!nvvm.annotations = !{!0, !1, !3, !4, !5, !6}
 !nvvmir.version = !{!2}
 !0 = !{ptr @maps, !"kernel", i32 1}
 !1 = !{ptr @packed, !"kernel", i32 1}
 !2 = !{i32 2, i32 0}
+!3 = !{ptr @grid_bytes128, !"kernel", i32 1}
+!4 = !{ptr @triton_map, !"kernel", i32 1}
+!5 = !{ptr @publish_map, !"kernel", i32 1}
+!6 = !{ptr @nvvm_map_fences, !"kernel", i32 1}
 IR
 
 llvm-as maps.ll -o maps.bc
@@ -62,7 +100,38 @@ if ! env -u CUPBOP_NARROW_VECTOR_ARGS VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLA
 fi
 opt -passes=verify -disable-output kernel.bc
 llvm-dis kernel.bc -o kernel.ll
+sed -n '/^define .*@nvvm_map_fences(/,/^}/p' kernel.ll > nvvm_fences.ll
+grep -F 'fence release' nvvm_fences.ll
+grep -F 'fence acquire' nvvm_fences.ll
 grep -F 'parameter 0 (128 bytes) narrowed to its first 8 bytes' translation.log
 grep -F 'parameter 1 (128 bytes) narrowed to its first 8 bytes' translation.log
 grep -E 'define void @packed\(ptr [^,]*"cupbop-arg-slots"="96"' kernel.ll
+grep -Fx 'packed 2 768 0 lifted-slots' cupbop_byval_args.txt
+grep -Fx 'grid_bytes128 2 128 0' cupbop_byval_args.txt
+if grep -q '^triton_map ' cupbop_byval_args.txt; then
+  echo 'The Triton tensor map lost its one-slot launch ABI.' >&2
+  exit 1
+fi
 sed -n '/^define .*@packed(/,/^}/p' kernel.ll | grep -F 'call void @__cupbop_tma_store('
+sed -n '/^define .*@triton_map(/,/^}/p' kernel.ll | grep -F 'call void @__cupbop_tma_store('
+sed -n '/^define .*@publish_map(/,/^}/p' kernel.ll | grep -F 'call void @__cupbop_tensormap_publish('
+sed -n '/^define .*@publish_map(/,/^}/p' kernel.ll | grep -F 'fence acquire'
+
+sed 's/\[\$1\], 128;/[$1], 64;/' maps.ll > bad_size.ll
+llvm-as bad_size.ll -o bad_size.bc
+if VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLAG=1 VORTEX_NUM_THREADS=32 \
+    "$translator" bad_size.bc rejected.bc > bad_size.log 2>&1; then
+  echo 'Tensor map publication accepted an invalid size.' >&2
+  exit 1
+fi
+grep -F 'tensor-map proxy operation requires immediate size 128' bad_size.log
+
+sed 's/acquire.gpu(ptr %map, i32 128)/acquire.gpu(ptr %map, i32 64)/' maps.ll > bad_nvvm_size.ll
+if llvm-as bad_nvvm_size.ll -o bad_nvvm_size.bc > bad_nvvm_size.log 2>&1; then
+  if VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLAG=1 VORTEX_NUM_THREADS=32 \
+      "$translator" bad_nvvm_size.bc rejected.bc > bad_nvvm_size.log 2>&1; then
+    echo 'NVVM tensor map acquire accepted an invalid size.' >&2
+    exit 1
+  fi
+fi
+grep -E 'only supported value for size operand is 128|tensor-map proxy operation requires immediate size 128' bad_nvvm_size.log

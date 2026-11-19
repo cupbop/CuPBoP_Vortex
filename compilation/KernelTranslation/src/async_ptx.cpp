@@ -56,6 +56,10 @@ int schedule() {
   return e ? std::atoi(e) : 0;
 }
 
+bool tensorMapScope(StringRef scope) {
+  return scope == "cta" || scope == "cluster" || scope == "gpu" || scope == "sys";
+}
+
 std::string str(const Value *V) {
   std::string s;
   raw_string_ostream os(s);
@@ -190,6 +194,47 @@ bool parsePtx(const std::string &in, std::vector<Stmt> &out, std::string &err) {
   return true;
 }
 
+static bool isWgmmaMma(const Stmt &s) {
+  return StringRef(s.op).starts_with("wgmma.mma_async");
+}
+
+static void validateWgmmaMma(CallInst *C, ArrayRef<Stmt> statements) {
+  const Stmt &mma = statements.back();
+  for (const Stmt &s : statements)
+    if (isWgmmaMma(s) && (s.has("sp") || s.hasPrefix("sp::")))
+      fail_at(C, "sparse WGMMA MMA is unsupported");
+  const auto *result = dyn_cast<StructType>(C->getType());
+  if (!StringRef(mma.op).starts_with("wgmma.mma_async.sync.aligned.m64n") || !mma.pred.empty() ||
+      !mma.label.empty() || !result || mma.ops.size() < 4)
+    fail_at(C, "WGMMA MMA requires a single unpredicated instruction and a register tuple result");
+
+  StringRef outputs(mma.ops[0]);
+  if (!outputs.consume_front("{") || !outputs.consume_back("}"))
+    fail_at(C, "WGMMA MMA is missing its accumulator register tuple");
+  auto registers = splitTop(outputs.str(), ',');
+  if (registers.size() != result->getNumElements())
+    fail_at(C, "WGMMA MMA accumulator count differs from its LLVM result");
+  for (unsigned i = 0; i < registers.size(); ++i) {
+    StringRef reg(registers[i]);
+    if (reg.consume_front("$")) {
+      if (reg.consume_front("{") && reg.consume_back("}")) reg = reg.split(':').first;
+      unsigned index = 0;
+      if (!reg.getAsInteger(10, index) && index == i) continue;
+    }
+    fail_at(C, "WGMMA MMA accumulator output operands must be in LLVM result order");
+  }
+
+  // CUTLASS defines its scale-D predicate with `setp.ne.b32 p, $input, 0` immediately before MMA.
+  if (statements.size() == 1 && mma.ops[3] != "p") return;
+  if (statements.size() == 2 && mma.ops[3] == "p") {
+    const Stmt &set = statements.front();
+    if (set.op == "setp.ne.b32" && set.pred.empty() && set.label.empty() && set.ops.size() == 3 &&
+        set.ops[0] == "p" && set.ops[1] == "$" + std::to_string(registers.size() + 2) && set.ops[2] == "0")
+      return;
+  }
+  fail_at(C, "WGMMA MMA inline asm must contain just the MMA and its optional scale-D setp.ne.b32");
+}
+
 // Scoped scalar atomics emitted by libcudacxx's barrier and pipeline state.
 static bool isCtaAtomic(const Stmt &s) {
   return s.op == "ld.acquire.cta.b64" || s.op == "ld.relaxed.cta.b32" ||
@@ -205,7 +250,7 @@ bool ownedOp(const Stmt &s) {
   if (sw("clusterlaunchcontrol.") || sw("tcgen05.") || sw("mbarrier.") || sw("cp.async.bulk") ||
       sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
       sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
-      sw("cvta.param") || sw("multimem.") || sw("tensormap."))
+      sw("cvta.param") || sw("multimem.") || sw("tensormap.") || sw("fence.proxy."))
     return true;
   if (isCtaAtomic(s) || o == "fence.sc.cta")
     return true;
@@ -220,7 +265,7 @@ bool ownedOp(const Stmt &s) {
 bool mentionsAsyncText(const std::string &s) {
   for (const char *k :
        {"clusterlaunchcontrol.", "tcgen05.", "mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
-        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param"})
+        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param", "fence.proxy.", "fence.mbarrier_init"})
     if (s.find(k) != std::string::npos) return true;
   return false;
 }
@@ -726,11 +771,54 @@ struct AsmLowering {
       }
       return;
     }
+    // Both proxies use the same record and memory on Vortex. Publication copies
+    // the record before the releasing warp resumes, and consumers use a memory fence.
+    if (sw("tensormap.cp_fenceproxy.")) {
+      nops(3, 3);
+      if (!sw("tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.") ||
+          s.tok.size() != 9 || s.tok[7] != "sync" || s.tok[8] != "aligned")
+        fail("unsupported tensor-map proxy operation");
+      if (!tensorMapScope(s.tok[6])) fail("unsupported tensor-map proxy scope");
+      auto *size = dyn_cast<ConstantInt>(val(s.ops.back(), S.I64));
+      if (!size || !size->equalsInt(128)) fail("tensor-map proxy operation requires immediate size 128");
+      needWarps();
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, "__cupbop_tensormap_publish", S.Void,
+                      {addr(s.ops[0], "tensor-map address"), addr(s.ops[1], "shared")});
+      });
+      return;
+    }
+    if (sw("fence.proxy.tensormap::generic.")) {
+      const bool acquire = sw("fence.proxy.tensormap::generic.acquire.");
+      if ((!acquire && !sw("fence.proxy.tensormap::generic.release.")) || s.tok.size() != 5)
+        fail("unsupported tensor-map proxy operation");
+      if (!tensorMapScope(s.tok[4])) fail("unsupported tensor-map proxy scope");
+      nops(acquire ? 2 : 0, acquire ? 2 : 0);
+      underPred(pred, [&]() -> Value * {
+        if (acquire) {
+          addr(s.ops[0], "tensor-map address");
+          auto *size = dyn_cast<ConstantInt>(val(s.ops[1], S.I64));
+          if (!size || !size->equalsInt(128)) fail("tensor-map proxy operation requires immediate size 128");
+        }
+        return B.CreateFence(acquire ? AtomicOrdering::Acquire : AtomicOrdering::Release);
+      });
+      return;
+    }
     // --- fences and hints
-    if (sw("fence.proxy.") || sw("fence.mbarrier_init") || sw("setmaxnreg.") || sw("griddepcontrol.") ||
+    if (sw("fence.proxy.") || sw("fence.mbarrier_init")) {
+      const bool init = o == "fence.mbarrier_init.release.cluster";
+      if (!s.ops.empty() || !(init || o == "fence.proxy.async" || o == "fence.proxy.async.global" ||
+                             o == "fence.proxy.async.shared::cta" || o == "fence.proxy.async.shared::cluster"))
+        fail("unsupported proxy or mbarrier initialization fence: " + s.text);
+      underPred(pred, [&]() -> Value * {
+        // Order the issuing thread's accesses before DXA/TCU can consume the data.
+        return B.CreateFence(init ? AtomicOrdering::Release : AtomicOrdering::SequentiallyConsistent);
+      });
+      return;
+    }
+    if (sw("setmaxnreg.") || sw("griddepcontrol.") ||
         sw("prefetch.tensormap") || sw("cp.async.bulk.prefetch") || sw("cp.async.bulk.commit_group") ||
-        sw("cp.async.bulk.wait_group") || sw("tensormap.cp_fenceproxy") ||
-        sw("wgmma.fence") || sw("wgmma.commit_group") || sw("wgmma.wait_group")) {
+        sw("cp.async.bulk.wait_group")) {
       return; // synchronous software copies: nothing to order beyond the compiler fence
     }
     if (sw("fence.") && o.find(".cluster") != std::string::npos) {
@@ -1135,6 +1223,48 @@ struct AsmLowering {
 // ---------------------------------------------------------------------------------------------------------
 // NVVM intrinsics
 
+static bool isOrdinaryTmaLoad(const CallInst &C) {
+  const Function *F = C.getCalledFunction();
+  if (!F || C.arg_size() < 2 || !F->getName().starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.tile.")) return false;
+  // The tile intrinsics end with the constant `has multicast` and `has cache hint` flags.
+  const auto *multicast = dyn_cast<ConstantInt>(C.getArgOperand(C.arg_size() - 2));
+  return multicast && multicast->isZero();
+}
+
+// Use the hardware-mbarrier ABI only for a structured load paired with an earlier local arrive in
+// the same producer block. Split byte accounting and other patterns keep the existing software ABI.
+static bool hasLocalTmaArrive(const CallInst &C, const DataLayout &DL) {
+  int64_t loadOffset = 0;
+  const Value *loadBar = GetPointerBaseWithConstantOffset(C.getArgOperand(1), loadOffset, DL);
+  for (const Instruction *I = C.getPrevNonDebugInstruction(); I; I = I->getPrevNonDebugInstruction()) {
+    const auto *A = dyn_cast<CallInst>(I);
+    if (!A) {
+      if (I->mayHaveSideEffects()) return false;
+      continue;
+    }
+    if (isOrdinaryTmaLoad(*A)) continue;
+    const auto *assembly = dyn_cast<InlineAsm>(A->getCalledOperand());
+    if (!assembly || !A->getType()->isVoidTy()) return false;
+    std::vector<Stmt> statements;
+    std::string error;
+    if (!parsePtx(assembly->getAsmString(), statements, error) || statements.size() != 1) return false;
+    const Stmt &s = statements.front();
+    if (!s.label.empty() || !s.pred.empty() || s.op.rfind("mbarrier.arrive.", 0) != 0 ||
+        !s.has("expect_tx") || !s.has("shared::cta") || s.ops.size() != 3 || s.ops[0] != "_")
+      return false;
+    StringRef operand(s.ops[1]);
+    if (!operand.consume_front("[$") || !operand.consume_back("]")) return false;
+    unsigned index;
+    if (operand.getAsInteger(10, index) || index >= A->arg_size()) return false;
+    Value *bar = A->getArgOperand(index);
+    if (!bar->getType()->isPointerTy()) bar = cupbop_trace_pointer(bar);
+    if (!bar || !bar->getType()->isPointerTy()) return false;
+    int64_t arriveOffset = 0;
+    return GetPointerBaseWithConstantOffset(bar, arriveOffset, DL) == loadBar && arriveOffset == loadOffset;
+  }
+  return false;
+}
+
 bool lowerIntrinsic(PassState &S, CallInst *C) {
   Function *Fn = C->getCalledFunction();
   if (!Fn) return false;
@@ -1228,6 +1358,18 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     }
     return done(nullptr);
   }
+  StringRef fence = n;
+  if (fence.consume_front("llvm.nvvm.fence.proxy.tensormap_generic.")) {
+    const bool acquire = fence.consume_front("acquire.");
+    if ((!acquire && !fence.consume_front("release.")) || !tensorMapScope(fence) ||
+        C->arg_size() != (acquire ? 2u : 0u))
+      fail_at(C, "unsupported tensor-map proxy intrinsic");
+    if (acquire) {
+      auto *size = dyn_cast<ConstantInt>(C->getArgOperand(1));
+      if (!size || !size->equalsInt(128)) fail_at(C, "tensor-map proxy operation requires immediate size 128");
+    }
+    return done(B.CreateFence(acquire ? AtomicOrdering::Acquire : AtomicOrdering::Release));
+  }
   if (n == "llvm.nvvm.cp.async.bulk.commit.group" || n.starts_with("llvm.nvvm.cp.async.bulk.wait.group") ||
       n.starts_with("llvm.nvvm.cp.async.bulk.prefetch") || n.starts_with("llvm.nvvm.cp.async.bulk.tensor.prefetch") ||
       n.starts_with("llvm.nvvm.fence.proxy") || n.starts_with("llvm.nvvm.setmaxnreg") ||
@@ -1269,7 +1411,12 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     if (load) {
       bool multicast = !cast<ConstantInt>(C->getArgOperand(rank+5))->isZero();
       if (multicast) args.push_back(B.CreateZExt(C->getArgOperand(rank+3),S.I32));
-      S.call(B,multicast ? "__cupbop_tma_multicast" : "__cupbop_tcgen_tma_load",S.Void,args);
+      if (multicast)
+        S.call(B, "__cupbop_tma_multicast", S.Void, args);
+      else if (S.tcgenFunctions.count(F))
+        S.call(B, "__cupbop_tcgen_tma_load", S.Void, args);
+      else
+        S.txCopies.insert(S.call(B, kTmaLoad, S.Void, args, false));
     } else if (n.contains(".reduce.")) {
       StringRef op = n.split(".reduce.").second.split('.').first;
       static const StringRef names[] = {"add","min","max","inc","dec","and","or","xor"};
@@ -1366,13 +1513,14 @@ bool tmaStatic() {
   return !e || std::atoi(e) != 0;
 }
 
-// The DXA slot of a TMA load's tensor map: on the 1:1 schedule read once at the function's entry when the tensor map is a
-// parameter (the host sets the slot before the launch, the record does not change during it), else right before the copy.
-// The core mapping would carry the entry's value through every thread's context.
+// A by-value tensor map keeps its launch-time slot. A descriptor reached
+// through a pointer may be published during the kernel, so read it at the copy.
+// The core mapping would carry an entry value through every thread's context.
 Value *tmaSlot(PassState &S, CallInst *Cp) {
   Function *F = Cp->getFunction();
   Value *desc = Cp->getArgOperand(1), *rank = Cp->getArgOperand(3);
-  if (tmaStatic() && schedule() == 2 && isa<Argument>(desc) && isa<ConstantInt>(rank)) {
+  auto *arg = dyn_cast<Argument>(desc);
+  if (tmaStatic() && schedule() == 2 && arg && arg->hasByValAttr() && isa<ConstantInt>(rank)) {
     Value *&V = S.slots[{F, desc}];
     if (!V) {
       Instruction *IP = &*F->getEntryBlock().getFirstInsertionPt();
@@ -2142,13 +2290,7 @@ static void markTensorMapParameters(PassState &S) {
     for (BasicBlock &bb : *F)
       for (Instruction &I : bb) {
         auto *call = dyn_cast<CallInst>(&I);
-        if (!call || !call->getCalledFunction()) continue;
-        StringRef callee = call->getCalledFunction()->getName();
-        Value *descriptor = nullptr;
-        if (callee == kTmaLoad || callee == "__cupbop_tcgen_tma_load" || callee == "__cupbop_tma_multicast")
-          descriptor = call->getArgOperand(1);
-        else if (callee == kTmaLoadQi) descriptor = call->getArgOperand(5);
-        else if (callee == kTmaStore || callee == "__cupbop_tensor_reduce") descriptor = call->getArgOperand(0);
+        Value *descriptor = call ? async_tensor_map_operand(*call) : nullptr;
         if (!descriptor) continue;
         if (auto off = paramBankOffset(descriptor, bank, DL)) {
           auto map = tensorMaps.find(*off);
@@ -2214,6 +2356,17 @@ static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *,
 }
 
 } // namespace
+
+Value *async_tensor_map_operand(CallBase &call) {
+  const Function *callee = call.getCalledFunction();
+  if (!callee) return nullptr;
+  StringRef name = callee->getName();
+  if (name == kTmaLoad || name == "__cupbop_tcgen_tma_load" || name == "__cupbop_tma_multicast")
+    return call.getArgOperand(1);
+  if (name == kTmaLoadQi) return call.getArgOperand(5);
+  if (name == kTmaStore || name == "__cupbop_tensor_reduce") return call.getArgOperand(0);
+  return nullptr;
+}
 
 // CuLifter emits both CTA-local and peer paths for SASS ARRIVES. A direct read
 // of the current CTA rank, including its low byte from the SASS address, proves
@@ -2294,6 +2447,7 @@ void lower_async_ptx(Module *M) {
   std::vector<CallInst *> calls;
   std::map<Function *, std::vector<Function *>> callers, callees;
   std::set<Function *> barrierFunctions;
+  std::set<Function *> structuredTma, splitByteTransactions;
   for (auto &F : *M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -2303,6 +2457,8 @@ void lower_async_ptx(Module *M) {
           simplifySelfClusterArrive(*C);
           const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
           if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
+          if (body.find("mbarrier.expect_tx.") != std::string::npos || body.find("mbarrier.complete_tx.") != std::string::npos)
+            splitByteTransactions.insert(&F);
           if (body.find("tcgen05.") != std::string::npos ||
               body.find("clusterlaunchcontrol.try_cancel") != std::string::npos ||
               body.find("multicast::cluster") != std::string::npos || body.find("cp.reduce.async.bulk") != std::string::npos ||
@@ -2315,7 +2471,12 @@ void lower_async_ptx(Module *M) {
             calls.push_back(C);
             if (callee->getName().contains("mbarrier")) barrierFunctions.insert(&F);
             StringRef name = callee->getName();
-            if (name.starts_with("llvm.nvvm.mapa") || name.starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.") ||
+            if (name.starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.")) {
+              barrierFunctions.insert(&F);
+              structuredTma.insert(&F);
+              if (!isOrdinaryTmaLoad(*C) || !hasLocalTmaArrive(*C, M->getDataLayout())) S.tcgenFunctions.insert(&F);
+            }
+            if (name.starts_with("llvm.nvvm.mapa") ||
                 name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
                 name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
           } else if (!callee->isDeclaration()) {
@@ -2324,6 +2485,8 @@ void lower_async_ptx(Module *M) {
           }
         }
       }
+  for (auto *F : structuredTma)
+    if (splitByteTransactions.count(F)) S.tcgenFunctions.insert(F);
   if (!S.tcgenFunctions.empty()) {
     // A noinline helper must agree with all callers on the 8-byte barrier ABI.
     // Only follow edges into helpers that actually use a barrier (transitively).
@@ -2359,7 +2522,21 @@ void lower_async_ptx(Module *M) {
     std::vector<Stmt> st;
     std::string err;
     if (!parsePtx(a, st, err)) {
-      if (mentionsAsyncText(a)) fail_at(C, "cannot parse async asm (" + err + ")");
+      if (mentionsAsyncText(a) || StringRef(a).contains("wgmma."))
+        fail_at(C, "cannot parse async asm (" + err + ")");
+      continue;
+    }
+    auto isWgmmaControl = [](const Stmt &s) {
+      StringRef op(s.op);
+      return op.starts_with("wgmma.fence") || op.starts_with("wgmma.commit_group") || op.starts_with("wgmma.wait_group");
+    };
+    if (llvm::any_of(st, isWgmmaControl)) {
+      if (!llvm::all_of(st, [&](const Stmt &s) { return isWgmmaControl(s) && s.pred.empty() && s.label.empty(); }))
+        fail_at(C, "WGMMA control must use unpredicated inline asm containing only fence/commit_group/wait_group");
+      continue; // Retain the call for the WGMMA lowering, including all of its group controls.
+    }
+    if (llvm::any_of(st, isWgmmaMma)) {
+      validateWgmmaMma(C, st);
       continue;
     }
     if (lowerSdkBuiltin(S, C, st)) continue;

@@ -7,6 +7,7 @@ set -euo pipefail
 : "${CuPBoP_PATH:?source the CuPBoP environment first}"
 : "${VORTEX_PATH:?select a Vortex build first}"
 : "${LLVM_PREFIX:?select the Vortex LLVM toolchain first}"
+bash "$CuPBoP_PATH/ci/wgmma_operand_test.sh" "$CuPBoP_PATH/build/compilation/kernelTranslator" "$LLVM_PREFIX/bin"
 work=$(mktemp -d "${TMPDIR:-/tmp}/cupbop-hopper.XXXXXXXX")
 echo "Hopper regression artifacts: $work"
 mkdir -p "$work/examples"

@@ -1177,11 +1177,11 @@ static uint64_t cupbop_frame_scratch_bytes(const std::string &lookup_name) {
   }
   return 0;
 }
-// By-value struct parameters (translator: generate_wrapper.cpp decode_input, cupbop_byval_args.txt: <name as in
-// lookup.txt> <parameters> <bytes of each by-value parameter, 0 = not by-value>): such a parameter takes
-// ceil(bytes / 8) consecutive launch slots holding all its bytes (zero-padded), every other one slot as before.
+// By-value parameters in cupbop_byval_args.txt: kernel name, logical parameter
+// count, one size per parameter (0 for a scalar), and an optional lifted-slots
+// marker for a kernel whose replay callers may already supply physical slots.
 // Returns false (one 8-byte slot per argument) when the kernel is not listed.
-static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint64_t> &bytes) {
+static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint64_t> &bytes, bool &lifted_slots) {
   std::ifstream f("cupbop_byval_args.txt");
   if (!f.is_open()) return false;
   std::string line;
@@ -1194,6 +1194,8 @@ static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint
     bytes.assign(n, 0);
     for (size_t i = 0; i < n; ++i)
       if (!(is >> bytes[i])) return false;
+    std::string layout;
+    lifted_slots = (is >> layout) && layout == "lifted-slots";
     return true;
   }
   return false;
@@ -2343,18 +2345,11 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blockDim, void **args,
                                         size_t sharedMem, cudaStream_t stream, int num_args,
                                         dim3 cluster, bool explicit_cluster) {
-  //open the file lookup.txt and load the content in the memory
-  //cpp hash table, look for the kernel name, and retrieve the kerenl index
-  
-  //DEBUG PURPOSE
+  if (!func || !*func) return cudaErrorInvalidDeviceFunction;
+  const bool launch_by_path = strchr(func, '/') != nullptr;
   DBG_COUT("RUNTIME FUNCTION" << std::endl);
   DBG_COUT("kernel_name: " << func << std::endl);
   DBG_COUT("number of arguments: " << num_args << std::endl);
-  //reading lookup.txt
-  std::fstream readfile;
-  readfile.open("lookup.txt", std::ios::in);
-  std::string kernel_idx_tmp;
-  std::string kernel_name_tmp;
 
   // Strip mangling prefix to get the bare function name for matching.
   // Host func: _ZL19initiPKiS0_Pi → strip _Z, L, digits → initiPKiS0_Pi
@@ -2365,23 +2360,38 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
     return s.substr(i);
   };
-  std::string func_stripped = stripPrefix(std::string(func));
-  DBG_COUT("func_stripped: " << func_stripped << std::endl);
-  cupbop_cta_fix cta_fix;
-
-  while(readfile >> kernel_idx_tmp) {
-    readfile >> kernel_name_tmp;
-    readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    std::string lookup_stripped = stripPrefix(kernel_name_tmp);
-    DBG_COUT("debug : " << func_stripped << " vs " << lookup_stripped << std::endl);
-    if(func_stripped == lookup_stripped) {
-      DBG_COUT("found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl);
-      break;
+  const std::string func_stripped = stripPrefix(func);
+  int kernel_index = -1;
+  std::string kernel_name_tmp;
+  {
+    std::ifstream lookup("lookup.txt");
+    int index, legacy_index = -1;
+    std::string entry, legacy_name;
+    bool ambiguous = false;
+    while (lookup >> index >> entry) {
+      lookup.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+      if (index < 0) continue;
+      // A by-path launch uses the selected module and its lookup table in the
+      // caller's working directory. Preserve its last-entry convention.
+      if (launch_by_path || entry == func) {
+        kernel_index = index;
+        kernel_name_tmp = entry;
+        if (!launch_by_path) break;
+      } else if (stripPrefix(entry) == func_stripped) {
+        if (legacy_index >= 0 && legacy_index != index) ambiguous = true;
+        legacy_index = index;
+        legacy_name = entry;
+      }
+    }
+    if (kernel_index < 0 && !ambiguous) {
+      kernel_index = legacy_index;
+      kernel_name_tmp = std::move(legacy_name);
     }
   }
-  readfile.close();                    
-  // The side-file tables hold kernel names. A launch by path names the module, and its kernel is what lookup.txt gave.
-  const std::string table_name = strchr(func, '/') ? stripPrefix(kernel_name_tmp) : func_stripped;
+  if (kernel_index < 0) return cudaErrorInvalidDeviceFunction;
+  DBG_COUT("kernel lookup matched " << kernel_name_tmp << " at index " << kernel_index << std::endl);
+  const std::string table_name = stripPrefix(kernel_name_tmp);
+  cupbop_cta_fix cta_fix;
                       
   std::ifstream shapes("cupbop_cluster_dims.txt");
   std::string name;
@@ -2424,7 +2434,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
   // upload kernel to device (reload when binary path changes)
   {
     // Use func as path if it looks like a file path (absolute or relative with /), else fallback
-    std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
+    std::string krnl_path = launch_by_path ? std::string(func) : "./kernel.vxbin";
     if (DC->module() == nullptr || krnl_path != DC->last_krnl_path()) {
       cupbop_switch_module(DC->last_krnl_path(), krnl_path);
       DC->cleanup_krnl();
@@ -2521,18 +2531,22 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
 
   // launch slots: one per argument, or ceil(bytes / 8) for a by-value struct parameter (cupbop_byval_layout)
   std::vector<uint64_t> byval_bytes;
-  const bool byval = cupbop_byval_layout(kernel_name_tmp, byval_bytes);
+  bool lifted_slots = false;
+  const bool byval = cupbop_byval_layout(kernel_name_tmp, byval_bytes, lifted_slots);
   int num_slots = num_args;
-  // host arguments: clang's launch stub passes one pointer per kernel parameter, but its own parameter count
-  // (num_args, from the host translator) counts a struct the x86-64 ABI splits in two (e.g. 16 bytes of floats) twice
-  const int nargs = byval ? (int)byval_bytes.size() : num_args;
   if (byval) {
-    if ((int)byval_bytes.size() != num_args)
-      DBG_PRINT("cudaLaunchKernel: %s: %zu kernel parameters, %d host arguments: using the kernel's\n",
-                kernel_name_tmp.c_str(), byval_bytes.size(), num_args);
     num_slots = 0;
     for (uint64_t b : byval_bytes) num_slots += b ? (int)((b + 7) / 8) : 1;
   }
+  // Binary replay can already supply a pointer to each physical launch slot
+  // for lifted kernels, including replay by name. Source launch stubs supply
+  // one pointer per logical parameter,
+  // even if the host translator's count includes x86-64 ABI fragments.
+  const bool flat_args = !byval || (lifted_slots && num_args == num_slots && size_t(num_slots) != byval_bytes.size());
+  const int nargs = flat_args ? num_args : (int)byval_bytes.size();
+  if (nargs != num_args)
+    DBG_PRINT("cudaLaunchKernel: %s: %zu kernel parameters, %d host arguments: using the kernel's\n",
+              kernel_name_tmp.c_str(), byval_bytes.size(), num_args);
 
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_slots > 1) ? (sizeof(uint64_t) * (num_slots - 1)) : 0);
@@ -2572,7 +2586,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
   memcpy(&abuf_ptr->ctx, &ctx, sizeof(context_t));
   
   // write the kerenel index here it retrives
-  abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
+  abuf_ptr->kernel_idx = kernel_index;
   abuf_ptr->num_args = num_slots;
   
   // Mark Debug Check 
@@ -2584,7 +2598,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
   DBG_PRINT("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
 
   // write arguments
-  if (!byval) {
+  if (flat_args) {
     for (int i = 0; i < nargs; ++i) {
       memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
       DBG_PRINT("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);

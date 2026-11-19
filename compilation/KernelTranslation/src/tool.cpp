@@ -2,6 +2,7 @@
 #include "warp_func.h"
 #include "flag.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
@@ -555,6 +556,7 @@ void lower_atomicrmw_add_i64(llvm::Module *M) {
       for (auto &I : BB)
         if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
           if (RMW->getOperation() == AtomicRMWInst::Add &&
+              RMW->getOrdering() == AtomicOrdering::Monotonic && !RMW->isVolatile() &&
               RMW->getValOperand()->getType()->isIntegerTy(64))
             add_ops.push_back(RMW);
 
@@ -2367,8 +2369,8 @@ static void tensor_set_convergent(CallInst *C) {
 // "mma.sync.aligned.<geom>.row.col[.satfinite].<d>.<a>.<b>.<c> {D}, {A}, {B}, {C};" (one or more statements)
 // becomes calls to the pseudo-intrinsic cupbop.mma.<geom>.row.col[.satfinite].<sig> (NVVM naming: sig .f32.f32
 // for f16, else .<a>[.<b>]), which the NT=16 staging and replace_nvvm_mma_intrinsics treat like llvm.nvvm.mma.*.
-// Returns false (asm left to the older handlers) when the string is not made of mma.sync statements or the
-// fragments come from ldmatrix asm (Triton path). Recognized but unsupported forms are a hard error.
+// Returns false for statements handled elsewhere. The ldmatrix prepass lowers
+// shared fragments before this pass. Recognized unsupported forms are errors.
 static std::string tensor_trim(const std::string &s) {
   size_t a = s.find_first_not_of(" \t\n\r"), b = s.find_last_not_of(" \t\n\r");
   return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
@@ -2417,14 +2419,6 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
     if (V->getType() == T) return V;
     if (V->getType()->getPrimitiveSizeInBits() == 32) return B.CreateBitCast(V, T);
     return nullptr;
-  };
-  auto fromLdmatrix = [](Value *V) {
-    if (auto *EV = dyn_cast<ExtractValueInst>(V)) V = EV->getAggregateOperand();
-    if (auto *C = dyn_cast<CallInst>(V))
-      if (C->isInlineAsm())
-        if (auto *X = dyn_cast<InlineAsm>(C->getCalledOperand()))
-          return X->getAsmString().find("ldmatrix") != std::string::npos;
-    return false;
   };
   // value of template operand n read as an input
   auto readOp = [&](int n) -> Value * {
@@ -2495,9 +2489,6 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
     P.D = groups[0]; P.A = groups[1]; P.Bv = groups[2]; P.C = groups[3];
     plans.push_back(P);
   }
-  // fragments loaded by ldmatrix asm: leave the whole asm to the Triton (WGMMA_SS) path
-  for (auto &P : plans)
-    for (int n : P.A) if (!ops[n].out && fromLdmatrix(Call->getArgOperand(ops[n].pos))) return false;
   { // validate before emitting anything: every operand readable and 32-bit
     std::vector<bool> written(nOut, false);
     auto ok = [&](int n) {
@@ -2643,6 +2634,180 @@ static void emit_wgmma_group_call(IRBuilder<> &builder, Module *M, Value *groups
                                           {builder.CreatePointerCast(groups, ptr)}));
 }
 
+static Value *wgmma_input(CallInst *call, StringRef operand, unsigned outputs) {
+  operand = operand.trim();
+  if (!operand.consume_front("$")) return nullptr;
+  if (operand.consume_front("{")) {
+    if (!operand.consume_back("}")) return nullptr;
+    operand = operand.split(':').first;
+  }
+  unsigned index = 0;
+  if (operand.getAsInteger(10, index) || index < outputs || index - outputs >= call->arg_size())
+    return nullptr;
+  return call->getArgOperand(index - outputs);
+}
+
+// Global memory PTX uses the LLVM operand order shown below. In particular,
+// parse the modifiers and operands together so an unrecognized ordering,
+// scope, offset or instruction sequence cannot become a weaker operation.
+static bool lower_inline_global_memory(CallInst *call, StringRef text, bool rv64) {
+  text = text.trim();
+  text.consume_back(";");
+  const size_t separator = text.find_first_of(" \t\r\n");
+  SmallVector<StringRef, 8> modifiers;
+  text.take_front(separator).split(modifiers, '.');
+  if (modifiers.empty()) return false;
+  const StringRef instruction = modifiers.front();
+  ArrayRef<StringRef> parts = ArrayRef(modifiers).drop_front();
+
+  std::string operands;
+  if (separator != StringRef::npos) {
+    for (char c : text.drop_front(separator))
+      if (!std::isspace(static_cast<unsigned char>(c))) operands += c;
+  }
+  IRBuilder<> b(call);
+  if (instruction == "fence" || instruction == "membar") {
+    if (!call->getType()->isVoidTy() || call->arg_size() || !operands.empty()) return false;
+    if (instruction == "membar") {
+      if (parts.size() != 1 || (parts[0] != "cta" && parts[0] != "gl")) return false;
+      b.CreateFence(AtomicOrdering::SequentiallyConsistent);
+    } else {
+      const bool sc = parts.size() == 2 && parts[0] == "sc";
+      if (parts.empty() || parts.size() > 2 ||
+          (parts.size() == 2 && !sc && parts[0] != "acq_rel") ||
+          (parts.back() != "cta" && parts.back() != "gpu")) return false;
+      b.CreateFence(sc ? AtomicOrdering::SequentiallyConsistent : AtomicOrdering::AcquireRelease);
+    }
+    return true;
+  }
+
+  const bool load = instruction == "ld", store = instruction == "st";
+  const bool atom = instruction == "atom", reduction = instruction == "red";
+  if (!(load || store || atom || reduction) || parts.empty()) return false;
+  const StringRef type = parts.back();
+  const bool wide = type == "b64" || type == "s64" || type == "u64";
+  if (wide ? !rv64 : (type != "b32" && type != "s32" && type != "u32")) return false;
+  parts = parts.drop_back();
+  Type *word = wide ? b.getInt64Ty() : b.getInt32Ty();
+  AtomicOrdering order = AtomicOrdering::Monotonic;
+  bool ordered = false;
+  if ((load || store) && !parts.empty() && parts.front() == "volatile") {
+    // CuLifter represents a SASS STRONG scalar access with volatile PTX.
+    order = load ? AtomicOrdering::Acquire : AtomicOrdering::Release;
+    ordered = true;
+    parts = parts.drop_front();
+  } else if (parts.size() >= 2 && (parts[1] == "cta" || parts[1] == "gpu")) {
+    order = StringSwitch<AtomicOrdering>(parts[0])
+        .Case("relaxed", AtomicOrdering::Monotonic)
+        .Case("acquire", AtomicOrdering::Acquire)
+        .Case("release", AtomicOrdering::Release)
+        .Case("acq_rel", AtomicOrdering::AcquireRelease)
+        .Default(AtomicOrdering::NotAtomic);
+    if (order == AtomicOrdering::NotAtomic ||
+        (load && (order == AtomicOrdering::Release || order == AtomicOrdering::AcquireRelease)) ||
+        (store && (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease)) ||
+        (reduction && (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease))) return false;
+    ordered = true;
+    parts = parts.drop_front(2);
+  }
+  if (parts.empty() || parts.front() != "global") return false;
+  parts = parts.drop_front();
+
+  StringRef operation;
+  if (atom || reduction) {
+    if (parts.size() != 1) return false;
+    operation = parts.front();
+  } else if (!parts.empty()) {
+    // CUDA cache operators are performance hints. Keep the memory access.
+    if (ordered || parts.size() != 1 ||
+        (parts.front() != "ca" && parts.front() != "cg" && parts.front() != "cs" &&
+         parts.front() != "wb" && parts.front() != "wt")) return false;
+  }
+  const bool cas = operation == "cas";
+  const unsigned arity = load ? 1 : (cas ? 3 : 2);
+  const StringRef expected = load ? "$0,[$1]" : (atom ? (cas ? "$0,[$1],$2,$3" : "$0,[$1],$2") : "[$0],$1");
+  if (operands != expected || call->arg_size() != arity ||
+      (load || atom ? call->getType() != word : !call->getType()->isVoidTy())) return false;
+  Value *address = call->getArgOperand(0);
+  if (!address->getType()->isIntOrPtrTy()) return false;
+  for (unsigned i = 1; i < arity; ++i)
+    if (call->getArgOperand(i)->getType() != word) return false;
+
+  const auto pointer = PointerType::getUnqual(call->getContext());
+  auto addressValue = [&]() {
+    return address->getType()->isPointerTy() ? b.CreatePointerCast(address, pointer)
+                                          : b.CreateIntToPtr(address, pointer);
+  };
+  const Align alignment(wide ? 8 : 4);
+  if (load) {
+    // Vortex's ordered global accesses use the shared LLC path. LR does not
+    // write the location and can observe another core's publication.
+    if (ordered) {
+      StringRef encoding = wide ? (order == AtomicOrdering::Acquire ? "lr.d.aq $0, ($1)" : "lr.d $0, ($1)")
+                                : (order == AtomicOrdering::Acquire ? "lr.w.aq $0, ($1)" : "lr.w $0, ($1)");
+      auto *lr = InlineAsm::get(FunctionType::get(word, {pointer}, false), encoding, "=r,r,~{memory}", true);
+      call->replaceAllUsesWith(b.CreateCall(lr, {addressValue()}, "ld.global.coherent"));
+    } else {
+      auto *read = b.CreateAlignedLoad(word, addressValue(), alignment);
+      read->setVolatile(true);
+      call->replaceAllUsesWith(read);
+    }
+    return true;
+  }
+  if (store && !ordered) {
+    b.CreateAlignedStore(call->getArgOperand(1), addressValue(), alignment)->setVolatile(true);
+    return true;
+  }
+  if (cas) {
+    if (!atom) return false;
+    const auto failure = (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease)
+                             ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic;
+    auto *cmp = b.CreateAtomicCmpXchg(addressValue(), call->getArgOperand(1), call->getArgOperand(2),
+                                      alignment, order, failure);
+    cmp->setVolatile(true);
+    call->replaceAllUsesWith(b.CreateExtractValue(cmp, 0));
+    return true;
+  }
+
+  const bool signedType = type.starts_with("s");
+  const auto op = store ? AtomicRMWInst::Xchg : StringSwitch<AtomicRMWInst::BinOp>(operation)
+      .Case("exch", atom ? AtomicRMWInst::Xchg : AtomicRMWInst::BAD_BINOP)
+      .Case("add", AtomicRMWInst::Add).Case("and", AtomicRMWInst::And)
+      .Case("or", AtomicRMWInst::Or).Case("xor", AtomicRMWInst::Xor)
+      .Case("min", signedType ? AtomicRMWInst::Min : AtomicRMWInst::UMin)
+      .Case("max", signedType ? AtomicRMWInst::Max : AtomicRMWInst::UMax)
+      .Default(AtomicRMWInst::BAD_BINOP);
+  if (op == AtomicRMWInst::BAD_BINOP) return false;
+  auto *rmw = b.CreateAtomicRMW(op, addressValue(), call->getArgOperand(1), alignment, order);
+  rmw->setVolatile(true);
+  if (atom) call->replaceAllUsesWith(rmw);
+  return true;
+}
+
+static bool compound_global_memory_asm(StringRef text) {
+  text = text.trim();
+  text.consume_back(";");
+  if (!text.contains(';')) return false;
+  SmallVector<StringRef, 8> statements;
+  text.split(statements, ';');
+  for (StringRef statement : statements) {
+    statement = statement.ltrim(" \t\r\n{");
+    if (statement.starts_with("@")) {
+      const size_t predicate = statement.find_first_of(" \t\r\n");
+      if (predicate == StringRef::npos) continue;
+      statement = statement.drop_front(predicate).ltrim();
+    }
+    const StringRef opcode = statement.take_front(statement.find_first_of(" \t\r\n"));
+    // Async PTX with shared/proxy instructions and mixed declarations has a
+    // dedicated parser earlier. These scalar recognizers consume one instruction.
+    if (opcode.starts_with("atom.") || opcode.starts_with("red.") ||
+        opcode.starts_with("fence.") || opcode.starts_with("membar.") ||
+        ((opcode.starts_with("ld.") || opcode.starts_with("st.")) && opcode.contains(".global")))
+      return true;
+  }
+  return false;
+}
+
 void replace_asm_call(llvm::Module *M) {
   const char *architecture = std::getenv("VORTEX_ARCHITECTURE");
   const bool rv64 = architecture && StringRef(architecture) == "64";
@@ -2700,52 +2865,6 @@ void replace_asm_call(llvm::Module *M) {
     return groups;
   };
 
-  // TCU: Track ldmatrix results → shared memory pointers
-  // Key: the ldmatrix CallInst result (struct {i32,i32,i32,i32})
-  // Value: {smem_ptr, is_transposed}
-  struct LdMatrixInfo {
-    Value *smem_ptr;    // ptr addrspace(3) operand
-    bool is_transposed; // .trans variant (B tile)
-  };
-  std::map<Value *, LdMatrixInfo> ldmatrix_map;
-
-  // Helper: strip thread-dependent GEP indices to get the tile base address.
-  // Triton IR pattern:
-  //   %ptr = GEP @global_smem, %thread_dep_offset   ← strip variable index
-  //   %ptr2 = GEP %ptr, 0                           ← strip constant-zero index
-  // Returns: @global_smem (for A) or ConstExpr GEP(@global_smem + offset) (for
-  // B)
-  auto getSmemTileBase = [](Value *smem_ptr) -> Value * {
-    Value *cur = smem_ptr;
-    while (auto *GEP = dyn_cast<GetElementPtrInst>(cur)) {
-      bool all_const = true;
-      for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-        if (!isa<ConstantInt>(*idx)) {
-          all_const = false;
-          break;
-        }
-      }
-      if (all_const) {
-        // Check if it's a no-op GEP (constant 0 index) — strip it too
-        bool all_zero = true;
-        for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-          if (!cast<ConstantInt>(*idx)->isZero()) {
-            all_zero = false;
-            break;
-          }
-        }
-        if (all_zero) {
-          cur = GEP->getPointerOperand();
-          continue;
-        }
-        break; // Non-zero constant offset — keep it (e.g., B tile offset)
-      }
-      // Variable index — strip this GEP (thread-dependent offset)
-      cur = GEP->getPointerOperand();
-    }
-    return cur;
-  };
-
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
     Function *F = &(*i);
 
@@ -2761,6 +2880,19 @@ void replace_asm_call(llvm::Module *M) {
             if (asm_str.rfind("csrr ", 0) == 0)
               continue;
 
+            if (compound_global_memory_asm(asm_str)) {
+              errs() << "error: unsupported compound PTX memory asm in " << F->getName() << ": " << asm_str << '\n';
+              exit(1);
+            }
+            if (lower_inline_global_memory(Call, asm_str, rv64)) {
+              need_remove.push_back(Call);
+              continue;
+            }
+            if (StringRef(asm_str).trim().contains("mma.sp")) {
+              errs() << "error: unsupported sparse PTX MMA in " << F->getName()
+                     << ": NVIDIA sparsity metadata and fragments are not mapped to Vortex\n  " << asm_str << '\n';
+              exit(1);
+            }
             if (lower_inline_mma_sync(Call, M)) { // mma.sync (all element types) -> cupbop.mma.*
               need_remove.push_back(Call);
               continue;
@@ -2819,305 +2951,6 @@ void replace_asm_call(llvm::Module *M) {
               result = builder.CreateInsertValue(result, hi, 1);
               Call->replaceAllUsesWith(result);
               need_remove.push_back(Call);
-            } else if (asm_str.find("ldmatrix.sync") != std::string::npos) {
-              // ── Triton ldmatrix: loads from shared memory into MMA register
-              // fragments ── Pattern:
-              // ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {$0,$1,$2,$3},
-              // [$4] Operands: 4 output i32 (packed fp16), 1 input ptr
-              // addrspace(3)
-              //
-              // For WGMMA_SS TCU path: ldmatrix is NOT needed — TCU reads
-              // directly from shared memory. But we save the shared memory
-              // pointer for later use by mma.sync conversion.
-              //
-              // TODO(TCU): Instead of removing, save the smem pointer and
-              // associate
-              //            it with the mma.sync that consumes these fragments.
-              //            For now, replace with undef (TCU conversion
-              //            pending).
-              bool is_trans = asm_str.find(".trans.") != std::string::npos;
-              Value *smem_ptr = Call->getArgOperand(0); // ptr addrspace(3)
-              if (cupbop_debug())
-                printf("[TCU] detected ldmatrix%s: smem_ptr operand found\n",
-                       is_trans ? " (transposed, B tile)" : " (A tile)");
-              // Save ldmatrix result → smem pointer mapping
-              // Don't replace with undef yet — mma.sync needs to trace operands
-              // back through extractvalue to this ldmatrix call.
-              ldmatrix_map[Call] = {smem_ptr, is_trans};
-
-            } else if (asm_str.find("mma.sync.aligned") != std::string::npos) {
-              // ── Triton mma.sync → Vortex TCU conversion ──
-              //
-              // Triton IR pattern (Turing fp16, one asm block = m16n8k16):
-              //   %result = call {f32,f32,f32,f32} asm "
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
-              //     {$0,$1,$2,$3},{$8,$9},{$10},{$4,$5,$6,$7};
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
-              //     {$0,$1,$2,$3},{$11,$12},{$13},{$4,$5,$6,$7};"
-              //   constraints: "=f,=f,=f,=f, 0,1,2,3, r,r,r,r,r,r"
-              //   operands: (C0,C1,C2,C3, A0_k0,A1_k0,B_k0, A0_k1,A1_k1,B_k1)
-              //
-              // Upstream chain:
-              //   A regs ← ldmatrix(@global_smem + offset_A)
-              //   B regs ← ldmatrix.trans(@global_smem + 1024 + offset_B)
-              //   C regs ← previous accumulator or zero
-              //
-              // Vortex TCU (NT=32, NR=8): m16n16k16
-              //   - Needs 2 mma.sync blocks in N direction (each covers n=8)
-              //   - Uses WGMMA_SS (flags=6): TCU reads A,B from shared memory
-              //   - Register layout differs: NVIDIA 2x2 block vs Vortex
-              //   quadrant
-              //   - C/D need layout shuffle between NVIDIA and Vortex
-              //
-              // NOTE: If Vortex NR changes, tile sizes change:
-              //   NR=8 → m16n16k16 (need 2 mma.sync blocks in N)
-              //   NR=4 → m16n8k8 (1:1 mapping, but still layout mismatch)
-              //
-              // Implementation plan:
-              //   1. Collect consecutive mma.sync calls covering full N
-              //   dimension
-              //   2. Find shared memory base for A and B from ldmatrix trace
-              //   3. Build WGMMA descriptors (smem addr, stride, layout)
-              //   4. Emit Vortex TCU: .insn r 0x0b, 0, 2, x0, x1, x6
-              //   5. Shuffle C/D between NVIDIA ↔ Vortex layout via shared
-              //   memory
-              //
-              // TODO(TCU): Replace undef with actual TCU instruction emission.
-
-              // Trace A/B operands back to ldmatrix → shared memory pointers
-              // mma.sync operands: (C0-C3, A0_k0, A1_k0, B_k0, A0_k1, A1_k1,
-              // B_k1) A operands come from extractvalue of ldmatrix result B
-              // operands come from extractvalue of ldmatrix.trans result
-              Value *smem_A = nullptr, *smem_B = nullptr;
-
-              // Trace operand 4 (first A reg) back to ldmatrix
-              if (Call->arg_size() >= 5) {
-                Value *a0 = Call->getArgOperand(4);
-                if (auto *EV = dyn_cast<ExtractValueInst>(a0)) {
-                  Value *agg = EV->getAggregateOperand();
-                  if (ldmatrix_map.count(agg)) {
-                    smem_A = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug())
-                      printf("[TCU] traced A to shared memory\n");
-                  }
-                }
-              }
-              // Trace operand 6 (first B reg) back to ldmatrix.trans
-              if (Call->arg_size() >= 7) {
-                Value *b0 = Call->getArgOperand(6);
-                if (auto *EV = dyn_cast<ExtractValueInst>(b0)) {
-                  Value *agg = EV->getAggregateOperand();
-                  if (ldmatrix_map.count(agg)) {
-                    smem_B = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug())
-                      printf("[TCU] traced B to shared memory (transposed)\n");
-                  }
-                }
-              }
-
-              if (cupbop_debug()) {
-                printf("[TCU] mma.sync: smem_A=%s, smem_B=%s\n",
-                       smem_A ? "found" : "NOT FOUND",
-                       smem_B ? "found" : "NOT FOUND");
-              }
-
-              // Parse operand info for logging
-              unsigned num_args = Call->arg_size();
-              if (cupbop_debug()) {
-                printf("[TCU] detected mma.sync (%u operands):\n", num_args);
-                // C/D: first 4 operands (tied float)
-                // A: operands 4-7 (i32 packed fp16)
-                // B: operands 8-9 (i32 packed fp16)
-                for (unsigned j = 0; j < num_args; j++) {
-                  Value *op = Call->getArgOperand(j);
-                  printf("  arg[%u]: ", j);
-                  op->getType()->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                }
-              }
-
-              // ── TCU instruction emission via WGMMA_SS ──
-              // Declare external functions from cudaKernelImpl.cpp (linked at
-              // kernel.elf time)
-              auto *VoidTy = Type::getVoidTy(context);
-              auto *wgmma_encode_fn =
-                  M->getOrInsertFunction(
-                       "_Z22__vx_wgmma_encode_descyjjjjjj",
-                       FunctionType::get(
-                           I32, {I64, I32, I32, I32, I32, I32, I32}, false))
-                      .getCallee();
-              auto *wgmma_mma_fn =
-                  M->getOrInsertFunction(
-                       "_Z17__vx_wgmma_mma_ssPfS_S_",
-                       FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy}, false))
-                      .getCallee();
-
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-
-              if (smem_A && smem_B) {
-                // ── Strip per-thread GEP to get tile base address ──
-                // ldmatrix operand is per-thread: GEP @global_smem,
-                // %thread_offset WGMMA needs tile base: @global_smem (A) or
-                // @global_smem+1024 (B)
-                Value *tile_base_A = getSmemTileBase(smem_A);
-                Value *tile_base_B = getSmemTileBase(smem_B);
-
-                if (cupbop_debug()) {
-                  printf("[TCU] A tile base: ");
-                  tile_base_A->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                  printf("[TCU] B tile base: ");
-                  tile_base_B->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                }
-
-                // Allocate stack arrays for TCU fragments (8 floats each for
-                // NR=8) NOTE: Vortex TCU is m16n16k16. This mma.sync covers
-                // m16n8k16. We compute the full m16n16k16 but only use first 4
-                // results.
-                // TODO: combine 2 mma.sync calls for full N=16.
-                auto *fragC_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragC");
-                auto *fragA_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragA");
-                auto *fragB_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragB");
-
-                // Initialize C accumulator from mma.sync input (first 4
-                // operands) Remaining 4 slots zeroed (for the n=8..15 half that
-                // this mma.sync doesn't cover)
-                for (int ci = 0; ci < 4; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ci));
-                  builder.CreateStore(Call->getArgOperand(ci), gep);
-                }
-                for (int ci = 4; ci < 8; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ci));
-                  builder.CreateStore(ConstantFP::get(F32, 0.0), gep);
-                }
-
-                // ── Encode A descriptor metadata ──
-                // Use TILE BASE (not per-thread) address for WGMMA descriptor.
-                // For fp16 A tile [M_tile × K_tile] stored row-major:
-                //   ldm = K_tile (leading dimension in elements)
-                //   TCU load_smem_word: addr = base + (row * ldm + col) *
-                //   sizeof(half)
-                // For 16x16 tile: ldm=16, is_col_major=0
-                Value *smem_A_base_i64 =
-                    builder.CreatePtrToInt(tile_base_A, I64);
-                Value *a_word = builder.CreateCall(
-                    cast<Function>(wgmma_encode_fn),
-                    {
-                        smem_A_base_i64,
-                        ConstantInt::get(I32,
-                                         32), // leading_bytes (unused by bugfix
-                                              // TCU, kept for compat)
-                        ConstantInt::get(I32,
-                                         512), // stride_bytes (unused by bugfix
-                                               // TCU, kept for compat)
-                        ConstantInt::get(I32, 0), // mn_idx (tile at position 0)
-                        ConstantInt::get(I32, 0), // k_idx (tile at position 0)
-                        ConstantInt::get(I32, 16), // ldm (K_tile = 16 elements)
-                        ConstantInt::get(I32,
-                                         0) // is_col_major (A is row-major)
-                    },
-                    "a_desc_word");
-
-                // Fill all 8 A fragment regs with the same metadata word
-                Value *a_meta_f =
-                    builder.CreateBitCast(a_word, F32, "a_meta_f");
-                for (int ai = 0; ai < 8; ai++) {
-                  auto *gep = builder.CreateGEP(F32, fragA_arr,
-                                                ConstantInt::get(I32, ai));
-                  builder.CreateStore(a_meta_f, gep);
-                }
-
-                // ── Encode B descriptor metadata ──
-                // B tile stored as [K_tile × N_tile] row-major in shared
-                // memory. Triton ldmatrix.trans transposes during load, but
-                // physical storage is K-major (rows = K, cols = N). TCU
-                // accesses B as: load_smem_word(meta_b, k, n, ...) With
-                // is_col_major=0: addr = base + (k * ldm + n) * sizeof(half)
-                // ldm = N_tile = 16 for [K=16 × N=16] tile
-                Value *smem_B_base_i64 =
-                    builder.CreatePtrToInt(tile_base_B, I64);
-                Value *b_word = builder.CreateCall(
-                    cast<Function>(wgmma_encode_fn),
-                    {
-                        smem_B_base_i64,
-                        ConstantInt::get(
-                            I32, 32), // leading_bytes (unused by bugfix TCU)
-                        ConstantInt::get(
-                            I32, 512), // stride_bytes (unused by bugfix TCU)
-                        ConstantInt::get(I32, 0),  // mn_idx
-                        ConstantInt::get(I32, 0),  // k_idx
-                        ConstantInt::get(I32, 16), // ldm (N_tile = 16 elements)
-                        ConstantInt::get(
-                            I32, 0) // is_col_major (B stored row-major [K×N])
-                    },
-                    "b_desc_word");
-
-                Value *b_meta_f =
-                    builder.CreateBitCast(b_word, F32, "b_meta_f");
-                for (int bi = 0; bi < 8; bi++) {
-                  auto *gep = builder.CreateGEP(F32, fragB_arr,
-                                                ConstantInt::get(I32, bi));
-                  builder.CreateStore(b_meta_f, gep);
-                }
-
-                // Call WGMMA_SS: TCU reads A,B from shared memory via
-                // descriptors
-                builder.CreateCall(cast<Function>(wgmma_mma_fn),
-                                   {fragC_arr, fragA_arr, fragB_arr});
-
-                // Extract results: first 4 floats from fragC (Vortex layout)
-                // Vortex TCU C/D layout: thread t owns elements:
-                //   fragC[i*tcN + j] for i in [0,tcM), j in [0,tcN)
-                //   where thread t is at row=(t/tcN), col=(t%tcN) in the output
-                //   tile
-                // NVIDIA mma.sync m16n8 layout: each thread owns 4 elements
-                //   mapped to specific (row,col) positions in the output
-                // TODO: C/D layout shuffle NVIDIA ↔ Vortex (for now, take
-                // as-is)
-                Value *result = UndefValue::get(Call->getType());
-                for (int ri = 0; ri < 4; ri++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ri));
-                  Value *val = builder.CreateLoad(F32, gep, "tcu_result");
-                  result = builder.CreateInsertValue(result, val, ri);
-                }
-                Call->replaceAllUsesWith(result);
-
-                if (cupbop_debug())
-                  printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync "
-                         "(tile base fixed)\n");
-              } else {
-                // Fallback: smem pointers not found, replace with undef
-                if (cupbop_debug())
-                  printf(
-                      "[TCU] WARNING: smem pointers not found, using undef\n");
-                if (!Call->getType()->isVoidTy()) {
-                  Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
-                }
-              }
-              need_remove.push_back(Call);
-
-              // Now clean up the ldmatrix calls that fed this mma.sync
-              for (auto &[ldCall, info] : ldmatrix_map) {
-                if (auto *CI = dyn_cast<CallInst>(ldCall)) {
-                  if (!CI->getType()->isVoidTy() && CI->getParent()) {
-                    CI->replaceAllUsesWith(UndefValue::get(CI->getType()));
-                    need_remove.push_back(CI);
-                  }
-                }
-              }
-              ldmatrix_map.clear();
-
             } else if (asm_str.find("cvt.rn.f16.f32") != std::string::npos) {
               // float → half conversion: replace with fptrunc
               IRBuilder<> builder(Call);
@@ -3175,7 +3008,8 @@ void replace_asm_call(llvm::Module *M) {
                 errs() << "error: WGMMA control and MMA need separate inline asm calls: " << code << '\n';
                 exit(1);
               }
-              if (Value *groups = wgmmaGroups(Call)) {
+              {
+                Value *groups = wgmmaGroups(Call);
                 SmallVector<StringRef, 2> instructions;
                 code.split(instructions, ';', -1, false);
                 IRBuilder<> builder(Call);
@@ -3189,13 +3023,8 @@ void replace_asm_call(llvm::Module *M) {
                     operation = 2;
                     instruction = instruction.trim();
                     bool invalid = false;
-                    if (instruction.consume_front("$")) {
-                      if (instruction.consume_front("{"))
-                        instruction = instruction.rtrim("}").split(':').first;
-                      unsigned index = 0;
-                      const ConstantInt *value = nullptr;
-                      if (!instruction.getAsInteger(10, index) && index < Call->arg_size())
-                        value = dyn_cast<ConstantInt>(Call->getArgOperand(index));
+                    if (instruction.starts_with("$")) {
+                      const auto *value = dyn_cast_or_null<ConstantInt>(wgmma_input(Call, instruction, 0));
                       invalid = !value || value->getValue().ugt(7);
                       if (!invalid) pending = value->getZExtValue();
                     } else {
@@ -3209,6 +3038,7 @@ void replace_asm_call(llvm::Module *M) {
                     errs() << "error: unsupported WGMMA control inline asm: " << code << '\n';
                     exit(1);
                   }
+                  if (!groups) continue; // The synchronous MMA helpers already completed the operation.
                   const std::string encoding = ".insn r 0x0b, 4, 2, x0, x" + std::to_string(operation) +
                                                ", x" + std::to_string(pending);
                   auto *type = FunctionType::get(Type::getVoidTy(context), false);
@@ -3218,16 +3048,13 @@ void replace_asm_call(llvm::Module *M) {
                 }
               }
               need_remove.push_back(Call);
-            } else if (asm_str.find("fence.proxy.async") != std::string::npos) {
-              // The operand adapter reads SMEM through ordinary loads.
-              need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.mma_async") != std::string::npos) {
               // wgmma.mma_async.sync.aligned.m64n<N>k<K>[.satfinite].<d>.<a>.<b> {d0..d(N/2-1)}, desc-a, desc-b, <tail>
               //   f16/bf16 (k16, f32): tail = scale-d, scale-a, scale-b, trans-a, trans-b
               //   tf32 (k8) / e4m3|e5m2 (k32), f32: tail = scale-d, scale-a, scale-b   (K-major only)
               //   s8|u8 (k32, s32):                tail = scale-d
-              // LLVM operands: [0] desc_a (i64), [1] desc_b (i64), [2] scale-d (i32, when it is a register), then the
-              // N/2 tied accumulators. -> __cupbop_wgmma_m64nNk<K>_<tag>[_sw|_tcu](N, desc_a, desc_b, scale_d, warp_in_wg, acc[N/2])
+              // LLVM inputs include two i64 descriptors in the order listed by the asm constraints, optional i32
+              // scale-d, and the N/2 tied accumulators. PTX operand placeholders specify which descriptor is A or B.
               size_t sp = asm_str.find("m64n");
               int N = (sp == std::string::npos) ? 0 : atoi(asm_str.c_str() + sp + 4);
               std::string opc;
@@ -3273,8 +3100,17 @@ void replace_asm_call(llvm::Module *M) {
                    Call->arg_size() == firstAcc + (hasTiedAccumulator ? nacc : 0) &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
                    Call->getArgOperand(1)->getType()->isIntegerTy(64);
-              for (unsigned i = firstAcc; ok && i < Call->arg_size(); i++)
-                if (Call->getArgOperand(i)->getType()->getPrimitiveSizeInBits() != 32) ok = false;
+              auto *resultType = dyn_cast<StructType>(Call->getType());
+              const auto constraints = cast<InlineAsm>(Call->getCalledOperand())->ParseConstraints();
+              ok = ok && resultType && resultType->getNumElements() == nacc && constraints.size() >= nacc;
+              for (unsigned i = 0; ok && i < nacc; ++i) {
+                const auto &constraint = constraints[i];
+                const int tied = hasTiedAccumulator ? static_cast<int>(nacc + firstAcc + i) : -1;
+                ok = constraint.Type == InlineAsm::isOutput && !constraint.isIndirect &&
+                     constraint.MatchingInput == tied && resultType->getElementType(i)->getPrimitiveSizeInBits() == 32 &&
+                     (!hasTiedAccumulator || Call->getArgOperand(firstAcc + i)->getType()->getPrimitiveSizeInBits() == 32);
+              }
+              Value *descriptorA = nullptr, *descriptorB = nullptr;
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
               unsigned transpose = 0;
               if (ok) {
@@ -3289,19 +3125,22 @@ void replace_asm_call(llvm::Module *M) {
                 auto resolve = [&](std::string tk, long &v, Value *&reg) {
                   tk.erase(0, tk.find_first_not_of(" \t\n")); tk.erase(tk.find_last_not_of(" \t\n;") + 1);
                   v = -999; reg = nullptr;
-                  if (!tk.empty() && tk[0] == '$') { // operand placeholder: outputs come first
-                    unsigned ph = (unsigned)atoi(tk.c_str() + 1);
-                    if (ph >= nacc && ph - nacc < Call->arg_size()) {
-                      Value *op = Call->getArgOperand(ph - nacc);
+                  if (!tk.empty() && tk[0] == '$') {
+                    if (Value *op = wgmma_input(Call, tk, nacc)) {
                       if (auto *CI = dyn_cast<ConstantInt>(op)) v = CI->getSExtValue(); else reg = op;
                     }
                   } else if (tk == "p") {
                     reg = (firstAcc >= 3) ? Call->getArgOperand(2) : nullptr; // predicate set from the "r" operand
-                  } else if (!tk.empty() && (isdigit(tk[0]) || tk[0] == '-')) {
-                    v = atol(tk.c_str());
+                  } else {
+                    long literal = 0;
+                    if (!StringRef(tk).getAsInteger(0, literal)) v = literal;
                   }
                 };
-                if ((int)toks.size() >= ntrail + 1 + 2) {
+                if (toks.size() == nacc + 3 + ntrail) {
+                  descriptorA = wgmma_input(Call, toks[nacc], nacc);
+                  descriptorB = wgmma_input(Call, toks[nacc + 1], nacc);
+                  ok = descriptorA && descriptorB && descriptorA->getType()->isIntegerTy(64) &&
+                       descriptorB->getType()->isIntegerTy(64);
                   long v; Value *reg;
                   for (int i = 0; i < ntrail; i++) {
                     resolve(toks[toks.size() - ntrail + i], v, reg);
@@ -3361,8 +3200,7 @@ void replace_asm_call(llvm::Module *M) {
                 builder.CreateStore(v, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
               }
               SmallVector<Type *, 8> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
-              SmallVector<Value *, 8> arguments{ConstantInt::get(I32, N), Call->getArgOperand(0),
-                                                Call->getArgOperand(1), scaleD, wig, Acc};
+              SmallVector<Value *, 8> arguments{ConstantInt::get(I32, N), descriptorA, descriptorB, scaleD, wig, Acc};
               if (tensor_is_f16ish(wa)) {
                 argumentTypes.push_back(I32);
                 arguments.push_back(ConstantInt::get(I32, transpose));
@@ -3378,10 +3216,9 @@ void replace_asm_call(llvm::Module *M) {
               tensor_set_convergent(builder.CreateCall(FC, arguments));
               if (groups) emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
               Value *Res = UndefValue::get(Call->getType());
-              auto *RST = dyn_cast<StructType>(Call->getType());
               for (unsigned i = 0; i < nacc; i++) {
                 Value *v = builder.CreateLoad(AccT, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
-                Type *ET = RST ? RST->getElementType(i) : Call->getType();
+                Type *ET = resultType->getElementType(i);
                 if (v->getType() != ET) v = builder.CreateBitCast(v, ET);
                 Res = builder.CreateInsertValue(Res, v, i);
               }
@@ -3403,40 +3240,6 @@ void replace_asm_call(llvm::Module *M) {
               if (!Call->getType()->isIntegerTy(32))
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
-              need_remove.push_back(Call);
-            } else if (asm_str.rfind("ld.volatile.global.b32 ", 0) == 0 ||
-                       asm_str.rfind("st.volatile.global.b32 ", 0) == 0 ||
-                       (rv64 && (asm_str.rfind("ld.volatile.global.b64 ", 0) == 0 ||
-                                 asm_str.rfind("st.volatile.global.b64 ", 0) == 0))) {
-              // SASS STRONG global accesses implement inter-CTA publication (for example, CUTLASS
-              // serial Split-K). A CTA barrier only synchronizes its own warps. A normal volatile
-              // load can keep reading an old line in the private data cache after another core
-              // publishes. The Vortex AMO path reaches the last-level cache. Use LR for the read
-              // so it does not write to the location, and an exchange for the store.
-              const bool store = asm_str[0] == 's';
-              const bool wide = asm_str.find(".b64 ") != std::string::npos;
-              Type *wordType = wide ? I64 : I32;
-              if (Call->arg_size() != (store ? 2 : 1) ||
-                  !Call->getArgOperand(0)->getType()->isIntOrPtrTy() ||
-                  (store ? (!Call->getType()->isVoidTy() || Call->getArgOperand(1)->getType() != wordType)
-                         : Call->getType() != wordType))
-                report_fatal_error("unsupported scalar volatile global access signature");
-
-              IRBuilder<> b(Call);
-              Type *pointerType = PointerType::getUnqual(wordType);
-              Value *address = Call->getArgOperand(0);
-              Value *ptr = address->getType()->isPointerTy() ? b.CreatePointerCast(address, pointerType)
-                                                            : b.CreateIntToPtr(address, pointerType);
-              if (store) {
-                auto *exchange = b.CreateAtomicRMW(AtomicRMWInst::Xchg, ptr, Call->getArgOperand(1),
-                                                   Align(wide ? 8 : 4), AtomicOrdering::Release);
-                exchange->setVolatile(true);
-              } else {
-                auto *load = InlineAsm::get(FunctionType::get(wordType, {pointerType}, false),
-                                            wide ? "lr.d.aq $0, ($1)" : "lr.w.aq $0, ($1)",
-                                            "=r,r,~{memory}", true);
-                Call->replaceAllUsesWith(b.CreateCall(load, {ptr}, "ld.global.coherent"));
-              }
               need_remove.push_back(Call);
             } else if (asm_str.rfind("ld.volatile.global.", 0) == 0 ||
                        asm_str.rfind("ld.volatile.v", 0) == 0 ||
@@ -3515,15 +3318,19 @@ void replace_asm_call(llvm::Module *M) {
                       asm_str.c_str());
               exit(1);
             } else {
-              // Anything left is dropped. A dropped asm that produces a value leaves undef
-              // behind, which silently changes the program, so say so on every run.
-              fprintf(stderr, "warning: unknown PTX InlineAsm: %s (removing%s)\n",
-                      asm_str.c_str(),
-                      Call->getType()->isVoidTy() ? "" : "; its result becomes undef");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              if (!Call->getType()->isVoidTy()) {
-                Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
+              StringRef text = StringRef(asm_str).trim();
+              text.consume_back(";");
+              if (text.empty() && Call->getType()->isVoidTy() && Call->arg_empty()) {
+                // clang lowers an empty asm with a memory clobber as a compiler barrier.
+                if (asm_inst->getConstraintString().find("~{memory}") != std::string::npos)
+                  IRBuilder<>(Call).CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
+              } else if (Call->getType()->isVoidTy() && !text.contains(';') &&
+                         (text.starts_with("prefetch.global.") || text.starts_with("prefetch.local.") ||
+                          text.starts_with("prefetchu."))) {
+                // Standalone PTX cache prefetch is a hint, with no value or memory update.
+              } else {
+                errs() << "error: unsupported PTX inline asm in " << F->getName() << ": " << asm_str << '\n';
+                exit(1);
               }
               need_remove.push_back(Call);
             }

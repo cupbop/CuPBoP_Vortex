@@ -3,6 +3,8 @@
 
 #include "llvm/IR/Module.h"
 
+namespace llvm { class CallBase; }
+
 // Hopper / Ampere asynchronous PTX -> CuPBoP internal calls, software mode (async design, stages 1-2).
 // Runs first in the translator (before lower_named_barriers and lower_cp_async), on CUDA-source inline asm,
 // the NVVM mbarrier intrinsics and CuLifter's asm forms. The asm is parsed statement by statement (labels,
@@ -22,6 +24,9 @@
 // loop, an arrive.expect_tx without its copies, sm_80 CuLifter mbarrier forms, the flat schedule, the core
 // mapping unless it is de facto 1:1 (checked again at launch), warps narrower than 32 lanes.
 void lower_async_ptx(llvm::Module *M);
+
+// The descriptor operand of a lowered tensor load, store or reduction.
+llvm::Value *async_tensor_map_operand(llvm::CallBase &call);
 
 // Vortex barrier numbers for the mbarriers (after lower_named_barriers, whose ids must not be reused):
 // an mbarrier.init at a constant shared-memory offset gets its own number; a __shared__ variable initialized

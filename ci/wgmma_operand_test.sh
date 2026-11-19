@@ -49,4 +49,50 @@ if "$translator" missing-acc.bc kernel.bc > missing-acc.log 2>&1; then
   exit 1
 fi
 rg -q 'error: unsupported wgmma form' missing-acc.log
-echo 'WGMMA unbound accumulator tests passed'
+
+sed 's/}, \$8, \$9/}, ${9:l}, $8/' reset.ll > swapped.ll
+llvm-as swapped.ll -o swapped.bc
+"$translator" swapped.bc kernel.bc > swapped.log 2>&1 || { cat swapped.log; exit 1; }
+opt -passes=verify -disable-output kernel.bc
+llvm-dis kernel.bc -o kernel.ll
+rg -q 'call void @__cupbop_wgmma_m64nNk16_f16f32(_native)?\(i32 16, i64 %b, i64 %a, i32 0,' kernel.ll
+
+sed 's/wgmma.commit_group.sync.aligned; wgmma.wait_group.sync.aligned 0;/{ .reg .b32 m; .reg .pred p; activemask.b32 m; elect.sync _|p, m; wgmma.commit_group.sync.aligned; wgmma.wait_group.sync.aligned 0; }/' reset.ll > mixed.ll
+llvm-as mixed.ll -o mixed.bc
+if "$translator" mixed.bc kernel.bc > mixed.log 2>&1; then
+  echo 'WGMMA accepted controls bundled with elect.sync' >&2
+  exit 1
+fi
+rg -q 'WGMMA control must use unpredicated inline asm' mixed.log
+
+sed -e 's/"wgmma.mma_async/"{ .reg .pred p; setp.ne.b32 p, $10, 0; wgmma.mma_async/' \
+    -e 's/\$9, 0, 1, 1, 0, 0;"/\$9, p, 1, 1, 0, 0; }"/' \
+    -e 's/l,l,~{memory}"(i64 %a, i64 %b)/l,l,r,0,1,2,3,4,5,6,7,~{memory}"(i64 %a, i64 %b, i32 1, float 0.0, float 0.0, float 0.0, float 0.0, float 0.0, float 0.0, float 0.0, float 0.0)/' \
+    reset.ll > predicate.ll
+llvm-as predicate.ll -o predicate.bc
+"$translator" predicate.bc kernel.bc > predicate.log 2>&1 || { cat predicate.log; exit 1; }
+opt -passes=verify -disable-output kernel.bc
+
+expect_bad_mma() {
+  local name=$1 diagnostic=$2
+  llvm-as "$name.ll" -o "$name.bc"
+  if "$translator" "$name.bc" kernel.bc > "$name.log" 2>&1; then
+    echo "WGMMA accepted invalid $name asm" >&2
+    exit 1
+  fi
+  grep -Fq "$diagnostic" "$name.log"
+}
+
+sed 's/\$9, 0, 1, 1, 0, 0;"/\$9, 0, 1, 1, 0, 0; st.shared.b32 [$8], 0;"/' reset.ll > mma-store.ll
+expect_bad_mma mma-store 'WGMMA MMA requires a single unpredicated instruction'
+sed '/wgmma\.mma_async/s/;"/; wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {$0,$1,$2,$3,$4,$5,$6,$7}, $8, $9, 0, 1, 1, 0, 0;"/' reset.ll > mma-twice.ll
+expect_bad_mma mma-twice 'WGMMA MMA inline asm must contain just the MMA'
+sed 's/setp.ne.b32 p, \$10, 0/setp.eq.b32 p, $10, 0/' predicate.ll > wrong-predicate.ll
+expect_bad_mma wrong-predicate 'WGMMA MMA inline asm must contain just the MMA'
+sed 's/{\$0,\$1,/{\$1,\$0,/' reset.ll > permuted-outputs.ll
+expect_bad_mma permuted-outputs 'WGMMA MMA accumulator output operands must be in LLVM result order'
+sed 's/l,l,r,0,1,/l,l,r,1,0,/' predicate.ll > permuted-ties.ll
+expect_bad_mma permuted-ties 'error: unsupported wgmma form'
+sed 's/wgmma.mma_async.sync.aligned/wgmma.mma_async.sp.sync.aligned/' reset.ll > sparse.ll
+expect_bad_mma sparse 'sparse WGMMA MMA is unsupported'
+echo 'WGMMA operand and control tests passed'

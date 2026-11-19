@@ -30,6 +30,18 @@ if ! bash ci/tma_self_arrive_test.sh build/compilation/kernelTranslator "$LLVM_P
   cat "$OUT/tma_self_arrive.log"
   exit 1
 fi
+if ! bash ci/tma_param_bank_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_param_bank.log" 2>&1; then
+  cat "$OUT/tma_param_bank.log"
+  exit 1
+fi
+if ! bash ci/inline_ptx_validation_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/inline_ptx_validation.log" 2>&1; then
+  cat "$OUT/inline_ptx_validation.log"
+  exit 1
+fi
+if ! bash ci/tma_nvvm_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_nvvm.log" 2>&1; then
+  cat "$OUT/tma_nvvm.log"
+  exit 1
+fi
 if ! bash ci/dxa_layout_metadata_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/dxa_layout_metadata.log" 2>&1; then
   cat "$OUT/dxa_layout_metadata.log"
   exit 1
@@ -48,9 +60,15 @@ expect_refused() { # tag pattern example sched [make vars...]
 for ex in async_mbar_ws async_tma2d async_bulk1d async_tma_store async_cpasync_mbar async_misc; do
   expect_pass s2_$ex $ex 2
 done
+run s2_async_tma_publish async_tma_publish 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_async_tma_publish.out" || { echo "s2_async_tma_publish: FAIL"; exit 1; }
+echo "s2_async_tma_publish: PASS"
 run s2_splitk_serial splitk_serial 2 LOCALMEM=1
 grep -q '^PASSED!' "$OUT/s2_splitk_serial.out" || { echo "s2_splitk_serial: FAIL"; exit 1; }
 echo "s2_splitk_serial: PASS"
+run s2_inline_ptx_memory inline_ptx_memory 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_inline_ptx_memory.out" || { echo "s2_inline_ptx_memory: FAIL"; exit 1; }
+echo "s2_inline_ptx_memory: PASS"
 for ex in cluster_group cluster_async cluster_reduce; do
   run s2_$ex $ex 2 LOCALMEM=1
   grep -q '^PASSED!' "$OUT/s2_$ex.out" || { echo "s2_$ex: FAIL"; exit 1; }

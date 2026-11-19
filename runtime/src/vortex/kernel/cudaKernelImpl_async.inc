@@ -497,6 +497,25 @@ extern "C" __attribute__((noinline)) void __cupbop_bulk_copy(void *dst, const vo
   for (uint32_t i = 0; i < bytes / 8; ++i) d[i] = s[i];
 }
 
+extern "C" __attribute__((noinline, convergent)) void __cupbop_tensormap_publish(void *dst, const void *src) {
+  static_assert(sizeof(cupbop_tmap) == 128, "TMA descriptors are 128 bytes");
+  if (!__cupbop_elect_sync(UINT32_MAX)) return;
+  if (!dst || !src || (((uintptr_t)dst | (uintptr_t)src) & 15u))
+    cupbop_async_fail("tensor-map publication needs aligned shared and global addresses",
+                      (uint32_t)(uintptr_t)dst, (uint32_t)(uintptr_t)src);
+  const auto *source = static_cast<const cupbop_tmap *>(src);
+  if (source->magic != CUPBOP_TMAP_MAGIC || source->rank < 1 || source->rank > 5 ||
+      (source->mode != CUPBOP_TMAP_MODE_SW && source->mode != CUPBOP_TMAP_MODE_DXA))
+    cupbop_async_fail("tensor-map publication needs a complete CuPBoP tensor-map record", source->magic, source->rank);
+  __cupbop_bulk_copy(dst, src, sizeof(cupbop_tmap));
+  auto *published = static_cast<cupbop_tmap *>(dst);
+  // Consumers follow self. A dynamically published map has no host-registered DXA slot.
+  published->self = (uintptr_t)published;
+  published->mode = CUPBOP_TMAP_MODE_SW;
+  published->dxa_slot = UINT32_MAX;
+  vx_fence();
+}
+
 extern "C" void __cupbop_tensor_reduce(const void *desc,void *src,unsigned rank,int c0,int c1,int c2,int c3,int c4,unsigned op) {
   const unsigned t = cupbop_tmap_of(desc,rank)->dtype;
   const bool supported = op == ReduceAdd ? (t == 2 || t == 3 || t == 4 || t == 6 || t == 7 || t == 9) :

@@ -789,7 +789,7 @@ const std::map<std::string, std::vector<unsigned>> &helperArgs() {
       {"__cupbop_mbar_wait_parity", {0}},   {"__cupbop_mbar_test_parity", {0}},  {"__cupbop_mbar_wait_state", {0}},
       {"__cupbop_mbar_test_state", {0}},    {"__cupbop_mbar_arrive_m", {1}},     {"__cupbop_mbar_arrive_tx_m", {1}},
       {"__cupbop_tma_load", {0, 2}},        {"__cupbop_tma_load_qi", {4, 6}},    {"__cupbop_tma_store", {1}},
-      {"__cupbop_bulk_copy", {0, 1}},
+      {"__cupbop_bulk_copy", {0, 1}},       {"__cupbop_tensormap_publish", {1}},
   };
   return m;
 }
@@ -885,7 +885,8 @@ bool GlobalUses::checkUse(Value *V, User *U) {
         return fail("shared address as argument " + std::to_string(a) + " of `" + n + "`");
       if (auto O = off(V); O && O->mixed) return fail("mixed pointer passed to `" + n + "`");
       // the row of ldmatrix / stmatrix, the 64-bit word of an mbarrier; TMA and bulk copies: extent not known here
-      const uint64_t ext = n.find("matrix") != std::string::npos ? 16 : n.find("__cupbop_mbar") == 0 ? 8 : 0;
+      const uint64_t ext = n == "__cupbop_tensormap_publish" ? 128 :
+                           n.find("matrix") != std::string::npos ? 16 : n.find("__cupbop_mbar") == 0 ? 8 : 0;
       if (!access(V, n.c_str(), ext)) return false;
     }
     return true;

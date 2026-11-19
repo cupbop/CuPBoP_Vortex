@@ -19,6 +19,18 @@ __global__ void atomic_max_kernel(int *result, int *data, int N) {
     }
 }
 
+__global__ void ordered_global_ptx(int *data) {
+    if (threadIdx.x == 0) {
+        int previous;
+        asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;"
+                     :: "l"(data), "r"(7) : "memory");
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        asm volatile("atom.release.gpu.global.exch.b32 %0, [%1], %2;"
+                     : "=r"(previous) : "l"(data + 1), "r"(9) : "memory");
+        data[2] = previous;
+    }
+}
+
 int main() {
     cudaSetDevice(0);
     int N = 64;
@@ -72,6 +84,22 @@ int main() {
         cudaFree(d_result);
         cudaFree(d_data);
         free(h_data);
+    }
+
+    {
+        int values[] = {5, 6, 81};
+        int *device_values;
+        if (cudaMalloc(&device_values, sizeof(values)) != cudaSuccess ||
+            cudaMemcpy(device_values, values, sizeof(values), cudaMemcpyHostToDevice) != cudaSuccess)
+            return 1;
+        ordered_global_ptx<<<1, 32>>>(device_values);
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+            cudaMemcpy(values, device_values, sizeof(values), cudaMemcpyDeviceToHost) != cudaSuccess)
+            return 1;
+        cudaFree(device_values);
+        printf("ordered PTX reduction=%d exchange=%d previous=%d\n", values[0], values[1], values[2]);
+        if (values[0] != 12 || values[1] != 9 || values[2] != 6)
+            ++errors;
     }
 
     printf("%s\n", errors ? "FAILED" : "PASSED");

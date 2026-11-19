@@ -1,9 +1,12 @@
 #include "generate_wrapper.h"
+#include "async_ptx.h"
 #include "base_address.h"
 #include "tool.h"
 #include "cg_sync.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Function.h"
@@ -451,20 +454,21 @@ void pass_wide_kernel_args_by_slot(llvm::Module *M) {
   Type *PtrT = PointerType::get(ctx, 0);
   for (Function *F : todo) {
     std::vector<Type *> params;
-    std::vector<unsigned> slots;
+    std::vector<uint64_t> bytes;
     for (auto &A : F->args()) {
-      unsigned k = wide(A) ? (unsigned)((DL.getTypeStoreSize(A.getType()) + 7) / 8) : 0;
-      slots.push_back(k);
-      params.push_back(k ? PtrT : A.getType());
+      const uint64_t size = wide(A) ? uint64_t(DL.getTypeStoreSize(A.getType())) : 0;
+      bytes.push_back(size);
+      params.push_back(size ? PtrT : A.getType());
     }
     FunctionType *FT = FunctionType::get(F->getReturnType(), params, F->isVarArg());
     Function *NF = Function::Create(FT, F->getLinkage(), F->getAddressSpace(), "", M);
     NF->copyAttributesFrom(F);
     AttributeList AL = F->getAttributes();
-    for (unsigned i = 0; i < slots.size(); ++i)
-      if (slots[i]) {
+    for (unsigned i = 0; i < bytes.size(); ++i)
+      if (bytes[i]) {
         AL = AL.removeParamAttributes(ctx, i);
-        AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, "cupbop-arg-slots", std::to_string(slots[i])));
+        AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, "cupbop-arg-slots", std::to_string((bytes[i] + 7) / 8)));
+        AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, "cupbop-byval-bytes", std::to_string(bytes[i])));
         AL = AL.addParamAttribute(ctx, i, Attribute::NoAlias);
         AL = AL.addParamAttribute(ctx, i, Attribute::get(ctx, Attribute::Alignment, 8));
       }
@@ -473,15 +477,15 @@ void pass_wide_kernel_args_by_slot(llvm::Module *M) {
     NF->takeName(F);
     NF->splice(NF->begin(), F);
     IRBuilder<> B(&*NF->getEntryBlock().getFirstInsertionPt());
-    for (unsigned i = 0; i < slots.size(); ++i) {
+    for (unsigned i = 0; i < bytes.size(); ++i) {
       Argument *OA = F->getArg(i), *NA = NF->getArg(i);
-      if (!slots[i]) { NA->takeName(OA); OA->replaceAllUsesWith(NA); continue; }
+      if (!bytes[i]) { NA->takeName(OA); OA->replaceAllUsesWith(NA); continue; }
       NA->setName(OA->getName() + ".slots");
       Value *v = B.CreateAlignedLoad(OA->getType(), NA, Align(8), OA->getName());
       OA->replaceAllUsesWith(v);
       if (cupbop_debug())
         fprintf(stderr, "[CuPBoP] %s: parameter %u (%u bytes) passed in %u launch slots\n", NF->getName().str().c_str(),
-                i, (unsigned)DL.getTypeStoreSize(OA->getType()), slots[i]);
+                i, (unsigned)bytes[i], (unsigned)((bytes[i] + 7) / 8));
     }
     F->replaceAllUsesWith(NF);
     F->eraseFromParent();
@@ -526,14 +530,45 @@ static bool is_tensor_map_type(Type *T) {
   auto *ST = dyn_cast<StructType>(T);
   return ST && ST->hasName() && ST->getName().starts_with("struct.CUtensorMap");
 }
-// Triton's tensor map parameter (capability 90, a host TensorDescriptor): `ptr byval([128 x i8]) align 64 "nvvm.grid_constant"`,
-// read only through the TMA instructions. The host passes it as CUDA's CUtensorMap, one launch slot holding the device address of its
-// record (cuTensorMapEncodeTiled shim), whose first 8 bytes are that address again (cupbop_async.h). Without `byval` the parameter is
-// that address: no copy of the 128 bytes per thread at the kernel call, which CUDA's struct form still makes.
+
+static bool used_as_tensor_map(Argument &arg) {
+  SmallVector<Value *, 8> pending{&arg};
+  SmallPtrSet<Value *, 16> visited;
+  while (!pending.empty()) {
+    Value *value = pending.pop_back_val();
+    if (!visited.insert(value).second) continue;
+    for (User *user : value->users()) {
+      if (auto *call = dyn_cast<CallBase>(user)) {
+        if (async_tensor_map_operand(*call) == value) return true;
+        if (Function *callee = call->getCalledFunction(); callee && !callee->isDeclaration()) {
+          for (unsigned i = 0; i < callee->arg_size(); ++i)
+            if (call->getArgOperand(i) == value) pending.push_back(callee->getArg(i));
+        }
+        continue;
+      }
+      if (auto *gep = dyn_cast<GetElementPtrInst>(user)) {
+        if (gep->getPointerOperand() == value && gep->hasAllZeroIndices()) pending.push_back(gep);
+        continue;
+      }
+      if (auto *select = dyn_cast<SelectInst>(user)) {
+        if (select->getTrueValue() == value || select->getFalseValue() == value) pending.push_back(select);
+        continue;
+      }
+      if (isa<BitCastInst, AddrSpaceCastInst, PHINode, FreezeInst>(user) ||
+          (isa<PtrToIntInst>(user) && user->getType()->isIntegerTy(64)) ||
+          (isa<IntToPtrInst>(user) && value->getType()->isIntegerTy(64)))
+        pending.push_back(user);
+    }
+  }
+  return false;
+}
+
+// Triton supplies its tensor map as an opaque 128-byte grid constant. Confirm
+// the argument is itself a TMA descriptor before selecting the one-slot ABI.
 static bool is_grid_constant_tensor_map(Argument &A) {
   if (!A.hasByValAttr() || !A.getParent()->getAttributes().hasParamAttr(A.getArgNo(), "nvvm.grid_constant")) return false;
   auto *AT = dyn_cast<ArrayType>(A.getParamByValType());
-  return AT && AT->getNumElements() == 128 && AT->getElementType()->isIntegerTy(8);
+  return AT && AT->getNumElements() == 128 && AT->getElementType()->isIntegerTy(8) && used_as_tensor_map(A);
 }
 void prepare_byval_args(llvm::Module *M) {
   if (!cupbop_byval_on()) return;
@@ -680,14 +715,16 @@ void decode_input(llvm::Module *M) {
 
     size_t idx = 0;
     std::vector<uint64_t> byval_bytes;
+    bool source_byval = false;
     for (Function::const_arg_iterator ii = F->arg_begin(), ee = F->arg_end();
          ii != ee; ++ii) {
       Type *ArgType = ii->getType();
-      // A by-value struct parameter (prepare_byval_args: marker "cupbop-byval-bytes"): pass the address of its
+      // A by-value struct or lifted aggregate ("cupbop-byval-bytes"): pass the address of its
       // first slot (an aligned copy when it needs more than the slots' 8-byte alignment). A CUtensorMap
       // (`const __grid_constant__ CUtensorMap`) keeps the old one-slot form below: the host's 8 first bytes are the
       // device address of its record (cuTensorMapEncodeTiled shim, cupbop_async.h), which the kernel reads.
       if (F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-byval-bytes")) {
+        source_byval |= !F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-arg-slots");
         uint64_t bytes = 0;
         F->getAttributes().getParamAttr(ii->getArgNo(), "cupbop-byval-bytes").getValueAsString().getAsInteger(10, bytes);
         const uint64_t nslots = (bytes + 7) / 8;
@@ -705,16 +742,6 @@ void decode_input(llvm::Module *M) {
         continue;
       }
       byval_bytes.push_back(0);
-      // A wide by-value parameter (pass_wide_kernel_args_by_slot) arrives in consecutive 8-byte slots: pass the
-      // address of its first slot and skip the rest.
-      if (F->getAttributes().hasParamAttr(ii->getArgNo(), "cupbop-arg-slots")) {
-        unsigned nslots = 0;
-        F->getAttributes().getParamAttr(ii->getArgNo(), "cupbop-arg-slots").getValueAsString().getAsInteger(10, nslots);
-        Value *SlotP = Builder.CreateGEP(PointerType::get(Int32T, 0), input_arg, ConstantInt::get(Int32T, idx));
-        Arguments.push_back(SlotP);
-        idx += nslots;
-        continue;
-      }
 
       // calculate addr
       // LLVM 18 changes
@@ -735,9 +762,10 @@ void decode_input(llvm::Module *M) {
     if (std::any_of(byval_bytes.begin(), byval_bytes.end(), [](uint64_t b) { return b != 0; })) {
       // the struct's slot pointer makes the inliner's cost model keep the kernel out of line (E10 hotspot: +7.5%
       // cycles, a call per thread); a kernel with scalar parameters is inlined into its wrapper anyway
-      if (!F->hasFnAttribute(Attribute::NoInline)) F->addFnAttr(Attribute::AlwaysInline);
+      if (source_byval && !F->hasFnAttribute(Attribute::NoInline)) F->addFnAttr(Attribute::AlwaysInline);
       byval_file << func_name << " " << byval_bytes.size();
       for (uint64_t b : byval_bytes) byval_file << " " << b;
+      if (!source_byval) byval_file << " lifted-slots";
       byval_file << "\n";
       if (cupbop_debug())
         fprintf(stderr, "[CuPBoP] %s: by-value struct parameters passed in launch slots (%zu slots)\n", func_name.c_str(), idx);
