@@ -1,3 +1,4 @@
+#include <cuda.h>
 #include "../async_common.h"
 
 #if defined(__clang__) && defined(__CUDA_ARCH__)

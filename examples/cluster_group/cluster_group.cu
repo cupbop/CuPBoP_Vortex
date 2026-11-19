@@ -15,11 +15,11 @@ __global__ void exchange(int *out) {
   // Implementing arrive as a blocking rendezvous would deadlock this launch.
   int *signal = out + gridDim.x + blockIdx.x / cg.num_blocks();
   if (r == 1)
-    while (!__atomic_load_n(signal, __ATOMIC_ACQUIRE)) {
+    while (!atomicAdd(signal, 0)) {
     }
   auto token = cg.barrier_arrive();
   if (r == 0 && threadIdx.x == 0)
-    __atomic_store_n(signal, 1, __ATOMIC_RELEASE);
+    atomicExch(signal, 1);
   cg.barrier_wait(static_cast<decltype(token) &&>(token));
 }
 
