@@ -20,7 +20,16 @@
 #endif
 
 #define WG_M 64
-#define WG_N 64
+#ifndef CUPBOP_WGMMA_N
+#define CUPBOP_WGMMA_N 64
+#endif
+#ifndef CUPBOP_WGMMA_TRANS_A
+#define CUPBOP_WGMMA_TRANS_A 0
+#endif
+#ifndef CUPBOP_WGMMA_TRANS_B
+#define CUPBOP_WGMMA_TRANS_B 0
+#endif
+#define WG_N CUPBOP_WGMMA_N
 #define WG_K 16
 #define WG_THREADS 128
 #define WG_ACC (WG_N / 2) // fp32 accumulators per thread for m64n64
@@ -66,6 +75,33 @@ __device__ __forceinline__ int core_off(int r, int k, unsigned) { // element off
 }
 #endif
 
+#define WG_STR_IMPL(x) #x
+#define WG_STR(x) WG_STR_IMPL(x)
+
+static __device__ constexpr int matrix_storage(int rows, bool mn_major) {
+#if CUPBOP_WGMMA_SWIZZLE
+  if (mn_major) {
+    constexpr int atom_rows = CUPBOP_WGMMA_SWIZZLE / sizeof(half);
+    return ((rows + atom_rows - 1) / atom_rows) * atom_rows * WG_K;
+  }
+#endif
+  return rows * WG_STORAGE_K;
+}
+
+__device__ __forceinline__ int matrix_off(int r, int k, int rows, bool mn_major, unsigned phase) {
+  if (!mn_major) return core_off(r, k, phase);
+#if CUPBOP_WGMMA_SWIZZLE
+  constexpr int width = CUPBOP_WGMMA_SWIZZLE;
+  constexpr int atom_rows = width / sizeof(half);
+  const unsigned strips = (rows + atom_rows - 1) / atom_rows;
+  const unsigned byte = ((k / 8) * strips + r / atom_rows) * 8 * width +
+                        (k % 8) * width + (r % atom_rows) * sizeof(half);
+  return (byte ^ ((((byte >> 7) + phase) & (width / 16 - 1)) << 4)) / sizeof(half);
+#else
+  return ((k / 8) * (rows / 8) + r / 8) * 64 + (k % 8) * 8 + r % 8;
+#endif
+}
+
 #ifndef CUPBOP_HOPPER_TMA_PIPELINE
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
   uint32_t a;
@@ -75,11 +111,21 @@ __device__ __forceinline__ uint32_t smem_u32(const void *p) {
 #endif
 // wgmma shared-memory matrix descriptor (PTX ISA "Matrix Descriptor Format"):
 //   [13:0] start address >> 4, [29:16] LBO >> 4, [45:32] SBO >> 4, [51:49] base offset, [63:62] swizzle (0 = none)
-__device__ __forceinline__ uint64_t make_desc(const void *smem_ptr) {
+__device__ __forceinline__ uint64_t make_desc(const void *smem_ptr, int rows, bool mn_major) {
   const uint32_t addr = smem_u32(smem_ptr);
   uint64_t d = (uint64_t)((addr & 0x3FFFFu) >> 4);
-  d |= (uint64_t)(SMEM_LBO_BYTES >> 4) << 16;
-  d |= (uint64_t)(SMEM_SBO_BYTES >> 4) << 32;
+  uint32_t lbo = SMEM_LBO_BYTES, sbo = SMEM_SBO_BYTES;
+  if (mn_major) {
+#if CUPBOP_WGMMA_SWIZZLE
+    lbo = 8 * CUPBOP_WGMMA_SWIZZLE;
+    sbo = matrix_storage(rows, true) * sizeof(half) / 2;
+#else
+    lbo = (rows / 8) * 128;
+    sbo = 128;
+#endif
+  }
+  d |= (uint64_t)(lbo >> 4) << 16;
+  d |= (uint64_t)(sbo >> 4) << 32;
 #if CUPBOP_WGMMA_SWIZZLE
   d |= (uint64_t)((addr >> 7) & 7) << 49;
   d |= (CUPBOP_WGMMA_SWIZZLE == 128 ? 1ull : CUPBOP_WGMMA_SWIZZLE == 64 ? 2ull : 3ull) << 62;
@@ -87,8 +133,24 @@ __device__ __forceinline__ uint64_t make_desc(const void *smem_ptr) {
   return d;
 }
 
-// D(64x64,f32) += A(64x16,f16,K-major) * B(16x64,f16,K-major i.e. stored N x K)
-__device__ __forceinline__ void wgmma_m64n64k16(float *d, uint64_t desc_a, uint64_t desc_b) {
+__device__ __forceinline__ void wgmma_tile(float *d, uint64_t desc_a, uint64_t desc_b) {
+#if WG_N == 8
+  asm volatile(
+      "{ .reg .pred p; setp.ne.b32 p, %6, 0; "
+      "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%0,%1,%2,%3}, %4, %5, p, 1, 1, "
+      WG_STR(CUPBOP_WGMMA_TRANS_A) ", " WG_STR(CUPBOP_WGMMA_TRANS_B) "; }"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "l"(desc_a), "l"(desc_b), "r"(1));
+#elif WG_N == 24
+  asm volatile(
+      "{ .reg .pred p; setp.ne.b32 p, %14, 0; "
+      "wgmma.mma_async.sync.aligned.m64n24k16.f32.f16.f16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, "
+      "%12, %13, p, 1, 1, " WG_STR(CUPBOP_WGMMA_TRANS_A) ", " WG_STR(CUPBOP_WGMMA_TRANS_B) "; }"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
+        "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
+      : "l"(desc_a), "l"(desc_b), "r"(1));
+#else
+  static_assert(WG_N == 64);
   asm volatile(
       "{\n"
       ".reg .pred p;\n"
@@ -96,19 +158,20 @@ __device__ __forceinline__ void wgmma_m64n64k16(float *d, uint64_t desc_a, uint6
       "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
       "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
       "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, "
-      "%32, %33, p, 1, 1, 0, 0;\n"
+      "%32, %33, p, 1, 1, " WG_STR(CUPBOP_WGMMA_TRANS_A) ", " WG_STR(CUPBOP_WGMMA_TRANS_B) ";\n"
       "}\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
         "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
         "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
         "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
       : "l"(desc_a), "l"(desc_b), "r"(1));
+#endif
 }
 
 __device__ __forceinline__ void accumulate_tile(float *d, const half *a, const half *b) {
-  const uint64_t da = make_desc(a), db = make_desc(b);
+  const uint64_t da = make_desc(a, WG_M, CUPBOP_WGMMA_TRANS_A), db = make_desc(b, WG_N, CUPBOP_WGMMA_TRANS_B);
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-  wgmma_m64n64k16(d, da, db);
+  wgmma_tile(d, da, db);
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
   asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
@@ -189,8 +252,8 @@ __global__ void __launch_bounds__(WG_THREADS)
 sgemm_wgmma_kernel(const half *A, const half *B, float *C, int M, int N, int K) {
   constexpr unsigned a_pad = 64 * CUPBOP_WGMMA_SWIZZLE_PHASE;
   constexpr unsigned b_pad = 64 * (CUPBOP_WGMMA_SWIZZLE_PHASE ? ((CUPBOP_WGMMA_SWIZZLE_PHASE + 1) & 7) : 0);
-  __shared__ __align__(WG_SMEM_ALIGNMENT) half a_storage[WG_M * WG_STORAGE_K + a_pad];
-  __shared__ __align__(WG_SMEM_ALIGNMENT) half b_storage[WG_N * WG_STORAGE_K + b_pad];
+  __shared__ __align__(WG_SMEM_ALIGNMENT) half a_storage[matrix_storage(WG_M, CUPBOP_WGMMA_TRANS_A) + a_pad];
+  __shared__ __align__(WG_SMEM_ALIGNMENT) half b_storage[matrix_storage(WG_N, CUPBOP_WGMMA_TRANS_B) + b_pad];
   half *sA = a_storage + a_pad;
   half *sB = b_storage + b_pad;
   const unsigned phase_a = (smem_u32(sA) >> 7) & 7;
@@ -201,11 +264,11 @@ sgemm_wgmma_kernel(const half *A, const half *B, float *C, int M, int N, int K) 
   for (int k0 = 0; k0 < K; k0 += WG_K) {
     for (int i = tid; i < WG_M * WG_K; i += WG_THREADS) {
       int m = i / WG_K, k = i % WG_K;
-      sA[core_off(m, k, phase_a)] = A[(size_t)(tile_m + m) * K + k0 + k];
+      sA[matrix_off(m, k, WG_M, CUPBOP_WGMMA_TRANS_A, phase_a)] = A[(size_t)(tile_m + m) * K + k0 + k];
     }
     for (int i = tid; i < WG_N * WG_K; i += WG_THREADS) {
       int n = i / WG_K, k = i % WG_K;
-      sB[core_off(n, k, phase_b)] = B[(size_t)(k0 + k) * N + tile_n + n];
+      sB[matrix_off(n, k, WG_N, CUPBOP_WGMMA_TRANS_B, phase_b)] = B[(size_t)(k0 + k) * N + tile_n + n];
     }
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -231,10 +294,10 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
       int n = atoi(argv[++i]);
-      if (n > 0 && n % WG_M == 0) {
+      if (n > 0 && n % WG_M == 0 && n % WG_N == 0) {
         M = N = K = n;
       } else {
-        fprintf(stderr, "Size must be a positive multiple of %d\n", WG_M);
+        fprintf(stderr, "Size must be a positive multiple of %d and %d\n", WG_M, WG_N);
         return 1;
       }
     }

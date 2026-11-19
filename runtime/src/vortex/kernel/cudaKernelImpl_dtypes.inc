@@ -468,7 +468,8 @@ CUPBOP_EXPAND(CUPBOP_XWD(u8, CUPBOP_D_INT8))
 //   acc[4j+0] = (g, 8j+2t)  acc[4j+1] = (g, 8j+2t+1)  acc[4j+2] = (g+8, 8j+2t)  acc[4j+3] = (g+8, 8j+2t+1)
 // scale_d = 0: D = A*B.
 template <class EA, class EB, bool SAT>
-static inline void __cupbop_wgmma_sw(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, uint32_t *acc) {
+static inline void __cupbop_wgmma_sw(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg,
+                                     uint32_t *acc, unsigned transpose = 0) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
   const int row0 = 16 * warp_in_wg;
@@ -488,7 +489,8 @@ static inline void __cupbop_wgmma_sw(int n_cols, uint64_t desc_a, uint64_t desc_
       } else {
         float d = scale_d ? __cupbop_bits_f32(acc[4 * j + s]) : 0.f;
         for (int w = 0; w < 8; ++w) {
-          const uint32_t aw = __cupbop_wg_word(A, r, w), bw = __cupbop_wg_word(B, c, w);
+          const uint32_t aw = __cupbop_wg_half_word(A, r, w, transpose & 1);
+          const uint32_t bw = __cupbop_wg_half_word(B, c, w, transpose & 2);
           for (int i = 0; i < EA::n; ++i) d += EA::get(aw, i) * EB::get(bw, i);
         }
         acc[4 * j + s] = __cupbop_f32_bits(d);
@@ -548,8 +550,16 @@ static inline void __cupbop_wgmma_tcu(int n_cols, uint64_t desc_a, uint64_t desc
 #define CUPBOP_WG_DISPATCH_BODY_1(NAME) NAME##_tcu(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
 #define CUPBOP_WG_DISPATCH_BODY_0(NAME) NAME##_sw(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
 #define CUPBOP_XWG(NAME, ACC, OK) CUPBOP_GEN_WG_DISPATCH(NAME, ACC, OK)
-CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk16_f16f32, float, __cupbop_el_f16, __cupbop_el_f16, false)
-CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk16_bf16f32, float, __cupbop_el_bf16, __cupbop_el_bf16, false)
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_f16f32_sw(
+    CUPBOP_WG_ARGS(float), unsigned transpose) {
+  __cupbop_wgmma_sw<__cupbop_el_f16, __cupbop_el_f16, false>(
+      n_cols, desc_a, desc_b, scale_d, warp_in_wg, (uint32_t *)acc, transpose);
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_bf16f32_sw(
+    CUPBOP_WG_ARGS(float), unsigned transpose) {
+  __cupbop_wgmma_sw<__cupbop_el_bf16, __cupbop_el_bf16, false>(
+      n_cols, desc_a, desc_b, scale_d, warp_in_wg, (uint32_t *)acc, transpose);
+}
 CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk8_tf32f32, float, __cupbop_el_tf32, __cupbop_el_tf32, false)
 CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e4m3f32, float, __cupbop_el_e4m3, __cupbop_el_e4m3, false)
 CUPBOP_GEN_WG_SW(__cupbop_wgmma_m64nNk32_e5m2f32, float, __cupbop_el_e5m2, __cupbop_el_e5m2, false)

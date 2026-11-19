@@ -26,6 +26,10 @@ if [ ! -x build/compilation/kernelTranslator ]; then
 fi
 make -C build kernelTranslator hostTranslator vortexRuntime ThreadPool -j8 > ci/logs_v3/async_test_build_$SLURM_JOB_ID.log 2>&1 || { echo BUILD FAILED; grep -n error ci/logs_v3/async_test_build_$SLURM_JOB_ID.log | head; exit 1; }
 OUT=$CuPBoP_PATH/ci/logs_v3/async_test_$SLURM_JOB_ID; mkdir -p $OUT
+if ! bash ci/tma_self_arrive_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_self_arrive.log" 2>&1; then
+  cat "$OUT/tma_self_arrive.log"
+  exit 1
+fi
 run() { # tag example sched [make vars...]
   local tag=$1 ex=$2 sched=$3; shift 3
   ( cd examples/$ex && make clean > /dev/null 2>&1; rm -f ci_output.txt cupbop_async_kernels.txt
@@ -40,6 +44,9 @@ expect_refused() { # tag pattern example sched [make vars...]
 for ex in async_mbar_ws async_tma2d async_bulk1d async_tma_store async_cpasync_mbar async_misc; do
   expect_pass s2_$ex $ex 2
 done
+run s2_splitk_serial splitk_serial 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_splitk_serial.out" || { echo "s2_splitk_serial: FAIL"; exit 1; }
+echo "s2_splitk_serial: PASS"
 for ex in cluster_group cluster_async cluster_reduce; do
   run s2_$ex $ex 2 LOCALMEM=1
   grep -q '^PASSED!' "$OUT/s2_$ex.out" || { echo "s2_$ex: FAIL"; exit 1; }

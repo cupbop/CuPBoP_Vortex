@@ -15,8 +15,10 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -237,7 +239,7 @@ struct PassState {
   std::map<BasicBlock *, WeakTrackingVH> txqIssueAnchors;
   std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
-  std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
+  std::set<std::pair<Function *, unsigned>> tensorMapArgs;
   std::map<Function *, std::pair<AllocaInst *, unsigned>> paramImages;
   unsigned n_asm = 0, n_intr = 0, n_moved = 0, n_issue = 0;
   explicit PassState(Module *m)
@@ -1044,7 +1046,6 @@ struct AsmLowering {
     if (fname != F->getName() && fname != F->getName().str().substr(F->getName().starts_with("__src_") ? 6 : 0))
       fail("cvta.param of another function's parameter (" + sym + ")");
     if (n >= F->arg_size()) fail("cvta.param of a parameter the function does not have (" + sym + ")");
-    S.paramAddrArgs.insert({F, n});
     Argument *A = F->getArg(n);
     IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
     StringRef name = A->getName();
@@ -1385,8 +1386,9 @@ bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI, const s
            n.starts_with("llvm.nvvm.read.ptx.sreg.ntid.");
   }
   if (auto *L = dyn_cast<LoadInst>(I))
-    if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()))
-      if (UA && UA->count(A) && !L->isVolatile()) return true;
+    if (UA && L->isSimple())
+      if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(L->getPointerOperand())))
+        if (UA->count(A)) return true;
   if (isa<LoadInst>(I) || isa<AllocaInst>(I) || I->mayHaveSideEffects()) return false;
   if (auto *P = dyn_cast<PHINode>(I)) { // a loop header's: the iteration all threads of the block are in
     Loop *L = LI.getLoopFor(P->getParent());
@@ -1528,18 +1530,34 @@ Instruction *convergedIssuePoint(PassState &S, Function *F, CallInst *Ar, std::s
     }
     return v;
   };
-  // CUDA input is unoptimized IR: loop counters and parameters live in allocas. An alloca that does not escape, and whose
-  // stores all store a uniform value at a point where no non-uniform branch decides (optimistic fixpoint), is uniform.
+  // Loop counters and parameters live in allocas. CuLifter copies parameters
+  // into a byte array and accesses them through fixed offsets. Track those
+  // addresses as well as scalar slots, and require uniform values and control
+  // for every store to an alloca before treating its loads as uniform.
   std::set<AllocaInst *> UA;
+  std::map<AllocaInst *, SmallVector<StoreInst *, 4>> stores;
   for (Instruction &I : F->getEntryBlock()) {
     auto *A = dyn_cast<AllocaInst>(&I);
     if (!A) continue;
     bool ok = true;
-    for (User *U : A->users()) {
-      if (auto *L = dyn_cast<LoadInst>(U)) ok &= L->getPointerOperand() == A;
-      else if (auto *St = dyn_cast<StoreInst>(U)) ok &= St->getPointerOperand() == A && St->getValueOperand() != A;
-      else if (auto *II = dyn_cast<IntrinsicInst>(U)) ok &= II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II);
-      else ok = false;
+    SmallVector<Value *, 4> pointers{A};
+    while (ok && !pointers.empty()) {
+      Value *pointer = pointers.pop_back_val();
+      for (User *U : pointer->users()) {
+        if (auto *L = dyn_cast<LoadInst>(U)) {
+          ok &= L->getPointerOperand() == pointer && L->isSimple();
+        } else if (auto *St = dyn_cast<StoreInst>(U)) {
+          ok &= St->getPointerOperand() == pointer && St->getValueOperand() != pointer && St->isSimple();
+          stores[A].push_back(St);
+        } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          ok &= GEP->getPointerOperand() == pointer && GEP->hasAllConstantIndices();
+          pointers.push_back(GEP);
+        } else if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+          ok &= II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II);
+        } else {
+          ok = false;
+        }
+      }
     }
     if (ok) UA.insert(A);
   }
@@ -1571,14 +1589,13 @@ Instruction *convergedIssuePoint(PassState &S, Function *F, CallInst *Ar, std::s
     changed = false;
     for (auto it = UA.begin(); it != UA.end();) {
       bool ok = true;
-      for (User *U : (*it)->users())
-        if (auto *St = dyn_cast<StoreInst>(U)) {
-          std::set<Value *> visiting;
-          if (St->isVolatile() || !isUniformValue(St->getValueOperand(), visiting, LI, &UA) || divergentBranch(St->getParent())) {
-            ok = false;
-            break;
-          }
+      for (StoreInst *St : stores[*it]) {
+        std::set<Value *> visiting;
+        if (!isUniformValue(St->getValueOperand(), visiting, LI, &UA) || divergentBranch(St->getParent())) {
+          ok = false;
+          break;
         }
+      }
       if (ok) { ++it; continue; }
       it = UA.erase(it);
       changed = true;
@@ -2012,9 +2029,8 @@ void foldIntegers(Function &F) {
 // cvta.param) becomes an i64: the CUDA host passes it in one 8-byte launch slot (cudaLaunchKernel_vortex), which
 // holds the device address of its record (cuTensorMapEncodeTiled shim). The body sees the old value rebuilt from
 // those 8 bytes, the rest zero.
-// Only vector-typed parameters reached through cvta.param: CuLifter types EVERY 64-byte-multiple parameter as
-// [N/64 x <8 x i64>] (for the .align 64 of the PTX parameter), e.g. a 448-byte CUTLASS Kernel::Params, and those
-// keep all their bytes through pass_wide_kernel_args_by_slot (generate_wrapper.cpp) like the [N x i8] ones.
+// CuLifter also uses vectors to represent aligned by-value structs. Taking the address of one does
+// not make it a standalone tensor map: a CUTLASS Kernel::Params may contain several embedded maps.
 // CUPBOP_NARROW_VECTOR_ARGS=1: the earlier rule (every vector-typed parameter wider than 8 bytes).
 static bool hasVectorType(Type *T) {
   if (T->isVectorTy()) return true;
@@ -2064,24 +2080,25 @@ static void markTensorMapParameters(PassState &S) {
         if (!call || !call->getCalledFunction()) continue;
         StringRef callee = call->getCalledFunction()->getName();
         Value *descriptor = nullptr;
-        if (callee == kTmaLoad || callee == "__cupbop_tcgen_tma_load") descriptor = call->getArgOperand(1);
+        if (callee == kTmaLoad || callee == "__cupbop_tcgen_tma_load" || callee == "__cupbop_tma_multicast")
+          descriptor = call->getArgOperand(1);
         else if (callee == kTmaLoadQi) descriptor = call->getArgOperand(5);
-        else if (callee == kTmaStore) descriptor = call->getArgOperand(0);
+        else if (callee == kTmaStore || callee == "__cupbop_tensor_reduce") descriptor = call->getArgOperand(0);
         if (!descriptor) continue;
         if (auto off = paramBankOffset(descriptor, bank, DL)) {
           auto map = tensorMaps.find(*off);
-          if (map != tensorMaps.end()) S.paramAddrArgs.insert({F, map->second});
+          if (map != tensorMaps.end()) S.tensorMapArgs.insert({F, map->second});
         }
       }
   }
 }
 
-static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &paramAddrArgs) {
+static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &tensorMapArgs) {
   const DataLayout &DL = M->getDataLayout();
   const bool all = std::getenv("CUPBOP_NARROW_VECTOR_ARGS") != nullptr;
   auto isWide = [&](Argument &A) {
     return !A.getType()->isPointerTy() && hasVectorType(A.getType()) && DL.getTypeStoreSize(A.getType()) > 8 &&
-           (all || paramAddrArgs.count({A.getParent(), A.getArgNo()}));
+           (all || tensorMapArgs.count({A.getParent(), A.getArgNo()}));
   };
   std::vector<Function *> todo;
   for (auto &F : *M)
@@ -2133,6 +2150,43 @@ static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *,
 
 } // namespace
 
+// CuLifter emits both CTA-local and peer paths for SASS ARRIVES. A direct read
+// of the current CTA rank, including its low byte from the SASS address, proves
+// that the peer path cannot execute for any supported CUDA cluster size.
+static void simplifySelfClusterArrive(CallInst &call) {
+  auto *assembly = cast<InlineAsm>(call.getCalledOperand());
+  StringRef body(assembly->getAsmString());
+  if (!body.consume_front("{.reg .pred p; .reg .u32 r; .reg .u32 m; .reg .b64 s; "
+                           "mov.u32 r, %cluster_ctarank; setp.ne.u32 p, r, $2; "
+                           "@p mapa.shared::cluster.u32 m, $0, $2; "))
+    return;
+
+  StringRef local;
+  if (call.arg_size() == 4 &&
+      body == "@p mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [m], $3; "
+              "@!p mbarrier.arrive.expect_tx.shared::cta.b64 s, [$1], $3;}") {
+    local = "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $3;";
+  } else if (call.arg_size() == 3 &&
+             body == "@p mbarrier.arrive.release.cluster.shared::cluster.b64 _, [m]; "
+                     "@!p mbarrier.arrive.shared::cta.b64 s, [$1];}") {
+    local = "mbarrier.arrive.shared::cta.b64 _, [$1];";
+  } else {
+    return;
+  }
+
+  using namespace llvm::PatternMatch;
+  Value *rank = call.getArgOperand(2);
+  Value *unmasked;
+  if (match(rank, m_c_And(m_Value(unmasked), m_SpecificInt(255))))
+    rank = unmasked;
+  const auto *read = dyn_cast<CallInst>(rank);
+  const Function *reg = read ? read->getCalledFunction() : nullptr;
+  if (!reg || reg->getIntrinsicID() != Intrinsic::nvvm_read_ptx_sreg_cluster_ctarank)
+    return;
+  call.setCalledOperand(InlineAsm::get(assembly->getFunctionType(), local,
+                                       assembly->getConstraintString(), assembly->hasSideEffects()));
+}
+
 void lower_async_ptx(Module *M) {
   PassState S(M);
   const int sched = schedule();
@@ -2146,6 +2200,7 @@ void lower_async_ptx(Module *M) {
         auto *C = dyn_cast<CallInst>(&I);
         if (!C) continue;
         if (C->isInlineAsm()) {
+          simplifySelfClusterArrive(*C);
           const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
           if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
           if (body.find("tcgen05.") != std::string::npos ||
@@ -2342,7 +2397,7 @@ void lower_async_ptx(Module *M) {
   }
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
   markTensorMapParameters(S);
-  narrowWideKernelArgs(M, S.paramAddrArgs);
+  narrowWideKernelArgs(M, S.tensorMapArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "
                   "copies, %u converged DXA issue point(s)\n", S.n_asm, S.n_intr, S.n_moved, S.n_issue);
 }

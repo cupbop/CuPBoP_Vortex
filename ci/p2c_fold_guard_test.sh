@@ -103,6 +103,15 @@ if grep -Eq 'p2c-fold|p2c-alias' "$work/ring.log"; then
   exit 1
 fi
 
+# The lifted cuBLAS stage-6 kernel uses a 24 KiB ring within its shared area.
+xz -dc "$repo/examples/lift_g32/raw.ll.xz" > "$work/stage6.ll"
+run_lift_opt stage6 CUPBOP_LIFT_OPT_WHY=1 P2C_BLOCK=128
+grep -qF '@shared_mem = external addrspace(3) global [32768 x i8]' "$work/stage6.out.ll"
+if grep -Eq 'p2c-fold|p2c-alias' "$work/stage6.log"; then
+  cat "$work/stage6.log"
+  exit 1
+fi
+
 for variant in guarded-source guarded-size; do
   run_lift_opt "$variant" CUPBOP_LIFT_OPT_PIPE=p2c-fold P2C_STAGES=1
   grep -F 'left as it is: copy source or size is not available at the guard' "$work/$variant.log"

@@ -1496,23 +1496,44 @@ static inline uint32_t __cupbop_wg_word(const __cupbop_smem_desc &m, int row, in
   return *(const uint32_t *)(m.base + offset);
 }
 
+static inline uint16_t __cupbop_wg_mn_half(const __cupbop_smem_desc &m, int row, int k) {
+  uint32_t offset;
+  if (m.row_bytes) {
+    const int rows = m.row_bytes / sizeof(uint16_t);
+    offset = (row / rows) * m.lbo + (k >> 3) * m.sbo + (k & 7) * m.row_bytes
+           + (row % rows) * sizeof(uint16_t);
+    const uint32_t bank_group = ((offset >> 7) + m.phase) & ((m.row_bytes >> 4) - 1);
+    offset ^= bank_group << 4;
+  } else {
+    offset = (row >> 3) * m.sbo + (k >> 3) * m.lbo + (k & 7) * 16 + (row & 7) * 2;
+  }
+  return *(const uint16_t *)(m.base + offset);
+}
+
+static inline uint32_t __cupbop_wg_half_word(const __cupbop_smem_desc &m, int row, int word, bool mn_major) {
+  if (!mn_major) return __cupbop_wg_word(m, row, word);
+  const uint32_t lo = __cupbop_wg_mn_half(m, row, 2 * word);
+  const uint32_t hi = __cupbop_wg_mn_half(m, row, 2 * word + 1);
+  return lo | (hi << 16);
+}
+
 #if defined(VX_CFG_NUM_THREADS) && defined(VX_CFG_EXT_TCU_ENABLE) && VX_CFG_NUM_THREADS == 32 // wgmma: NT=32 fragments
-static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k) { // fp16 pair (k, k+1), k even
-  uint32_t v = __cupbop_wg_word(m, r, k / 2);
+static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k, bool mn_major) {
+  uint32_t v = __cupbop_wg_half_word(m, r, k / 2, mn_major);
   float f; __builtin_memcpy(&f, &v, 4); return f;
 }
-// wgmma.mma_async.sync.aligned.m64nNk16.f32.f16.f16 with K-major A (64x16) and B (Nx16, i.e. KxN
-// column-major) in shared memory. Warp `warp_in_wg` of the warpgroup owns rows
-// 16w..16w+15 and computes them as N/16 TCU m16n16k16 ops (the k32 tile's upper half zero).
+// Each warp owns 16 rows. A final N=8 tile uses half of the native 16-column
+// tile, with no B or accumulator accesses outside the source PTX tile.
 // acc: N/2 fp32 per thread, in/out, PTX accumulator layout
 //   acc[4j+0] = (g, 8j+2t)  acc[4j+1] = (g, 8j+2t+1)  acc[4j+2] = (g+8, 8j+2t)  acc[4j+3] = (g+8, 8j+2t+1)
 // Vortex acc reg r = (g + 8*(r>>2), t + 4*(r&3)) within a 16-column block, hence the shuffles.
 // scale_d = 0 ignores the incoming accumulator (D = A*B). The register path is synchronous.
 template <class CTX, class WCTX = void>
 static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
-                                              int warp_in_wg, float *acc, uint32_t *scratch = nullptr) {
+                                              int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch = nullptr) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
+  const bool a_mn = transpose & 1, b_mn = transpose & 2;
   const int row0 = 16 * warp_in_wg;
   constexpr bool has_native = !std::is_void<WCTX>::value;
   bool use_native = false;
@@ -1524,20 +1545,25 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
     use_native = scratch_offset <= 65536 - 1024;
     if (use_native) {
       for (int i = lane; i < 128; i += 32)
-        scratch[i] = __cupbop_wg_word(A, row0 + i / 8, i % 8);
+        scratch[i] = __cupbop_wg_half_word(A, row0 + i / 8, i % 8, a_mn);
     }
   }
   typename CTX::fragment_a fa; // reg r: row g + 8*(r>>2), k = 8*(r&3) + 2t ; k >= 16 zero
   if (!use_native)
-    fa.data = {{__cupbop_core_ld(A, row0 + g, 2 * t), __cupbop_core_ld(A, row0 + g, 8 + 2 * t), 0.f, 0.f,
-                __cupbop_core_ld(A, row0 + g + 8, 2 * t), __cupbop_core_ld(A, row0 + g + 8, 8 + 2 * t), 0.f, 0.f}};
+    fa.data = {{__cupbop_core_ld(A, row0 + g, 2 * t, a_mn), __cupbop_core_ld(A, row0 + g, 8 + 2 * t, a_mn), 0.f, 0.f,
+                __cupbop_core_ld(A, row0 + g + 8, 2 * t, a_mn), __cupbop_core_ld(A, row0 + g + 8, 8 + 2 * t, a_mn), 0.f, 0.f}};
   const bool odd = t & 1, hi = t >> 1;
-  for (int nb = 0; nb < n_cols / 16; ++nb) {
+  for (int nb = 0; 16 * nb < n_cols; ++nb) {
     const int n0 = 16 * nb;
+    const bool full = n0 + 16 <= n_cols;
     typename CTX::fragment_acc fc, fd;
     if (scale_d) {
       for (int r = 0; r < 8; ++r) { // Vortex reg r <- PTX owner lane (g, cc>>1), slot cc&1, cc = t + 4*((r&3)&1), j = 2nb + ((r&3)>>1)
         const int jl = (r & 3) >> 1, q = (r & 3) & 1;
+        if (jl && !full) {
+          fc.data[r] = 0.f;
+          continue;
+        }
         const int src = (g << 2) | ((t >> 1) + 2 * q);
         const int base = 4 * (2 * nb + jl) + 2 * (r >> 2);
         const float v0 = __cupbop_shflf(acc[base], src), v1 = __cupbop_shflf(acc[base + 1], src);
@@ -1550,7 +1576,7 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
       if (use_native) {
         uint32_t *staged_b = scratch + 128;
         for (int i = lane; i < 128; i += 32)
-          staged_b[i] = __cupbop_wg_word(B, n0 + i / 8, i % 8);
+          staged_b[i] = full || i < 64 ? __cupbop_wg_half_word(B, n0 + i / 8, i % 8, b_mn) : 0;
         // The TCU reads this warp's cooperative stores through its own LMEM port.
         vx_fence();
         vx_wsync();
@@ -1565,11 +1591,12 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
     }
     if (!use_native) {
       typename CTX::fragment_b fb; // reg r: k = 8*(r>>1) + 2t, n = g + 8*(r&1) ; k >= 16 zero
-      fb.data = {{__cupbop_core_ld(B, n0 + g, 2 * t), __cupbop_core_ld(B, n0 + g + 8, 2 * t),
-                  __cupbop_core_ld(B, n0 + g, 8 + 2 * t), __cupbop_core_ld(B, n0 + g + 8, 8 + 2 * t), 0.f, 0.f, 0.f, 0.f}};
+      fb.data = {{__cupbop_core_ld(B, n0 + g, 2 * t, b_mn), full ? __cupbop_core_ld(B, n0 + g + 8, 2 * t, b_mn) : 0.f,
+                  __cupbop_core_ld(B, n0 + g, 8 + 2 * t, b_mn), full ? __cupbop_core_ld(B, n0 + g + 8, 8 + 2 * t, b_mn) : 0.f,
+                  0.f, 0.f, 0.f, 0.f}};
       CTX::mma_sync(fd, fa, fb, fc);
     }
-    for (int jl = 0; jl < 2; ++jl) { // PTX acc[4j+s] <- Vortex holder lane (g, c&3), reg 4*(s>>1) + (c>>2), c = 8jl + 2t + (s&1)
+    for (int jl = 0; jl < (full ? 2 : 1); ++jl) { // PTX acc[4j+s] <- Vortex holder lane (g, c&3), reg 4*(s>>1) + (c>>2), c = 8jl + 2t + (s&1)
       const int j = 2 * nb + jl;
       for (int s = 0; s < 4; ++s) {
         const int c = 8 * jl + 2 * t + (s & 1);
@@ -1583,11 +1610,11 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
     }
   }
 }
-extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc) {
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
+extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_f16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose) {
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose);
 }
-extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_bf16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc) {
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc);
+extern "C" __attribute__((always_inline)) void __cupbop_wgmma_m64nNk16_bf16f32(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose) {
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose);
 }
 #if defined(VX_CFG_TCU_WGMMA_ENABLE) && defined(VX_CFG_EXT_A_ENABLE)
 extern "C" __attribute__((noinline, convergent)) void __cupbop_wgmma_group_init(uint32_t *groups) {
@@ -1617,14 +1644,14 @@ extern "C" __attribute__((noinline, convergent)) void __cupbop_wgmma_group_sync(
 }
 
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_f16f32_native(
-    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, uint32_t *scratch) {
+    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch) {
   using wgmma_ctx = vt::wgmma_context<32, vt::fp16, vt::fp32>;
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, scratch);
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch);
 }
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_bf16f32_native(
-    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, uint32_t *scratch) {
+    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch) {
   using wgmma_ctx = vt::wgmma_context<32, vt::bf16, vt::fp32>;
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, scratch);
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch);
 }
 #endif
 #endif // wgmma (TCU builds)

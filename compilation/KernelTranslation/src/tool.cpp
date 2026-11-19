@@ -2644,6 +2644,8 @@ static void emit_wgmma_group_call(IRBuilder<> &builder, Module *M, Value *groups
 }
 
 void replace_asm_call(llvm::Module *M) {
+  const char *architecture = std::getenv("VORTEX_ARCHITECTURE");
+  const bool rv64 = architecture && StringRef(architecture) == "64";
   // clang (CUDA 12, sm_90) emits __activemask() as the llvm.nvvm.activemask intrinsic,
   // not the `activemask.b32` asm the lifter uses; lower it the same way here so the
   // schedule-1 staging sees a __cupbop_activemask call and the backend never sees the
@@ -3258,8 +3260,9 @@ void replace_asm_call(llvm::Module *M) {
                 if (wb != wa || wd != "s32" || wK != 32) werr = "int8 wgmma needs m64nNk32 .s32 with equal A/B types (PTX has no mixed s8/u8 wgmma)";
                 wtag = wa + "s32" + (wsat ? "sat" : ""); ntrail = 0;
               } else werr = "element type " + wa + " not lowered (f16, bf16, tf32, e4m3, e5m2, s8, u8)";
-              bool ok = werr.empty() && N >= 16 && N <= 256 && (N % 16) == 0;
-              if (werr.empty() && !ok) werr = "N must be a multiple of 16";
+              const int nStep = tensor_is_f16ish(wa) ? 8 : 16;
+              bool ok = werr.empty() && N >= nStep && N <= 256 && (N % nStep) == 0;
+              if (werr.empty() && !ok) werr = "N must be a supported multiple of " + std::to_string(nStep);
               unsigned nacc = ok ? (unsigned)N / 2 : 0;
               const bool hasTiedAccumulator = Call->arg_size() != 2;
               unsigned firstAcc = hasTiedAccumulator && Call->arg_size() >= nacc ? Call->arg_size() - nacc : 2;
@@ -3273,6 +3276,7 @@ void replace_asm_call(llvm::Module *M) {
               for (unsigned i = firstAcc; ok && i < Call->arg_size(); i++)
                 if (Call->getArgOperand(i)->getType()->getPrimitiveSizeInBits() != 32) ok = false;
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
+              unsigned transpose = 0;
               if (ok) {
                 size_t kpos = asm_str.find(opc);
                 size_t semi = asm_str.find(';', kpos);
@@ -3301,7 +3305,8 @@ void replace_asm_call(llvm::Module *M) {
                   long v; Value *reg;
                   for (int i = 0; i < ntrail; i++) {
                     resolve(toks[toks.size() - ntrail + i], v, reg);
-                    if (v != want[i]) ok = false;
+                    if (i >= 2 && (v == 0 || v == 1)) transpose |= (unsigned)v << (i - 2);
+                    else if (v != want[i]) ok = false;
                   }
                   resolve(toks[toks.size() - ntrail - 1], v, reg); // scale-d
                   if (reg) scaleD = reg;
@@ -3318,7 +3323,7 @@ void replace_asm_call(llvm::Module *M) {
               }
               if (!ok) {
                 fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
-                        "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (K-major A and B, trans 0,0, scale 1,1), "
+                        "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (trans 0 or 1, scale 1,1), "
                         "m64nNk8 .f32.tf32.tf32 and m64nNk32 .f32.e4m3|e5m2 (scale 1,1), m64nNk32 [.satfinite].s32.s8.s8 / .u8.u8\n",
                         (unsigned)Call->arg_size(), asm_str.c_str(), werr.empty() ? "operands" : werr.c_str());
                 exit(1);
@@ -3355,9 +3360,13 @@ void replace_asm_call(llvm::Module *M) {
                 if (v->getType() != AccT) v = builder.CreateBitCast(v, AccT);
                 builder.CreateStore(v, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
               }
-              SmallVector<Type *, 7> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
-              SmallVector<Value *, 7> arguments{ConstantInt::get(I32, N), Call->getArgOperand(0),
+              SmallVector<Type *, 8> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
+              SmallVector<Value *, 8> arguments{ConstantInt::get(I32, N), Call->getArgOperand(0),
                                                 Call->getArgOperand(1), scaleD, wig, Acc};
+              if (tensor_is_f16ish(wa)) {
+                argumentTypes.push_back(I32);
+                arguments.push_back(ConstantInt::get(I32, transpose));
+              }
               if (scratch) {
                 argumentTypes.push_back(PtrTy);
                 arguments.push_back(builder.CreatePointerCast(scratch->Inputs[0], PtrTy));
@@ -3394,6 +3403,40 @@ void replace_asm_call(llvm::Module *M) {
               if (!Call->getType()->isIntegerTy(32))
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
+              need_remove.push_back(Call);
+            } else if (asm_str.rfind("ld.volatile.global.b32 ", 0) == 0 ||
+                       asm_str.rfind("st.volatile.global.b32 ", 0) == 0 ||
+                       (rv64 && (asm_str.rfind("ld.volatile.global.b64 ", 0) == 0 ||
+                                 asm_str.rfind("st.volatile.global.b64 ", 0) == 0))) {
+              // SASS STRONG global accesses implement inter-CTA publication (for example, CUTLASS
+              // serial Split-K). A CTA barrier only synchronizes its own warps. A normal volatile
+              // load can keep reading an old line in the private data cache after another core
+              // publishes. The Vortex AMO path reaches the last-level cache. Use LR for the read
+              // so it does not write to the location, and an exchange for the store.
+              const bool store = asm_str[0] == 's';
+              const bool wide = asm_str.find(".b64 ") != std::string::npos;
+              Type *wordType = wide ? I64 : I32;
+              if (Call->arg_size() != (store ? 2 : 1) ||
+                  !Call->getArgOperand(0)->getType()->isIntOrPtrTy() ||
+                  (store ? (!Call->getType()->isVoidTy() || Call->getArgOperand(1)->getType() != wordType)
+                         : Call->getType() != wordType))
+                report_fatal_error("unsupported scalar volatile global access signature");
+
+              IRBuilder<> b(Call);
+              Type *pointerType = PointerType::getUnqual(wordType);
+              Value *address = Call->getArgOperand(0);
+              Value *ptr = address->getType()->isPointerTy() ? b.CreatePointerCast(address, pointerType)
+                                                            : b.CreateIntToPtr(address, pointerType);
+              if (store) {
+                auto *exchange = b.CreateAtomicRMW(AtomicRMWInst::Xchg, ptr, Call->getArgOperand(1),
+                                                   Align(wide ? 8 : 4), AtomicOrdering::Release);
+                exchange->setVolatile(true);
+              } else {
+                auto *load = InlineAsm::get(FunctionType::get(wordType, {pointerType}, false),
+                                            wide ? "lr.d.aq $0, ($1)" : "lr.w.aq $0, ($1)",
+                                            "=r,r,~{memory}", true);
+                Call->replaceAllUsesWith(b.CreateCall(load, {ptr}, "ld.global.coherent"));
+              }
               need_remove.push_back(Call);
             } else if (asm_str.rfind("ld.volatile.global.", 0) == 0 ||
                        asm_str.rfind("ld.volatile.v", 0) == 0 ||
