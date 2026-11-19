@@ -1,5 +1,6 @@
 #include "cudaRuntimeImpl.h"
 #include "cupbop_async.h"
+#include "cupbop_launch_context.h"
 #include "base_address.h"
 #include "api.h"
 #include "cuda_runtime.h"
@@ -747,32 +748,11 @@ static bool cupbop_debug_enabled() {
    } while (false)
 
 
-// Different structure based on the architecture
 #ifdef VORTEX_ARCHITECTURE_64
-  struct alignas(4) context_t {
-    uint32_t num_groups[3];
-    uint32_t global_offset[3];
-    uint32_t local_size[3];
-    char * printf_buffer;
-    uint32_t printf_buffer_position;
-    uint32_t printf_buffer_capacity;
-    uint32_t work_dim;
-    uint32_t dyn_shared_mem_size;
-  };
-
+using context_t = cupbop_launch_context<uint64_t>;
 #else
-  struct alignas(4) context_t {
-    uint32_t num_groups[3];
-    uint32_t global_offset[3];
-    uint32_t local_size[3];
-    uint32_t printf_buffer;
-    uint32_t printf_buffer_position;
-    uint32_t printf_buffer_capacity;
-    uint32_t work_dim;
-    uint32_t dyn_shared_mem_size;
-  };
+using context_t = cupbop_launch_context<uint32_t>;
 #endif
-
 
 struct alignas(64) kernel_arg_t {
   context_t ctx;
@@ -1592,7 +1572,7 @@ static std::string cupbop_json_str(const std::string &x) {
 }
 static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int kernel_idx, int schedule,
                              const uint32_t grid[3], const uint32_t block[3], uint32_t ndim, uint32_t lmem,
-                             const dim3 &cgrid, const dim3 &cblock, size_t dyn_smem) {
+                             const dim3 &cgrid, const dim3 &cblock, size_t dyn_smem, const dim3 &cluster = dim3(1,1,1)) {
   const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE");
   if (!pk || !*pk) return;
   FILE *pf = fopen(pk, "a");
@@ -1638,10 +1618,11 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
   };
   auto d3 = [](const uint32_t *x) { return "[" + std::to_string(x[0]) + "," + std::to_string(x[1]) + "," + std::to_string(x[2]) + "]"; };
   const uint32_t cg[3] = {cgrid.x, cgrid.y, cgrid.z}, cb[3] = {cblock.x, cblock.y, cblock.z};
+  const uint32_t cd[3] = {cluster.x, cluster.y, cluster.z};
   std::string line = "{\"v\":1,\"pid\":" + std::to_string((long)getpid()) + ",\"launch\":" + std::to_string(launch_no) +
       ",\"kernel\":" + cupbop_json_str(kernel) + ",\"kernel_idx\":" + std::to_string(kernel_idx) +
       ",\"sched\":" + std::to_string(schedule) + ",\"ndim\":" + std::to_string(ndim) + ",\"grid\":" + d3(grid) +
-      ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) +
+      ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) + ",\"cluster\":" + d3(cd) +
       ",\"lmem\":" + std::to_string(lmem) + ",\"dyn_smem\":" + std::to_string(dyn_smem) +
       ",\"service_launches\":" + std::to_string(g_cupbop_service_launches - last_service) +
       ",\"cycles\":" + std::to_string(cyc_delta) +
@@ -1656,7 +1637,7 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
 // service: a service launch (kernel_idx -1 / -2), which goes to cupbop_service_main when the module has it
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
                                const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes,
-                               bool service = false) {
+                               bool service = false, dim3 cluster = dim3(1,1,1)) {
   vx_launch_info_t li = {};
   li.struct_size = sizeof(li);
   li.kernel      = service ? DC->service_kernel() : DC->kernel();
@@ -1664,7 +1645,10 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   li.args_host   = blob;
   li.args_size   = size;
   li.ndim        = ndim;
-  for (int i = 0; i < 3; ++i) { li.grid_dim[i] = grid[i]; li.block_dim[i] = block[i]; li.cluster_dim[i] = 1; }
+  for (int i = 0; i < 3; ++i) { li.grid_dim[i] = grid[i]; li.block_dim[i] = block[i];  }
+  li.cluster_dim[0] = cluster.x;
+  li.cluster_dim[1] = cluster.y;
+  li.cluster_dim[2] = cluster.z;
   li.lmem_size   = lmem_bytes;
   vx_event_h ev = nullptr;
   RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
@@ -1701,11 +1685,11 @@ static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inn
   const uint64_t resident = per_core * nc;
   const uint32_t k = cupbop_env_u32("CUPBOP_CTA_K", 0);
   const uint64_t target = k ? std::max<uint64_t>((blocks + k - 1) / k, resident) : resident * std::max<uint32_t>(cupbop_env_u32("CUPBOP_CTA_WAVES", 1), 1);
-  uint32_t *w = &ka->ctx.printf_buffer_position;   // w[d]: printf_buffer_position, printf_buffer_capacity, work_dim
+  uint32_t *w = &ka->ctx.cluster_shape;   // CTA-loop geometry overlays cluster_shape, cluster_stride, work_dim
   w[0] = w[1] = w[2] = 0;
-  ka->ctx.printf_buffer = nullptr;                 // its low word: 1 = this launch loops
+  ka->ctx.cluster_barriers = 0;                 // its low word: 1 = this launch loops
   if (target * cupbop_env_u32("CUPBOP_CTA_MIN_TRIPS", 2) > blocks) return;   // the old code, the grid as launched
-  ka->ctx.printf_buffer = (char *)1;
+  ka->ctx.cluster_barriers = 1;
   int order[3], n = 0;
   order[n++] = (int)inner;
   for (int d = 2; d >= 0; --d)
@@ -2280,16 +2264,9 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 }
 } // extern C
 
-cudaError_t cudaLaunchKernel_vortex(                          
-                             const char *func, //-> kernel_name
-                             dim3 gridDim, 
-                             dim3 blockDim,
-                             void **args, 
-                             size_t sharedMem,
-                             cudaStream_t stream,
-                             const int num_args
-                             ) {
-
+static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blockDim, void **args,
+                                        size_t sharedMem, cudaStream_t stream, int num_args,
+                                        dim3 cluster, bool explicit_cluster) {
   //open the file lookup.txt and load the content in the memory
   //cpp hash table, look for the kernel name, and retrieve the kerenl index
   
@@ -2330,10 +2307,41 @@ cudaError_t cudaLaunchKernel_vortex(
   // The side-file tables hold kernel names. A launch by path names the module, and its kernel is what lookup.txt gave.
   const std::string table_name = strchr(func, '/') ? stripPrefix(kernel_name_tmp) : func_stripped;
                       
+  std::ifstream shapes("cupbop_cluster_dims.txt");
+  std::string name;
+  unsigned x, y, z;
+  bool split_barrier = false;
+  unsigned uses_barrier;
+  while (shapes >> name >> x >> y >> z >> uses_barrier) {
+    if (stripPrefix(name) != table_name) continue;
+    split_barrier = uses_barrier;
+    if (x) {
+      if (explicit_cluster && (x != cluster.x || y != cluster.y || z != cluster.z))
+        return cudaErrorInvalidValue;
+      cluster = dim3(x,y,z);
+      explicit_cluster = true;
+    }
+    break;
+  }
+  if (!gridDim.x || !gridDim.y || !gridDim.z || !blockDim.x || !blockDim.y || !blockDim.z ||
+      ((explicit_cluster || split_barrier) && uint64_t(blockDim.x) * blockDim.y > 1024 / blockDim.z) || sharedMem > UINT32_MAX)
+    return cudaErrorInvalidConfiguration;
+  if (!cluster.x || !cluster.y || !cluster.z || cluster.x > 16 || cluster.y > 16 || cluster.z > 16 ||
+      cluster.x * cluster.y * cluster.z > 16 || gridDim.x % cluster.x || gridDim.y % cluster.y ||
+      gridDim.z % cluster.z) return cudaErrorInvalidConfiguration;
+  const unsigned members = cluster.x * cluster.y * cluster.z;
+  const char *local_memory = getenv("VORTEX_LOCALMEM_FLAG");
+  if (members > 1 && local_memory && atoi(local_memory) != 1) return cudaErrorInvalidConfiguration;
+  if ((members > 1 || split_barrier) && cupbop_schedule_flag() != 2) return cudaErrorInvalidConfiguration;
   DBG_PRINT("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
   auto DC = DeviceContext::instance();
+  if (explicit_cluster && sharedMem) {
+    uint64_t max_shared = 0;
+    if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &max_shared) || sharedMem > max_shared)
+      return cudaErrorInvalidConfiguration;
+  }
   DC->cleanup_args();
 
   int status = C_RUN;
@@ -2696,6 +2704,7 @@ cudaError_t cudaLaunchKernel_vortex(
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
       const uint64_t core_threads = (uint64_t)CUPBOP_EFF_NUM_WARPS() * CUPBOP_EFF_NUM_THREADS();   // VX_RT_NUM_WARPS/SIMD_WIDTH-aware
       if (block_threads > core_threads) {
+        if (explicit_cluster) return cudaErrorInvalidConfiguration;
         printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
                (unsigned long)block_threads, (unsigned long)core_threads);
         std::abort();
@@ -2783,18 +2792,55 @@ cudaError_t cudaLaunchKernel_vortex(
     if (schedule == 1 || schedule == 2) {
       uint64_t lmem_cap = 0;
       if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
+        if (explicit_cluster) return cudaErrorInvalidConfiguration;
         printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
         std::abort();
       }
     }
+    // Match the KMU slot pitch (CtaDispatcher::step).
+#ifdef VX_CFG_MEM_BLOCK_SIZE
+    constexpr uint64_t alignment = VX_CFG_MEM_BLOCK_SIZE;
+#else
+    constexpr uint64_t alignment = 64;
+#endif
+    const uint64_t stride = (uint64_t(lmem) + alignment - 1) & ~(alignment - 1);
+    const uint64_t threads = uint64_t(blockDim.x) * blockDim.y * blockDim.z;
+    const uint32_t lanes = CUPBOP_EFF_NUM_THREADS();
+    if (members > 1) {
+      uint64_t capacity = 0;
+      if (cta_fix.dims || vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity) ||
+          members * stride > capacity ||
+          members * ((threads + lanes - 1) / lanes) > CUPBOP_EFF_NUM_WARPS())
+        return cudaErrorInvalidConfiguration;
+    }
+    if (cta_fix.dims && split_barrier) return cudaErrorInvalidConfiguration;
+    if (!cta_fix.dims) {
+      abuf_ptr->ctx.cluster_shape = cluster.x | (cluster.y << 8) | (cluster.z << 16) |
+                                  (uint32_t(explicit_cluster) << 24);
+      abuf_ptr->ctx.cluster_stride = stride;
+    }
+    void *barriers = nullptr;
+    if (split_barrier) {
+      const size_t groups = size_t(gridDim.x / cluster.x) * (gridDim.y / cluster.y);
+      const size_t nz = gridDim.z / cluster.z;
+      const size_t bytes = (8 + 4 * threads * members + 7) & ~size_t(7);
+      if (!nz || groups > SIZE_MAX / nz / bytes) return cudaErrorInvalidConfiguration;
+      const size_t storage = groups * nz * bytes;
+      cudaError_t error = cudaMalloc(&barriers, storage);
+      if (error != cudaSuccess) return error;
+      error = cudaMemset(barriers, 0, storage);
+      if (error != cudaSuccess) { cudaFree(barriers); return error; }
+      abuf_ptr->ctx.cluster_barriers = uintptr_t(barriers);
+    }
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
-    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
+    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, cluster);
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
     // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
     // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
     // SimX v3.0 resets its memory, L2 and LMEM counters at every launch, so for a program with __device__ variables that
     // dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
-    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem);
+    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem, cluster);
+    if (barriers) cudaFree(barriers);
   }
 
   // Descriptor DCRs are reused at the next launch, including launches that access a map indirectly.
@@ -2923,5 +2969,32 @@ cudaError_t cudaLaunchKernel_vortex(
   
   return cudaSuccess;
 }
+
+cudaError_t cudaLaunchKernel_vortex(const char *func, dim3 grid, dim3 block, void **args,
+                                    size_t shared, cudaStream_t stream, int nargs) {
+  return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, dim3(1,1,1), false);
+}
+
+// Used by cubin replay with the geometry captured by the CUDA driver.
+cudaError_t cupbopLaunchClusterKernel(const char *func, dim3 grid, dim3 block, void **args,
+                                      size_t shared, cudaStream_t stream, int nargs, dim3 cluster) {
+  return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, cluster, true);
+}
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+cudaError_t cupbopLaunchKernelEx(const cudaLaunchConfig_t *config, const char *func, void **args, int nargs) {
+  if (!config || (nargs && !args) || (config->numAttrs && !config->attrs)) return cudaErrorInvalidValue;
+  dim3 cluster(1,1,1);
+  bool has_cluster = false;
+  for (unsigned i = 0; i < config->numAttrs; ++i) {
+    const auto &a = config->attrs[i];
+    if (a.id == cudaLaunchAttributeIgnore) continue;
+    if (a.id != cudaLaunchAttributeClusterDimension || has_cluster) return cudaErrorNotSupported;
+    cluster = dim3(a.val.clusterDim.x, a.val.clusterDim.y, a.val.clusterDim.z);
+    has_cluster = true;
+  }
+  return cupbop_launch_kernel(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes,
+                              config->stream, nargs, cluster, has_cluster);
+}
+#endif
 
 }

@@ -313,6 +313,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_bar_arrive(u
 
 // mbarrier / TMA / bulk copy helpers (software mode)
 #include "cudaKernelImpl_async.inc"
+#include "cudaKernelImpl_cluster.inc"
 #include "cudaKernelImpl_tmem.inc"
 
 // Get packed barrier id for DXA

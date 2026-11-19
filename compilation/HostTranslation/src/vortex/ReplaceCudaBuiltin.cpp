@@ -1,4 +1,5 @@
 #include "ReplaceCudaBuiltin.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
@@ -18,6 +19,45 @@ using namespace llvm;
 static bool cupbop_debug() {
   static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
   return enabled;
+}
+
+// CUDA's templated cudaLaunchKernelEx calls the C API through a kernel
+// pointer. Match the host stub to the device name in clang's registration.
+static void replaceExtendedLaunch(Module &M, CallBase &launch,
+                                  const std::map<Function *, std::string> &registered) {
+  IRBuilder<> b(&launch);
+  Type *ptr = b.getPtrTy();
+  auto target = M.getOrInsertFunction("cupbopLaunchKernelEx", b.getInt32Ty(), ptr, ptr, ptr, b.getInt32Ty());
+  auto arguments = [](IRBuilder<> &ir, Value *cfg, Value *args, Function *stub, StringRef name) {
+    return SmallVector<Value *,4>{cfg, ir.CreateGlobalStringPtr(name), args, ir.getInt32(stub->arg_size())};
+  };
+  auto replace = [&](FunctionCallee callee, ArrayRef<Value *> args) {
+    if (auto *invoke = dyn_cast<InvokeInst>(&launch))
+      launch.replaceAllUsesWith(b.CreateInvoke(callee,invoke->getNormalDest(),invoke->getUnwindDest(),args));
+    else
+      launch.replaceAllUsesWith(b.CreateCall(callee,args));
+  };
+  auto *stub = dyn_cast<Function>(launch.getArgOperand(1)->stripPointerCasts());
+  auto it = registered.find(stub);
+  if (it != registered.end()) {
+    replace(target, arguments(b,launch.getArgOperand(0),launch.getArgOperand(2),stub,it->second));
+    return;
+  }
+  auto *dispatch = M.getFunction("__cupbop_dispatch_extended_launch");
+  if (!dispatch) {
+    dispatch = Function::Create(launch.getFunctionType(),Function::InternalLinkage,"__cupbop_dispatch_extended_launch",M);
+    IRBuilder<> ir(BasicBlock::Create(M.getContext(),"entry",dispatch));
+    for (auto &entry : registered) {
+      auto *matched = BasicBlock::Create(M.getContext(),"matched",dispatch);
+      auto *next = BasicBlock::Create(M.getContext(),"next",dispatch);
+      ir.CreateCondBr(ir.CreateICmpEQ(dispatch->getArg(1),entry.first),matched,next);
+      ir.SetInsertPoint(matched);
+      ir.CreateRet(ir.CreateCall(target, arguments(ir,dispatch->getArg(0),dispatch->getArg(2),entry.first,entry.second)));
+      ir.SetInsertPoint(next);
+    }
+    ir.CreateRet(ir.getInt32(98)); // cudaErrorInvalidDeviceFunction
+  }
+  replace(dispatch,{launch.getArgOperand(0),launch.getArgOperand(1),launch.getArgOperand(2)});
 }
 
 /*
@@ -144,6 +184,7 @@ void ReplaceKernelLaunch(llvm::Module *M) {
   */
 
   if (cupbop_debug()) std::cout << "Does it come here?" << std::endl;
+  std::map<Function *, std::string> extendedKernels;
   Function *f_register_global = M->getFunction("__cuda_register_globals");
   if (f_register_global) {
     for (Function::iterator b = f_register_global->begin();
@@ -154,6 +195,10 @@ void ReplaceKernelLaunch(llvm::Module *M) {
         if (llvm::CallInst *callInst = llvm::dyn_cast<llvm::CallInst>(inst)) {
           if (Function *calledFunction = callInst->getCalledFunction()) {
             if (calledFunction->getName().str() == "__cudaRegisterFunction") {
+              StringRef deviceName;
+              if (auto *stub = dyn_cast<Function>(callInst->getArgOperand(1)->stripPointerCasts()))
+                if (getConstantStringInfo(callInst->getArgOperand(2),deviceName))
+                  extendedKernels.emplace(stub,deviceName.str());
               Value *callOperand = callInst->getArgOperand(1);
 
               Function *functionOperand =
@@ -175,6 +220,15 @@ void ReplaceKernelLaunch(llvm::Module *M) {
           }
         }
       }
+    }
+  }
+  // A host-only bitcode module has launch stubs but no fatbin constructor.
+  if (auto *ordinary = M->getFunction("cudaLaunchKernel")) {
+    for (auto *user : ordinary->users()) {
+      auto *call = dyn_cast<CallBase>(user);
+      if (!call || call->arg_empty()) continue;
+      if (auto *stub = dyn_cast<Function>(call->getArgOperand(0)->stripPointerCasts()))
+        extendedKernels.emplace(stub,std::regex_replace(stub->getName().str(),std::regex("__device_stub__"),""));
     }
   }
 bool host_changed = false;
@@ -203,6 +257,11 @@ int kernel_idx = 0;
               //print function name
               if (cupbop_debug()) std::cout << "function_name2: " << calledFunction->getName().str() << std::endl;
 
+              if (calledFunction->getName() == "cudaLaunchKernelExC" && callInst->arg_size() == 3) {
+                replaceExtendedLaunch(*M,*callInst,extendedKernels);
+                need_remove_inst.push_back(callInst);
+                continue;
+              }
               Value *callOperand = callInst->getArgOperand(0);
 
               Function *functionOperand =

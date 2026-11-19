@@ -21,7 +21,7 @@ static inline TcgenOperand tcgen_operand(uint64_t desc) {
   // uses 128B swizzling (mode 2). Reject absolute-stride and other layouts.
   if (((desc >> 46) & 0x7fff) != 1 || (mode != 0 && mode != 2))
     cupbop_async_fail("unsupported TCGEN SMEM descriptor", uint32_t(desc >> 32), uint32_t(desc));
-  const uintptr_t lmem = csr_read_nv(VX_CSR_LOCAL_MEM_BASE);
+  const uintptr_t lmem = csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
   const uintptr_t start = lmem + ((((desc & 0x3fff) << 4) - lmem) & 0x3ffff);
   return {start, uint32_t((desc >> 16) & 0x3fff) * 16, uint32_t((desc >> 32) & 0x3fff) * 16, mode};
 }
@@ -34,6 +34,8 @@ static inline const int8_t *tcgen_chunk(const TcgenOperand &a, unsigned row, uns
   return (const int8_t *)(a.start + offset + (row & 7) * 16 + half * a.leading);
 }
 } // namespace
+
+#endif
 
 // The hardware initializer in lifted Blackwell SASS uses a 20-bit biased
 // expected count at bit 1, a biased pending count at bit 43, and parity at
@@ -87,9 +89,12 @@ extern "C" void __cupbop_tcgen_decline_cancel(uint32_t *response, uint64_t *bar)
   // KMU runs every CTA in the grid. Declining each optional work-stealing
   // request is valid; SM100's query checks bit 0 of the third response word.
   // A completed unsuccessful request still supplies 16 bytes to mbarrier.
-  for (unsigned i = 0; i < 4; ++i)
-    response[i] = 0;
-  __cupbop_tcgen_arrive(bar, 0, -16);
+  unsigned k = __cupbop_cluster_register(1,0);
+  for (unsigned r = 0; r < k; ++r) {
+    auto *p = static_cast<uint32_t *>(__cupbop_cluster_map(response,r));
+    for (unsigned i = 0; i < 4; ++i) p[i] = 0;
+    __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,r)), 0, -16);
+  }
 }
 
 extern "C" unsigned __cupbop_tcgen_wait(uint64_t *bar, unsigned parity, unsigned blocking) {
@@ -109,6 +114,46 @@ extern "C" void __cupbop_tcgen_tma_load(void *smem, const void *desc, uint64_t *
   __cupbop_tcgen_arrive(bar, 0, -int32_t(bytes));
 }
 
+// Complete the selected remote barriers at their matching CTA-relative offset.
+extern "C" void __cupbop_cluster_commit(void *bar, unsigned mask) {
+  for (unsigned r = 0; mask; ++r, mask >>= 1)
+    if (mask & 1) __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,r)), 1, 0);
+}
+
+extern "C" void __cupbop_tma_multicast(void *dst, const void *desc, void *bar, unsigned rank,
+                                       int c0,int c1,int c2,int c3,int c4,unsigned mask) {
+  if (!mask) return;
+  const auto *t = cupbop_tmap_of(desc, rank);
+  unsigned bytes = t->elem;
+  for (unsigned i = 0; i < rank; ++i) bytes *= t->box[i];
+  // Read each source element once. The swizzle phase is local to each receiver.
+  auto *first = static_cast<char *>(__cupbop_cluster_map(dst, __builtin_ctz(mask)));
+  cupbop_tma_box(first, desc, rank, c0,c1,c2,c3,c4,0);
+  for (unsigned peers = mask & (mask - 1); peers; peers &= peers - 1) {
+    auto *target = static_cast<char *>(__cupbop_cluster_map(dst, __builtin_ctz(peers)));
+    for (unsigned row = 0; row < bytes; row += t->box[0] * t->elem) {
+      const uintptr_t src = uintptr_t(first + row), dest = uintptr_t(target + row);
+      const unsigned a = t->swizzle ? ((src >> 7) & 7) << 4 : 0;
+      const unsigned b = t->swizzle ? ((dest >> 7) & 7) << 4 : 0;
+      for (unsigned col = 0; col < t->box[0] * t->elem; col += t->elem)
+        cupbop_copy_elem(reinterpret_cast<void *>((dest+col)^b), reinterpret_cast<const void *>((src+col)^a), t->elem);
+    }
+  }
+  for (; mask; mask &= mask-1)
+    __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,__builtin_ctz(mask))),0,-int32_t(bytes));
+}
+
+extern "C" void __cupbop_bulk_multicast(void *dst, const void *src, unsigned bytes, void *bar, unsigned mask) {
+  if (!mask) return;
+  void *first = __cupbop_cluster_map(dst, __builtin_ctz(mask));
+  __cupbop_bulk_copy(first,src,bytes);
+  for (unsigned peers = mask & (mask-1); peers; peers &= peers-1)
+    __cupbop_bulk_copy(__cupbop_cluster_map(dst,__builtin_ctz(peers)),first,bytes);
+  for (; mask; mask &= mask-1)
+    __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,__builtin_ctz(mask))),0,-int32_t(bytes));
+}
+
+#if defined(VX_CFG_NUM_THREADS) && VX_CFG_NUM_THREADS == 32
 extern "C" void __cupbop_tmem_alloc512(uint32_t *dst) {
   // One full allocation per live CTA. Each slot's logical base is zero.
   if (vx_thread_id() == 0) *dst = 0;

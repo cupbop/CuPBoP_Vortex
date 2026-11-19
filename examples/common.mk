@@ -206,7 +206,7 @@ clean:
 	rm -f .cupbop-live-cta-barrier
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_cluster_dims.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:
@@ -223,20 +223,20 @@ ifeq ($(VORTEX_VER),3)
 # With -nocudalib this clang no longer reports the SDK version, which would select the pre-CUDA-9
 # cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
 # DEVICE_BC_SRC: the examples/lift.mk examples have their device bitcode from a lifted IR file and use this one at most for the source kernels of the program.
-$(DEVICE_BC_SRC): $(KERNEL_CU)
+$(DEVICE_BC_SRC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=$(CUDA_GPU_ARCH) --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
-$(HOST_BC): $(KERNEL_CU)
+$(HOST_BC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h
 	@echo "--- Generate host bitcode (clang --cuda-host-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only --sysroot=/ --target=x86_64-linux-gnu \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
 else
 $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate bitcode files for host and device"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		./$(KERNEL_CU) --sysroot=/ --target=x86_64-linux-gnu \
 		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=$(CUDA_GPU_ARCH) \
 		-lcudart_static -ldl -lrt -pthread -save-temps -v 2>&1 || true
@@ -279,7 +279,7 @@ host.o: host.bc
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 ifeq ($(VORTEX_VER),3)
 # Vortex 3.0: delegate the kernel ELF to Vortex's own regression makefile (see examples/v3_cell.mk).
-kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc)
+kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) $(addprefix $(CuPBoP_PATH)/runtime/include/,cupbop_launch_context.h cupbop_reduce.h)
 	@echo "--- Building kernel ELF with Vortex 3.0 tests/regression/common.mk in $(VX3_CELL)"
 	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
 	printf 'int main(){return 0;}\n' > dummy_host.cpp

@@ -25,6 +25,8 @@ static __attribute__((noinline)) void cupbop_async_fail(const char *what, uint32
   (void)what; (void)a; (void)b; // (vx_printf from many lanes at once did not come out before the stop)
   __asm__ volatile("unimp" ::: "memory");
 }
+#include "cudaKernelImpl_reduce.inc"
+
 static __attribute__((always_inline)) inline uint32_t cupbop_mbar_hw(uint32_t rec) {
   return ((rec & 7u) << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID);
 }
@@ -235,7 +237,11 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
             const int64_t g0 = (int64_t)c[0] + j0;
             const bool in = row_in && g0 >= 0 && g0 < (int64_t)dm[0];
             if (store) {
-              if (in) cupbop_copy_elem((void *)(row + (uint64_t)g0 * e), shared, e);
+              if (in) {
+                void *destination = (void *)(row + (uint64_t)g0 * e);
+                if (store == 1) cupbop_copy_elem(destination, shared, e);
+                else cupbop_reduce_element(destination, shared, t->dtype, store - 2);
+              }
             } else if (in) {
               cupbop_copy_elem(shared, row + (uint64_t)g0 * e, e);
             } else {
@@ -437,4 +443,13 @@ extern "C" __attribute__((noinline)) void __cupbop_bulk_copy(void *dst, const vo
   uint64_t *d = (uint64_t *)dst;
   const uint64_t *s = (const uint64_t *)src;
   for (uint32_t i = 0; i < bytes / 8; ++i) d[i] = s[i];
+}
+
+extern "C" void __cupbop_tensor_reduce(const void *desc,void *src,unsigned rank,int c0,int c1,int c2,int c3,int c4,unsigned op) {
+  const unsigned t = cupbop_tmap_of(desc,rank)->dtype;
+  const bool supported = op == ReduceAdd ? (t == 2 || t == 3 || t == 4 || t == 6 || t == 7 || t == 9) :
+                         op == ReduceMin || op == ReduceMax ? (t >= 2 && t <= 6) || t == 9 :
+                         op == ReduceInc || op == ReduceDec ? t == 2 : t >= 2 && t <= 5;
+  if (!supported) cupbop_async_fail("invalid tensor reduction operation or element type",op,t);
+  cupbop_tma_box(src,desc,rank,c0,c1,c2,c3,c4,int(op)+2);
 }

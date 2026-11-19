@@ -1,12 +1,14 @@
 // Hopper / Ampere asynchronous PTX (mbarrier, TMA, bulk copy, elect, cluster registers, proxy fences) lowered
 // to CuPBoP internal calls in software mode. See async_ptx.h and 2026-10-28_ASYNC_DESIGN_KO.md (§4-§6).
 #include "async_ptx.h"
+#include "../../../runtime/include/cupbop_reduce.h"
 #include "async_copy.h"
 #include "tool.h"
 
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -21,6 +23,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -39,7 +42,7 @@ const char *kInit = "__cupbop_mbar_init", *kArrive = "__cupbop_mbar_arrive", *kA
            *kWaitPar = "__cupbop_mbar_wait_parity", *kTestPar = "__cupbop_mbar_test_parity",
            *kWaitSt = "__cupbop_mbar_wait_state", *kTestSt = "__cupbop_mbar_test_state",
            *kElect = "__cupbop_elect_sync", *kElectLane = "__cupbop_elect_lane", *kTmaLoad = "__cupbop_tma_load",
-           *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy", *kRankFail = "__cupbop_cluster_rank_fail",
+           *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy",
            *kActive = "__cupbop_activemask", *kTmaLoadQi = "__cupbop_tma_load_qi",
            *kArriveM = "__cupbop_mbar_arrive_m", *kArriveTxM = "__cupbop_mbar_arrive_tx_m", *kTmaSlot = "__cupbop_tma_slot",
            *kTxqIssue = "__cupbop_txq_issue", *kTxqCheck = "__cupbop_txq_check";
@@ -191,7 +194,7 @@ bool ownedOp(const Stmt &s) {
   auto sw = [&](const char *p) { return o.rfind(p, 0) == 0; };
   if (sw("clusterlaunchcontrol.") || sw("tcgen05.") || sw("mbarrier.") || sw("cp.async.bulk") ||
       sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
-      sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
+      sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
       sw("cvta.param") || sw("multimem.") || sw("tensormap."))
     return true;
   if ((sw("fence.") && o.find(".cluster") != std::string::npos)) return true;
@@ -244,6 +247,7 @@ struct PassState {
     FunctionCallee f = M->getOrInsertFunction(name, FunctionType::get(ret, args, false));
     if (auto *Fn = dyn_cast<Function>(f.getCallee())) {
       if (convergent) Fn->addFnAttr(Attribute::Convergent);
+      if (StringRef(name) == "__cupbop_cluster_sync") Fn->addFnAttr(Attribute::NoDuplicate);
       if (noreturn) Fn->addFnAttr(Attribute::NoReturn);
     }
     return f;
@@ -257,6 +261,15 @@ struct PassState {
   }
 };
 
+// CUDA CTA coordinates are relative to the recorded launch geometry.
+static Value *clusterRegister(PassState &S, IRBuilder<> &B, StringRef reg) {
+  unsigned axis = reg.ends_with(".z") ? 2 : reg.ends_with(".y") ? 1 : 0;
+  unsigned which = reg.contains("is_explicit_cluster") || reg.contains("is.explicit.cluster") ? 6 :
+                   reg.contains("nclusterid") ? 5 : reg.contains("clusterid") ? 4 :
+                   reg.contains("nctaid") ? 3 : reg.contains("ctaid") ? 2 : reg.contains("nctarank") ? 1 : 0;
+  return S.call(B, "__cupbop_cluster_register", S.I32, {B.getInt32(which), B.getInt32(axis)});
+}
+
 // A pointer (generic address space) for an address operand value.
 Value *toPointer(IRBuilder<> &B, PassState &S, Value *V, Instruction *at, const char *what) {
   Value *P = nullptr;
@@ -267,6 +280,8 @@ Value *toPointer(IRBuilder<> &B, PassState &S, Value *V, Instruction *at, const 
     return P;
   }
   if (V->getType()->isIntegerTy(64)) return B.CreateIntToPtr(V, S.Ptr, "async_i2p"); // flat memory
+  if (V->getType()->isIntegerTy(32) && (StringRef(what).contains("shared") || StringRef(what).contains("barrier")))
+    return S.call(B,"__cupbop_cluster_shared_ptr",S.Ptr,{V});
   fail_at(at, std::string("cannot recover the ") + what +
                   " pointer from its 32-bit operand (expected a cvta / ptrtoint of a pointer)");
 }
@@ -314,10 +329,8 @@ struct AsmLowering {
         if (k - nout >= C->arg_size()) fail("operand `" + t + "` out of range");
         v = C->getArgOperand(k - nout);
       }
-    } else if (t == "%cluster_ctarank" || t.rfind("%cluster_ctaid", 0) == 0 || t == "%is_explicit_cluster") {
-      v = ConstantInt::get(S.I32, 0);
-    } else if (t == "%cluster_nctarank" || t.rfind("%cluster_nctaid", 0) == 0) {
-      v = ConstantInt::get(S.I32, 1);
+    } else if (t.rfind("%cluster", 0) == 0 || t.rfind("%nclusterid", 0) == 0 || t == "%is_explicit_cluster") {
+      v = clusterRegister(S,B,t);
     } else if (t[0] == '%') {
       fail("special register `" + t + "` in async asm is not supported");
     } else if (isdigit((unsigned char)t[0]) || t[0] == '-') {
@@ -333,6 +346,7 @@ struct AsmLowering {
     if (want && v->getType() != want) {
       if (v->getType()->isPointerTy() && want->isIntegerTy()) v = B.CreatePtrToInt(v, want);
       else if (v->getType()->isIntegerTy() && want->isIntegerTy()) v = B.CreateZExtOrTrunc(v, want);
+      else if (v->getType()->isFloatingPointTy() && want->isIntegerTy() && v->getType()->getPrimitiveSizeInBits() == want->getPrimitiveSizeInBits()) v = B.CreateBitCast(v,want);
       else fail("operand `" + t + "` has an unexpected type");
     }
     return v;
@@ -375,6 +389,7 @@ struct AsmLowering {
       if (v->getType() != T) {
         if (v->getType()->isIntegerTy() && T->isIntegerTy()) v = B.CreateZExtOrTrunc(v, T);
         else if (v->getType()->isPointerTy() && T->isIntegerTy()) v = B.CreatePtrToInt(v, T);
+        else if (T->isFloatingPointTy() && v->getType()->getPrimitiveSizeInBits() == T->getPrimitiveSizeInBits()) v = B.CreateBitCast(v,T);
         else fail("cannot assign to output `" + d + "`");
       }
       outVal[k] = v;
@@ -488,7 +503,7 @@ struct AsmLowering {
     };
     auto width = [&]() -> Type * {
       for (auto &t : s.tok)
-        if (t.size() >= 2 && (t[0] == 'u' || t[0] == 's' || t[0] == 'b') && isdigit((unsigned char)t[1]))
+        if (t.size() >= 2 && (t[0] == 'u' || t[0] == 's' || t[0] == 'b' || t[0] == 'f') && isdigit((unsigned char)t[1]))
           return IntegerType::get(S.ctx, std::atoi(t.c_str() + 1));
       return S.I32;
     };
@@ -613,32 +628,69 @@ struct AsmLowering {
       return;
     }
     if (sw("mapa")) {
-      nops(3, 3);
-      // clusters of one CTA: mapa(a, 0) = a; any other rank traps (and the predicate is false afterwards)
-      Value *a = val(s.ops[1], nullptr);
-      Value *rank = val(s.ops[2], S.I32);
-      bool known0 = isa<ConstantInt>(rank) && cast<ConstantInt>(rank)->isZero();
-      if (!known0) {
-        Value *bad = B.CreateICmpNE(rank, ConstantInt::get(S.I32, 0));
-        if (pred && !isa<ConstantInt>(pred)) bad = B.CreateAnd(bad, pred);
-        if (!(pred && isa<ConstantInt>(pred) && cast<ConstantInt>(pred)->isZero())) {
-          // a normal join, not `unreachable`: the Vortex back end inserts no split/join for a divergent branch
-          // whose immediate post-dominator is unreachable, and the warp then never reconverges (lifted tma2d hung)
-          Instruction *T = SplitBlockAndInsertIfThen(bad, C->getIterator(), /*Unreachable=*/false);
-          IRBuilder<> TB(T);
-          TB.CreateCall(S.fn(kRankFail, S.Void, {S.I32}, false, false), {rank});
-          B.SetInsertPoint(C);
-        }
-        // past the check the predicate cannot hold (a rank != 0 trapped)
-        if (!s.pred.empty() && !s.neg && pred && !isa<ConstantInt>(pred)) regs[s.pred] = ConstantInt::getFalse(S.ctx);
+      nops(3,3);
+      Value *mapped = underPred(pred, [&]() -> Value * {
+        auto *a = toPointer(B,S,val(s.ops[1],nullptr),C,"shared");
+        return S.call(B,"__cupbop_cluster_map",S.Ptr,{a,val(s.ops[2],S.I32)});
+      });
+      if (mapped) setReg(trim(s.ops[0]),mapped,pred);
+      return;
+    }
+    if (sw("st.async.")) {
+      if (!s.has("shared::cluster") || !s.has("mbarrier::complete_tx::bytes") ||
+          s.has("v2") || s.has("v4")) fail("unsupported async store form");
+      nops(3,3);
+      Type *ty = width();
+      underPred(pred,[&]() -> Value * {
+        B.CreateStore(val(s.ops[1],ty),addr(s.ops[0],"shared destination"));
+        return S.call(B,"__cupbop_tcgen_arrive",S.I64,{addr(s.ops[2],"completion barrier"),
+                        B.getInt32(0),B.getInt32(-int(ty->getIntegerBitWidth()/8))});
+      });
+      return;
+    }
+    if (sw("getctarank") || sw("isspacep.shared::cluster")) {
+      nops(2,2);
+      Value *value = underPred(pred,[&]() -> Value * {
+        auto *ptr = toPointer(B,S,val(s.ops[1],nullptr),C,"shared");
+        return S.call(B,sw("getctarank") ? "__cupbop_cluster_query_rank" : "__cupbop_cluster_contains",
+                      S.I32,{ptr});
+      });
+      if (value) setReg(s.ops[0],value,pred);
+      return;
+    }
+    if (sw("ld.shared::cluster.") || sw("st.shared::cluster.")) {
+      bool load = sw("ld.");
+      nops(2,2);
+      const unsigned count = s.has("v4") ? 4 : s.has("v2") ? 2 : 1;
+      Type *ty = width();
+      std::string reg = trim(s.ops[load ? 0 : 1]);
+      std::vector<std::string> regs = {reg};
+      if (count > 1) {
+        if (reg.size() < 2 || reg.front() != '{' || reg.back() != '}') fail("expected a shared vector operand");
+        regs = splitTop(reg.substr(1,reg.size()-2), ',');
+        if (regs.size() != count) fail("wrong number of shared vector elements");
       }
-      setReg(trim(s.ops[0]), a, nullptr);
+      for (unsigned i=0; i<count; ++i) {
+        Value *value = underPred(pred,[&]() -> Value * {
+          auto *ptr = addr(s.ops[load ? 1 : 0],"shared::cluster");
+          if (i) ptr = B.CreateGEP(ty,ptr,B.getInt32(i));
+          if (load) {
+            Value *v = B.CreateLoad(ty,ptr);
+            if (ty->getIntegerBitWidth()<32 && (s.has("s8") || s.has("s16")))
+              v = B.CreateSExt(v,S.I32);
+            return v;
+          }
+          B.CreateStore(val(regs[i],ty),ptr);
+          return nullptr;
+        });
+        if (load && value) setReg(trim(regs[i]),value,pred);
+      }
       return;
     }
     // --- fences and hints
     if (sw("fence.proxy.") || sw("fence.mbarrier_init") || sw("setmaxnreg.") || sw("griddepcontrol.") ||
         sw("prefetch.tensormap") || sw("cp.async.bulk.prefetch") || sw("cp.async.bulk.commit_group") ||
-        sw("cp.async.bulk.wait_group") || sw("barrier.cluster.arrive") || sw("tensormap.cp_fenceproxy") ||
+        sw("cp.async.bulk.wait_group") || sw("tensormap.cp_fenceproxy") ||
         sw("wgmma.fence") || sw("wgmma.commit_group") || sw("wgmma.wait_group")) {
       return; // synchronous software copies: nothing to order beyond the compiler fence
     }
@@ -649,9 +701,10 @@ struct AsmLowering {
       });
       return;
     }
-    if (sw("barrier.cluster.wait")) {
-      if (pred) fail("predicated barrier.cluster.wait");
-      B.CreateCall(S.M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(S.Void, false)), {});
+    if (sw("barrier.cluster.")) {
+      underPred(pred,[&]() -> Value * {
+        return S.call(B,"__cupbop_cluster_sync",S.Void,{B.getInt32(sw("barrier.cluster.wait") ? 1 : 0)});
+      });
       return;
     }
     // --- mbarrier
@@ -680,7 +733,10 @@ struct AsmLowering {
       // lower_cp_async makes the copies synchronous
       return;
     }
-    if (sw("cp.reduce.async.bulk")) fail("cp.reduce.async.bulk (bulk reductions) is not supported");
+    if (sw("cp.reduce.async.bulk")) {
+      lowerBulk(idx,pred,true);
+      return;
+    }
     if (sw("cp.async.bulk")) {
       lowerBulk(idx, pred);
       return;
@@ -733,6 +789,12 @@ struct AsmLowering {
         setReg(dst[i], S.call(B, "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
       return;
     }
+    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64") {
+      underPred(pred,[&]() -> Value * {
+        return S.call(B,"__cupbop_cluster_commit",S.Void,{addr(s.ops[0],"barrier"),val(s.ops[1],S.I32)});
+      });
+      return;
+    }
     if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64" && s.ops.size() == 1) {
       underPred(pred, [&]() -> Value * {
         B.CreateFence(AtomicOrdering::Release);
@@ -747,7 +809,7 @@ struct AsmLowering {
   void lowerMbarrier(size_t idx, Value *pred) {
     const Stmt &s = st[idx];
     const std::string what = s.tok.size() > 1 ? s.tok[1] : "";
-    if (s.has("shared::cluster") && what != "arrive")
+    if (s.has("shared::cluster") && !S.tcgenFunctions.count(F) && what != "arrive")
       fail("`" + s.op + "` on a shared::cluster address (clusters are not supported)");
     if (S.tcgenFunctions.count(F)) {
       if (what == "init" && s.ops.size() == 2) {
@@ -838,10 +900,18 @@ struct AsmLowering {
     fail("unsupported mbarrier operation `" + s.op + "`");
   }
 
-  void lowerBulk(size_t idx, Value *pred) {
-    const Stmt &s = st[idx];
+  void lowerBulk(size_t idx, Value *pred, bool reduction = false) {
+    Stmt s = st[idx];
+    unsigned op = ReduceAdd;
+    if (reduction) {
+      s.tok.erase(s.tok.begin()+1);
+      const std::vector<std::string> names = {"add","min","max","inc","dec","and","or","xor"};
+      auto it = std::find_if(names.begin(),names.end(),[&](const auto &name){return s.has(name);});
+      if (it == names.end()) fail("unknown bulk reduction operation");
+      op = it - names.begin();
+    }
     needWarps();
-    for (const char *bad : {"multicast::cluster", "cta_group::1", "cta_group::2", "cp_mask", "im2col", "im2col::w",
+    for (const char *bad : {"cta_group::1", "cta_group::2", "cp_mask", "im2col", "im2col::w",
                             "im2col::w::128", "tile::gather4", "tile::scatter4", "im2col_no_offs"})
       if (s.has(bad)) fail("`" + s.op + "`: ." + bad + " is not supported");
     std::vector<std::string> ops = s.ops;
@@ -875,12 +945,14 @@ struct AsmLowering {
       };
       if (load) {
         if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: a tensor load must complete on an mbarrier");
-        if (ops.size() != 3) fail("`" + s.op + "`: expected [dst], [tmap, {coords}], [mbar]");
+        if (ops.size() != (s.has("multicast::cluster") ? 4 : 3)) fail("invalid tensor-load operand count");
         underPred(pred, [&]() -> Value * {
           Value *dst = addr(ops[0], "shared destination");
           Value *desc = nullptr;
           std::vector<Value *> c = coords(ops[1], desc);
           Value *mb = addr(ops[2], "mbarrier"); // DXA mode completes the transfer there; software mode ignores it
+          if (s.has("multicast::cluster"))
+            return S.call(B,"__cupbop_tma_multicast",S.Void,{dst,desc,mb,B.getInt32(rank),c[0],c[1],c[2],c[3],c[4],val(ops[3],S.I32)});
           bool tcgen = S.tcgenFunctions.count(F);
           CallInst *k = S.call(B, tcgen ? "__cupbop_tcgen_tma_load" : kTmaLoad, S.Void,
                                {dst, desc, mb, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
@@ -896,6 +968,8 @@ struct AsmLowering {
           Value *desc = nullptr;
           std::vector<Value *> c = coords(ops[0], desc);
           Value *src = addr(ops[1], "shared source");
+          if (reduction)
+            return S.call(B,"__cupbop_tensor_reduce",S.Void,{desc,src,B.getInt32(rank),c[0],c[1],c[2],c[3],c[4],B.getInt32(op)});
           S.call(B, kTmaStore, S.Void, {desc, src, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
           return nullptr;
         });
@@ -909,13 +983,33 @@ struct AsmLowering {
     const bool g2s = dsp.rfind("shared::", 0) == 0 && ssp == "global";
     const bool s2s = dsp == "shared::cluster" && ssp == "shared::cta";
     const bool s2g = dsp == "global" && ssp == "shared::cta";
+    if (reduction) {
+      const bool remote = s.has("shared::cluster") && s.has("mbarrier::complete_tx::bytes");
+      if (!(remote || (s.has("global") && s.has("bulk_group"))) || !s.has("shared::cta") ||
+          ops.size() != (remote ? 4 : 3)) fail("invalid bulk reduction direction or operands");
+      const std::map<std::string,unsigned> types = {{"b32",2},{"u32",2},{"s32",3},{"b64",4},{"u64",4},
+          {"s64",5},{"f16",6},{"f32",7},{"f64",8},{"bf16",9}};
+      auto ty = types.find(s.tok.back());
+      if (ty == types.end()) fail("unsupported bulk reduction type");
+      underPred(pred,[&]() -> Value * {
+        auto *size = val(ops[2],S.I32);
+        S.call(B,"__cupbop_bulk_reduce",S.Void,{addr(ops[0],remote?"shared destination":"global destination"),
+               addr(ops[1],"shared source"),size,B.getInt32(ty->second),B.getInt32(op)});
+        if (remote) S.call(B,"__cupbop_tcgen_arrive",S.I64,{addr(ops[3],"barrier"),B.getInt32(0),B.CreateNeg(size)});
+        return nullptr;
+      });
+      return;
+    }
     if (g2s || s2s) {
       if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: expected mbarrier::complete_tx::bytes");
-      if (ops.size() != 4) fail("`" + s.op + "`: expected [dst], [src], size, [mbar]");
+      const bool multicast = s.has("multicast::cluster");
+      if (ops.size() != (multicast ? 5 : 4)) fail("invalid bulk copy operand count");
       underPred(pred, [&]() -> Value * {
         Value *dst = addr(ops[0], "shared destination");
         Value *src = addr(ops[1], "source");
         Value *n = val(ops[2], S.I32);
+        if (multicast)
+          return S.call(B,"__cupbop_bulk_multicast",S.Void,{dst,src,n,addr(ops[3],"completion barrier"),val(ops[4],S.I32)});
         CallInst *k = S.call(B, kBulk, S.Void, {dst, src, n}, false);
         if (S.tcgenFunctions.count(F))
           S.call(B, "__cupbop_tcgen_arrive", S.I64,
@@ -1008,19 +1102,20 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
-  if (n == "llvm.nvvm.read.ptx.sreg.smid") return done(S.call(B, "__cupbop_smid", S.I32, {}));
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctarank") || n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctaid") ||
-      n.starts_with("llvm.nvvm.read.ptx.sreg.is.explicit.cluster"))
-    return done(ConstantInt::get(C->getType(), 0));
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.nctarank") || n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.nctaid"))
-    return done(ConstantInt::get(C->getType(), 1));
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.clusterid.") || n.starts_with("llvm.nvvm.read.ptx.sreg.nclusterid.")) {
-    std::string d = n.str().substr(n.rfind('.') + 1);
-    bool nc = n.contains("nclusterid");
-    Function *G = S.M->getFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d);
-    FunctionCallee GC = G ? FunctionCallee(G) : S.M->getOrInsertFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d, FunctionType::get(S.I32, false));
-    return done(B.CreateCall(GC, {}));
+  if (n.starts_with("llvm.nvvm.mapa")) {
+    Value *mapped = S.call(B,"__cupbop_cluster_map",S.Ptr,{P(0),C->getArgOperand(1)});
+    return done(B.CreatePointerCast(mapped,C->getType()));
   }
+  if (n == "llvm.nvvm.isspacep.shared.cluster")
+    return done(S.call(B,"__cupbop_cluster_contains",S.I32,{P(0)}));
+  if (n.starts_with("llvm.nvvm.getctarank"))
+    return done(S.call(B,"__cupbop_cluster_query_rank",S.I32,{P(0)}));
+  if (n == "llvm.nvvm.is_explicit_cluster")
+    return done(clusterRegister(S,B,"is_explicit_cluster"));
+  if (n == "llvm.nvvm.read.ptx.sreg.smid") return done(S.call(B, "__cupbop_smid", S.I32, {}));
+  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster") || n.starts_with("llvm.nvvm.read.ptx.sreg.nclusterid") ||
+      n.starts_with("llvm.nvvm.read.ptx.sreg.is.explicit.cluster"))
+    return done(clusterRegister(S,B,n));
   if (S.tcgenFunctions.count(F) && n.starts_with("llvm.nvvm.mbarrier.")) {
     auto *zero = B.getInt32(0);
     if (n.starts_with("llvm.nvvm.mbarrier.init")) {
@@ -1070,13 +1165,57 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
   if (n == "llvm.nvvm.cp.async.bulk.commit.group" || n.starts_with("llvm.nvvm.cp.async.bulk.wait.group") ||
       n.starts_with("llvm.nvvm.cp.async.bulk.prefetch") || n.starts_with("llvm.nvvm.cp.async.bulk.tensor.prefetch") ||
       n.starts_with("llvm.nvvm.fence.proxy") || n.starts_with("llvm.nvvm.setmaxnreg") ||
-      n.starts_with("llvm.nvvm.griddepcontrol") || n.starts_with("llvm.nvvm.prefetch.tensormap") ||
-      n.starts_with("llvm.nvvm.barrier.cluster.arrive")) {
+      n.starts_with("llvm.nvvm.griddepcontrol") || n.starts_with("llvm.nvvm.prefetch.tensormap")) {
     B.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
     return done(nullptr);
   }
-  if (n.starts_with("llvm.nvvm.barrier.cluster.wait")) {
-    B.CreateCall(S.M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(S.Void, false)), {});
+  if (n.starts_with("llvm.nvvm.fence.") && n.ends_with(".cluster")) {
+    B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+    return done(nullptr);
+  }
+  if (n == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
+      n == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") {
+    S.needWarps.insert(F);
+    Value *bytes = C->getArgOperand(3);
+    const bool multicast = C->arg_size() == 8 && !cast<ConstantInt>(C->getArgOperand(6))->isZero();
+    if (multicast)
+      S.call(B,"__cupbop_bulk_multicast",S.Void,{P(0),P(2),bytes,P(1),B.CreateZExt(C->getArgOperand(4),S.I32)});
+    else {
+      S.call(B,kBulk,S.Void,{P(0),P(2),bytes});
+      S.call(B,"__cupbop_tcgen_arrive",S.I64,{P(1),B.getInt32(0),B.CreateNeg(bytes)});
+    }
+    return done(nullptr);
+  }
+  if (n == "llvm.nvvm.cp.async.bulk.shared.cta.to.global") {
+    S.call(B,kBulk,S.Void,{P(0),P(1),C->getArgOperand(2)});
+    return done(nullptr);
+  }
+  if (n.starts_with("llvm.nvvm.cp.async.bulk.tensor.") && n.contains(".tile.")) {
+    S.needWarps.insert(F);
+    bool load = n.contains(".g2s.");
+    unsigned rank = n.rsplit('.').second.front() - '0';
+    SmallVector<Value *,10> args;
+    if (load) args = {P(0),P(2),P(1)};
+    else args = {P(1),P(0)};
+    args.push_back(B.getInt32(rank));
+    for (unsigned d=0; d<5; ++d)
+      args.push_back(d < rank ? C->getArgOperand((load ? 3 : 2) + d) : B.getInt32(0));
+    if (load) {
+      bool multicast = !cast<ConstantInt>(C->getArgOperand(rank+5))->isZero();
+      if (multicast) args.push_back(B.CreateZExt(C->getArgOperand(rank+3),S.I32));
+      S.call(B,multicast ? "__cupbop_tma_multicast" : "__cupbop_tcgen_tma_load",S.Void,args);
+    } else if (n.contains(".reduce.")) {
+      StringRef op = n.split(".reduce.").second.split('.').first;
+      static const StringRef names[] = {"add","min","max","inc","dec","and","or","xor"};
+      auto id = llvm::find(names,op) - std::begin(names);
+      if (id == std::size(names)) fail_at(C,"unknown tensor reduction operation");
+      args.push_back(B.getInt32(id));
+      S.call(B,"__cupbop_tensor_reduce",S.Void,args);
+    } else S.call(B,kTmaStore,S.Void,args);
+    return done(nullptr);
+  }
+  if (n.starts_with("llvm.nvvm.barrier.cluster.")) {
+    S.call(B,"__cupbop_cluster_sync",S.Void,{B.getInt32(n.contains("wait") ? 1 : 0)});
     return done(nullptr);
   }
   if (n == "llvm.nvvm.elect.sync") {
@@ -2010,12 +2149,20 @@ void lower_async_ptx(Module *M) {
           const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
           if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
           if (body.find("tcgen05.") != std::string::npos ||
-              body.find("clusterlaunchcontrol.try_cancel") != std::string::npos)
+              body.find("clusterlaunchcontrol.try_cancel") != std::string::npos ||
+              body.find("multicast::cluster") != std::string::npos || body.find("cp.reduce.async.bulk") != std::string::npos ||
+              body.find("st.async.") != std::string::npos ||
+              (body.find("mbarrier.") != std::string::npos && body.find("shared::cluster") != std::string::npos) ||
+              body.find("shared::cluster.shared::cta") != std::string::npos || body.find("mapa.") != std::string::npos)
             S.tcgenFunctions.insert(&F);
         } else if (auto *callee = C->getCalledFunction()) {
           if (callee->getName().starts_with("llvm.nvvm.")) {
             calls.push_back(C);
             if (callee->getName().contains("mbarrier")) barrierFunctions.insert(&F);
+            StringRef name = callee->getName();
+            if (name.starts_with("llvm.nvvm.mapa") || name.starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.") ||
+                name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
+                name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
           } else if (!callee->isDeclaration()) {
             callers[callee].push_back(&F);
             callees[&F].push_back(callee);
@@ -2072,6 +2219,70 @@ void lower_async_ptx(Module *M) {
     L.st = st;
     L.run();
     S.n_asm++;
+  }
+  // Record fixed geometry and the kernels whose threads participate in a split
+  // barrier (including through a callee). Retired threads no longer owe an arrival.
+  std::set<Function *> syncKernels;
+  if (auto *sync = M->getFunction("__cupbop_cluster_sync")) {
+    std::vector<Function *> pending;
+    for (auto *u : sync->users())
+      if (auto *call = dyn_cast<CallInst>(u)) pending.push_back(call->getFunction());
+    while (!pending.empty()) {
+      auto *f = pending.back(); pending.pop_back();
+      if (!syncKernels.insert(f).second) continue;
+      pending.insert(pending.end(),callers[f].begin(),callers[f].end());
+    }
+  }
+  std::map<Function *, std::array<unsigned,3>> sourceShapes;
+  if (auto *annotations = M->getGlobalVariable("llvm.global.annotations")) {
+    for (auto &operand : annotations->getInitializer()->operands()) {
+      auto *record = dyn_cast<ConstantStruct>(operand.get());
+      StringRef tag;
+      if (!record || record->getNumOperands() < 5 || !getConstantStringInfo(record->getOperand(1), tag) ||
+          tag != "cupbop.cluster_dims") continue;
+      auto *kernel = cast<Function>(record->getOperand(0)->stripPointerCasts());
+      auto *args = cast<GlobalVariable>(record->getOperand(4)->stripPointerCasts())->getInitializer();
+      if (args->getNumOperands() == 0 || args->getNumOperands() > 3)
+        report_fatal_error("invalid __cluster_dims__ argument count");
+      auto &dims = sourceShapes[kernel];
+      dims = {1,1,1};
+      for (unsigned d=0; d<args->getNumOperands(); ++d) {
+        auto *value = dyn_cast<ConstantInt>(args->getOperand(d));
+        if (!value || value->isZero() || value->getLimitedValue() > 16)
+          report_fatal_error("invalid __cluster_dims__ dimension");
+        dims[d] = value->getZExtValue();
+      }
+    }
+  }
+  std::ofstream shapes("cupbop_cluster_dims.txt");
+  for (auto &F : *M) {
+    if (!isKernelFunction(M,&F)) continue;
+    auto dims = sourceShapes[&F];
+    if (auto *metadata = M->getNamedMetadata("nvvm.annotations"))
+      for (auto *node : metadata->operands()) {
+        auto *v = dyn_cast<ValueAsMetadata>(node->getOperand(0));
+        if (!v || v->getValue() != &F) continue;
+        for (unsigned i=1; i+1<node->getNumOperands(); i+=2) {
+          auto *key = dyn_cast<MDString>(node->getOperand(i));
+          auto *number = mdconst::dyn_extract<ConstantInt>(node->getOperand(i+1));
+          if (!key || !number) continue;
+          StringRef k = key->getString();
+          if (k == "cluster_dim_x" || k == "cluster_dim_y" || k == "cluster_dim_z")
+            dims[k.back()-'x'] = number->getZExtValue();
+        }
+      }
+    if (dims[0]) {
+      if (!dims[1]) dims[1] = 1;
+      if (!dims[2]) dims[2] = 1;
+    }
+    const bool sync = syncKernels.count(&F);
+    if (sync || dims[0]) shapes << cupbop_kernel_lookup_name(F.getName().str()) << ' ' << dims[0] << ' ' << dims[1]
+                                << ' ' << dims[2] << ' ' << sync << '\n';
+    if (sync) for (auto &BB : F)
+      if (auto *ret = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        IRBuilder<> rb(ret);
+        S.call(rb,"__cupbop_cluster_sync",S.Void,{rb.getInt32(2)});
+      }
   }
   if (!S.n_asm && !S.n_intr) {
     std::remove("cupbop_async_kernels.txt");
