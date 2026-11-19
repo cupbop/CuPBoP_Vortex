@@ -170,6 +170,8 @@ int main(int argc, char **argv) {
       if (has_switch) FAM.invalidate(F, LowerSwitchPass().run(F, FAM));
       FAM.invalidate(F, FixIrreduciblePass().run(F, FAM));
       FAM.invalidate(F, LoopSimplifyPass().run(F, FAM));
+      if (getVirtGeom().subpasses > 1 && isKernelFunction(program, &F))
+        record_uniform_loop_selectors(F, FAM);
       fprintf(stderr, "[fixirr] %s: irreducible control flow made reducible (FixIrreducible%s + LoopSimplify)\n",
               F.getName().str().c_str(), has_switch ? " after LowerSwitch" : "");
     }

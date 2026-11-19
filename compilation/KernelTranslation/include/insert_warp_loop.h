@@ -4,9 +4,11 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 
 using namespace llvm;
 
+void record_uniform_loop_selectors(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
 void insert_warp_loop(llvm::Module *M);
 // core mapping: move the context arrays to the host-allocated scratch buffer (after the translator's -O3)
 void virt_ctx_to_scratch(llvm::Module *M);

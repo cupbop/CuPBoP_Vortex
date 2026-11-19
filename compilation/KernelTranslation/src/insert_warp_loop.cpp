@@ -20,6 +20,11 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/TargetTransformInfoImpl.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
+#include "llvm/ADT/GenericUniformityImpl.h"
+#include "llvm/IR/ValueMap.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
@@ -2411,6 +2416,58 @@ void remove_barrier(llvm::Function *F, bool intra_warp_loop,
   }  
 }
 
+// Before init_block demotes PHIs, LLVM can distinguish a lane-dependent selector
+// from one that only chooses between the launch parameters and CTA-uniform loop
+// iterations. After demotion the same selector looks like a per-lane spill.
+namespace {
+ValueMap<const Value *, bool> uniformLoopSelectors;
+
+struct CtaUniformityTTI : TargetTransformInfoImplCRTPBase<CtaUniformityTTI> {
+  explicit CtaUniformityTTI(const DataLayout &DL) : TargetTransformInfoImplCRTPBase(DL) {}
+  bool isSourceOfDivergence(const Value *V) const {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I) return false; // Called only on kernel entries: the arguments are CTA-uniform.
+    if (auto *L = dyn_cast<LoadInst>(I)) {
+      auto *A = dyn_cast<Argument>(getUnderlyingObject(L->getPointerOperand()));
+      // These are CuPBoP's by-value launch slots. UniformityInfo still tracks
+      // the GEP index, so a per-lane offset gives a per-lane load.
+      return !L->isSimple() || !A ||
+             !A->getParent()->getAttributes().hasParamAttr(A->getArgNo(), "cupbop-arg-slots");
+    }
+    if (auto *C = dyn_cast<CallBase>(I)) {
+      auto *F = C->getCalledFunction();
+      if (!F || !F->isIntrinsic()) return true;
+      auto N = F->getName();
+      return !N.starts_with("llvm.nvvm.read.ptx.sreg.ctaid.") &&
+             !N.starts_with("llvm.nvvm.read.ptx.sreg.ntid.") &&
+             !N.starts_with("llvm.nvvm.read.ptx.sreg.nctaid.");
+    }
+    if (isa<PHINode, BranchInst, SwitchInst, CmpInst, CastInst, BinaryOperator,
+            SelectInst, GetElementPtrInst, ExtractValueInst, ExtractElementInst>(I))
+      return false; // LLVM propagates data, control and temporal divergence.
+    return true;
+  }
+};
+
+} // namespace
+
+void record_uniform_loop_selectors(Function &F, FunctionAnalysisManager &FAM) {
+  SmallVector<BranchInst *> selectors;
+  const auto &LI = FAM.getResult<LoopAnalysis>(F);
+  for (auto &B : F) {
+    auto *BI = dyn_cast<BranchInst>(B.getTerminator());
+    if (BI && BI->isConditional() && LI.isLoopHeader(&B) && isa<PHINode>(BI->getCondition()))
+      selectors.push_back(BI);
+  }
+  if (selectors.empty()) return;
+  TargetTransformInfo TTI{CtaUniformityTTI(F.getParent()->getDataLayout())};
+  UniformityInfo UI(FAM.getResult<DominatorTreeAnalysis>(F), FAM.getResult<CycleAnalysis>(F), &TTI);
+  UI.compute();
+  for (auto *BI : selectors)
+    if (!UI.isDivergentUse(BI->getOperandUse(0)))
+      uniformLoopSelectors[BI] = true;
+}
+
 // Core mapping, single warp loop: code between the warp loops runs once per physical warp, every lane holding its
 // logical thread of slot 0. A branch there on a thread-dependent value (DI) splits the lanes of a physical warp, and
 // the physical warps of a CTA, different ways. The kernel's own barriers are never under such a branch (CUDA requires
@@ -2502,7 +2559,7 @@ static void note_p1_only_kernel(llvm::Function &F, const std::vector<ParallelReg
     if (wrapped.count(&X)) continue;
     auto *BI = llvm::dyn_cast<llvm::BranchInst>(X.getTerminator());
     if (!BI || !BI->isConditional() || llvm::isa<llvm::Constant>(BI->getCondition())) continue;
-    if (!DI.isDivergent(BI->getCondition())) continue;
+    if (uniformLoopSelectors.count(BI) || !DI.isDivergent(BI->getCondition())) continue;
     llvm::BasicBlock *M = nullptr;
     if (auto *N = PDT.getNode(&X)) if (auto *IN = N->getIDom()) M = IN->getBlock();
     std::vector<llvm::BasicBlock *> work(llvm::succ_begin(&X), llvm::succ_end(&X));
@@ -3056,7 +3113,7 @@ static std::vector<VirtGate> virt_gate_collect(llvm::Function &F, const std::vec
     Cand c; c.div = DI.isDivergent(BI->getCondition());
     c.kind = virt_classify(&X, BI, DT, PDT, LI, c.g, c.why);
     std::set<llvm::Value *> seen;
-    c.uni = c.div && virt_launch_uniform(BI->getCondition(), DT, seen);
+    c.uni = c.div && (uniformLoopSelectors.count(BI) || virt_launch_uniform(BI->getCondition(), DT, seen));
     cands.push_back(c);
   }
   std::vector<VirtGate> gates;
@@ -3257,7 +3314,7 @@ static void s1_check_unlooped(llvm::Function &F, bool nested) {
         std::set<Value *> vs;
         bool dead_arm = false;
         for (BasicBlock *S : successors(X)) dead_arm |= !live.count(S);
-        if (kernel) count["uniform-branch"]++;
+        if (kernel || uniformLoopSelectors.count(BI)) count["uniform-branch"]++;
         else if (dead_arm) count["dead-arm-branch"]++;   // the other arm is undefined: nothing to decide
         else if (virt_launch_uniform(BI->getCondition(), DT, vs)) count["launch-uniform-branch"]++;
         else if (added) found("branch-added-barriers", UI);
@@ -3832,9 +3889,9 @@ public:
     // print function
     // F.print(llvm::errs());
     const bool s1_absorb = g_schedule_flag == 1 && !need_nested_loop && intra_warp_loop && s1_absorb_on();
-    // sub-pass form, inter pass: the same split for the regions between CTA barriers (lifted GEMM: `if (k > 0) main loop`
-    // joins the epilogue from the entry's barrier and from the loop's last barrier)
-    const bool s1_split_merges = s1_absorb || (g_schedule_flag == 1 && need_nested_loop && !intra_warp_loop && virt_gate_on());
+    // Both levels of the sub-pass loop can have multiple entries. Use a warp marker
+    // for an inner lane region and a CTA marker for an outer warp region.
+    const bool s1_split_merges = s1_absorb || (g_schedule_flag == 1 && need_nested_loop && virt_gate_on());
     s1_marker_is_warp_sync = g_schedule_flag == 1 && need_nested_loop && intra_warp_loop;
     std::vector<llvm::BasicBlock *> multi_entry, two_arm_stops;
     if (s1_split_merges) defer_multi_entry = &multi_entry;
@@ -4547,6 +4604,7 @@ void insert_warp_loop(llvm::Module *M) {
     for (auto F = M->begin(); F != M->end(); ++F)
       remove_barrier(dyn_cast<llvm::Function>(F), false, schedule);
   }
+  uniformLoopSelectors.clear();
   // core mapping: kernels the host must run with one physical warp per CTA (note_p1_only_kernel)
   if (schedule == 1) {
     std::remove("cupbop_virt_p1_only.txt");
