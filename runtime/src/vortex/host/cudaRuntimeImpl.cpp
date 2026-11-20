@@ -836,6 +836,8 @@ private:
     , queue_(nullptr)
   {
     RT_CHECK(vx_dev_open(&device_));
+    const char *driver = std::getenv("VORTEX_DRIVER");
+    simx_ = !driver || strcmp(driver, "simx") == 0;
     // CUPBOP_LAUNCH2: one in-order queue for kernel launches (vx_enqueue_launch).
     vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
     RT_CHECK((int)vx_queue_create(device_, &qi, &queue_));
@@ -857,6 +859,8 @@ private:
   }
 
 public:
+  bool is_simx() const { return simx_; }
+
   void cleanup_args() {
     if (args_buffer_ != nullptr) {
       vx_mem_free(args_buffer_);
@@ -906,6 +910,7 @@ private:
   vx_kernel_h kernel_;
   vx_kernel_h service_kernel_;
   vx_queue_h  queue_;
+  bool simx_;
 
   // Pointer manager
   struct MemoryInfo {
@@ -2909,6 +2914,9 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       abuf_ptr->ctx.cluster_shape = cluster.x | (cluster.y << 8) | (cluster.z << 16) |
                                   (uint32_t(explicit_cluster) << 24);
       abuf_ptr->ctx.cluster_stride = stride;
+      // Blackwell's opaque response packs the Y and Z coordinates into 16 bits each.
+      if (DC->is_simx() && (schedule == 1 || schedule == 2) && grid[1] <= 65536 && grid[2] <= 65536)
+        abuf_ptr->ctx.direct_launch_flags = CUPBOP_LAUNCH_SIMX_CLC;
     }
     void *barriers = nullptr;
     if (split_barrier) {

@@ -39,8 +39,7 @@ __global__ void tma_phases(const __grid_constant__ CUtensorMap map, int *out) {
     }
     __syncthreads();
   }
-  // Vortex schedules every CTA. Its local cancellation response must report
-  // failure and release the 16-byte wait, including after the initial phases.
+  // This launch has one CTA, so cancellation must decline and complete 16 bytes.
   __shared__ __align__(16) uint32_t response[4];
   __shared__ uint64_t work_bar;
   // This is the literal STS.64 initialization emitted by SM100 ptxas for

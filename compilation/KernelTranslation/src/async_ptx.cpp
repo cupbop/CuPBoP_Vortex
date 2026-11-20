@@ -594,16 +594,60 @@ struct AsmLowering {
       underPred(pred, [&]() -> Value * { return B.CreateFence(AtomicOrdering::SequentiallyConsistent); });
       return;
     }
-    if (sw("clusterlaunchcontrol.")) {
-      if (o != "clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128")
-        fail("unsupported cluster launch control operation: " + s.text);
+    if (sw("clusterlaunchcontrol.try_cancel.")) {
       nops(2, 2);
+      StringRef modifiers(o);
+      if (!modifiers.consume_front("clusterlaunchcontrol.try_cancel.async."))
+        fail("unsupported cluster launch control operation: " + s.text);
+      modifiers.consume_front("shared::cta.");
+      if (!modifiers.consume_front("mbarrier::complete_tx::bytes."))
+        fail("unsupported cluster launch control operation: " + s.text);
+      bool multicast = modifiers.consume_front("multicast::cluster::all.");
+      if (modifiers != "b128") fail("unsupported cluster launch control operation: " + s.text);
       needWarps();
       underPred(pred, [&]() -> Value * {
-        return S.call(B, "__cupbop_tcgen_decline_cancel", S.Void,
-                      {addr(s.ops[0], "cancellation response"), addr(s.ops[1], "completion barrier")});
+        return S.call(B, "__cupbop_cluster_try_cancel", S.Void,
+                      {addr(s.ops[0], "shared cancellation response"), addr(s.ops[1], "completion barrier"),
+                       B.getInt32(multicast)});
       });
       return;
+    }
+    if (sw("clusterlaunchcontrol.query_cancel.")) {
+      nops(2, 2);
+      auto *response = val(s.ops[1], nullptr);
+      if (!response->getType()->isIntegerTy(128)) fail("expected a b128 cancellation response: " + s.text);
+      // The lifted Blackwell SASS also decodes these response fields directly.
+      auto field = [&](unsigned offset, unsigned bits) {
+        return B.CreateTrunc(B.CreateLShr(response, offset), B.getIntNTy(bits));
+      };
+      StringRef query(o);
+      query.consume_front("clusterlaunchcontrol.query_cancel.");
+      if (query == "is_canceled.pred.b128") {
+        setReg(s.ops[0], field(64, 1), pred);
+        return;
+      }
+      auto coordinate = [&](unsigned axis) -> Value * {
+        if (axis == 0) return field(0, 32);
+        return B.CreateZExt(field(axis == 1 ? 32 : 48, 16), S.I32);
+      };
+      if (query == "get_first_ctaid.v4.b32.b128") {
+        StringRef tuple(s.ops[0]);
+        if (!tuple.consume_front("{") || !tuple.consume_back("}")) fail("expected a v4 destination: " + s.text);
+        auto regs = splitTop(tuple.str(), ',');
+        if (regs.size() != 4) fail("expected four destination registers: " + s.text);
+        for (unsigned i = 0; i < 3; ++i) setReg(regs[i], coordinate(i), pred);
+        setReg(regs[3], B.getInt32(0), pred); // PTX leaves the fourth element unspecified.
+        return;
+      }
+      if (query.consume_front("get_first_ctaid::") && query.consume_back(".b32.b128")) {
+        for (unsigned i = 0; i < 3; ++i) {
+          if (query.size() == 1 && query.front() == "xyz"[i]) {
+            setReg(s.ops[0], coordinate(i), pred);
+            return;
+          }
+        }
+      }
+      fail("unsupported cluster launch control operation: " + s.text);
     }
     if (sw("tcgen05.")) {
       lowerTcgen(s, pred);
@@ -635,9 +679,11 @@ struct AsmLowering {
       B.CreateFence(AtomicOrdering::SequentiallyConsistent);
       return;
     }
-    if (o == "ld.shared.b32") {
+    if (o == "ld.shared.b32" || o == "ld.shared.b128" || o == "ld.shared::cta.b128" || o == "ld.global.b128") {
       nops(2, 2);
-      Value *v = underPred(pred, [&]() -> Value * { return B.CreateLoad(S.I32, addr(s.ops[1], "shared")); });
+      Value *v = underPred(pred, [&]() -> Value * {
+        return B.CreateLoad(width(), addr(s.ops[1], s.has("global") ? "global" : "shared"));
+      });
       if (v) setReg(s.ops[0], v, pred);
       return;
     }
@@ -645,6 +691,21 @@ struct AsmLowering {
     if (o == "mov" || sw("mov.")) {
       nops(2, 2);
       std::string src = trim(s.ops[1]);
+      StringRef tuple(src);
+      if (o == "mov.b128" && tuple.consume_front("{") && tuple.consume_back("}")) {
+        auto parts = splitTop(tuple.str(), ',');
+        if (parts.size() != 2 && parts.size() != 4) fail("expected two b64 or four b32 registers: " + s.text);
+        unsigned bits = 128 / parts.size();
+        Value *packed = ConstantInt::get(B.getInt128Ty(), 0);
+        for (unsigned i = 0; i < parts.size(); ++i) {
+          auto *part = val(parts[i], nullptr);
+          if (!part->getType()->isIntegerTy(bits)) fail("incorrect register width in mov.b128: " + s.text);
+          auto *wide = B.CreateZExt(part, B.getInt128Ty());
+          packed = B.CreateOr(packed, B.CreateShl(wide, i * bits));
+        }
+        setReg(s.ops[0], packed, pred);
+        return;
+      }
       if (src.find("_param_") != std::string::npos && src[0] != '$' && src[0] != '%') {
         paramSym[trim(s.ops[0])] = src;
         return;

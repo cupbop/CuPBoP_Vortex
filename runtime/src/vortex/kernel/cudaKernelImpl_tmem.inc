@@ -134,15 +134,45 @@ extern "C" uint64_t __cupbop_tcgen_arrive(uint64_t *bar, unsigned arrivals, int3
   return token;
 }
 
-extern "C" void __cupbop_tcgen_decline_cancel(uint32_t *response, uint64_t *bar) {
-  // KMU runs every CTA in the grid. Declining each optional work-stealing
-  // request is valid; SM100's query checks bit 0 of the third response word.
-  // A completed unsuccessful request still supplies 16 bytes to mbarrier.
-  unsigned k = __cupbop_cluster_register(1,0);
-  for (unsigned r = 0; r < k; ++r) {
-    auto *p = static_cast<uint32_t *>(__cupbop_cluster_map(response,r));
-    for (unsigned i = 0; i < 4; ++i) p[i] = 0;
-    __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,r)), 0, -16);
+#if defined(VX_SIMX_CSR_CANCEL_SUBMIT) && __has_include(<vx_simx_clc.h>)
+#include <vx_simx_clc.h>
+#define CUPBOP_NATIVE_SIMX_CLC
+#endif
+
+static void cluster_cancel_fallback(uint32_t *response, uint64_t *bar, bool multicast, unsigned recipients) {
+  uint32_t first[3] = {};
+  uint32_t success = 0;
+#if defined(CUPBOP_NATIVE_SIMX_CLC) && !defined(VX_SIMX_CSR_CANCEL_ASYNC)
+  if (cluster_context().direct_launch_flags & CUPBOP_LAUNCH_SIMX_CLC)
+    success = vx_simx_try_cancel(first);
+#endif
+  // Older SimX builds publish a polled result. Other backends decline the request.
+  for (unsigned rank = 0; rank < recipients; ++rank) {
+    auto *dst = multicast ? static_cast<uint32_t *>(__cupbop_cluster_map(response, rank)) : response;
+    auto *done = multicast ? static_cast<uint64_t *>(__cupbop_cluster_map(bar, rank)) : bar;
+    dst[0] = first[0];
+    dst[1] = first[1] | (first[2] << 16);
+    dst[2] = success;
+    dst[3] = 0;
+    __cupbop_tcgen_arrive(done, 0, -16);
+  }
+}
+
+extern "C" __attribute__((convergent, noduplicate)) void
+__cupbop_cluster_try_cancel(uint32_t *response, uint64_t *bar, uint32_t multicast) {
+  const unsigned recipients = multicast ? __cupbop_cluster_register(1, 0) : 1;
+#if defined(CUPBOP_NATIVE_SIMX_CLC) && defined(VX_SIMX_CSR_CANCEL_ASYNC)
+  if (cluster_context().direct_launch_flags & CUPBOP_LAUNCH_SIMX_CLC) {
+    auto *dst = multicast ? static_cast<uint32_t *>(__cupbop_cluster_map(response, 0)) : response;
+    auto *done = multicast ? static_cast<uint64_t *>(__cupbop_cluster_map(bar, 0)) : bar;
+    vx_simx_cancel_async(dst, done, cluster_context().cluster_stride, recipients);
+    return;
+  }
+#endif
+  // Older SimX mailboxes admit one requesting lane per warp at a time.
+  for (uint32_t lanes = vx_active_threads(); lanes; lanes &= lanes - 1) {
+    if (vx_thread_id() == __builtin_ctz(lanes))
+      cluster_cancel_fallback(response, bar, multicast, recipients);
   }
 }
 

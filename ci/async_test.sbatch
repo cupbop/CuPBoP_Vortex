@@ -26,6 +26,10 @@ if [ ! -x build/compilation/kernelTranslator ]; then
 fi
 make -C build kernelTranslator hostTranslator vortexRuntime ThreadPool -j8 > ci/logs_v3/async_test_build_$SLURM_JOB_ID.log 2>&1 || { echo BUILD FAILED; grep -n error ci/logs_v3/async_test_build_$SLURM_JOB_ID.log | head; exit 1; }
 OUT=$CuPBoP_PATH/ci/logs_v3/async_test_$SLURM_JOB_ID; mkdir -p $OUT
+if ! bash ci/cluster_launch_control_translation_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/cluster_launch_control_translation.log" 2>&1; then
+  cat "$OUT/cluster_launch_control_translation.log"
+  exit 1
+fi
 if ! bash ci/tma_self_arrive_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_self_arrive.log" 2>&1; then
   cat "$OUT/tma_self_arrive.log"
   exit 1
@@ -78,6 +82,12 @@ for ex in cluster_group cluster_async cluster_reduce; do
   grep -q '^PASSED!' "$OUT/s2_$ex.out" || { echo "s2_$ex: FAIL"; exit 1; }
   echo "s2_$ex: PASS"
 done
+if [[ "$VORTEX_NUM_THREADS" == 32 && -f "$VORTEX_HOME/sw/kernel/include/vx_simx_clc.h" ]] &&
+   grep -q '^#define VX_SIMX_CSR_CANCEL_SUBMIT ' "$VORTEX_PATH/sw/VX_types.h"; then
+  run s2_cluster_cancel cluster_cancel 2 LOCALMEM=1
+  [[ $(grep -c '^PASSED!' "$OUT/s2_cluster_cancel.out") == 4 ]] || { echo "s2_cluster_cancel: FAIL"; exit 1; }
+  echo "s2_cluster_cancel: PASS"
+fi
 expect_pass    s2_async_mbar_ws_nolto async_mbar_ws 2 CUPBOP_LTO=0
 expect_pass    s1_async_mbar_ws  async_mbar_ws 1        # CUPBOP_VIRT_WARPS unset: one physical warp per CUDA warp
 expect_pass    s1_async_tma2d    async_tma2d 1
