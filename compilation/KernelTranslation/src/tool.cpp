@@ -1,4 +1,5 @@
 #include "tool.h"
+#include "async_ptx.h"
 #include "warp_func.h"
 #include "flag.h"
 #include "llvm/ADT/MapVector.h"
@@ -2375,6 +2376,219 @@ static std::string tensor_trim(const std::string &s) {
   size_t a = s.find_first_not_of(" \t\n\r"), b = s.find_last_not_of(" \t\n\r");
   return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
+
+static bool is_ptx_mma_sp(StringRef assembly) {
+  return assembly.contains("mma.sp.sync.aligned") ||
+         assembly.contains("mma.sp::ordered_metadata.sync.aligned");
+}
+
+void prepare_mma_sp_scratch(Module *M) {
+  const VirtGeom geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32 || tensor_lowering_mode() == "sw" ||
+      !tensor_cfg_known() || !vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_TCU_SPARSE_ENABLE"))
+    return;
+
+  unsigned warps = 32;
+  if (const char *value = std::getenv("VORTEX_NUM_WARPS")) {
+    const int configured = std::atoi(value);
+    if (configured > 0 && configured <= 32) warps = configured;
+  }
+  auto &context = M->getContext();
+  constexpr const char *bundleName = "cupbop.mma.sp.scratch";
+  const unsigned bundleID = context.getOrInsertBundleTag(bundleName)->getValue();
+  SmallVector<Function *, 8> deadHelpers;
+  for (auto &F : *M) {
+    SmallVector<CallInst *, 8> calls;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *call = dyn_cast<CallInst>(&I))
+          if (auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand()))
+            if (is_ptx_mma_sp(assembly->getAsmString())) calls.push_back(call);
+    if (calls.empty()) continue;
+    if (!isKernelFunction(M, &F)) {
+      // The general device inliner leaves unused internal helper definitions.
+      // Their live kernel clones receive the CTA-local metadata reservation.
+      if (F.hasLocalLinkage() && F.use_empty()) deadHelpers.push_back(&F);
+      continue;
+    }
+
+    // TCU metadata loads need a single aligned address in CTA local memory.
+    // Allocate one 128-byte metadata segment for each possible physical warp.
+    auto *scratchType = ArrayType::get(Type::getInt32Ty(context), 32 * warps);
+    auto *scratch = new GlobalVariable(*M, scratchType, false, GlobalValue::InternalLinkage,
+                                       UndefValue::get(scratchType), "cupbop.mma.sp.scratch", nullptr,
+                                       GlobalValue::NotThreadLocal, 3);
+    Value *inputs[] = {scratch};
+    const OperandBundleDef bundle(bundleName, ArrayRef<Value *>(inputs));
+    for (auto *call : calls) {
+      auto *replacement = CallBase::addOperandBundle(call, bundleID, bundle, call->getIterator());
+      call->replaceAllUsesWith(replacement);
+      call->eraseFromParent();
+    }
+  }
+  for (auto *F : deadHelpers) F->eraseFromParent();
+}
+
+static void lower_inline_mma_sp(CallInst *call, Module *M, StringRef assembly) {
+  auto fail = [&](StringRef reason) {
+    errs() << "error: unsupported sparse PTX MMA in " << call->getFunction()->getName()
+           << ": " << reason << "\n  " << assembly << '\n';
+    exit(1);
+  };
+  assembly = assembly.trim();
+  assembly.consume_back(";");
+  const auto end = assembly.find_first_of(" \t\r\n");
+  if (end == StringRef::npos) fail("expected opcode and operands");
+  auto opcode = assembly.take_front(end);
+  auto operands = assembly.drop_front(end);
+  if (!opcode.consume_front("mma.sp.sync.aligned.") &&
+      !opcode.consume_front("mma.sp::ordered_metadata.sync.aligned."))
+    fail("expected one mma.sp.sync.aligned instruction");
+
+  const char *dtype = nullptr;
+  unsigned selectors = 1;
+  const bool sat = opcode.contains(".satfinite");
+  if (opcode == "m16n8k32.row.col.f32.f16.f16.f32") { dtype = "f16"; selectors = 2; }
+  else if (opcode == "m16n8k32.row.col.f32.bf16.bf16.f32") { dtype = "bf16"; selectors = 2; }
+  else if (opcode == "m16n8k16.row.col.f32.tf32.tf32.f32") { dtype = "tf32"; selectors = 2; }
+  else if (opcode == "m16n8k64.row.col.s32.s8.s8.s32" ||
+           opcode == "m16n8k64.row.col.satfinite.s32.s8.s8.s32" ||
+           opcode == "m16n8k64.row.col.s32.s8.s8.s32.satfinite") dtype = "s8";
+  else if (opcode == "m16n8k64.row.col.s32.u8.u8.s32" ||
+           opcode == "m16n8k64.row.col.satfinite.s32.u8.u8.s32" ||
+           opcode == "m16n8k64.row.col.s32.u8.u8.s32.satfinite") dtype = "u8";
+  else fail("supported shapes are m16n8k32 f16/bf16, m16n8k16 tf32, and m16n8k64 s8/s8 or u8/u8");
+
+  const auto geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32)
+    fail("sparse MMA requires a 32-lane Vortex schedule-2 build");
+  auto scratch = call->getOperandBundle("cupbop.mma.sp.scratch");
+  const std::string mode = tensor_lowering_mode();
+  std::string reason;
+  const bool native = mode != "sw" && scratch && tensor_build_enables(dtype, reason);
+  if (!native && mode == "tcu") {
+    if (!reason.empty()) fail(reason);
+    fail("native sparse MMA requires an inlined kernel and a known Vortex LMEM build with TCU sparse support");
+  }
+
+  struct Operand { bool output; unsigned index; std::string constraint; };
+  SmallVector<Operand, 20> numbers;
+  unsigned outputs = 0, inputs = 0;
+  for (const auto &constraint : cast<InlineAsm>(call->getCalledOperand())->ParseConstraints()) {
+    if (constraint.Type == InlineAsm::isClobber) continue;
+    if (constraint.isIndirect || constraint.Codes.size() != 1) fail("unsupported operand constraint");
+    const bool output = constraint.Type == InlineAsm::isOutput;
+    numbers.push_back({output, output ? outputs++ : inputs++, constraint.Codes.front()});
+  }
+  auto *resultType = dyn_cast<StructType>(call->getType());
+  if (outputs != 4 || inputs != call->arg_size() || !resultType || resultType->getNumElements() != 4)
+    fail("expected four 32-bit results and register inputs");
+
+  auto operandIndex = [&](StringRef operand) -> unsigned {
+    operand = operand.trim();
+    if (operand.consume_front("${")) {
+      if (!operand.consume_back("}")) fail("invalid operand placeholder");
+      operand = operand.split(':').first;
+    } else if (!operand.consume_front("$")) {
+      fail("expected an LLVM inline-asm register operand");
+    }
+    unsigned index = 0;
+    if (operand.getAsInteger(10, index) || index >= numbers.size()) fail("invalid operand placeholder");
+    return index;
+  };
+  auto readOperand = [&](StringRef token) -> Value * {
+    const unsigned index = operandIndex(token);
+    const auto &operand = numbers[index];
+    if (!operand.output) return call->getArgOperand(operand.index);
+    for (const auto &tied : numbers)
+      if (!tied.output && tied.constraint == std::to_string(index)) return call->getArgOperand(tied.index);
+    fail("output used as input without a matching tied constraint");
+    return nullptr;
+  };
+  auto takeGroup = [&]() {
+    operands = operands.ltrim();
+    if (!operands.consume_front("{")) fail("expected a register fragment list");
+    SmallVector<StringRef, 4> group;
+    for (unsigned i = 0; i < 4; ++i) {
+      operands = operands.ltrim();
+      size_t end = 0;
+      while (end < operands.size() && operands[end] != ',' && operands[end] != '}') {
+        if (operands.substr(end).starts_with("${")) {
+          end = operands.find('}', end + 2);
+          if (end == StringRef::npos) fail("unterminated inline-asm register operand");
+        }
+        ++end;
+      }
+      if (end == operands.size()) fail("unterminated register fragment list");
+      group.push_back(operands.take_front(end));
+      operands = operands.drop_front(end);
+      if (!operands.consume_front(i == 3 ? "}" : ",")) fail("expected exactly four registers per fragment");
+    }
+    operands = operands.ltrim();
+    if (!operands.consume_front(",")) fail("expected another sparse MMA operand");
+    return group;
+  };
+  auto d = takeGroup();
+  auto a = takeGroup();
+  auto b = takeGroup();
+  auto c = takeGroup();
+  auto [metadata, selection] = operands.split(',');
+  metadata = metadata.trim();
+  selection = selection.trim();
+  if (metadata.empty() || selection.empty()) fail("expected metadata register and selector");
+
+  unsigned selector = 0;
+  if (selection.starts_with("$")) {
+    auto *value = dyn_cast<ConstantInt>(readOperand(selection));
+    if (!value || value->getValue().uge(selectors)) fail("invalid compile-time sparsity selector");
+    selector = value->getZExtValue();
+  } else if (selection.getAsInteger(0, selector) || selector >= selectors) {
+    fail("invalid compile-time sparsity selector");
+  }
+
+  IRBuilder<> builder(call);
+  auto *i32 = builder.getInt32Ty();
+  auto *f32 = builder.getFloatTy();
+  auto *accumulatorType = selectors == 2 ? f32 : i32;
+  auto *pointerType = PointerType::get(M->getContext(), 0);
+  auto *fragmentType = ArrayType::get(i32, 4);
+  auto pack = [&](ArrayRef<StringRef> group, Type *type) -> Value * {
+    auto *array = builder.CreateAlloca(fragmentType);
+    for (unsigned i = 0; i < 4; ++i) {
+      auto *value = readOperand(group[i]);
+      if (value->getType() != type) fail("unexpected fragment register type");
+      builder.CreateStore(builder.CreateBitCast(value, i32), builder.CreateConstGEP2_32(fragmentType, array, 0, i));
+    }
+    return array;
+  };
+  auto *aFragment = pack(a, i32);
+  auto *bFragment = pack(b, i32);
+  auto *cFragment = pack(c, accumulatorType);
+  auto *e = readOperand(metadata);
+  if (e->getType() != i32) fail("expected 32-bit integer metadata register");
+  auto *dFragment = builder.CreateAlloca(fragmentType);
+  auto *scratchPointer = native ? builder.CreatePointerCast(scratch->Inputs.front(), pointerType)
+                                : ConstantPointerNull::get(pointerType);
+  auto type = FunctionType::get(builder.getVoidTy(), {pointerType, pointerType, pointerType, i32, i32, pointerType, pointerType}, false);
+  const std::string helperName = std::string("__cupbop_mma_sp_") + dtype +
+                                 (sat ? "_satfinite" : "") + (native ? "_tcu" : "_sw");
+  auto helper = M->getOrInsertFunction(helperName, type);
+  builder.CreateCall(helper, {aFragment, bFragment, cFragment, e, builder.getInt32(selector), scratchPointer, dFragment})
+      ->setConvergent();
+  Value *result = PoisonValue::get(resultType);
+  unsigned written = 0;
+  for (unsigned i = 0; i < 4; ++i) {
+    const auto &operand = numbers[operandIndex(d[i])];
+    if (!operand.output || resultType->getElementType(operand.index) != accumulatorType || (written & (1u << operand.index)))
+      fail("destination must list four distinct output registers of the accumulator type");
+    written |= 1u << operand.index;
+    auto *bits = builder.CreateLoad(i32, builder.CreateConstGEP2_32(fragmentType, dFragment, 0, i));
+    result = builder.CreateInsertValue(result, builder.CreateBitCast(bits, accumulatorType), operand.index);
+  }
+  call->replaceAllUsesWith(result);
+}
+
 static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
   auto *IA = dyn_cast<InlineAsm>(Call->getCalledOperand());
   if (!IA) return false;
@@ -2580,7 +2794,8 @@ void prepare_wgmma_scratch(llvm::Module *M) {
           if (auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand())) {
             StringRef code = assembly->getAsmString();
             if (code.contains("wgmma.mma_async") &&
-                (code.contains("k16.f32.f16.f16") || code.contains("k16.f32.bf16.bf16")))
+                (code.contains("k16.f32.f16.f16") || code.contains("k16.f32.bf16.bf16") ||
+                 code.contains("mma_async.sp.")))
               calls.push_back(call);
             else if (code.contains("wgmma.fence") || code.contains("wgmma.commit_group") ||
                      code.contains("wgmma.wait_group"))
@@ -2621,6 +2836,7 @@ void prepare_wgmma_scratch(llvm::Module *M) {
     const OperandBundleDef bundle(bundleName, ArrayRef<Value *>(inputs));
     for (auto *call : calls) {
       auto *replacement = CallBase::addOperandBundle(call, bundleID, bundle, call->getIterator());
+      replacement->copyMetadata(*call);
       call->replaceAllUsesWith(replacement);
       call->eraseFromParent();
     }
@@ -2849,6 +3065,7 @@ void replace_asm_call(llvm::Module *M) {
   auto PtrTy = PointerType::getUnqual(context);
   std::vector<CallInst *> need_remove;
   std::set<Function *> initializedWgmmaGroups;
+  std::set<CallInst *> earlyWgmmaCommits;
   auto wgmmaGroups = [&](CallInst *call) -> Value * {
     auto scratch = call->getOperandBundle("cupbop.wgmma.scratch");
     if (!scratch) return nullptr;
@@ -2889,9 +3106,9 @@ void replace_asm_call(llvm::Module *M) {
               continue;
             }
             if (StringRef(asm_str).trim().contains("mma.sp")) {
-              errs() << "error: unsupported sparse PTX MMA in " << F->getName()
-                     << ": NVIDIA sparsity metadata and fragments are not mapped to Vortex\n  " << asm_str << '\n';
-              exit(1);
+              lower_inline_mma_sp(Call, M, asm_str);
+              need_remove.push_back(Call);
+              continue;
             }
             if (lower_inline_mma_sync(Call, M)) { // mma.sync (all element types) -> cupbop.mma.*
               need_remove.push_back(Call);
@@ -3010,6 +3227,7 @@ void replace_asm_call(llvm::Module *M) {
               }
               {
                 Value *groups = wgmmaGroups(Call);
+                const auto *gsb = Call->getMetadata("cupbop.wgmma.gsb");
                 SmallVector<StringRef, 2> instructions;
                 code.split(instructions, ';', -1, false);
                 IRBuilder<> builder(Call);
@@ -3038,12 +3256,30 @@ void replace_asm_call(llvm::Module *M) {
                     errs() << "error: unsupported WGMMA control inline asm: " << code << '\n';
                     exit(1);
                   }
+                  unsigned board = 0;
+                  if (gsb) {
+                    const auto *index = gsb->getNumOperands() > 0
+                        ? mdconst::dyn_extract_or_null<ConstantInt>(gsb->getOperand(0)) : nullptr;
+                    const auto *count = gsb->getNumOperands() == 2
+                        ? mdconst::dyn_extract_or_null<ConstantInt>(gsb->getOperand(1)) : nullptr;
+                    if (instructions.size() != 1 || operation == 0 || gsb->getNumOperands() != operation ||
+                        !index || !index->getType()->isIntegerTy(32) || index->getValue().ugt(7) ||
+                        (operation == 2 && (!count || !count->getType()->isIntegerTy(32) || count->getValue().ugt(7)))) {
+                      errs() << "error: invalid !cupbop.wgmma.gsb metadata on " << code << '\n';
+                      exit(1);
+                    }
+                    // Native queue zero is the untagged PTX sequence. SASS gsb0 starts at queue one.
+                    board = index->getZExtValue() + 1;
+                    if (count) pending = count->getZExtValue();
+                  }
                   if (!groups) continue; // The synchronous MMA helpers already completed the operation.
-                  const std::string encoding = ".insn r 0x0b, 4, 2, x0, x" + std::to_string(operation) +
-                                               ", x" + std::to_string(pending);
-                  auto *type = FunctionType::get(Type::getVoidTy(context), false);
-                  auto *native = InlineAsm::get(type, encoding, "~{memory}", true);
-                  tensor_set_convergent(builder.CreateCall(type, native));
+                  if (!earlyWgmmaCommits.count(Call)) {
+                    const std::string encoding = ".insn r 0x0b, 4, 2, x" + std::to_string(board) +
+                                                 ", x" + std::to_string(operation) + ", x" + std::to_string(pending);
+                    auto *type = FunctionType::get(Type::getVoidTy(context), false);
+                    auto *native = InlineAsm::get(type, encoding, "~{memory}", true);
+                    tensor_set_convergent(builder.CreateCall(type, native));
+                  }
                   emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
                 }
               }
@@ -3064,6 +3300,7 @@ void replace_asm_call(llvm::Module *M) {
               }
               std::vector<std::string> otk; // m64nNkK [satfinite] d a b
               { size_t p = 0; while (!opc.empty()) { size_t q = opc.find('.', p); otk.push_back(opc.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+              const bool sparse = StringRef(asm_str).contains("wgmma.mma_async.sp.");
               bool wsat = false;
               for (size_t i = 1; i < otk.size(); ++i) if (otk[i] == "satfinite") { wsat = true; otk.erase(otk.begin() + i); break; }
               std::string wd = otk.size() == 4 ? otk[1] : "", wa = otk.size() == 4 ? otk[2] : "", wb = otk.size() == 4 ? otk[3] : "";
@@ -3075,28 +3312,32 @@ void replace_asm_call(llvm::Module *M) {
               bool wint = tensor_is_int8(wa);
               if (otk.size() != 4) werr = "unrecognized opcode";
               else if (tensor_is_f16ish(wa)) {
-                if (wb != wa || wd != "f32" || wK != 16 || wsat) werr = "f16/bf16 wgmma needs m64nNk16 .f32 with equal A/B types";
+                if (wb != wa || (wd != "f32" && !(sparse && wd == "f16" && wa == "f16")) || wK != (sparse ? 32 : 16) || wsat) werr = "f16/bf16 wgmma needs m64nNk16 .f32 with equal A/B types";
                 wtag = wa + "f32"; ntrail = 4;
               } else if (wa == "tf32") {
-                if (wb != wa || wd != "f32" || wK != 8 || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
+                if (wb != wa || wd != "f32" || wK != (sparse ? 16 : 8) || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
                 wtag = "tf32f32"; ntrail = 2;
               } else if (tensor_is_fp8(wa)) {
-                if (!tensor_is_fp8(wb) || wd != "f32" || wK != 32 || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
+                if (!tensor_is_fp8(wb) || (wd != "f32" && !(sparse && wd == "f16")) || wK != (sparse ? 64 : 32) || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
                 wtag = wa + (wb != wa ? wb : std::string("")) + "f32"; ntrail = 2;
               } else if (wint) {
-                if (wb != wa || wd != "s32" || wK != 32) werr = "int8 wgmma needs m64nNk32 .s32 with equal A/B types (PTX has no mixed s8/u8 wgmma)";
+                if ((!sparse && wb != wa) || !tensor_is_int8(wb) || wd != "s32" || wK != (sparse ? 64 : 32)) werr = "unsupported int8 WGMMA input types, accumulator or K dimension";
                 wtag = wa + "s32" + (wsat ? "sat" : ""); ntrail = 0;
               } else werr = "element type " + wa + " not lowered (f16, bf16, tf32, e4m3, e5m2, s8, u8)";
-              const int nStep = tensor_is_f16ish(wa) ? 8 : 16;
+              const int nStep = (sparse || tensor_is_f16ish(wa)) ? 8 : 16;
               bool ok = werr.empty() && N >= nStep && N <= 256 && (N % nStep) == 0;
               if (werr.empty() && !ok) werr = "N must be a supported multiple of " + std::to_string(nStep);
-              unsigned nacc = ok ? (unsigned)N / 2 : 0;
-              const bool hasTiedAccumulator = Call->arg_size() != 2;
+              const bool packed = sparse && wd == "f16";
+              unsigned nacc = ok ? (unsigned)N / (packed ? 4 : 2) : 0;
+              SparseWgmmaOperands sparseOps;
+              if (sparse) sparseOps = parse_sparse_wgmma(Call, nacc);
+              const bool hasTiedAccumulator = sparse ? sparseOps.tied : Call->arg_size() != 2;
               unsigned firstAcc = hasTiedAccumulator && Call->arg_size() >= nacc ? Call->arg_size() - nacc : 2;
               // operands before the accumulators: desc_a, desc_b and, when scale-d is a register ("r" operand,
               // clang/CUTLASS form) rather than a literal in the string (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"),
               // the i32 scale-d
-              ok = ok && (firstAcc == 2 || firstAcc == 3) &&
+              if (sparse) firstAcc = sparseOps.firstAcc;
+              else ok = ok && (firstAcc == 2 || firstAcc == 3) &&
                    Call->arg_size() == firstAcc + (hasTiedAccumulator ? nacc : 0) &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
                    Call->getArgOperand(1)->getType()->isIntegerTy(64);
@@ -3113,7 +3354,14 @@ void replace_asm_call(llvm::Module *M) {
               Value *descriptorA = nullptr, *descriptorB = nullptr;
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
               unsigned transpose = 0;
-              if (ok) {
+              if (sparse) {
+                descriptorA = sparseOps.a ? sparseOps.a : ConstantInt::get(I64, 0);
+                descriptorB = sparseOps.b;
+                scaleD = sparseOps.scale;
+                transpose = sparseOps.flags;
+                if (getVirtGeom().nt != 32 || getVirtGeom().lanes != 32 || getVirtGeom().schedule != 2)
+                  report_fatal_error("sparse WGMMA requires 32 lanes and CTA scheduling");
+              } else if (ok) {
                 size_t kpos = asm_str.find(opc);
                 size_t semi = asm_str.find(';', kpos);
                 std::string tail = asm_str.substr(kpos, semi - kpos);
@@ -3170,13 +3418,18 @@ void replace_asm_call(llvm::Module *M) {
               auto scratch = Call->getOperandBundle("cupbop.wgmma.scratch");
               const std::string wbase = "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wtag;
               std::string wname;
-              if (scratch)
+              if (sparse) {
+                std::string reason;
+                const bool native = scratch && vortexConfigHasFlag("-DVX_CFG_TCU_SPARSE_ENABLE") &&
+                                    tensor_build_enables(wa == wb ? wa : "f16", reason);
+                wname = "__cupbop_sparse_wgmma_" + wa + (wa == wb ? "" : wb) + (native ? "_native" : "_sw");
+              } else if (scratch)
                 wname = wbase + "_native";
               else if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
                 wname = wbase; // f16/bf16: the TCU wrappers as before (TCU builds)
               else
                 wname = tensor_pick_symbol("wgmma " + opc, wbase, "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wa + "s32", wa, wb, wsat);
-              Type *AccT = wint ? I32 : F32;
+              Type *AccT = (wint || packed) ? I32 : F32;
               IRBuilder<> builder(Call);
               auto sreg = [&](const char *name) -> Value * {
                 return builder.CreateCall(
@@ -3191,7 +3444,7 @@ void replace_asm_call(llvm::Module *M) {
               lin = builder.CreateAdd(lin, builder.CreateMul(sreg("llvm.nvvm.read.ptx.sreg.tid.z"),
                                                              builder.CreateMul(ntx, nty)));
               Value *wig = builder.CreateAnd(builder.CreateLShr(lin, 5), 3, "warp.in.wg");
-              Type *AccTy = ArrayType::get(AccT, nacc);
+              Type *AccTy = ArrayType::get(AccT, packed ? 2 * nacc : nacc);
               IRBuilder<> AB(&Call->getFunction()->getEntryBlock().front());
               Value *Acc = AB.CreateAlloca(AccTy, nullptr, "wgmma.acc");
               for (unsigned i = 0; hasTiedAccumulator && i < nacc; i++) {
@@ -3201,13 +3454,45 @@ void replace_asm_call(llvm::Module *M) {
               }
               SmallVector<Type *, 8> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
               SmallVector<Value *, 8> arguments{ConstantInt::get(I32, N), descriptorA, descriptorB, scaleD, wig, Acc};
-              if (tensor_is_f16ish(wa)) {
+              if (sparse || tensor_is_f16ish(wa)) {
                 argumentTypes.push_back(I32);
                 arguments.push_back(ConstantInt::get(I32, transpose));
               }
-              if (scratch) {
+              if (sparse) {
+                arguments.push_back(sparseOps.meta);
+                argumentTypes.push_back(I32);
+                for (unsigned r = 0; r < 4; ++r) {
+                  arguments.push_back(sparseOps.aRegs.empty() ? ConstantInt::get(I32, 0) : sparseOps.aRegs[r]);
+                  argumentTypes.push_back(I32);
+                }
+              }
+              if (scratch && (!sparse || StringRef(wname).ends_with("_native"))) {
                 argumentTypes.push_back(PtrTy);
                 arguments.push_back(builder.CreatePointerCast(scratch->Inputs[0], PtrTy));
+                unsigned commitQueue = 0;
+                const auto *tag = Call->getMetadata("cupbop.wgmma.gsb");
+                Instruction *next = Call->getNextNonDebugInstruction();
+                // The lift optimizer can hoist fragment extraction and bit
+                // packing before the commit. These instructions carry SSA
+                // values only and cannot affect the WGMMA group sequence.
+                while (next && (isa<ExtractValueInst, BitCastInst, ZExtInst>(next) ||
+                                next->getOpcode() == Instruction::Shl || next->getOpcode() == Instruction::Or))
+                  next = next->getNextNonDebugInstruction();
+                auto *commit = dyn_cast_or_null<CallInst>(next);
+                const auto *commitAsm = commit ? dyn_cast<InlineAsm>(commit->getCalledOperand()) : nullptr;
+                // Only the tagged commit from the same SASS operation moves.
+                // No intervening call, executable memory op or CFG edge.
+                if (tag && tag->getNumOperands() == 1 && commitAsm && commit->getType()->isVoidTy() &&
+                    commit->getMetadata("cupbop.wgmma.gsb") == tag &&
+                    StringRef(commitAsm->getAsmString()).trim() == "wgmma.commit_group.sync.aligned;") {
+                  const auto *board = mdconst::dyn_extract_or_null<ConstantInt>(tag->getOperand(0));
+                  if (board && board->getType()->isIntegerTy(32) && board->getValue().ule(7)) {
+                    commitQueue = board->getZExtValue() + 1;
+                    earlyWgmmaCommits.insert(commit);
+                  }
+                }
+                argumentTypes.push_back(I32);
+                arguments.push_back(builder.getInt32(commitQueue));
               }
               FunctionCallee FC = M->getOrInsertFunction(
                   wname, FunctionType::get(Type::getVoidTy(context), argumentTypes, false));

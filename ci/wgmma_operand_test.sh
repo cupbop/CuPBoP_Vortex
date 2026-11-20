@@ -42,6 +42,20 @@ if rg -q 'call void @__cupbop_wgmma_m64nNk16_f16f32_native' kernel.ll; then
   rg -q 'call void @__cupbop_wgmma_group_sync' kernel.ll
 fi
 
+sed 's/"wgmma.commit_group.sync.aligned; wgmma.wait_group.sync.aligned 0;", "~{memory}"()/"wgmma.commit_group.sync.aligned;", "~{memory}"(), !cupbop.wgmma.gsb !0\n  call void asm sideeffect "wgmma.wait_group.sync.aligned 0;", "~{memory}"(), !cupbop.wgmma.gsb !1/' reset.ll > tagged.ll
+cat >> tagged.ll <<'IR'
+!0 = !{i32 2}
+!1 = !{i32 2, i32 1}
+IR
+llvm-as tagged.ll -o tagged.bc
+"$translator" tagged.bc kernel.bc > tagged.log 2>&1 || { cat tagged.log; exit 1; }
+opt -passes=verify -disable-output kernel.bc
+llvm-dis kernel.bc -o kernel.ll
+if rg -q 'call void @__cupbop_wgmma_m64nNk16_f16f32_native' kernel.ll; then
+  rg -q '\.insn r 0x0b, 4, 2, x3, x1, x0' kernel.ll
+  rg -q '\.insn r 0x0b, 4, 2, x3, x2, x1' kernel.ll
+fi
+
 sed 's/\$9, 0, 1, 1, 0, 0/\$9, 1, 1, 1, 0, 0/' reset.ll > missing-acc.ll
 llvm-as missing-acc.ll -o missing-acc.bc
 if "$translator" missing-acc.bc kernel.bc > missing-acc.log 2>&1; then
@@ -83,6 +97,8 @@ expect_bad_mma() {
   grep -Fq "$diagnostic" "$name.log"
 }
 
+sed 's/!{i32 2, i32 1}/!{i32 2, i32 8}/' tagged.ll > tagged-count.ll
+expect_bad_mma tagged-count 'invalid !cupbop.wgmma.gsb metadata'
 sed 's/\$9, 0, 1, 1, 0, 0;"/\$9, 0, 1, 1, 0, 0; st.shared.b32 [$8], 0;"/' reset.ll > mma-store.ll
 expect_bad_mma mma-store 'WGMMA MMA requires a single unpredicated instruction'
 sed '/wgmma\.mma_async/s/;"/; wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {$0,$1,$2,$3,$4,$5,$6,$7}, $8, $9, 0, 1, 1, 0, 0;"/' reset.ll > mma-twice.ll
@@ -94,5 +110,17 @@ expect_bad_mma permuted-outputs 'WGMMA MMA accumulator output operands must be i
 sed 's/l,l,r,0,1,/l,l,r,1,0,/' predicate.ll > permuted-ties.ll
 expect_bad_mma permuted-ties 'error: unsupported wgmma form'
 sed 's/wgmma.mma_async.sync.aligned/wgmma.mma_async.sp.sync.aligned/' reset.ll > sparse.ll
-expect_bad_mma sparse 'sparse WGMMA MMA is unsupported'
+expect_bad_mma sparse 'sparse WGMMA'
+sed -e 's/mma_async.sync.aligned.m64n16k16/mma_async.sp.sync.aligned.m64n16k32/' \
+    -e 's/}, \$8, \$9, 0, 1, 1, 0, 0/}, \$8, \$9, \$10, 1, 0, -1, 1, 0, 1/' \
+    -e 's/l,l,~{memory}"(i64 %a, i64 %b)/l,l,r,~{memory}"(i64 %a, i64 %b, i32 0)/' reset.ll > sparse-valid.ll
+llvm-as sparse-valid.ll -o sparse-valid.bc
+"$translator" sparse-valid.bc kernel.bc > sparse-valid.log 2>&1 || { cat sparse-valid.log; exit 1; }
+opt -passes=verify -disable-output kernel.bc
+llvm-dis kernel.bc -o kernel.ll
+rg -q 'call void @__cupbop_sparse_wgmma_f16_(native|sw)' kernel.ll
+sed 's/\$10, 1, 0, -1/\$10, 2, 0, -1/' sparse-valid.ll > sparse-selector.ll
+expect_bad_mma sparse-selector 'invalid sparse WGMMA immediate'
+sed 's/\$10, 1, 0, -1/\$10, 1, 1, -1/' sparse-valid.ll > sparse-acc.ll
+expect_bad_mma sparse-acc 'sparse WGMMA with scale-D requires incoming accumulators'
 echo 'WGMMA operand and control tests passed'

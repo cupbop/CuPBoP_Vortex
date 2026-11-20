@@ -1469,8 +1469,8 @@ extern "C" __attribute__((always_inline)) uint32_t __cupbop_cvta_to_shared(const
 }
 extern "C" __attribute__((always_inline)) int __cupbop_activemask() { return (int)vx_active_threads(); }
 
-// PTX K-major WGMMA tiles have 32 bytes of K data per row for every supported input type.
-// The swizzled layouts use 32/64/128-byte rows, group 8 rows at stride SBO, and ignore LBO.
+// PTX K-major WGMMA normally consumes 32 bytes per row. Sparse K32 has a
+// 64-byte B row, and its second half starts at LBO in the 32B swizzle layout.
 struct __cupbop_smem_desc { const char *base; uint32_t lbo, sbo, row_bytes, phase; };
 static inline __cupbop_smem_desc __cupbop_decode_desc(uint64_t d) {
   __cupbop_smem_desc m;
@@ -1483,30 +1483,32 @@ static inline __cupbop_smem_desc __cupbop_decode_desc(uint64_t d) {
   m.phase = (uint32_t)((d >> 49) & 7u);
   return m;
 }
+
+static inline const char *__cupbop_wg_swizzle(const __cupbop_smem_desc &m, uint32_t offset) {
+  const uintptr_t address = (uintptr_t)m.base + offset;
+  const uintptr_t bank_group = ((address >> 7) - m.phase) & ((m.row_bytes >> 4) - 1);
+  return (const char *)(address ^ (bank_group << 4));
+}
+
 static inline uint32_t __cupbop_wg_word(const __cupbop_smem_desc &m, int row, int word) {
   const uint32_t row_group = (row >> 3) * m.sbo;
-  uint32_t offset;
   if (m.row_bytes) {
-    offset = row_group + (row & 7) * m.row_bytes + word * 4;
-    const uint32_t bank_group = ((offset >> 7) + m.phase) & ((m.row_bytes >> 4) - 1);
-    offset ^= bank_group << 4;
-  } else {
-    offset = row_group + (word >> 2) * m.lbo + (row & 7) * 16 + (word & 3) * 4;
+    const uint32_t k_offset = m.row_bytes == 32 ? (word >> 3) * m.lbo + (word & 7) * 4 : word * 4;
+    const uint32_t offset = row_group + (row & 7) * m.row_bytes + k_offset;
+    return *(const uint32_t *)__cupbop_wg_swizzle(m, offset);
   }
+  const uint32_t offset = row_group + (word >> 2) * m.lbo + (row & 7) * 16 + (word & 3) * 4;
   return *(const uint32_t *)(m.base + offset);
 }
 
 static inline uint16_t __cupbop_wg_mn_half(const __cupbop_smem_desc &m, int row, int k) {
-  uint32_t offset;
   if (m.row_bytes) {
     const int rows = m.row_bytes / sizeof(uint16_t);
-    offset = (row / rows) * m.lbo + (k >> 3) * m.sbo + (k & 7) * m.row_bytes
-           + (row % rows) * sizeof(uint16_t);
-    const uint32_t bank_group = ((offset >> 7) + m.phase) & ((m.row_bytes >> 4) - 1);
-    offset ^= bank_group << 4;
-  } else {
-    offset = (row >> 3) * m.sbo + (k >> 3) * m.lbo + (k & 7) * 16 + (row & 7) * 2;
+    const uint32_t offset = (row / rows) * m.lbo + (k >> 3) * m.sbo + (k & 7) * m.row_bytes
+                          + (row % rows) * sizeof(uint16_t);
+    return *(const uint16_t *)__cupbop_wg_swizzle(m, offset);
   }
+  const uint32_t offset = (row >> 3) * m.sbo + (k >> 3) * m.lbo + (k & 7) * 16 + (row & 7) * 2;
   return *(const uint16_t *)(m.base + offset);
 }
 
@@ -1522,6 +1524,30 @@ static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k, 
   uint32_t v = __cupbop_wg_half_word(m, r, k / 2, mn_major);
   float f; __builtin_memcpy(&f, &v, 4); return f;
 }
+
+// The scoreboard queue is encoded as an immediate register number in the
+// custom instruction. Dispatch concretely even in a separate-object build.
+template <class Emit>
+static inline __attribute__((always_inline)) void __cupbop_wgmma_dispatch_queue(unsigned queue, Emit emit) {
+  switch (queue) {
+  case 1: emit(std::integral_constant<unsigned, 1>{}); break;
+  case 2: emit(std::integral_constant<unsigned, 2>{}); break;
+  case 3: emit(std::integral_constant<unsigned, 3>{}); break;
+  case 4: emit(std::integral_constant<unsigned, 4>{}); break;
+  case 5: emit(std::integral_constant<unsigned, 5>{}); break;
+  case 6: emit(std::integral_constant<unsigned, 6>{}); break;
+  case 7: emit(std::integral_constant<unsigned, 7>{}); break;
+  case 8: emit(std::integral_constant<unsigned, 8>{}); break;
+  default: __builtin_unreachable();
+  }
+}
+
+static inline void __cupbop_wgmma_commit_completed_group(unsigned queue) {
+  __cupbop_wgmma_dispatch_queue(queue, [](auto q) {
+    asm volatile(".insn r 0x0b, 4, 2, x%0, x1, x0" :: "i"(decltype(q)::value) : "memory");
+  });
+}
+
 // Each warp owns 16 rows. A final N=8 tile uses half of the native 16-column
 // tile, with no B or accumulator accesses outside the source PTX tile.
 // acc: N/2 fp32 per thread, in/out, PTX accumulator layout
@@ -1530,7 +1556,8 @@ static inline float __cupbop_core_ld(const __cupbop_smem_desc &m, int r, int k, 
 // scale_d = 0 ignores the incoming accumulator (D = A*B). The register path is synchronous.
 template <class CTX, class WCTX = void>
 static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d,
-                                              int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch = nullptr) {
+                                              int warp_in_wg, float *acc, unsigned transpose,
+                                              uint32_t *scratch = nullptr, unsigned commit_queue = 0) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
   const __cupbop_smem_desc A = __cupbop_decode_desc(desc_a), B = __cupbop_decode_desc(desc_b);
   const bool a_mn = transpose & 1, b_mn = transpose & 2;
@@ -1556,6 +1583,7 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
   for (int nb = 0; 16 * nb < n_cols; ++nb) {
     const int n0 = 16 * nb;
     const bool full = n0 + 16 <= n_cols;
+    const bool tagged_commit = commit_queue && n0 + 16 >= n_cols;
     typename CTX::fragment_acc fc, fd;
     if (scale_d) {
       for (int r = 0; r < 8; ++r) { // Vortex reg r <- PTX owner lane (g, cc>>1), slot cc&1, cc = t + 4*((r&3)&1), j = 2nb + ((r&3)>>1)
@@ -1584,7 +1612,15 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
         // Native WGMMA orders accumulator registers by N block, then M block.
         for (int r = 0; r < 8; ++r)
           native_c.data[2 * (r & 3) + (r >> 2)] = fc.data[r];
-        WCTX::wgmma_async(native_d, vt::vx_make_smem_desc(scratch, 32), vt::vx_make_smem_desc(staged_b, 32), native_c);
+        const auto native_a = vt::vx_make_smem_desc(scratch, 32);
+        const auto native_b = vt::vx_make_smem_desc(staged_b, 32);
+        if (tagged_commit) {
+          __cupbop_wgmma_dispatch_queue(commit_queue, [&](auto queue) {
+            WCTX::template wgmma_async_commit<decltype(queue)::value>(native_d, native_a, native_b, native_c);
+          });
+        } else {
+          WCTX::wgmma_async(native_d, native_a, native_b, native_c);
+        }
         for (int r = 0; r < 8; ++r)
           fd.data[r] = native_d.data[2 * (r & 3) + (r >> 2)];
       }
@@ -1595,6 +1631,13 @@ static inline void __cupbop_wgmma_m64nNk16_impl(int n_cols, uint64_t desc_a, uin
                   __cupbop_core_ld(B, n0 + g, 8 + 2 * t, b_mn), full ? __cupbop_core_ld(B, n0 + g + 8, 8 + 2 * t, b_mn) : 0.f,
                   0.f, 0.f, 0.f, 0.f}};
       CTX::mma_sync(fd, fa, fb, fc);
+      if constexpr (has_native) {
+        if (tagged_commit) {
+          // Large CTA scratch offsets cannot use a native WGMMA descriptor.
+          // Publish the original tagged group even for this synchronous tile.
+          __cupbop_wgmma_commit_completed_group(commit_queue);
+        }
+      }
     }
     for (int jl = 0; jl < (full ? 2 : 1); ++jl) { // PTX acc[4j+s] <- Vortex holder lane (g, c&3), reg 4*(s>>1) + (c>>2), c = 8jl + 2t + (s&1)
       const int j = 2 * nb + jl;
@@ -1644,17 +1687,21 @@ extern "C" __attribute__((noinline, convergent)) void __cupbop_wgmma_group_sync(
 }
 
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_f16f32_native(
-    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch) {
+    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc,
+    unsigned transpose, uint32_t *scratch, unsigned commit_queue) {
   using wgmma_ctx = vt::wgmma_context<32, vt::fp16, vt::fp32>;
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch);
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch, commit_queue);
 }
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_wgmma_m64nNk16_bf16f32_native(
-    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc, unsigned transpose, uint32_t *scratch) {
+    int n_cols, uint64_t desc_a, uint64_t desc_b, int scale_d, int warp_in_wg, float *acc,
+    unsigned transpose, uint32_t *scratch, unsigned commit_queue) {
   using wgmma_ctx = vt::wgmma_context<32, vt::bf16, vt::fp32>;
-  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch);
+  __cupbop_wgmma_m64nNk16_impl<tcu_ctx_bf16, wgmma_ctx>(n_cols, desc_a, desc_b, scale_d, warp_in_wg, acc, transpose, scratch, commit_queue);
 }
 #endif
 #endif // wgmma (TCU builds)
 
 // bf16 wmma, tf32, int8 and fp8 tensor ops (sw reference + TCU), see the file header
 #include "cudaKernelImpl_dtypes.inc"
+#include "cudaKernelImpl_sparse_wgmma.inc"
+#include "cudaKernelImpl_sparse_mma.inc"

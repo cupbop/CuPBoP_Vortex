@@ -988,6 +988,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
     if (local_mem_use == 1)
     {
       prepare_wgmma_scratch(M);
+      prepare_mma_sp_scratch(M);
       mem_share2local(M);
     }
     else

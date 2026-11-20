@@ -60,17 +60,17 @@
 #define WG_STORAGE_K (CUPBOP_WGMMA_SWIZZLE / sizeof(half))
 #define SMEM_LBO_BYTES 16
 #define SMEM_SBO_BYTES (8 * CUPBOP_WGMMA_SWIZZLE)
-__device__ __forceinline__ int core_off(int r, int k, unsigned phase) {
+__device__ __forceinline__ int core_off(int r, int k) {
   const unsigned byte = r * CUPBOP_WGMMA_SWIZZLE + k * sizeof(half);
   const unsigned mask = CUPBOP_WGMMA_SWIZZLE / 16 - 1;
-  return (byte ^ ((((byte >> 7) + phase) & mask) << 4)) / sizeof(half);
+  return (byte ^ (((byte >> 7) & mask) << 4)) / sizeof(half);
 }
 #else
 #define WG_SMEM_ALIGNMENT 128
 #define WG_STORAGE_K WG_K
 #define SMEM_LBO_BYTES 128
 #define SMEM_SBO_BYTES 256
-__device__ __forceinline__ int core_off(int r, int k, unsigned) { // element offset in the tile
+__device__ __forceinline__ int core_off(int r, int k) { // element offset in the tile
   return (r >> 3) * (SMEM_SBO_BYTES / 2) + (k >> 3) * (SMEM_LBO_BYTES / 2) + (r & 7) * 8 + (k & 7);
 }
 #endif
@@ -88,15 +88,15 @@ static __device__ constexpr int matrix_storage(int rows, bool mn_major) {
   return rows * WG_STORAGE_K;
 }
 
-__device__ __forceinline__ int matrix_off(int r, int k, int rows, bool mn_major, unsigned phase) {
-  if (!mn_major) return core_off(r, k, phase);
+__device__ __forceinline__ int matrix_off(int r, int k, int rows, bool mn_major) {
+  if (!mn_major) return core_off(r, k);
 #if CUPBOP_WGMMA_SWIZZLE
   constexpr int width = CUPBOP_WGMMA_SWIZZLE;
   constexpr int atom_rows = width / sizeof(half);
   const unsigned strips = (rows + atom_rows - 1) / atom_rows;
   const unsigned byte = ((k / 8) * strips + r / atom_rows) * 8 * width +
                         (k % 8) * width + (r % atom_rows) * sizeof(half);
-  return (byte ^ ((((byte >> 7) + phase) & (width / 16 - 1)) << 4)) / sizeof(half);
+  return (byte ^ (((byte >> 7) & (width / 16 - 1)) << 4)) / sizeof(half);
 #else
   return ((k / 8) * (rows / 8) + r / 8) * 64 + (k % 8) * 8 + r % 8;
 #endif
@@ -256,19 +256,17 @@ sgemm_wgmma_kernel(const half *A, const half *B, float *C, int M, int N, int K) 
   __shared__ __align__(WG_SMEM_ALIGNMENT) half b_storage[matrix_storage(WG_N, CUPBOP_WGMMA_TRANS_B) + b_pad];
   half *sA = a_storage + a_pad;
   half *sB = b_storage + b_pad;
-  const unsigned phase_a = (smem_u32(sA) >> 7) & 7;
-  const unsigned phase_b = (smem_u32(sB) >> 7) & 7;
   const int tile_m = blockIdx.y * WG_M, tile_n = blockIdx.x * WG_N;
   const int tid = threadIdx.x;
   float d[WG_ACC] = {};
   for (int k0 = 0; k0 < K; k0 += WG_K) {
     for (int i = tid; i < WG_M * WG_K; i += WG_THREADS) {
       int m = i / WG_K, k = i % WG_K;
-      sA[matrix_off(m, k, WG_M, CUPBOP_WGMMA_TRANS_A, phase_a)] = A[(size_t)(tile_m + m) * K + k0 + k];
+      sA[matrix_off(m, k, WG_M, CUPBOP_WGMMA_TRANS_A)] = A[(size_t)(tile_m + m) * K + k0 + k];
     }
     for (int i = tid; i < WG_N * WG_K; i += WG_THREADS) {
       int n = i / WG_K, k = i % WG_K;
-      sB[matrix_off(n, k, WG_N, CUPBOP_WGMMA_TRANS_B, phase_b)] = B[(size_t)(k0 + k) * N + tile_n + n];
+      sB[matrix_off(n, k, WG_N, CUPBOP_WGMMA_TRANS_B)] = B[(size_t)(k0 + k) * N + tile_n + n];
     }
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");

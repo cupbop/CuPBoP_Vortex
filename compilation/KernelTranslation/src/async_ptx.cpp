@@ -200,11 +200,12 @@ static bool isWgmmaMma(const Stmt &s) {
 
 static void validateWgmmaMma(CallInst *C, ArrayRef<Stmt> statements) {
   const Stmt &mma = statements.back();
-  for (const Stmt &s : statements)
-    if (isWgmmaMma(s) && (s.has("sp") || s.hasPrefix("sp::")))
-      fail_at(C, "sparse WGMMA MMA is unsupported");
+  const bool sparse = mma.has("sp") || mma.hasPrefix("sp::");
   const auto *result = dyn_cast<StructType>(C->getType());
-  if (!StringRef(mma.op).starts_with("wgmma.mma_async.sync.aligned.m64n") || !mma.pred.empty() ||
+  const StringRef op(mma.op);
+  const bool validOpcode = op.starts_with("wgmma.mma_async.sync.aligned.m64n") ||
+                           op.starts_with("wgmma.mma_async.sp.sync.aligned.m64n");
+  if (!validOpcode || !mma.pred.empty() ||
       !mma.label.empty() || !result || mma.ops.size() < 4)
     fail_at(C, "WGMMA MMA requires a single unpredicated instruction and a register tuple result");
 
@@ -223,6 +224,8 @@ static void validateWgmmaMma(CallInst *C, ArrayRef<Stmt> statements) {
     }
     fail_at(C, "WGMMA MMA accumulator output operands must be in LLVM result order");
   }
+
+  if (sparse) return; // parse_sparse_wgmma validates the SS/RS operands at lowering.
 
   // CUTLASS defines its scale-D predicate with `setp.ne.b32 p, $input, 0` immediately before MMA.
   if (statements.size() == 1 && mma.ops[3] != "p") return;
@@ -2356,6 +2359,99 @@ static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *,
 }
 
 } // namespace
+
+SparseWgmmaOperands parse_sparse_wgmma(CallInst *call, unsigned outputs) {
+  auto *assembly = cast<InlineAsm>(call->getCalledOperand());
+  std::vector<Stmt> statements;
+  std::string error;
+  if (!parsePtx(assembly->getAsmString(), statements, error) || statements.empty())
+    fail_at(call, "invalid sparse WGMMA instruction");
+  const auto &mma = statements.back();
+  const auto &op = mma.ops;
+  StringRef shape(mma.op);
+  unsigned n;
+  if (!shape.consume_front("wgmma.mma_async.sp.sync.aligned.m64n") || shape.consumeInteger(10, n) ||
+      !n || n > 256 || n % 8)
+    fail_at(call, "invalid sparse WGMMA shape or accumulator width");
+  bool packed = shape.split('.').second.starts_with("f16.");
+  if (outputs != n / (packed ? 4 : 2)) fail_at(call, "invalid sparse WGMMA accumulator width");
+  bool half = shape == "k32.f32.f16.f16" || shape == "k32.f16.f16.f16" || shape == "k32.f32.bf16.bf16";
+  bool tf32 = shape == "k16.f32.tf32.tf32";
+  bool fp8 = shape == "k64.f32.e4m3.e4m3" || shape == "k64.f32.e5m2.e5m2" ||
+             shape == "k64.f32.e4m3.e5m2" || shape == "k64.f32.e5m2.e4m3" ||
+             shape == "k64.f16.e4m3.e4m3" || shape == "k64.f16.e5m2.e5m2" ||
+             shape == "k64.f16.e4m3.e5m2" || shape == "k64.f16.e5m2.e4m3";
+  StringRef intTypes = shape;
+  bool saturate = intTypes.consume_front("k64.satfinite.s32.");
+  bool integer = (saturate || intTypes.consume_front("k64.s32.")) &&
+                 (intTypes == "s8.s8" || intTypes == "u8.u8" || intTypes == "s8.u8" || intTypes == "u8.s8");
+  if (!(half || tf32 || fp8 || integer) || (integer && n > 32 && n % 16))
+    fail_at(call, "unsupported sparse WGMMA shape or element types");
+  const bool regA = op.size() > 1 && StringRef(op[1]).starts_with("{");
+  if (op.size() != (half ? (regA ? 9u : 10u) : integer ? 6u : 8u))
+    fail_at(call, "sparse WGMMA operand count differs from the SS or RS form");
+
+  auto resolve = [&](StringRef token, unsigned bits) -> Value * {
+    token = token.trim();
+    unsigned index;
+    if (token.consume_front("$")) {
+      if (token.consume_front("{") && token.consume_back("}")) token = token.split(':').first;
+      if (!token.getAsInteger(10, index) && index >= outputs && index - outputs < call->arg_size()) {
+        auto *v = call->getArgOperand(index - outputs);
+        if (v->getType()->isIntegerTy(bits)) return v;
+      }
+    } else {
+      int64_t value;
+      if (!token.getAsInteger(0, value))
+        return ConstantInt::get(IntegerType::get(call->getContext(), bits), value);
+    }
+    fail_at(call, "invalid sparse WGMMA operand " + token.str());
+  };
+  auto imm = [&](unsigned i, int lo, int hi) {
+    auto *ci = dyn_cast<ConstantInt>(resolve(op[i], 32));
+    if (!ci || ci->getSExtValue() < lo || ci->getSExtValue() > hi)
+      fail_at(call, "invalid sparse WGMMA immediate");
+    return static_cast<int>(ci->getSExtValue());
+  };
+  SparseWgmmaOperands result;
+  if (regA) {
+    StringRef tuple(op[1]);
+    if (!tuple.consume_front("{") || !tuple.consume_back("}")) fail_at(call, "invalid sparse WGMMA register A");
+    for (const auto &reg : splitTop(tuple.str(), ',')) result.aRegs.push_back(resolve(reg, 32));
+    if (result.aRegs.size() != 4) fail_at(call, "sparse WGMMA requires four packed A registers");
+  } else result.a = resolve(op[1], 64);
+  result.b = resolve(op[2], 64);
+  result.meta = resolve(op[3], 32);
+  int selector = imm(4, 0, (half || tf32) ? 1 : 0);
+  int scaleA = integer ? 1 : imm(6, -1, 1), scaleB = integer ? 1 : imm(7, -1, 1);
+  if (!scaleA || !scaleB) fail_at(call, "sparse WGMMA input scales must be +1 or -1");
+  result.flags = (half && !regA ? imm(8, 0, 1) : 0) | (half ? imm(regA ? 8 : 9, 0, 1) << 1 : 0) |
+                 (selector << 2) | ((scaleA < 0) << 3) | ((scaleB < 0) << 4) | (regA << 5) | (packed << 6) | (saturate << 7);
+  if (statements.size() == 1) {
+    result.scale = resolve(op[5], 32);
+  } else {
+    const auto &set = statements.front();
+    if (statements.size() != 2 || set.op != "setp.ne.b32" || !set.pred.empty() || !set.label.empty() ||
+        set.ops.size() != 3 || set.ops[0] != op[5] || set.ops[2] != "0")
+      fail_at(call, "unexpected sparse WGMMA scale-D predicate or bundled instruction");
+    result.scale = resolve(set.ops[1], 32);
+  }
+  auto constraints = assembly->ParseConstraints();
+  if (constraints.size() < outputs) fail_at(call, "missing sparse WGMMA outputs");
+  result.tied = constraints[0].MatchingInput >= 0;
+  if (result.tied && call->arg_size() < outputs) fail_at(call, "missing sparse WGMMA input accumulators");
+  result.firstAcc = call->arg_size() - (result.tied ? outputs : 0);
+  for (unsigned i = 0; i < outputs; ++i) {
+    int tie = result.tied ? outputs + result.firstAcc + i : -1;
+    Type *expected = (integer || packed) ? Type::getInt32Ty(call->getContext()) : Type::getFloatTy(call->getContext());
+    if (constraints[i].MatchingInput != tie || cast<StructType>(call->getType())->getElementType(i) != expected ||
+        (result.tied && call->getArgOperand(result.firstAcc + i)->getType() != expected))
+      fail_at(call, "invalid sparse WGMMA accumulator ties");
+  }
+  if (!result.tied && !(isa<ConstantInt>(result.scale) && cast<ConstantInt>(result.scale)->isZero()))
+    fail_at(call, "sparse WGMMA with scale-D requires incoming accumulators");
+  return result;
+}
 
 Value *async_tensor_map_operand(CallBase &call) {
   const Function *callee = call.getCalledFunction();

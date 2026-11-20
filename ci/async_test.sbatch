@@ -38,6 +38,10 @@ if ! bash ci/inline_ptx_validation_test.sh build/compilation/kernelTranslator "$
   cat "$OUT/inline_ptx_validation.log"
   exit 1
 fi
+if [[ "$VORTEX_NUM_THREADS" == 32 ]] && ! bash ci/sparse_mma_test.sh > "$OUT/sparse_mma.log" 2>&1; then
+  cat "$OUT/sparse_mma.log"
+  exit 1
+fi
 if ! bash ci/tma_nvvm_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_nvvm.log" 2>&1; then
   cat "$OUT/tma_nvvm.log"
   exit 1

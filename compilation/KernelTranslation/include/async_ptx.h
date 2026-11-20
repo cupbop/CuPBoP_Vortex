@@ -1,9 +1,18 @@
 #ifndef __CUPBOP_ASYNC_PTX__
 #define __CUPBOP_ASYNC_PTX__
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Module.h"
 
-namespace llvm { class CallBase; }
+namespace llvm { class CallBase; class CallInst; }
+
+struct SparseWgmmaOperands {
+  llvm::Value *a = nullptr, *b = nullptr, *meta = nullptr, *scale = nullptr;
+  llvm::SmallVector<llvm::Value *, 4> aRegs;
+  unsigned flags = 0, firstAcc = 0;
+  bool tied = false;
+};
+SparseWgmmaOperands parse_sparse_wgmma(llvm::CallInst *, unsigned outputs);
 
 // Hopper / Ampere asynchronous PTX -> CuPBoP internal calls, software mode (async design, stages 1-2).
 // Runs first in the translator (before lower_named_barriers and lower_cp_async), on CUDA-source inline asm,

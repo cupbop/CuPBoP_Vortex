@@ -20,6 +20,15 @@ if [[ ${CUPBOP_HOPPER_LIFTED:-0} == 1 ]]; then
   ln -s "$CuPBoP_PATH/examples/"{lift.mk,lift_d2h.c} "$work/examples/"
 fi
 
+lift_hopper() {
+  "${CUPBOP_HOPPER_NVCC:-$CUDA_PATH/bin/nvcc}" --allow-unsupported-compiler -O3 -arch=sm_90a --cubin "$@" -o hopper.cubin
+  "$CUDA_PATH/bin/cuobjdump" -sass hopper.cubin > hopper.sass
+  "$CULIFTER_ENV/bin/python" "$CULIFTER_HOME/main.py" -i hopper.sass hopper.cubin -o raw --lifter nvvm > lift.log 2>&1
+  if grep -qi 'unsupported instruction' lift.log; then cat lift.log; exit 1; fi
+  "$LLVM_PREFIX/bin/opt" -passes=verify -disable-output raw.ll
+  xz -k raw.ll
+}
+
 run_gemm() {
   local tag=$1 swizzle=$2 pipeline=$3 phase=${4:-0}
   local width=${5:-64} trans_a=${6:-0} trans_b=${7:-0}
@@ -40,13 +49,7 @@ run_gemm() {
     cd "$folder"
     export CUPBOP_MMA_LOWERING=tcu VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOUT_S:-180}
     if [[ $input == lifted ]]; then
-      "${CUPBOP_HOPPER_NVCC:-$CUDA_PATH/bin/nvcc}" --allow-unsupported-compiler -O3 -arch=sm_90a --cubin "${defines[@]}" \
-        sgemm_wgmma.cu -o hopper.cubin
-      "$CUDA_PATH/bin/cuobjdump" -sass hopper.cubin > hopper.sass
-      "$CULIFTER_ENV/bin/python" "$CULIFTER_HOME/main.py" -i hopper.sass hopper.cubin -o raw --lifter nvvm > lift.log 2>&1
-      if grep -qi 'unsupported instruction' lift.log; then cat lift.log; exit 1; fi
-      "$LLVM_PREFIX/bin/opt" -passes=verify -disable-output raw.ll
-      xz -k raw.ll
+      lift_hopper "${defines[@]}" sgemm_wgmma.cu
       sed -i 's|include ../common.mk|include ../lift.mk|' Makefile
     fi
     make build SCHEDULE=2 LOCALMEM=1 EXTRA_CLANG_FLAGS="$flags" > build.log 2>&1
@@ -86,6 +89,76 @@ PY
   )
 }
 
+run_lifted_gsb() (
+  folder="$work/examples/gsb-$(basename "$work")"
+  mkdir "$folder"
+  cp "$CuPBoP_PATH/examples/hopper_wgmma_gsb/"{Makefile,hopper_wgmma_gsb.cu} "$folder/"
+  cd "$folder"
+  export CUPBOP_MMA_LOWERING=tcu VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOUT_S:-180}
+  lift_hopper hopper_wgmma_gsb.cu
+  make build SCHEDULE=2 LOCALMEM=1 > build.log 2>&1
+  CUPBOP_PERF_KERNEL_FILE=perf.jsonl make ci-run SCHEDULE=2 LOCALMEM=1 > run.log 2>&1
+  grep -F 'PASSED!: 1024/1024' run.log
+  "$LLVM_PREFIX/bin/llvm-objdump" -d --section=.text kernel.elf > text.dump
+  python3 - <<'PY'
+import json
+from pathlib import Path
+import re
+
+words = {int(addr, 16): int(word, 16) for addr, word in re.findall(
+    r"^\s*([0-9a-f]+):\s+([0-9a-f]{8})\s", Path("text.dump").read_text(), re.M)}
+controls = [(addr, (word >> 15) & 31, (word >> 20) & 31) for addr, word in words.items()
+            if word & 0x7f == 0x0b and word >> 25 == 2 and (word >> 12) & 7 == 4 and (word >> 7) & 31 == 1]
+commits = [addr for addr, op, pending in controls if op == 1 and pending == 0]
+waits = [pending for _, op, pending in controls if op == 2]
+def native_wgmma(word):
+    return word & 0x7f == 0x0b and word >> 25 == 2 and (word >> 12) & 7 == 3
+
+paired = [addr for addr in commits if native_wgmma(words.get(addr - 4, 0))]
+assert len(paired) == 3, (paired, controls)
+# Every source group has a native and a mutually exclusive high-LMEM fallback site.
+assert len(commits) == 6 and waits == [1, 0], controls
+records = [json.loads(line) for line in Path("perf.jsonl").read_text().splitlines()]
+assert len(records) == 1 and records[0]["val"]["tcu.lmem_reads"] > 0, records
+print("native gsb0: three immediately paired WGMMA/commit sites, waits for one and zero pending groups")
+PY
+
+  if [[ " ${VORTEX_CONFIGS:-} " =~ [[:space:]]-DVX_CFG_LMEM_LOG_SIZE=([0-9]+)[[:space:]] ]] &&
+     (( BASH_REMATCH[1] >= 17 )); then
+    high="$work/examples/gsb-high-$(basename "$work")"
+    mkdir "$high"
+    cp Makefile hopper_wgmma_gsb.cu "$high/"
+    # Retain the lifted operand addresses and move only the generated scratch
+    # beyond the native 16-bit local-memory descriptor offset.
+    python3 - "$high/raw.ll" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path("raw.ll").read_text()
+storage = re.search(r'^@"shared_mem" = external addrspace\(3\) global \[(\d+) x i8\]', source, re.M)
+assert storage, "missing lifted static shared storage"
+size = int(storage[1])
+Path(sys.argv[1]).write_text(source.replace(f"[{size} x i8]", f"[{size + 65536} x i8]"))
+PY
+    cd "$high"
+    xz -k raw.ll
+    make build SCHEDULE=2 LOCALMEM=1 > build.log 2>&1
+    CUPBOP_PERF_KERNEL_FILE=perf.jsonl make ci-run SCHEDULE=2 LOCALMEM=1 > run.log 2>&1
+    grep -F 'PASSED!: 1024/1024' run.log
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+records = [json.loads(line) for line in Path("perf.jsonl").read_text().splitlines()]
+assert len(records) == 1, records
+counters = records[0]["val"]
+assert counters["tcu.lmem_reads"] == 0 and counters["core.instr_tcu"] > 0, counters
+print("high scratch: register MMA, tagged commits, and both waits completed")
+PY
+  fi
+)
+
 run_gemm linear 0 0
 run_gemm swizzle32 32 0 3
 run_gemm swizzle64 64 0 3
@@ -95,4 +168,7 @@ run_gemm n8-trans-a 128 0 3 8 1 0
 run_gemm n24-trans-b 32 0 3 24 0 1
 if [[ ${CUPBOP_HOPPER_LIFTED:-0} == 1 ]]; then
   run_gemm lifted-pipeline 128 1 0 64 0 0 lifted
+  run_lifted_gsb
+  bash "$CuPBoP_PATH/ci/sparse_imma_lift_test.sh"
 fi
+bash "$CuPBoP_PATH/ci/sparse_wgmma_test.sh"
