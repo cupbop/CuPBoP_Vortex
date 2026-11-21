@@ -406,6 +406,7 @@ static std::vector<std::pair<std::string, std::string>> g_kabi_kernels;   // (ke
 static std::vector<std::string> g_kabi_cxx_wrappers;                      // cuda_* in kernel_wrapper.cpp
 const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list() { return g_kabi_kernels; }
 void kabi_add_wrapper(const std::string &wrapper) { g_kabi_kernels.emplace_back("", wrapper); }   // CUPBOP_CTA_LOOP: no kernel under it keeps the ABI
+bool cupbop_kabi_on() { return kabi_on(); }   // cta_loop.cpp (CUPBOP_CTA_LOOP_CALL=2)
 
 using namespace llvm;
 

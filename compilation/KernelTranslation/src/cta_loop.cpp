@@ -13,7 +13,8 @@
 // +33.7%, experiments/ctaloop), so no value of the switch acts there unless CUPBOP_CTA_LOOP_S1=1 is set too, which is for measuring
 // that. Schedule 0 has none of this.
 // CUPBOP_CTA_LOOP_CALL=1 keeps the kernel a separate function: what the loop alone is worth, without the optimizer seeing
-// the kernel inside the loop. Otherwise the kernel is inlined into the wrapper's loop: everything that does not depend on
+// the kernel inside the loop. CUPBOP_CTA_LOOP_CALL=2 calls it under the Vortex kernel calling convention (build_loop): each
+// block runs the kernel's own code. Otherwise the kernel is inlined into the wrapper's loop: everything that does not depend on
 // the block index leaves the loop.
 //
 // What changes in the kernel: blockIdx and gridDim stop being the CTA CSRs (they now describe the hardware grid) and become
@@ -69,6 +70,7 @@ using namespace llvm;
 
 const std::vector<std::pair<std::string, std::string>> &kabi_kernel_list();   // generate_wrapper.cpp: (kernel, wrapper)
 void kabi_add_wrapper(const std::string &wrapper);                            // generate_wrapper.cpp
+bool cupbop_kabi_on();                                                          // generate_wrapper.cpp
 
 namespace {
 enum Mode { M_OFF = 0, M_X = 1, M_Y = 2, M_Z = 3, M_AUTO = 4 };
@@ -313,7 +315,8 @@ unsigned block_dims_read(Function *K) {
   return dims;
 }
 
-bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, bool barrier, bool call_mode) {   // true: the linear walk
+// call_mode: 0 the kernel is inlined into the loop, 1 a plain call (CUPBOP_CTA_LOOP_CALL=1), 2 the kernel ABI call (=2, below)
+bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, bool barrier, int call_mode) {   // true: the linear walk
   LLVMContext &C = M->getContext();
   // The wrapper stays as it was, so a launch without a loop runs the old code; kernel_main takes the copy of the wrapper when the
   // host's word in the context says so (cta_loop_finalize_wrapper). A branch inside the wrapper would not do: the wrapper then
@@ -338,6 +341,53 @@ bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
   Value *Args = W->getArg(0);
   std::vector<Value *> callargs(Call->arg_begin(), Call->arg_end());
   Instruction *Ret = Call->getNextNode();
+  // CUPBOP_CTA_LOOP_CALL=2 (2026-11-21, README 8.15): the kernel ABI call. Inlined, the kernel's launch-invariant values leave the
+  // block loop and the backend spills them (softmax 2048: 72 stack accesses per block against the kernel's 42; MachineLICM's
+  // -sink-insts-to-avoid-spills halves that but puts work into matmul's K loop, +6 to +20%). A plain call saves and restores every
+  // callee-saved register the kernel uses at each block (19 for layernorm). Here the body is <wrapper>_cta_body(args, bx, by, bz):
+  // a copy of the wrapper whose kernel takes the block index as arguments, under the Vortex kernel calling convention (no
+  // callee-saved register saved: annotate_kernel_abi), called the way kernel_main calls a kernel (__cupbop_kcall): inline asm
+  // `jalr ra, 0(t2)` that clobbers every register but sp, gp and tp. So each block runs the kernel's own code, and the loop keeps
+  // its few values on its stack across the call.
+  Function *Body = nullptr;
+  if (call_mode == 2) {
+    Type *I64 = Type::getInt64Ty(C), *PT = W0->getArg(0)->getType();
+    Body = Function::Create(FunctionType::get(Type::getVoidTy(C), {PT, I64, I64, I64}, false), GlobalValue::ExternalLinkage,
+                            W0->getName() + "_cta_body", M);
+    ValueToValueMapTy VB;
+    VB[W0->getArg(0)] = Body->getArg(0);
+    SmallVector<ReturnInst *, 4> rets;
+    CloneFunctionInto(Body, W0, VB, CloneFunctionChangeType::LocalChangesOnly, rets);
+    Body->setLinkage(GlobalValue::ExternalLinkage);
+    Body->removeFnAttr(Attribute::AlwaysInline);
+    Body->addFnAttr(Attribute::NoInline);
+    CallInst *BC = nullptr;
+    for (auto &BB : *Body)
+      for (auto &I : BB)
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (CI->getCalledFunction() == K) BC = CI;
+    if (!BC) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP_CALL=2: no kernel call in %s\n", Body->getName().str().c_str()); std::exit(1); }
+    IRBuilder<> BB(BC);
+    std::vector<Value *> ba(BC->arg_begin(), BC->arg_end());
+    for (int i = 0; i < 3; ++i) ba.push_back(uniform_i32(BB, BB.CreateTrunc(Body->getArg(1 + i), BB.getInt32Ty()), "cta.b"));
+    for (int i = 0; i < 3; ++i) ba.push_back(ctx_word(BB, Body->getArg(0), CTX_NUM_GROUPS + 4 * i, "cta.g"));
+    BB.CreateCall(NK, ba);
+    BC->eraseFromParent();
+    kabi_add_wrapper(Body->getName().str());
+  }
+  // one block: the kernel copy with the block index v[] (and the CUDA grid g[], read by the copy itself under call mode 2)
+  auto run_block = [&](IRBuilder<> &B, std::vector<Value *> a, Value *const v[3]) {
+    if (!Body) { B.CreateCall(NK, a); return; }
+    Type *I64 = B.getInt64Ty(), *PT = Args->getType();
+    std::string cons = "={x10},={x11},={x12},={x13},={x7},0,1,2,3,4";
+    for (int r : {1, 5, 6, 8, 9, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}) cons += ",~{x" + std::to_string(r) + "}";
+    for (int r = 0; r < 32; ++r) cons += ",~{f" + std::to_string(r) + "}";
+    cons += ",~{memory}";
+    auto *RT = StructType::get(C, {PT, I64, I64, I64, PT});
+    auto *IA = InlineAsm::get(FunctionType::get(RT, {PT, I64, I64, I64, PT}, false), "jalr ra, 0(t2)", cons, /*sideeffect*/ true);
+    CallInst *CI = B.CreateCall(IA, {Args, B.CreateZExt(v[0], I64), B.CreateZExt(v[1], I64), B.CreateZExt(v[2], I64), Body});
+    CI->addFnAttr(Attribute::Convergent);
+  };
   IRBuilder<> B(Call);
   // per dimension: blocks start, start + step, ... below end. Cyclic: start = hw, step = launched extent, end = grid; a launch of
   // the whole grid makes one trip. CUPBOP_CTA_LOOP_CHUNK=1 (measurement): context word k != 0 runs k neighbours instead.
@@ -404,7 +454,7 @@ bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
     }
     std::vector<Value *> a = callargs;
     a.insert(a.end(), {v[0], v[1], v[2], g[0], g[1], g[2]});
-    B.CreateCall(NK, a);
+    run_block(B, a, v);
     if (barrier) cta_barrier(B, M);
     Value *carry = B.getInt32(0), *nc[3];
     for (size_t k = 0; k < n; ++k) {
@@ -445,7 +495,7 @@ bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
   }
   std::vector<Value *> a = callargs;
   a.insert(a.end(), {v[0], v[1], v[2], g[0], g[1], g[2]});
-  B.CreateCall(NK, a);
+  run_block(B, a, v);
   if (barrier) cta_barrier(B, M);
   for (auto it = order.rbegin(); it != order.rend(); ++it) {
     const int d = *it;
@@ -460,7 +510,7 @@ bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
   B.CreateRetVoid();
   }
 
-  if (call_mode) {
+  if (call_mode == 1) {
     NK->removeFnAttr(Attribute::AlwaysInline);
     NK->addFnAttr(Attribute::NoInline);
   } else {
@@ -480,7 +530,9 @@ void cta_loop_transform(Module *M) {
   if (schedule() == 1 && !measure_s1) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP: not applied at schedule 1 (schedule 2 only; CUPBOP_CTA_LOOP_S1=1 measures it)\n"); return; }
   if (schedule() != 1 && schedule() != 2) return;
   if (!sreg_from_csr() || !fast_entry_on()) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP needs the CTA CSR reads (CUPBOP_SREG_TLS or CUPBOP_FAST_ENTRY=0 is set): off\n"); return; }
-  const bool call_mode = std::getenv("CUPBOP_CTA_LOOP_CALL") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_CALL"));
+  const int call_mode = std::getenv("CUPBOP_CTA_LOOP_CALL") ? std::atoi(std::getenv("CUPBOP_CTA_LOOP_CALL")) : 0;
+  if (call_mode < 0 || call_mode > 2) { std::fprintf(stderr, "kernelTranslator: CUPBOP_CTA_LOOP_CALL=%d: expected 0, 1 or 2\n", call_mode); std::exit(1); }
+  if (call_mode == 2 && !cupbop_kabi_on()) { std::fprintf(stderr, "[CuPBoP] CUPBOP_CTA_LOOP_CALL=2 needs CUPBOP_KABI: plain call instead\n"); }
   // Legality is read from an optimized copy of the module: a CUDA source kernel has its values in allocas and its atomics
   // behind calls here, and a wait would hide behind them.
   std::unique_ptr<Module> Copy = CloneModule(*M);
@@ -509,12 +561,12 @@ void cta_loop_transform(Module *M) {
     if (!dims) { std::fprintf(stderr, "[CuPBoP] cta_loop: %s: refused: reads no block index\n", lookup.c_str()); continue; }
     int inner = mode == M_AUTO ? cta_loop_pick_dim(dims) : mode - M_X;
     if (!(dims >> inner & 1)) inner = cta_loop_pick_dim(dims);
-    const bool linear = build_loop(M, K, W, inner, dims, lmem, call_mode);
+    const bool linear = build_loop(M, K, W, inner, dims, lmem, call_mode == 2 && !cupbop_kabi_on() ? 1 : call_mode);
     launch_fix_note(M, lookup, "cta_inner", (uint64_t)inner);
     launch_fix_note(M, lookup, "cta_dims", (uint64_t)dims);
     if (linear) launch_fix_note(M, lookup, "cta_linear", 1);
     if (std::getenv("CUPBOP_CTA_LOOP_CHUNK") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_CHUNK"))) launch_fix_note(M, lookup, "cta_chunk", 1);
-    if (report()) std::fprintf(stderr, "[CuPBoP] cta_loop: %s: dims %u, inner %d, %s, %s, %s\n", lookup.c_str(), dims, inner, lmem ? "barrier between blocks" : "no barrier", call_mode ? "call" : "inline", linear ? "linear" : "nest");
+    if (report()) std::fprintf(stderr, "[CuPBoP] cta_loop: %s: dims %u, inner %d, %s, %s, %s\n", lookup.c_str(), dims, inner, lmem ? "barrier between blocks" : "no barrier", call_mode == 2 && cupbop_kabi_on() ? "kernel ABI call" : call_mode ? "call" : "inline", linear ? "linear" : "nest");
   }
 }
 
