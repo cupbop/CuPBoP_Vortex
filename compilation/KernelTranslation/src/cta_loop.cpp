@@ -3,9 +3,11 @@
 // on the launch) is paid once per hardware CTA instead of once per CUDA block.
 //
 //   off / 0   the previous translation, byte for byte
-//   x, y, z   the wrapper walks the grid in a nest of cyclic loops, one per grid dimension the kernel reads, the given one
-//             innermost: hardware CTA (hx, hy, hz) of a launched grid (nx, ny, nz) runs the blocks hx + i nx, hy + j ny,
-//             hz + k nz. The host chooses the launched grid at each launch (cudaRuntimeImpl.cpp cupbop_cta_loop_launch)
+//   x, y, z   the wrapper walks the grid dimensions the kernel reads, the given one innermost. One such dimension: hardware CTA h
+//             of a launched extent n runs the blocks h + i n. Several: they are one index, the given dimension fastest, and
+//             hardware CTA h of H runs h, h + H, ... of it (build_loop, the linear walk; CUPBOP_CTA_LOOP_NEST=1 restores the
+//             earlier nest of cyclic loops, one per dimension). The host chooses the launched grid at each launch
+//             (cudaRuntimeImpl.cpp cupbop_cta_loop_launch)
 //   auto      the innermost dimension from cta_loop_pick_dim
 // Schedule 2 only. At schedule 1 (core mapping) the answers stay right but cells get much slower (sgeam 333x777 +34.1%, hotspot 512
 // +33.7%, experiments/ctaloop), so no value of the switch acts there unless CUPBOP_CTA_LOOP_S1=1 is set too, which is for measuring
@@ -311,7 +313,7 @@ unsigned block_dims_read(Function *K) {
   return dims;
 }
 
-void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, bool barrier, bool call_mode) {
+bool build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, bool barrier, bool call_mode) {   // true: the linear walk
   LLVMContext &C = M->getContext();
   // The wrapper stays as it was, so a launch without a loop runs the old code; kernel_main takes the copy of the wrapper when the
   // host's word in the context says so (cta_loop_finalize_wrapper). A branch inside the wrapper would not do: the wrapper then
@@ -360,6 +362,67 @@ void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
     }
   }
 
+  // Linear walk (2026-11-20, experiments/osdi_upstream README 8.15): with more than one looped dimension the host launches H
+  // hardware CTAs on `inner` (1 on the other looped dimensions), and CTA h runs the blocks h, h + H, h + 2H, ... of the looped
+  // dimensions taken as one index, `inner` fastest, then the others from the lowest (the nest's order). The nest needs the
+  // launched extents to divide the target: a 5 x 5 grid at 8 resident CTAs got 1 x 5 = 5 CTAs, cores 3:2, matmul 320 +13.9%
+  // (README 8.14). Divisions only at the entry: the coordinates advance by the digits of H with one carry per digit.
+  // CUPBOP_CTA_LOOP_NEST=1 keeps the nest (measurement); one looped dimension and the chunk form always use the nest.
+  const char *nest_env = std::getenv("CUPBOP_CTA_LOOP_NEST");
+  const bool linear = !chunk_mode && __builtin_popcount(dims) > 1 && !(nest_env && std::atoi(nest_env));
+  if (linear) {
+    std::vector<int> rad{inner};   // digits, fastest first
+    for (int i = 0; i <= 2; ++i)
+      if ((dims >> i & 1) && i != inner) rad.push_back(i);
+    const size_t n = rad.size();
+    Value *H = uniform_i32(B, read_cta_csr(B, CSR_GRID_DIM + inner, "cta.n.ld"), "cta.n");
+    if (neg_control("skip")) H = B.CreateAdd(H, B.getInt32(1));   // skips blocks: the checks must see it
+    Value *c0[3], *dlt[3], *q = hw[inner], *s = H;
+    for (size_t k = 0; k < n; ++k) {
+      Value *gd = g[rad[k]];
+      if (k + 1 < n) {
+        c0[k] = B.CreateURem(q, gd); q = B.CreateUDiv(q, gd);
+        dlt[k] = B.CreateURem(s, gd); s = B.CreateUDiv(s, gd);
+      } else {   // the slowest digit does not wrap: the walk ends when it reaches its extent
+        c0[k] = q; dlt[k] = s;
+      }
+      c0[k] = uniform_i32(B, c0[k], "cta.c0");
+      dlt[k] = uniform_i32(B, dlt[k], "cta.dc");
+    }
+    Call->eraseFromParent();
+    Ret->eraseFromParent();
+    B.SetInsertPoint(Entry);
+    BasicBlock *Head = BasicBlock::Create(C, "cta.head", W);
+    B.CreateBr(Head);
+    B.SetInsertPoint(Head);
+    PHINode *P[3];
+    Value *v[3] = {hw[0], hw[1], hw[2]};
+    for (size_t k = 0; k < n; ++k) {
+      P[k] = B.CreatePHI(B.getInt32Ty(), 2, "cta.b");
+      P[k]->addIncoming(c0[k], Entry);
+      v[rad[k]] = P[k];
+    }
+    std::vector<Value *> a = callargs;
+    a.insert(a.end(), {v[0], v[1], v[2], g[0], g[1], g[2]});
+    B.CreateCall(NK, a);
+    if (barrier) cta_barrier(B, M);
+    Value *carry = B.getInt32(0), *nc[3];
+    for (size_t k = 0; k < n; ++k) {
+      Value *x = B.CreateAdd(B.CreateAdd(P[k], dlt[k]), carry);   // < 2 x extent: one subtraction wraps it
+      if (k + 1 < n) {
+        Value *wrap = B.CreateICmpUGE(x, g[rad[k]]);
+        x = B.CreateSelect(wrap, B.CreateSub(x, g[rad[k]]), x);
+        carry = B.CreateZExt(wrap, B.getInt32Ty());
+      }
+      nc[k] = uniform_i32(B, x, "cta.nc");
+    }
+    Value *more = uniform_i1(B, B.CreateICmpULT(nc[n - 1], g[rad[n - 1]]), "cta.more");
+    BasicBlock *Latch = B.GetInsertBlock(), *Next = BasicBlock::Create(C, "cta.next", W);
+    B.CreateCondBr(more, Head, Next);
+    for (size_t k = 0; k < n; ++k) P[k]->addIncoming(nc[k], Latch);
+    B.SetInsertPoint(Next);
+    B.CreateRetVoid();
+  } else {
   // nest: the other dimensions outside (higher first), `inner` innermost
   Call->eraseFromParent();
   Ret->eraseFromParent();
@@ -395,6 +458,7 @@ void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
     B.SetInsertPoint(Next);
   }
   B.CreateRetVoid();
+  }
 
   if (call_mode) {
     NK->removeFnAttr(Attribute::AlwaysInline);
@@ -404,6 +468,7 @@ void build_loop(Module *M, Function *K, Function *W0, int inner, unsigned dims, 
     NK->addFnAttr(Attribute::AlwaysInline);
   }
   NK->setLinkage(GlobalValue::InternalLinkage);
+  return linear;
 }
 } // namespace
 
@@ -444,11 +509,12 @@ void cta_loop_transform(Module *M) {
     if (!dims) { std::fprintf(stderr, "[CuPBoP] cta_loop: %s: refused: reads no block index\n", lookup.c_str()); continue; }
     int inner = mode == M_AUTO ? cta_loop_pick_dim(dims) : mode - M_X;
     if (!(dims >> inner & 1)) inner = cta_loop_pick_dim(dims);
-    build_loop(M, K, W, inner, dims, lmem, call_mode);
+    const bool linear = build_loop(M, K, W, inner, dims, lmem, call_mode);
     launch_fix_note(M, lookup, "cta_inner", (uint64_t)inner);
     launch_fix_note(M, lookup, "cta_dims", (uint64_t)dims);
+    if (linear) launch_fix_note(M, lookup, "cta_linear", 1);
     if (std::getenv("CUPBOP_CTA_LOOP_CHUNK") && std::atoi(std::getenv("CUPBOP_CTA_LOOP_CHUNK"))) launch_fix_note(M, lookup, "cta_chunk", 1);
-    if (report()) std::fprintf(stderr, "[CuPBoP] cta_loop: %s: dims %u, inner %d, %s, %s\n", lookup.c_str(), dims, inner, lmem ? "barrier between blocks" : "no barrier", call_mode ? "call" : "inline");
+    if (report()) std::fprintf(stderr, "[CuPBoP] cta_loop: %s: dims %u, inner %d, %s, %s, %s\n", lookup.c_str(), dims, inner, lmem ? "barrier between blocks" : "no barrier", call_mode ? "call" : "inline", linear ? "linear" : "nest");
   }
 }
 
