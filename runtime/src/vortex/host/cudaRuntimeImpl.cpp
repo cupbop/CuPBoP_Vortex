@@ -1164,7 +1164,7 @@ static std::string cupbop_strip_prefix(const std::string &s) {
 // A new key goes into cupbop_apply_launch_fix: a key this runtime does not know stops the launch, because a transformed kernel
 // launched without its rewrite runs wrongly.
 // cta_*: CUPBOP_CTA_LOOP; what the launched grid becomes is decided with the block's local memory, cupbop_cta_loop_launch.
-struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false; };
+struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false, linear = false; };
 static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem, cupbop_cta_fix &cta) {
   static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
   static uint64_t seen = 0;
@@ -1200,6 +1200,8 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
       cta.inner = (uint32_t)v;
     } else if (key == "cta_chunk") {
       cta.chunk = v != 0;
+    } else if (key == "cta_linear") {
+      cta.linear = v != 0;
     } else {
       fprintf(stderr, "cudaLaunchKernel: %s: unknown launch rewrite `%s` in cupbop_launch_fix.txt\n", func_stripped.c_str(), key.c_str());
       std::abort();
@@ -1662,11 +1664,14 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
 //   CUPBOP_CTA_WAVES=<m>  persistent: m times what fits the cores at once (default 1)
 //   CUPBOP_CTA_MIN_TRIPS=<t>  a launch loops when it has at least t blocks per hardware CTA (default 2)
 //   chunk (translated with CUPBOP_CTA_LOOP_CHUNK=1, measurement): a hardware CTA runs neighbouring blocks, not a cyclic walk
+//   linear (cta_linear, several looped dimensions): the looped dimensions are one index; the launch has H hardware CTAs on
+//   `inner` and 1 on the other looped dimensions, H = what fits divided by the extent of the dimensions that are not looped
+//   (README 8.15: the per-dimension split gave a 5 x 5 grid 5 CTAs where 8 fit)
 static uint32_t cupbop_env_u32(const char *name, uint32_t dflt) {
   const char *e = getenv(name);
   return e && *e ? (uint32_t)strtoul(e, nullptr, 10) : dflt;
 }
-static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inner, bool chunk, uint32_t grid[3],
+static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inner, bool chunk, bool linear, uint32_t grid[3],
                                    const uint32_t block[3], uint32_t lmem) {
   const uint64_t cg[3] = {ka->ctx.num_groups[0], ka->ctx.num_groups[1], ka->ctx.num_groups[2]};
   const uint64_t blocks = cg[0] * cg[1] * cg[2];
@@ -1689,6 +1694,15 @@ static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inn
   ka->ctx.printf_buffer = nullptr;                 // its low word: 1 = this launch loops
   if (target * cupbop_env_u32("CUPBOP_CTA_MIN_TRIPS", 2) > blocks) return;   // the old code, the grid as launched
   ka->ctx.printf_buffer = (char *)1;
+  if (linear && !chunk) {
+    uint64_t looped = 1, other = 1;
+    for (int d = 0; d < 3; ++d) (dims >> d & 1 ? looped : other) *= cg[d];
+    const uint64_t H = other >= target ? 1 : std::min<uint64_t>(looped, std::max<uint64_t>(target / other, 1));
+    for (int d = 0; d < 3; ++d) grid[d] = (uint32_t)(dims >> d & 1 ? (d == (int)inner ? H : 1) : cg[d]);
+    DBG_PRINT("cta_loop: blocks=%lu resident=%lu target=%lu linear hw grid=(%u,%u,%u)\n", (unsigned long)blocks, (unsigned long)resident,
+              (unsigned long)target, grid[0], grid[1], grid[2]);
+    return;
+  }
   int order[3], n = 0;
   order[n++] = (int)inner;
   for (int d = 2; d >= 0; --d)
@@ -2737,7 +2751,7 @@ cudaError_t cudaLaunchKernel_vortex(
               func_stripped.c_str(), need, lmem, (unsigned long)lmem_cap);
     }
     if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
-      cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, grid, block, lmem);
+      cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, cta_fix.linear, grid, block, lmem);
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
