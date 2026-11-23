@@ -1,4 +1,6 @@
 #include "ReplaceCudaBuiltin.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
@@ -7,10 +9,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <map>
-#include <regex>
 #include <set>
 
 using namespace llvm;
@@ -18,6 +21,85 @@ using namespace llvm;
 static bool cupbop_debug() {
   static bool enabled = (std::getenv("CUPBOP_DEBUG") != nullptr);
   return enabled;
+}
+
+static std::string functionBaseName(const std::string &name) {
+  ItaniumPartialDemangler demangler;
+  if (demangler.partialDemangle(name.c_str()) || !demangler.isFunction()) return {};
+  size_t size = 0;
+  char *base = demangler.getFunctionBaseName(nullptr, &size);
+  if (!base) return {};
+  std::string result(base);
+  std::free(base);
+  return result;
+}
+
+// Host-only CUDA modules have no registration table. Clang inserts the stub
+// prefix inside the Itanium source name, so removing it must also change that
+// source name's byte count, including inside namespaces and templates.
+static std::string deviceNameFromStub(StringRef symbol) {
+  const StringRef prefix = "__device_stub__";
+  if (symbol.consume_front(prefix)) return symbol.str(); // extern "C"
+  if (!symbol.starts_with("_Z") || !symbol.contains(prefix)) return symbol.str();
+  const std::string oldBase = functionBaseName(symbol.str());
+  StringRef base(oldBase);
+  if (!base.consume_front(prefix)) return symbol.str();
+  const std::string stubComponent = std::to_string(oldBase.size()) + oldBase;
+  const std::string deviceComponent = std::to_string(base.size()) + base.str();
+  for (size_t pos = symbol.find(stubComponent); pos != StringRef::npos;
+       pos = symbol.find(stubComponent, pos + 1)) {
+    std::string candidate = symbol.str();
+    candidate.replace(pos, stubComponent.size(), deviceComponent);
+    if (functionBaseName(candidate) == base) return candidate;
+  }
+  return symbol.str();
+}
+
+// Keep the kernel translator's lookup.txt convention for named launches.
+static std::string deviceLookupName(StringRef name) {
+  const char *triton = std::getenv("TRITON_CUPBOP");
+  if (name.starts_with("_Z") || (triton && StringRef(triton) == "1" && name.starts_with("_")))
+    return name.drop_front(std::min<size_t>(2, name.size())).ltrim("0123456789").str();
+  return name.str();
+}
+
+// CUDA's templated cudaLaunchKernelEx calls the C API through a kernel
+// pointer. Match the host stub to the device name in clang's registration.
+static void replaceExtendedLaunch(Module &M, CallBase &launch,
+                                  const std::map<Function *, std::string> &registered) {
+  IRBuilder<> b(&launch);
+  Type *ptr = b.getPtrTy();
+  auto target = M.getOrInsertFunction("cupbopLaunchKernelEx", b.getInt32Ty(), ptr, ptr, ptr, b.getInt32Ty());
+  auto arguments = [](IRBuilder<> &ir, Value *cfg, Value *args, Function *stub, StringRef name) {
+    return SmallVector<Value *,4>{cfg, ir.CreateGlobalStringPtr(name), args, ir.getInt32(stub->arg_size())};
+  };
+  auto replace = [&](FunctionCallee callee, ArrayRef<Value *> args) {
+    if (auto *invoke = dyn_cast<InvokeInst>(&launch))
+      launch.replaceAllUsesWith(b.CreateInvoke(callee,invoke->getNormalDest(),invoke->getUnwindDest(),args));
+    else
+      launch.replaceAllUsesWith(b.CreateCall(callee,args));
+  };
+  auto *stub = dyn_cast<Function>(launch.getArgOperand(1)->stripPointerCasts());
+  auto it = registered.find(stub);
+  if (it != registered.end()) {
+    replace(target, arguments(b,launch.getArgOperand(0),launch.getArgOperand(2),stub,it->second));
+    return;
+  }
+  auto *dispatch = M.getFunction("__cupbop_dispatch_extended_launch");
+  if (!dispatch) {
+    dispatch = Function::Create(launch.getFunctionType(),Function::InternalLinkage,"__cupbop_dispatch_extended_launch",M);
+    IRBuilder<> ir(BasicBlock::Create(M.getContext(),"entry",dispatch));
+    for (auto &entry : registered) {
+      auto *matched = BasicBlock::Create(M.getContext(),"matched",dispatch);
+      auto *next = BasicBlock::Create(M.getContext(),"next",dispatch);
+      ir.CreateCondBr(ir.CreateICmpEQ(dispatch->getArg(1),entry.first),matched,next);
+      ir.SetInsertPoint(matched);
+      ir.CreateRet(ir.CreateCall(target, arguments(ir,dispatch->getArg(0),dispatch->getArg(2),entry.first,entry.second)));
+      ir.SetInsertPoint(next);
+    }
+    ir.CreateRet(ir.getInt32(98)); // cudaErrorInvalidDeviceFunction
+  }
+  replace(dispatch,{launch.getArgOperand(0),launch.getArgOperand(1),launch.getArgOperand(2)});
 }
 
 /*
@@ -102,8 +184,6 @@ void ReplaceKernelLaunch(llvm::Module *M) {
   auto I8 = PointerType::getUnqual(context);
   //auto I8 = llvm::Type::getInt8PtrTy(context);
 
-  std::map<std::string, Function *> kernels;
-
   std::set<llvm::Function *> need_remove;
   LLVMContext *C = &M->getContext();
 
@@ -144,40 +224,30 @@ void ReplaceKernelLaunch(llvm::Module *M) {
   */
 
   if (cupbop_debug()) std::cout << "Does it come here?" << std::endl;
-  Function *f_register_global = M->getFunction("__cuda_register_globals");
-  if (f_register_global) {
-    for (Function::iterator b = f_register_global->begin();
-         b != f_register_global->end(); ++b) {
-      BasicBlock *B = &(*b);
-      for (BasicBlock::iterator i = B->begin(); i != B->end(); ++i) {
-        Instruction *inst = &(*i);
-        if (llvm::CallInst *callInst = llvm::dyn_cast<llvm::CallInst>(inst)) {
-          if (Function *calledFunction = callInst->getCalledFunction()) {
-            if (calledFunction->getName().str() == "__cudaRegisterFunction") {
-              Value *callOperand = callInst->getArgOperand(1);
-
-              Function *functionOperand =
-                  dyn_cast<Function>(callInst->getArgOperand(1));
-
-              // call function is wrapped in a bitcast
-              if (functionOperand == NULL) {
-
-                std::vector<size_t> arg_sizes;
-                functionOperand =
-                    dyn_cast<Function>(callOperand->stripPointerCasts());
-
-                cuda_register_kernel_names.insert(
-                    functionOperand->getName().str());
-                if (cupbop_debug()) std::cout << "Cuda Register Global Kernel: "
-                          << functionOperand->getName().str() << std::endl;
-              }
-            }
-          }
-        }
-      }
+  std::map<Function *, std::string> deviceKernels;
+  if (auto *registration = M->getFunction("__cudaRegisterFunction")) {
+    for (auto *user : registration->users()) {
+      auto *call = dyn_cast<CallBase>(user);
+      if (!call || call->arg_size() < 4) continue;
+      auto *stub = dyn_cast<Function>(call->getArgOperand(1)->stripPointerCasts());
+      if (!stub) continue;
+      StringRef deviceName;
+      if ((getConstantStringInfo(call->getArgOperand(3), deviceName) && !deviceName.empty()) ||
+          (getConstantStringInfo(call->getArgOperand(2), deviceName) && !deviceName.empty()))
+        deviceKernels.emplace(stub, deviceLookupName(deviceName));
+      if (!isa<Function>(call->getArgOperand(1)))
+        cuda_register_kernel_names.insert(stub->getName().str());
     }
   }
-bool host_changed = false;
+  // Registration takes precedence over the fallback used in host-only modules.
+  if (auto *ordinary = M->getFunction("cudaLaunchKernel")) {
+    for (auto *user : ordinary->users()) {
+      auto *call = dyn_cast<CallBase>(user);
+      if (!call || call->arg_empty()) continue;
+      if (auto *stub = dyn_cast<Function>(call->getArgOperand(0)->stripPointerCasts()))
+        deviceKernels.emplace(stub, deviceLookupName(deviceNameFromStub(stub->getName())));
+    }
+  }
 
 std::vector<llvm::Instruction *> need_remove_inst;
 int kernel_idx = 0;
@@ -203,6 +273,11 @@ int kernel_idx = 0;
               //print function name
               if (cupbop_debug()) std::cout << "function_name2: " << calledFunction->getName().str() << std::endl;
 
+              if (calledFunction->getName() == "cudaLaunchKernelExC" && callInst->arg_size() == 3) {
+                replaceExtendedLaunch(*M,*callInst,deviceKernels);
+                need_remove_inst.push_back(callInst);
+                continue;
+              }
               Value *callOperand = callInst->getArgOperand(0);
 
               Function *functionOperand =
@@ -229,85 +304,19 @@ int kernel_idx = 0;
                           << functionOperand->getName().str() << ", args "
                           << functionOperand->arg_size() << std::endl;
                 
-                auto rep = kernels.find(functionOperand->getName().str());
-                if (rep != kernels.end()) {
-                  Function *FC = rep->second;
-                  BitCastInst *B = new BitCastInst(FC, I8, "", callInst);
-                  callInst->setArgOperand(0, B);
+                auto kernel = deviceKernels.find(functionOperand);
+                const std::string name = kernel == deviceKernels.end()
+                    ? deviceLookupName(deviceNameFromStub(functionOperand->getName())) : kernel->second;
+                if (cupbop_debug()) std::cout << "Change Kernel Name to: " << name << std::endl;
 
-                  continue;
-                }
-
-                std::vector<Type *> Params;
-                Params.push_back(I8);
-                FunctionType *FT = FunctionType::get(VoidTy, Params, false);
-
-                /*
-                  Because of the TODO in the 2nd if statement, need to get the
-                  prior name before _host is add
-                */
-                std::string oldName = functionOperand->getName().str();
-
-
-                // if parent function is __host and same as the
-                // cudaKernelLaunch
-                std::string newName = oldName + "_wrapper";
-                if (func_name == oldName && host_changed &&
-                    oldName.find("_host") != std::string::npos) {
-                  newName =
-                      oldName.substr(0, oldName.length() - 5) + "_wrapper";
-                }
-
-                // For LLVM>=14, it will add _device_stub prefix for the kernel
-                // name, thus, we need to remove the prefix
-                // example:
-                // from: _Z24__device_stub__HistogramPjS_jj
-                // to: HistogramPjS_jj
-                newName = std::regex_replace(newName,
-                                             std::regex("__device_stub__"), "");
-                // remove _Z24 (a mangled stub only: an extern "C" kernel's stub __device_stub__<name> keeps its
-                // name, as kernelTranslator's cupbop_kernel_lookup_name does for lookup.txt)
-                if ((newName.size() > 2 && newName[0] == '_' && newName[1] == 'Z') ||
-                    (std::getenv("TRITON_CUPBOP") && std::string(std::getenv("TRITON_CUPBOP")) == "1" && !newName.empty() && newName[0] == '_'))
-                for (int i = 2; i < newName.length(); i++) {
-                  if (newName[i] >= '0' && newName[i] <= '9')
-                    continue;
-                  newName = newName.substr(i);
-                  break;
-                }
-
-                if (cupbop_debug()) std::cout << "Change Kernel Name to: " << newName << std::endl;
-                
-                // FROM HERE
-                /* wrapper function, removed since vortex doesn't require wrapper function
-                Function *F = Function::Create(FT, Function::ExternalLinkage, newName, M);
-                  F->setDSOLocal(true);
-                  F->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-
-                BitCastInst *BC = new BitCastInst(F, I8, "", callInst);
-                callInst->setArgOperand(0, BC);
-                kernels.insert({functionOperand->getName().str(), F});
-                // UNTIL here */
-
-                // Creating a new Integercaset for number of arguments 
-                Value *arg_num = dyn_cast<Value>(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), functionOperand->arg_size()));
-                CastInst *BC_argnum = CastInst::CreateIntegerCast(arg_num, llvm::Type::getInt32Ty(context), false, "", callInst_inst);
-
-                // Creating a new Cast for kernel name
-                IRBuilder<> Builder(inst);
-                llvm::Value *kernel_name_ptr = Builder.CreateGlobalStringPtr(newName.substr(0, newName.length() - 8));
-                callInst->setArgOperand(0, kernel_name_ptr);
-
-                //// For temporary reason, will delete it later.
-                //Value *kernel_name = llvm::ConstantArray::get(llvm::Type::getInt8PtrTy(context), functionOperand->getName());
-                //Value *kernel_name = llvm::ConstantDataArray::getString(context, functionOperand->getName(), true);
-                //Value *kernel_name = dyn_cast<Value>(Builder.CreateGlobalStringPtr(oldName));
-                //CastInst *BC_kernel_name = CastInst::CreatePointerCast(kernel_name, kernel_name->getPointerElementType(), "", BC_argnum);
+                IRBuilder<> builder(callInst_inst);
+                callInst_inst->setArgOperand(0, builder.CreateGlobalStringPtr(name));
+                Value *arg_count = builder.getInt32(functionOperand->arg_size());
 
                 std::vector<Value*> ArgsT;
                 for (int oper_idx = 0; oper_idx <= 7; ++oper_idx) {
                   ArgsT.push_back(callInst_inst->getArgOperand(oper_idx));}
-                ArgsT.push_back(BC_argnum);
+                ArgsT.push_back(arg_count);
 
                 std::vector<llvm::Type *> ArgTys;
                 for (Value *V : ArgsT)
@@ -336,7 +345,6 @@ int kernel_idx = 0;
               // TODO: some reason changes all occurences of the function name
               // for both cudaKernelLaunch calls and regular function call
               
-              host_changed = true;
               calledFunction->setName(calledFunction->getName() + "_host");
               if (cupbop_debug()) std::cout << std::endl;
               if (cupbop_debug()) std::cout << "Change Host Function Name To: "

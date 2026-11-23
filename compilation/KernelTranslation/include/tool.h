@@ -29,6 +29,8 @@ llvm::CallInst *CreateIntraWarpBarrier(llvm::Instruction *InsertBefore);
 // index < block_size guard (a divergent split/join per region) is dropped.
 struct VirtGeom { int schedule; int nt; int lanes; int subpasses; int lg_lanes; int trips; int trips_exact; };
 VirtGeom getVirtGeom();
+// Tests a complete -D flag in VORTEX_CONFIGS. With no configuration the link decides.
+bool vortexConfigHasFlag(const char *flag);
 void VerifyModule(llvm::Module *);
 void phi2alloc(llvm::Module *M);
 void remove_cuda_built_in(llvm::Module *M);
@@ -61,6 +63,8 @@ void replace_warp_shfl_early(llvm::Module *M);
 void lower_cmpxchg_for_flat(llvm::Module *M);
 void lower_atomicrmw_fadd(llvm::Module *M);
 void lower_atomicrmw_add_i64(llvm::Module *M);
+void prepare_wgmma_scratch(llvm::Module *M);
+void prepare_mma_sp_scratch(llvm::Module *M);
 void replace_asm_call(llvm::Module *M);
 bool find_block_barrier_in_region(llvm::BasicBlock *start,
                                   llvm::BasicBlock *end);

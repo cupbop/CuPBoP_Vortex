@@ -29,6 +29,11 @@
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -56,6 +61,57 @@ static void dumpFile(llvm::Module *program, std::string name) {
 }
 
 #define DBG_LOG(msg) do { if (debug_mode()) std::cout << msg << std::flush; } while(0)
+
+// At -O0 Clang leaves the libcudacxx barrier/pipeline implementation out of
+// line. Inline the SDK helpers before assigning hardware barrier IDs, so the
+// initializer retains the identity and byte offset of its CTA shared object.
+static void inlineCudaAsyncHeaders(Module &module) {
+  auto sdk = [](StringRef name) {
+    return name.starts_with("_ZN4cuda") || name.starts_with("_ZNK4cuda") ||
+           name.starts_with("_ZN6nvcuda") || (name.starts_with("_ZL") && name.contains("__pipeline_"));
+  };
+  bool needed = llvm::any_of(module, [&](Function &f) {
+    return f.hasFnAttribute(Attribute::OptimizeNone) && sdk(f.getName()) &&
+           (f.getName().contains("memcpy_async") || f.getName().contains("pipeline") ||
+            f.getName().contains("barrier"));
+  });
+  if (!needed) return;
+  SmallPtrSet<Function *, 32> affected;
+  SmallVector<Function *> work;
+  for (Function &f : module) {
+    if (f.isDeclaration() || !sdk(f.getName())) continue;
+    f.removeFnAttr(Attribute::NoInline);
+    f.addFnAttr(Attribute::AlwaysInline);
+    work.push_back(&f);
+  }
+  while (!work.empty()) {
+    auto *f = work.pop_back_val();
+    if (!affected.insert(f).second) continue;
+    f->removeFnAttr(Attribute::OptimizeNone);
+    for (User *user : f->users())
+      if (auto *call = dyn_cast<CallBase>(user))
+        work.push_back(call->getFunction());
+  }
+  PassBuilder pb;
+  LoopAnalysisManager loops;
+  FunctionAnalysisManager functions;
+  CGSCCAnalysisManager scc;
+  ModuleAnalysisManager modules;
+  pb.registerModuleAnalyses(modules);
+  pb.registerCGSCCAnalyses(scc);
+  pb.registerFunctionAnalyses(functions);
+  pb.registerLoopAnalyses(loops);
+  pb.crossRegisterProxies(loops, functions, scc, modules);
+  ModulePassManager passes;
+  passes.addPass(AlwaysInlinerPass());
+  FunctionPassManager simplify;
+  simplify.addPass(SROAPass(SROAOptions::ModifyCFG));
+  simplify.addPass(InstCombinePass(InstCombineOptions().setVerifyFixpoint(false)));
+  simplify.addPass(SimplifyCFGPass());
+  passes.addPass(createModuleToFunctionPassAdaptor(std::move(simplify)));
+  passes.addPass(GlobalDCEPass());
+  passes.run(module, modules);
+}
 
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
@@ -93,6 +149,7 @@ int main(int argc, char **argv) {
   // Hopper/Ampere async PTX (mbarrier, TMA, bulk copy, elect, cluster registers; async_ptx.h): first, so that
   // lower_named_barriers and lower_cp_async only see what is left, and every later pass sees plain calls
   DBG_LOG("lower_async_ptx\n");
+  inlineCudaAsyncHeaders(*program);
   lower_async_ptx(program);
   // wide by-value parameters (CuLifter parameter structs) -> pointer to their consecutive launch slots
   pass_wide_kernel_args_by_slot(program);
@@ -170,6 +227,8 @@ int main(int argc, char **argv) {
       if (has_switch) FAM.invalidate(F, LowerSwitchPass().run(F, FAM));
       FAM.invalidate(F, FixIrreduciblePass().run(F, FAM));
       FAM.invalidate(F, LoopSimplifyPass().run(F, FAM));
+      if (getVirtGeom().subpasses > 1 && isKernelFunction(program, &F))
+        record_uniform_loop_selectors(F, FAM);
       fprintf(stderr, "[fixirr] %s: irreducible control flow made reducible (FixIrreducible%s + LoopSimplify)\n",
               F.getName().str().c_str(), has_switch ? " after LowerSwitch" : "");
     }

@@ -1,9 +1,11 @@
 
 #include "warp_func.h"
+#include "cg_sync.h"
 #include "flag.h"
 #include "tool.h"
 #include "triton_ir.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
@@ -15,6 +17,8 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/IR/PassManager.h"
@@ -189,12 +193,9 @@ static bool voteFeedsOnlyMasks(CallInst *ci, std::set<CallInst *> &local_syncs) 
 //    < NT, constant member mask within lanes [0, NT), or a constant / kernel-argument value). A Triton module generated
 //    for NT threads per warp (TRITON_CUPBOP_WARP_SIZE) is on NT-lane warps by construction: its shuffles are kept
 //    (check_narrow_triton_warp, triton_ir.cpp), the other kinds are not.
-//  - core mapping sub-pass form (S > 1): staged are shfl, vote/activemask, every mma.sync form replace_nvvm_mma_intrinsics
-//    lowers, movmatrix and (16 lanes) ldmatrix/stmatrix and redux.sync; the %laneid asm reads the logical lane. wmma, wgmma,
-//    match and anything else would run once per sub-pass with 32-lane semantics -> refused. The staged mma/movmatrix glue
-//    exists only on a real NT=16 build (TCU glue for f16/bf16: NT=16 TCU build); with a wider bitstream (as-if NT16,
-//    CUPBOP_VIRT_LANES=16) the link used to fail on an undefined __cupbop_*_glue16 symbol -> refused with a reason (the
-//    TCU tile is fixed by the synthesized NT, 2026-10-26_TCU_DATAPATH_KO.md 6.1).
+//  - core mapping sub-pass form (S > 1): stage shfl, vote/activemask, and at 8 or 16 lanes, mma.sync and
+//    ldmatrix/stmatrix. Movmatrix and redux.sync are staged at 16 lanes. The %laneid asm reads the logical lane.
+//    Wmma, wgmma and match are refused. Staged MMA helpers are built for the synthesized width.
 // CUPBOP_ALLOW_NARROW_WARP_OPS=1 translates anyway (warnings only).
 // ---------------------------------------------------------------------------
 static bool narrowWarpOpsAllowed() {
@@ -210,19 +211,14 @@ static int bitstreamThreads() {
   return p == std::string::npos ? 0 : std::atoi(s.c_str() + p + k.size());
 }
 static bool bitstreamHasTcu() {
-  const char *e = std::getenv("VORTEX_CONFIGS");
-  return e && std::string(e).find("-DVX_CFG_EXT_TCU_ENABLE") != std::string::npos;
+  return std::getenv("VORTEX_CONFIGS") && vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE");
 }
-// The sub-pass glue (__cupbop_*_glue16, cudaKernelImpl.cpp, cudaKernelImpl_dtypes.inc) is only built for an NT=16
-// bitstream; the TCU glue runs on the NT=16 TCU tile (needTcu), the software glue needs no TCU. Unknown configuration
-// (no VORTEX_CONFIGS): left to the link, as before.
-static void requireGlue16Bitstream(const char *what, int n, bool needTcu = true) {
+// Native MMA helpers use the TCU tile of the synthesized warp width.
+static void requireStagedWarpBitstream(const char *what, int lanes, bool needTcu) {
   const int hw = bitstreamThreads();
-  if (hw == 0 || (hw == 16 && (!needTcu || bitstreamHasTcu()))) return;
-  fprintf(stderr, "error: virt sub-pass form (16 lanes): %d %s site(s) need the NT=16 glue, but the bitstream is "
-                  "VX_CFG_NUM_THREADS=%d%s (as-if NT=16 / CUPBOP_VIRT_LANES on a wider warp): its TCU tile is fixed by the "
-                  "synthesized NT and cannot serve a 16-lane warp; refusing (no __cupbop_*_glue16 for this build)\n",
-          n, what, hw, bitstreamHasTcu() ? "" : " without the TCU");
+  if (hw == 0 || (hw == lanes && (!needTcu || bitstreamHasTcu()))) return;
+  fprintf(stderr, "error: staged %s needs a %d-lane Vortex build%s, got VX_CFG_NUM_THREADS=%d%s\n",
+          what, lanes, needTcu ? " with TCU" : "", hw, bitstreamHasTcu() ? " with TCU" : "");
   if (!narrowWarpOpsAllowed()) exit(1);
 }
 // What a call does across the CUDA warp, by callee name as the module has it when ReplaceWarpLevelPrimitive runs
@@ -335,7 +331,10 @@ static void rejectUnstagedWarpOpsSubpass(Module &m) {
       if (kernel && !CI->isInlineAsm()) {
         StringRef n = CI->getCalledFunction()->getName();
         if (n.starts_with("llvm.nvvm.mma.") || n.starts_with("cupbop.mma.") || n == "__cupbop_movmatrix_m8n8_trans_b16") continue;
-        if ((n == "__cupbop_ldmatrix_m8n8_b16" || n == "__cupbop_stmatrix_m8n8_b16" || n == "__cupbop_redux_sync") && getVirtGeom().lanes == 16) continue;
+        const int lanes = getVirtGeom().lanes;
+        if ((n == "__cupbop_ldmatrix_m8n8_b16" || n == "__cupbop_stmatrix_m8n8_b16") &&
+            (lanes == 8 || lanes == 16)) continue;
+        if (n == "__cupbop_redux_sync" && lanes == 16) continue;
       }
       if (kernel && CI->isInlineAsm() &&
           cast<InlineAsm>(CI->getCalledOperand())->getAsmString().find("movmatrix.sync.aligned.m8n8.trans.b16") != std::string::npos)
@@ -357,16 +356,6 @@ static void rejectUnstagedWarpOpsSubpass(Module &m) {
   if (!narrowWarpOpsAllowed()) exit(1);
 }
 
-// virt sub-pass form (S > 1): a hardware thread runs the logical lanes l, l+L, ... through ONE copy of the
-// control flow, so a loop whose trip count differs between those lanes runs on sub-pass 0's count and the
-// warp ops staged inside it see the other sub-passes on the wrong iteration (conformance div_loop_ballot:
-// lane t+16 copied lane t's ballot pattern). Until a per-sub-pass gate exists (decision 2A, 2026-10-24) the
-// translator refuses such kernels instead of producing wrong results: a warp op that may legally run with
-// part of the warp (activemask, or a vote/shfl/match whose mask is not the constant 0xffffffff) inside a loop
-// with an exit condition that depends on the thread or lane id. A full-mask op is exempt: CUDA requires all
-// 32 lanes to reach it together, so in a valid program the enclosing loops run the same trips on every lane
-// (jaccard's rounded bound, cc-cuda's warp-uniform worklist loop). mma/movmatrix are warp-wide by definition.
-// CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 translates anyway (warning only; the conformance test uses it).
 static bool isLaneSource(const Instruction *I) {
   auto *CI = dyn_cast<CallInst>(I);
   if (!CI) return false;
@@ -378,7 +367,8 @@ static bool isLaneSource(const Instruction *I) {
   if (!F) return false;
   StringRef n = F->getName();
   return n.starts_with("llvm.nvvm.read.ptx.sreg.tid.") || n == "llvm.nvvm.read.ptx.sreg.laneid" ||
-         n.starts_with("llvm.nvvm.shfl.") || n == "__cupbop_laneid"; // a shuffle result is per lane too
+         n.starts_with("llvm.nvvm.shfl.") || n.starts_with("llvm.nvvm.mma.") || n.starts_with("llvm.nvvm.movmatrix") ||
+         n.starts_with("llvm.nvvm.match.") || n == "__cupbop_laneid";
 }
 static bool isStagedWarpOp(const CallInst *CI) {
   if (CI->isInlineAsm() || !CI->getCalledFunction()) return false;
@@ -420,9 +410,91 @@ static void markPartialMaskWarpOps(Module &m) {
         if (isStagedWarpOp(CI) && mayRunPartialWarp(CI))
           CI->setMetadata("cupbop.virt_partial_mask", MDNode::get(m.getContext(), {}));
 }
-static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
-  const bool allow = std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS") && std::atoi(std::getenv("CUPBOP_VIRT_ALLOW_LANE_LOOPS"));
-  int found = 0;
+static bool containsCtaBarrier(const Loop &L) {
+  for (auto *B : L.blocks())
+    for (auto &I : *B) {
+      auto *call = dyn_cast<CallInst>(&I);
+      if (!call || !call->getCalledFunction()) continue;
+      StringRef name = call->getCalledFunction()->getName();
+      if (name == "llvm.nvvm.barrier0" || name == "llvm.nvvm.barrier.sync" || isCGSync(name.str())) return true;
+    }
+  return false;
+}
+
+// One iteration of the source loop runs inside a forward gate. A logical lane
+// takes a backedge or parks at its own exit. Parked lanes retain their live-outs;
+// all sub-passes meet at the latch, where a staged vote chooses the next round.
+static void lowerLaneLoop(Loop &L) {
+  BasicBlock *header = L.getHeader();
+  Function &F = *header->getParent();
+  LLVMContext &C = F.getContext();
+  SmallVector<BasicBlock *, 4> exits;
+  L.getUniqueExitBlocks(exits);
+  SmallVector<BasicBlock *, 4> entries;
+  for (auto *P : predecessors(header))
+    if (!L.contains(P)) entries.push_back(P);
+
+  // The parked path bypasses definitions in the final source iteration.
+  // Spill just the values for which the new edges change SSA dominance.
+  SmallVector<Instruction *> liveOut;
+  for (auto *B : L.blocks())
+    for (Instruction &I : *B)
+      if (any_of(I.users(), [&](User *U) {
+            auto *use = dyn_cast<Instruction>(U);
+            return use && !L.contains(use->getParent());
+          }))
+        liveOut.push_back(&I);
+  for (auto *I : liveOut)
+    DemoteRegToStack(*I);
+  for (auto *E : exits)
+    while (!E->phis().empty()) DemotePHIToStack(&*E->phis().begin());
+  while (!header->phis().empty()) DemotePHIToStack(&*header->phis().begin());
+
+  IRBuilder<> entry(&*F.getEntryBlock().getFirstInsertionPt());
+  // Zero selects the next iteration. Positive values name the original exit.
+  auto *state = entry.CreateAlloca(entry.getInt32Ty(), nullptr, "lane.loop.exit");
+  auto block = [&](StringRef name) { return BasicBlock::Create(C, name, &F, header); };
+  auto *init = block("lane.loop.init");
+  auto *round = block("lane.loop.round");
+  auto *latch = block("lane.loop.vote");
+  for (auto *P : entries) P->getTerminator()->replaceSuccessorWith(header, init);
+  IRBuilder<> b(init);
+  b.CreateStore(b.getInt32(0), state);
+  b.CreateBr(round);
+  b.SetInsertPoint(round);
+  auto active = [&] { return b.CreateICmpEQ(b.CreateLoad(b.getInt32Ty(), state), b.getInt32(0)); };
+  b.CreateCondBr(active(), header, latch);
+
+  SmallVector<BasicBlock *, 4> parked;
+  for (unsigned i = 0; i < exits.size(); ++i) {
+    auto *park = block("lane.loop.park");
+    b.SetInsertPoint(park);
+    b.CreateStore(b.getInt32(i + 1), state);
+    b.CreateBr(latch);
+    parked.push_back(park);
+  }
+  for (auto *B : L.blocks()) {
+    Instruction *term = B->getTerminator();
+    term->replaceSuccessorWith(header, latch);
+    for (unsigned i = 0; i < exits.size(); ++i)
+      term->replaceSuccessorWith(exits[i], parked[i]);
+  }
+
+  // Outside the loop each lane resumes at its own original successor.
+  BasicBlock *resume = exits.back();
+  for (unsigned i = 0; i + 1 < exits.size(); ++i) {
+    auto *test = block("lane.loop.resume");
+    b.SetInsertPoint(test);
+    b.CreateCondBr(b.CreateICmpEQ(b.CreateLoad(b.getInt32Ty(), state), b.getInt32(i + 1)), exits[i], resume);
+    resume = test;
+  }
+  b.SetInsertPoint(latch);
+  FunctionCallee any = F.getParent()->getOrInsertFunction("llvm.nvvm.vote.any.sync",
+      FunctionType::get(b.getInt1Ty(), {b.getInt32Ty(), b.getInt1Ty()}, false));
+  b.CreateCondBr(b.CreateCall(any, {b.getInt32(-1), active()}), round, resume);
+}
+
+static void lowerLaneVariantLoopsAroundWarpOps(Module &m) {
   for (auto &F : m.functions()) {
     if (F.isDeclaration()) continue;
     std::vector<CallInst *> ops;
@@ -432,25 +504,38 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
     if (ops.empty()) continue;
     DominatorTree DT(F);
     LoopInfo LI(DT);
+    if (LI.empty()) continue;
+    PostDominatorTree PDT(F);
+    SmallPtrSet<const BasicBlock *, 16> divergentBranches, controlled;
     // lane-dependent values: SSA uses, memory written with one (by underlying object), loads at a
     // lane-dependent address, and phis joining a lane-dependent branch (fixpoint)
     std::set<const Value *> T, Tobj;
     auto divBranch = [&](const BasicBlock *B) {
-      auto *Br = dyn_cast<BranchInst>(B->getTerminator());
-      return Br && Br->isConditional() && T.count(Br->getCondition());
+      const Instruction *term = B->getTerminator();
+      if (auto *br = dyn_cast<BranchInst>(term))
+        return br->isConditional() && T.count(br->getCondition()) != 0;
+      auto *sw = dyn_cast<SwitchInst>(term);
+      return sw && T.count(sw->getCondition()) != 0;
     };
     for (bool changed = true; changed;) {
       changed = false;
       for (auto &I : instructions(F)) {
         if (auto *St = dyn_cast<StoreInst>(&I)) {
-          if (T.count(St->getValueOperand()) && Tobj.insert(getUnderlyingObject(St->getPointerOperand())).second) changed = true;
+          if (T.count(St->getValueOperand()) || controlled.contains(I.getParent()))
+            changed |= Tobj.insert(getUnderlyingObject(St->getPointerOperand())).second;
           continue;
         }
         if (T.count(&I)) continue;
         bool t = isLaneSource(&I);
         if (!t) {
           if (auto *Ld = dyn_cast<LoadInst>(&I)) t = T.count(Ld->getPointerOperand()) || Tobj.count(getUnderlyingObject(Ld->getPointerOperand()));
-          else if (auto *CI = dyn_cast<CallInst>(&I); CI && isStagedWarpOp(CI)) t = false; // vote/ballot results are warp-uniform
+          else if (auto *CI = dyn_cast<CallInst>(&I); CI && isStagedWarpOp(CI)) {
+            // The aggregate is uniform for one member mask. Disjoint groups
+            // can issue the same vote with different masks and get different results.
+            StringRef name = CI->getCalledFunction()->getName();
+            if (name.starts_with("llvm.nvvm.vote.")) t = T.count(CI->getArgOperand(0));
+            if (name == "__cupbop_redux_sync") t = T.count(CI->getArgOperand(1));
+          }
           else for (auto &U : I.operands()) if (T.count(U.get())) { t = true; break; }
           if (!t)
             if (auto *Phi = dyn_cast<PHINode>(&I)) {
@@ -461,29 +546,62 @@ static void rejectLaneVariantLoopsAroundWarpOps(Module &m) {
         }
         if (t) { T.insert(&I); changed = true; }
       }
+      // Different constants stored along a divergent branch also give the
+      // logical lanes different bounds after the paths meet.
+      for (auto &B : F) {
+        if (!divBranch(&B) || !divergentBranches.insert(&B).second) continue;
+        auto *node = PDT.getNode(&B);
+        auto *merge = node && node->getIDom() ? node->getIDom()->getBlock() : nullptr;
+        SmallVector<const BasicBlock *> work(successors(&B));
+        SmallPtrSet<const BasicBlock *, 16> seen;
+        while (!work.empty()) {
+          auto *arm = work.pop_back_val();
+          if (arm == merge || !seen.insert(arm).second) continue;
+          changed |= controlled.insert(arm).second;
+          append_range(work, successors(arm));
+        }
+      }
     }
-    for (auto *CI : ops)
-      for (Loop *L = CI->getMetadata("cupbop.virt_partial_mask") ? LI.getLoopFor(CI->getParent()) : nullptr; L; L = L->getParentLoop()) {
+    SmallPtrSet<BasicBlock *, 8> selected;
+    for (auto *CI : ops) {
+      for (Loop *L = LI.getLoopFor(CI->getParent()); L; L = L->getParentLoop()) {
+        if (selected.contains(L->getHeader())) continue;
         SmallVector<BasicBlock *, 4> exiting;
         L->getExitingBlocks(exiting);
-        bool lane = false;
-        for (auto *E : exiting) lane |= divBranch(E);
-        if (!lane) continue;
-        found++;
-        std::string ms;
-        if (CI->arg_size()) { raw_string_ostream os(ms); CI->getArgOperand(0)->print(os); }
-        fprintf(stderr, "[virt-stage] %s: %s in %s inside loop %s whose trip count depends on the lane (mask:%s)\n",
-                allow ? "WARNING" : "error", CI->getCalledFunction()->getName().str().c_str(), F.getName().str().c_str(),
-                L->getHeader()->getName().str().c_str(), ms.c_str());
-        break;
+        if (!any_of(exiting, divBranch)) continue;
+        if (!CI->getMetadata("cupbop.virt_partial_mask")) {
+          // In CTA-synchronized loops a full-warp operation supplies no
+          // evidence of partial participation (e.g. a lifted GEMM's MMA).
+          // Leave these loops to the CTA scheduler. In warp-only code, a
+          // full-mask op reached just on the first iteration permits the
+          // lanes to take different numbers of subsequent iterations.
+          SmallVector<BasicBlock *, 4> latches;
+          L->getLoopLatches(latches);
+          if (all_of(latches, [&](BasicBlock *B) { return DT.dominates(CI->getParent(), B); }) ||
+              containsCtaBarrier(*L)) continue;
+        } else if (containsCtaBarrier(*L)) {
+          report_fatal_error(Twine("lane-dependent loop in ") + F.getName() +
+                             " contains a CTA barrier; a warp vote cannot establish CTA convergence");
+        }
+        selected.insert(L->getHeader());
       }
-  }
-  if (found && !allow) {
-    fprintf(stderr, "error: virt sub-pass form (S=%d, %d lanes): %d warp op(s) in lane-dependent loops are unsupported at S>1 "
-                    "(per-sub-pass loop gate not implemented); use 32 lanes (NT32, no CUPBOP_VIRT_LANES) or set "
-                    "CUPBOP_VIRT_ALLOW_LANE_LOOPS=1 to translate anyway\n",
-            getVirtGeom().subpasses, getVirtGeom().lanes, found);
-    exit(1);
+    }
+    if (selected.empty()) continue;
+    if (!isKernelFunction(&m, &F))
+      report_fatal_error(Twine("lane-dependent warp collective in uninlined device function ") + F.getName());
+    // Edge-specific PHI inputs must be saved on their own incoming edge.
+    SplitAllCriticalEdges(F, CriticalEdgeSplittingOptions(&DT, &LI));
+    SmallVector<BasicBlock *, 8> headers;
+    for (Loop *L : LI.getLoopsInReverseSiblingPreorder())
+      if (selected.contains(L->getHeader())) headers.push_back(L->getHeader());
+    // Lower children first and rediscover the enclosing loop after each CFG change.
+    for (auto *H : reverse(headers)) {
+      lowerLaneLoop(*LI.getLoopFor(H));
+      DT.recalculate(F);
+      LI.releaseMemory();
+      LI.analyze(DT);
+    }
+    errs() << "[virt-stage] lowered " << headers.size() << " lane-dependent loop(s) in " << F.getName() << "\n";
   }
 }
 
@@ -496,8 +614,8 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectUnstagedWarpOpsSubpass(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) markPartialMaskWarpOps(m);
   if (mapping_ == MAPPING_CORE) foldReconvergenceMasks(m); // virt: before staging
-  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) rejectLaneVariantLoopsAroundWarpOps(m);
-  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m); // virt sub-pass form: mma.sync -> NT=16 TCU glue
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) lowerLaneVariantLoopsAroundWarpOps(m);
+  if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMmaStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceLdStMatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceReduxStaged(m);
@@ -506,7 +624,7 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ != MAPPING_FLAT)
     replaceWarpShfl(m);
   replaceWarpVote(m);
-  return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
 
 bool ReplaceWarpLevelPrimitive::replaceWarpVote(Module &m) {
@@ -1250,10 +1368,8 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const CallSet &
   fprintf(stderr, "[virt-stage] %d shfl sites staged over %d sub-passes of %d lanes\n", n, S, L);
 }
 
-// virt sub-pass form: mma.sync (llvm.nvvm.mma.*, cupbop.mma.*) staged over the S=2 passes and executed once per CUDA warp
-// by the glue in the device runtime, which owns the PTX fragment layouts: __cupbop_mma_m16n8k16_{f16f32,bf16f32,f16f16}_glue16
-// on the NT=16 TCU tile (half shapes with the missing registers zero), <helper>_sw_glue16 in software for every form
-// (cudaKernelImpl_dtypes.inc). Store phase: this pass's A, B, C registers into the thread's slots [pass][word]; marker; glue
+// Stage the operands of each logical lane before executing the device helper once per CUDA warp.
+// Store phase: this pass's A, B, C registers into the thread's slots [pass][word]; marker; glue
 // (uniform); glue_end; load phase: D. A stride 4 words, B 2, C/D nC registers (a double is two words).
 static void replaceMmaStaged(Module &m) {
   const VirtGeom vg = getVirtGeom();
@@ -1268,8 +1384,8 @@ static void replaceMmaStaged(Module &m) {
             if (cf->getName().starts_with("llvm.nvvm.mma.") || cf->getName().starts_with("cupbop.mma.")) sites.push_back(ci);
   }
   if (sites.empty()) return;
-  if (vg.lanes != 16) {
-    fprintf(stderr, "error: virt sub-pass form stages mma.sync for 16 lanes only (lanes=%d)\n", vg.lanes);
+  if (vg.lanes != 8 && vg.lanes != 16) {
+    fprintf(stderr, "error: virt sub-pass form stages mma.sync for 8 or 16 lanes (lanes=%d)\n", vg.lanes);
     exit(1);
   }
   const char *lowEnv = std::getenv("CUPBOP_MMA_LOWERING");
@@ -1286,22 +1402,21 @@ static void replaceMmaStaged(Module &m) {
       exit(1);
     }
     if (forms[k].tcu.empty() && lowering == "tcu") {
-      fprintf(stderr, "error: virt sub-pass form: %s has no NT=16 TCU glue (CUPBOP_MMA_LOWERING=tcu); use auto or sw\n", Name.c_str());
+      fprintf(stderr, "error: virt sub-pass form: %s has no NT=%d TCU glue (CUPBOP_MMA_LOWERING=tcu); use auto or sw\n", Name.c_str(), vg.lanes);
       exit(1);
     }
     if (mayTcu && !forms[k].tcu.empty()) nTcu++; else nSw++;
     maxC = std::max(maxC, forms[k].f64 ? 2 * forms[k].nC : forms[k].nC);
   }
-  if (nTcu) requireGlue16Bitstream("mma.sync", nTcu);
-  if (nSw) requireGlue16Bitstream("mma.sync (software glue)", nSw, false);
+  if (nTcu || nSw) requireStagedWarpBitstream("mma.sync", vg.lanes, nTcu != 0);
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *I64 = Type::getInt64Ty(ctx), *F32 = Type::getFloatTy(ctx), *F64 = Type::getDoubleTy(ctx), *VoidT = Type::getVoidTy(ctx);
   Type *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
   if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
-  auto *ATy = ArrayType::get(I32, 8); auto *BTy = ArrayType::get(I32, 4); auto *CTy = ArrayType::get(F32, maxC > 4 ? 16 : 8);
-  // one set of slots per function: a slot is written and read back within one staged op, and 112 bytes per site filled the
-  // frame of the lifted GEMMs (tg2: 33 sites)
+  auto *ATy = ArrayType::get(I32, 4 * vg.subpasses);
+  auto *BTy = ArrayType::get(I32, 2 * vg.subpasses);
+  auto *CTy = ArrayType::get(F32, maxC * vg.subpasses);
   struct Slots { AllocaInst *a = nullptr, *b = nullptr, *c = nullptr, *d = nullptr; };
   std::map<Function *, Slots> slots;
   int n = 0;
@@ -1321,7 +1436,7 @@ static void replaceMmaStaged(Module &m) {
     auto *stA = sl.a, *stB = sl.b, *stC = sl.c, *stD = sl.d;
     IRBuilder<> b(ci);
     Value *l = virtLogicalLane(b, m);
-    Value *j = b.CreateLShr(l, ConstantInt::get(I32, 4), "msub");
+    Value *j = b.CreateLShr(l, ConstantInt::get(I32, vg.lg_lanes), "msub");
     auto slot = [&](Value *base, Type *ArrT, int stride, int i) {
       Value *idx = b.CreateAdd(b.CreateMul(j, ConstantInt::get(I32, stride)), ConstantInt::get(I32, i));
       return b.CreateInBoundsGEP(ArrT, base, {ConstantInt::get(I32, 0), idx});
@@ -1345,7 +1460,7 @@ static void replaceMmaStaged(Module &m) {
       for (int i = fm.nB; i < 2; i++) vstore(b, ConstantInt::get(I32, 0), slot(stB, BTy, 2, i));
     }
     CreateIntraWarpBarrier(ci)->setMetadata("cupbop.virt_marker", MDNode::get(ctx, {}));
-    std::string gname = useTcu ? fm.tcu + "_glue16" : fm.sw + "_sw_glue16";
+    std::string gname = (useTcu ? fm.tcu + "_glue" : fm.sw + "_sw_glue") + std::to_string(vg.lanes);
     FunctionCallee glue = m.getOrInsertFunction(gname, FunctionType::get(VoidT, {PtrTy, PtrTy, PtrTy, PtrTy}, false));
     if (auto *Fn = dyn_cast<Function>(glue.getCallee())) Fn->addFnAttr(Attribute::Convergent);
     b.CreateCall(glue, {stA, stB, stC, stD})->addFnAttr(Attribute::Convergent);
@@ -1367,7 +1482,8 @@ static void replaceMmaStaged(Module &m) {
     ci->eraseFromParent();
     n++;
   }
-  fprintf(stderr, "[virt-stage] %d mma.sync sites staged over 2 sub-passes of 16 lanes (%d TCU glue, %d software glue)\n", n, nTcu, nSw);
+  fprintf(stderr, "[virt-stage] %d mma.sync sites staged over %d sub-passes of %d lanes (%d TCU glue, %d software glue)\n",
+          n, vg.subpasses, vg.lanes, nTcu, nSw);
 }
 
 // virt sub-pass form: CuLifter's `movmatrix.sync.aligned.m8n8.trans.b16` (inline asm, i32 -> i32)
@@ -1390,7 +1506,7 @@ static void replaceMovmatrixStaged(Module &m) {
   }
   if (sites.empty()) return;
   if (getVirtGeom().lanes != 16) { fprintf(stderr, "error: virt sub-pass form stages movmatrix for 16 lanes only\n"); exit(1); }
-  requireGlue16Bitstream("movmatrix", (int)sites.size());
+  requireStagedWarpBitstream("movmatrix", 16, true);
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
@@ -1421,12 +1537,7 @@ static void replaceMovmatrixStaged(Module &m) {
   fprintf(stderr, "[virt-stage] %d movmatrix sites staged over 2 sub-passes of 16 lanes\n", n);
 }
 
-// virt sub-pass form: __cupbop_ldmatrix_m8n8_b16 / __cupbop_stmatrix_m8n8_b16 (lower_ldmatrix_asm) staged at 16 lanes. The
-// rows' addresses come from logical lanes of both passes, so the shuffles of the 32-lane helper cannot run per pass. Store
-// phase: this pass's address (stmatrix: its registers); marker; glue (uniform, __cupbop_*matrix_m8n8_b16_glue16 in
-// cudaKernelImpl_dtypes.inc: index shuffles per reader pass, the shared-memory accesses of both passes); glue_end; load
-// phase (ldmatrix): this pass's registers, in place of the loads of the helper's buffer. One set of slots per function:
-// a slot is written and read back within one staged op.
+// Stage row addresses from all logical lanes for the warp-level matrix load or store.
 static void replaceLdStMatrixStaged(Module &m) {
   if (std::getenv("CUPBOP_VIRT_NO_MMA_STAGE")) return;
   std::vector<CallInst *> sites;
@@ -1440,18 +1551,23 @@ static void replaceLdStMatrixStaged(Module &m) {
   }
   if (sites.empty()) return;
   const VirtGeom vg = getVirtGeom();
-  if (vg.lanes != 16) { fprintf(stderr, "error: virt sub-pass form stages ldmatrix/stmatrix for 16 lanes only (lanes=%d)\n", vg.lanes); exit(1); }
+  if (vg.lanes != 8 && vg.lanes != 16) {
+    fprintf(stderr, "error: virt sub-pass form stages ldmatrix/stmatrix for 8 or 16 lanes (lanes=%d)\n", vg.lanes);
+    exit(1);
+  }
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));
   if (auto *Fn = dyn_cast<Function>(glueEnd.getCallee())) Fn->addFnAttr(Attribute::Convergent);
-  auto glueOf = [&](const char *name) {
+  auto glueOf = [&](const std::string &name) {
     FunctionCallee g = m.getOrInsertFunction(name, FunctionType::get(VoidT, {PtrTy, I32, I32, PtrTy}, false));
     if (auto *Fn = dyn_cast<Function>(g.getCallee())) Fn->addFnAttr(Attribute::Convergent);
     return g;
   };
-  FunctionCallee ldGlue = glueOf("__cupbop_ldmatrix_m8n8_b16_glue16"), stGlue = glueOf("__cupbop_stmatrix_m8n8_b16_glue16");
-  auto *ATy = ArrayType::get(I32, 2), *DTy = ArrayType::get(I32, 8);
+  const std::string suffix = std::to_string(vg.lanes);
+  FunctionCallee ldGlue = glueOf("__cupbop_ldmatrix_m8n8_b16_glue" + suffix);
+  FunctionCallee stGlue = glueOf("__cupbop_stmatrix_m8n8_b16_glue" + suffix);
+  auto *ATy = ArrayType::get(I32, vg.subpasses), *DTy = ArrayType::get(I32, 4 * vg.subpasses);
   std::map<Function *, std::pair<AllocaInst *, AllocaInst *>> slots;
   int nld = 0, nst = 0;
   Value *zero = ConstantInt::get(I32, 0);
@@ -1471,7 +1587,7 @@ static void replaceLdStMatrixStaged(Module &m) {
     if (!BufA) { fprintf(stderr, "error: virt sub-pass form: ldmatrix/stmatrix buffer is not a local array\n"); exit(1); }
     Type *BufT = BufA->getAllocatedType();
     IRBuilder<> b(ci);
-    Value *j = b.CreateLShr(virtLogicalLane(b, m), ConstantInt::get(I32, 4), "lmsub");
+    Value *j = b.CreateLShr(virtLogicalLane(b, m), ConstantInt::get(I32, vg.lg_lanes), "lmsub");
     auto dslot = [&](IRBuilder<> &bb, Value *jj, int r) {
       return bb.CreateInBoundsGEP(DTy, stD, {zero, bb.CreateAdd(bb.CreateMul(jj, ConstantInt::get(I32, 4)), ConstantInt::get(I32, r))});
     };
@@ -1487,14 +1603,15 @@ static void replaceLdStMatrixStaged(Module &m) {
       // the lowering loads the registers from the buffer right after the call: they become loads of this pass's slots
       Instruction *after = ci->getNextNode();
       IRBuilder<> lb(after);
-      Value *j2 = lb.CreateLShr(virtLogicalLane(lb, m), ConstantInt::get(I32, 4), "lmsub2");
+      Value *j2 = lb.CreateLShr(virtLogicalLane(lb, m), ConstantInt::get(I32, vg.lg_lanes), "lmsub2");
       for (int r = 0; r < nreg; r++)
         vstore(lb, vload(lb, I32, dslot(lb, j2, r), "ldsm_r"), lb.CreateConstInBoundsGEP2_32(BufT, BufA, 0, r));
       nld++;
     } else nst++;
     ci->eraseFromParent();
   }
-  fprintf(stderr, "[virt-stage] %d ldmatrix / %d stmatrix sites staged over 2 sub-passes of 16 lanes\n", nld, nst);
+  fprintf(stderr, "[virt-stage] %d ldmatrix / %d stmatrix sites staged over %d sub-passes of %d lanes\n",
+          nld, nst, vg.subpasses, vg.lanes);
 }
 
 // virt sub-pass form: __cupbop_redux_sync (lower_redux_sync) staged at 16 lanes. Store phase: this pass's value and member
@@ -1511,7 +1628,7 @@ static void replaceReduxStaged(Module &m) {
             if (cf->getName() == "__cupbop_redux_sync") sites.push_back(ci);
   }
   if (sites.empty()) return;
-  requireGlue16Bitstream("redux.sync", (int)sites.size(), false);
+  requireStagedWarpBitstream("redux.sync", 16, false);
   auto &ctx = m.getContext();
   Type *I32 = Type::getInt32Ty(ctx), *VoidT = Type::getVoidTy(ctx), *PtrTy = PointerType::getUnqual(ctx);
   FunctionCallee glueEnd = m.getOrInsertFunction("cupbop.virt.syncwarp.glue_end", FunctionType::get(VoidT, {}, false));

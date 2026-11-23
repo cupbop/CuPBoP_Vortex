@@ -1,7 +1,9 @@
 #include "tool.h"
+#include "async_ptx.h"
 #include "warp_func.h"
 #include "flag.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
@@ -555,6 +557,7 @@ void lower_atomicrmw_add_i64(llvm::Module *M) {
       for (auto &I : BB)
         if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
           if (RMW->getOperation() == AtomicRMWInst::Add &&
+              RMW->getOrdering() == AtomicOrdering::Monotonic && !RMW->isVolatile() &&
               RMW->getValOperand()->getType()->isIntegerTy(64))
             add_ops.push_back(RMW);
 
@@ -1345,6 +1348,11 @@ void replace_built_in_function(llvm::Module *M) {
     schedule = std::stoi(std::string(env));
   }
 
+  const char *driver = std::getenv("VORTEX_DRIVER");
+  const char *liveCtaBarrier = std::getenv("CUPBOP_SIMX_LIVE_CTA_BARRIER");
+  const bool useLiveCtaBarrier = driver && std::strcmp(driver, "simx") == 0 &&
+                                liveCtaBarrier && std::strcmp(liveCtaBarrier, "1") == 0;
+
   LLVMContext &context = M->getContext();
   auto I32 = llvm::Type::getInt32Ty(context);
   std::vector<llvm::Instruction *> need_remove;
@@ -1762,6 +1770,11 @@ void replace_built_in_function(llvm::Module *M) {
                   warpsPerGroup = builder.CreateLoad(warpsPerGroupGV->getValueType(), warpsPerGroupGV);
                 }
 
+                if (useLiveCtaBarrier) {
+                  // SimX VX_BAR_LIVE_CTA selects a full CTA barrier over warps that have not exited.
+                  localGroupId = builder.CreateOr(localGroupId, ConstantInt::get(I32, 0x40000000),
+                                                  "live_cta_barrier_id");
+                }
                 CallInst *syncThreads = builder.CreateCall(
                     threadIdxFunc, {localGroupId, warpsPerGroup});
                 // convergent like the llvm.nvvm.barrier0 it replaces: without it LLVM may copy the barrier into
@@ -2272,7 +2285,7 @@ static bool classify_mma_form(const std::string &geom, const std::string &ta, co
 // VORTEX_CONFIGS (exported by examples/common.mk callers: ci/rg-ci-setup-v3.sh, the coadapt harness) holds the
 // -DVX_CFG_* flags of the SimX build the kernel is compiled for. Unset: unknown build (the link then decides).
 static bool tensor_cfg_known() { return std::getenv("VORTEX_CONFIGS") != nullptr; }
-static bool tensor_cfg_has(const char *flag) {
+bool vortexConfigHasFlag(const char *flag) {
   const char *e = std::getenv("VORTEX_CONFIGS");
   if (!e) return true;
   std::string s(e), f(flag);
@@ -2292,13 +2305,13 @@ static const char *tensor_type_flag(const std::string &t) {
   return "?";
 }
 static bool tensor_build_enables(const std::string &t, std::string &why) {
-  if (!tensor_cfg_has("-DVX_CFG_EXT_TCU_ENABLE")) { why = "VORTEX_CONFIGS has no -DVX_CFG_EXT_TCU_ENABLE"; return false; }
+  if (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE")) { why = "VORTEX_CONFIGS has no -DVX_CFG_EXT_TCU_ENABLE"; return false; }
   if (tensor_is_f16ish(t)) {
-    if (tensor_cfg_known() && tensor_cfg_has("-DVX_CFG_TCU_FP16_DISABLE")) { why = "VORTEX_CONFIGS has -DVX_CFG_TCU_FP16_DISABLE"; return false; }
+    if (tensor_cfg_known() && vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")) { why = "VORTEX_CONFIGS has -DVX_CFG_TCU_FP16_DISABLE"; return false; }
     return true;
   }
   const char *f = tensor_type_flag(t);
-  if (!tensor_cfg_has(f)) { why = std::string("VORTEX_CONFIGS has no ") + f; return false; }
+  if (!vortexConfigHasFlag(f)) { why = std::string("VORTEX_CONFIGS has no ") + f; return false; }
   return true;
 }
 static std::string tensor_lowering_mode() {
@@ -2359,12 +2372,225 @@ static void tensor_set_convergent(CallInst *C) {
 // "mma.sync.aligned.<geom>.row.col[.satfinite].<d>.<a>.<b>.<c> {D}, {A}, {B}, {C};" (one or more statements)
 // becomes calls to the pseudo-intrinsic cupbop.mma.<geom>.row.col[.satfinite].<sig> (NVVM naming: sig .f32.f32
 // for f16, else .<a>[.<b>]), which the NT=16 staging and replace_nvvm_mma_intrinsics treat like llvm.nvvm.mma.*.
-// Returns false (asm left to the older handlers) when the string is not made of mma.sync statements or the
-// fragments come from ldmatrix asm (Triton path). Recognized but unsupported forms are a hard error.
+// Returns false for statements handled elsewhere. The ldmatrix prepass lowers
+// shared fragments before this pass. Recognized unsupported forms are errors.
 static std::string tensor_trim(const std::string &s) {
   size_t a = s.find_first_not_of(" \t\n\r"), b = s.find_last_not_of(" \t\n\r");
   return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
+
+static bool is_ptx_mma_sp(StringRef assembly) {
+  return assembly.contains("mma.sp.sync.aligned") ||
+         assembly.contains("mma.sp::ordered_metadata.sync.aligned");
+}
+
+void prepare_mma_sp_scratch(Module *M) {
+  const VirtGeom geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32 || tensor_lowering_mode() == "sw" ||
+      !tensor_cfg_known() || !vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_TCU_SPARSE_ENABLE"))
+    return;
+
+  unsigned warps = 32;
+  if (const char *value = std::getenv("VORTEX_NUM_WARPS")) {
+    const int configured = std::atoi(value);
+    if (configured > 0 && configured <= 32) warps = configured;
+  }
+  auto &context = M->getContext();
+  constexpr const char *bundleName = "cupbop.mma.sp.scratch";
+  const unsigned bundleID = context.getOrInsertBundleTag(bundleName)->getValue();
+  SmallVector<Function *, 8> deadHelpers;
+  for (auto &F : *M) {
+    SmallVector<CallInst *, 8> calls;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *call = dyn_cast<CallInst>(&I))
+          if (auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand()))
+            if (is_ptx_mma_sp(assembly->getAsmString())) calls.push_back(call);
+    if (calls.empty()) continue;
+    if (!isKernelFunction(M, &F)) {
+      // The general device inliner leaves unused internal helper definitions.
+      // Their live kernel clones receive the CTA-local metadata reservation.
+      if (F.hasLocalLinkage() && F.use_empty()) deadHelpers.push_back(&F);
+      continue;
+    }
+
+    // TCU metadata loads need a single aligned address in CTA local memory.
+    // Allocate one 128-byte metadata segment for each possible physical warp.
+    auto *scratchType = ArrayType::get(Type::getInt32Ty(context), 32 * warps);
+    auto *scratch = new GlobalVariable(*M, scratchType, false, GlobalValue::InternalLinkage,
+                                       UndefValue::get(scratchType), "cupbop.mma.sp.scratch", nullptr,
+                                       GlobalValue::NotThreadLocal, 3);
+    Value *inputs[] = {scratch};
+    const OperandBundleDef bundle(bundleName, ArrayRef<Value *>(inputs));
+    for (auto *call : calls) {
+      auto *replacement = CallBase::addOperandBundle(call, bundleID, bundle, call->getIterator());
+      call->replaceAllUsesWith(replacement);
+      call->eraseFromParent();
+    }
+  }
+  for (auto *F : deadHelpers) F->eraseFromParent();
+}
+
+static void lower_inline_mma_sp(CallInst *call, Module *M, StringRef assembly) {
+  auto fail = [&](StringRef reason) {
+    errs() << "error: unsupported sparse PTX MMA in " << call->getFunction()->getName()
+           << ": " << reason << "\n  " << assembly << '\n';
+    exit(1);
+  };
+  assembly = assembly.trim();
+  assembly.consume_back(";");
+  const auto end = assembly.find_first_of(" \t\r\n");
+  if (end == StringRef::npos) fail("expected opcode and operands");
+  auto opcode = assembly.take_front(end);
+  auto operands = assembly.drop_front(end);
+  if (!opcode.consume_front("mma.sp.sync.aligned.") &&
+      !opcode.consume_front("mma.sp::ordered_metadata.sync.aligned."))
+    fail("expected one mma.sp.sync.aligned instruction");
+
+  const char *dtype = nullptr;
+  unsigned selectors = 1;
+  const bool sat = opcode.contains(".satfinite");
+  if (opcode == "m16n8k32.row.col.f32.f16.f16.f32") { dtype = "f16"; selectors = 2; }
+  else if (opcode == "m16n8k32.row.col.f32.bf16.bf16.f32") { dtype = "bf16"; selectors = 2; }
+  else if (opcode == "m16n8k16.row.col.f32.tf32.tf32.f32") { dtype = "tf32"; selectors = 2; }
+  else if (opcode == "m16n8k64.row.col.s32.s8.s8.s32" ||
+           opcode == "m16n8k64.row.col.satfinite.s32.s8.s8.s32" ||
+           opcode == "m16n8k64.row.col.s32.s8.s8.s32.satfinite") dtype = "s8";
+  else if (opcode == "m16n8k64.row.col.s32.u8.u8.s32" ||
+           opcode == "m16n8k64.row.col.satfinite.s32.u8.u8.s32" ||
+           opcode == "m16n8k64.row.col.s32.u8.u8.s32.satfinite") dtype = "u8";
+  else fail("supported shapes are m16n8k32 f16/bf16, m16n8k16 tf32, and m16n8k64 s8/s8 or u8/u8");
+
+  const auto geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32)
+    fail("sparse MMA requires a 32-lane Vortex schedule-2 build");
+  auto scratch = call->getOperandBundle("cupbop.mma.sp.scratch");
+  const std::string mode = tensor_lowering_mode();
+  std::string reason;
+  const bool native = mode != "sw" && scratch && tensor_build_enables(dtype, reason);
+  if (!native && mode == "tcu") {
+    if (!reason.empty()) fail(reason);
+    fail("native sparse MMA requires an inlined kernel and a known Vortex LMEM build with TCU sparse support");
+  }
+
+  struct Operand { bool output; unsigned index; std::string constraint; };
+  SmallVector<Operand, 20> numbers;
+  unsigned outputs = 0, inputs = 0;
+  for (const auto &constraint : cast<InlineAsm>(call->getCalledOperand())->ParseConstraints()) {
+    if (constraint.Type == InlineAsm::isClobber) continue;
+    if (constraint.isIndirect || constraint.Codes.size() != 1) fail("unsupported operand constraint");
+    const bool output = constraint.Type == InlineAsm::isOutput;
+    numbers.push_back({output, output ? outputs++ : inputs++, constraint.Codes.front()});
+  }
+  auto *resultType = dyn_cast<StructType>(call->getType());
+  if (outputs != 4 || inputs != call->arg_size() || !resultType || resultType->getNumElements() != 4)
+    fail("expected four 32-bit results and register inputs");
+
+  auto operandIndex = [&](StringRef operand) -> unsigned {
+    operand = operand.trim();
+    if (operand.consume_front("${")) {
+      if (!operand.consume_back("}")) fail("invalid operand placeholder");
+      operand = operand.split(':').first;
+    } else if (!operand.consume_front("$")) {
+      fail("expected an LLVM inline-asm register operand");
+    }
+    unsigned index = 0;
+    if (operand.getAsInteger(10, index) || index >= numbers.size()) fail("invalid operand placeholder");
+    return index;
+  };
+  auto readOperand = [&](StringRef token) -> Value * {
+    const unsigned index = operandIndex(token);
+    const auto &operand = numbers[index];
+    if (!operand.output) return call->getArgOperand(operand.index);
+    for (const auto &tied : numbers)
+      if (!tied.output && tied.constraint == std::to_string(index)) return call->getArgOperand(tied.index);
+    fail("output used as input without a matching tied constraint");
+    return nullptr;
+  };
+  auto takeGroup = [&]() {
+    operands = operands.ltrim();
+    if (!operands.consume_front("{")) fail("expected a register fragment list");
+    SmallVector<StringRef, 4> group;
+    for (unsigned i = 0; i < 4; ++i) {
+      operands = operands.ltrim();
+      size_t end = 0;
+      while (end < operands.size() && operands[end] != ',' && operands[end] != '}') {
+        if (operands.substr(end).starts_with("${")) {
+          end = operands.find('}', end + 2);
+          if (end == StringRef::npos) fail("unterminated inline-asm register operand");
+        }
+        ++end;
+      }
+      if (end == operands.size()) fail("unterminated register fragment list");
+      group.push_back(operands.take_front(end));
+      operands = operands.drop_front(end);
+      if (!operands.consume_front(i == 3 ? "}" : ",")) fail("expected exactly four registers per fragment");
+    }
+    operands = operands.ltrim();
+    if (!operands.consume_front(",")) fail("expected another sparse MMA operand");
+    return group;
+  };
+  auto d = takeGroup();
+  auto a = takeGroup();
+  auto b = takeGroup();
+  auto c = takeGroup();
+  auto [metadata, selection] = operands.split(',');
+  metadata = metadata.trim();
+  selection = selection.trim();
+  if (metadata.empty() || selection.empty()) fail("expected metadata register and selector");
+
+  unsigned selector = 0;
+  if (selection.starts_with("$")) {
+    auto *value = dyn_cast<ConstantInt>(readOperand(selection));
+    if (!value || value->getValue().uge(selectors)) fail("invalid compile-time sparsity selector");
+    selector = value->getZExtValue();
+  } else if (selection.getAsInteger(0, selector) || selector >= selectors) {
+    fail("invalid compile-time sparsity selector");
+  }
+
+  IRBuilder<> builder(call);
+  auto *i32 = builder.getInt32Ty();
+  auto *f32 = builder.getFloatTy();
+  auto *accumulatorType = selectors == 2 ? f32 : i32;
+  auto *pointerType = PointerType::get(M->getContext(), 0);
+  auto *fragmentType = ArrayType::get(i32, 4);
+  auto pack = [&](ArrayRef<StringRef> group, Type *type) -> Value * {
+    auto *array = builder.CreateAlloca(fragmentType);
+    for (unsigned i = 0; i < 4; ++i) {
+      auto *value = readOperand(group[i]);
+      if (value->getType() != type) fail("unexpected fragment register type");
+      builder.CreateStore(builder.CreateBitCast(value, i32), builder.CreateConstGEP2_32(fragmentType, array, 0, i));
+    }
+    return array;
+  };
+  auto *aFragment = pack(a, i32);
+  auto *bFragment = pack(b, i32);
+  auto *cFragment = pack(c, accumulatorType);
+  auto *e = readOperand(metadata);
+  if (e->getType() != i32) fail("expected 32-bit integer metadata register");
+  auto *dFragment = builder.CreateAlloca(fragmentType);
+  auto *scratchPointer = native ? builder.CreatePointerCast(scratch->Inputs.front(), pointerType)
+                                : ConstantPointerNull::get(pointerType);
+  auto type = FunctionType::get(builder.getVoidTy(), {pointerType, pointerType, pointerType, i32, i32, pointerType, pointerType}, false);
+  const std::string helperName = std::string("__cupbop_mma_sp_") + dtype +
+                                 (sat ? "_satfinite" : "") + (native ? "_tcu" : "_sw");
+  auto helper = M->getOrInsertFunction(helperName, type);
+  builder.CreateCall(helper, {aFragment, bFragment, cFragment, e, builder.getInt32(selector), scratchPointer, dFragment})
+      ->setConvergent();
+  Value *result = PoisonValue::get(resultType);
+  unsigned written = 0;
+  for (unsigned i = 0; i < 4; ++i) {
+    const auto &operand = numbers[operandIndex(d[i])];
+    if (!operand.output || resultType->getElementType(operand.index) != accumulatorType || (written & (1u << operand.index)))
+      fail("destination must list four distinct output registers of the accumulator type");
+    written |= 1u << operand.index;
+    auto *bits = builder.CreateLoad(i32, builder.CreateConstGEP2_32(fragmentType, dFragment, 0, i));
+    result = builder.CreateInsertValue(result, builder.CreateBitCast(bits, accumulatorType), operand.index);
+  }
+  call->replaceAllUsesWith(result);
+}
+
 static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
   auto *IA = dyn_cast<InlineAsm>(Call->getCalledOperand());
   if (!IA) return false;
@@ -2409,14 +2635,6 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
     if (V->getType() == T) return V;
     if (V->getType()->getPrimitiveSizeInBits() == 32) return B.CreateBitCast(V, T);
     return nullptr;
-  };
-  auto fromLdmatrix = [](Value *V) {
-    if (auto *EV = dyn_cast<ExtractValueInst>(V)) V = EV->getAggregateOperand();
-    if (auto *C = dyn_cast<CallInst>(V))
-      if (C->isInlineAsm())
-        if (auto *X = dyn_cast<InlineAsm>(C->getCalledOperand()))
-          return X->getAsmString().find("ldmatrix") != std::string::npos;
-    return false;
   };
   // value of template operand n read as an input
   auto readOp = [&](int n) -> Value * {
@@ -2487,9 +2705,6 @@ static bool lower_inline_mma_sync(CallInst *Call, Module *M) {
     P.D = groups[0]; P.A = groups[1]; P.Bv = groups[2]; P.C = groups[3];
     plans.push_back(P);
   }
-  // fragments loaded by ldmatrix asm: leave the whole asm to the Triton (WGMMA_SS) path
-  for (auto &P : plans)
-    for (int n : P.A) if (!ops[n].out && fromLdmatrix(Call->getArgOperand(ops[n].pos))) return false;
   { // validate before emitting anything: every operand readable and 32-bit
     std::vector<bool> written(nOut, false);
     auto ok = [&](int n) {
@@ -2555,7 +2770,265 @@ static Value *emit_cvt_rna_tf32(IRBuilder<> &B, Value *x, bool satfinite) {
   return B.CreateSelect(special, s, r, "cvt.rna.tf32");
 }
 
+void prepare_wgmma_scratch(llvm::Module *M) {
+  const VirtGeom geometry = getVirtGeom();
+  if (geometry.schedule != 2 || geometry.nt != 32 || tensor_lowering_mode() == "sw" || !tensor_cfg_known() ||
+      !vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_EXT_A_ENABLE") ||
+      !vortexConfigHasFlag("-DVX_CFG_TCU_WGMMA_ENABLE"))
+    return;
+
+  unsigned warps = 32;
+  if (const char *value = std::getenv("VORTEX_NUM_WARPS")) {
+    const int configured = std::atoi(value);
+    if (configured > 0 && configured <= 32) warps = configured;
+  }
+  auto &context = M->getContext();
+  const char *bundleName = "cupbop.wgmma.scratch";
+  const unsigned bundleID = context.getOrInsertBundleTag(bundleName)->getValue();
+  for (auto &F : *M) {
+    if (!isKernelFunction(M, &F)) continue;
+    SmallVector<CallInst *, 8> calls;
+    SmallVector<CallInst *, 8> controls;
+    for (auto &BB : F)
+      for (Instruction &I : BB)
+        if (auto *call = dyn_cast<CallInst>(&I))
+          if (auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand())) {
+            StringRef code = assembly->getAsmString();
+            if (code.contains("wgmma.mma_async") &&
+                (code.contains("k16.f32.f16.f16") || code.contains("k16.f32.bf16.bf16") ||
+                 code.contains("mma_async.sp.")))
+              calls.push_back(call);
+            else if (code.contains("wgmma.fence") || code.contains("wgmma.commit_group") ||
+                     code.contains("wgmma.wait_group"))
+              controls.push_back(call);
+          }
+    if (calls.empty()) continue;
+    calls.append(controls.begin(), controls.end());
+
+    unsigned scratchWarps = warps;
+    if (auto *annotations = M->getNamedMetadata("nvvm.annotations")) {
+      unsigned maxThreads[3] = {0, 1, 1};
+      for (auto *row : annotations->operands()) {
+        if (row->getNumOperands() < 3) continue;
+        const auto *function = dyn_cast_or_null<ValueAsMetadata>(row->getOperand(0));
+        if (!function || function->getValue() != &F) continue;
+        const auto *kind = dyn_cast_or_null<MDString>(row->getOperand(1));
+        const auto *count = mdconst::dyn_extract_or_null<ConstantInt>(row->getOperand(2));
+        if (!kind || !count) continue;
+        if (kind->getString() == "maxntidx") maxThreads[0] = count->getZExtValue();
+        if (kind->getString() == "maxntidy") maxThreads[1] = count->getZExtValue();
+        if (kind->getString() == "maxntidz") maxThreads[2] = count->getZExtValue();
+      }
+      const unsigned maxBlock = maxThreads[0] * maxThreads[1] * maxThreads[2];
+      if (maxBlock) scratchWarps = std::min(warps, (maxBlock + 31) / 32);
+    }
+    // A and B each need 16 x 16 half elements per physical warp. The array's
+    // ABI alignment keeps the staged word accesses aligned after shared relocation.
+    auto *scratchType = ArrayType::get(Type::getInt32Ty(context), scratchWarps * 256);
+    auto *scratch = new GlobalVariable(*M, scratchType, false, GlobalValue::InternalLinkage,
+                                       UndefValue::get(scratchType), "cupbop.wgmma.scratch", nullptr,
+                                       GlobalValue::NotThreadLocal, 3);
+    // Keep the additional CTA footprint a multiple of the swizzled TMA tile alignment.
+    auto *barrierType = ArrayType::get(Type::getInt32Ty(context), 128 / sizeof(uint32_t));
+    auto *barriers = new GlobalVariable(*M, barrierType, false, GlobalValue::InternalLinkage,
+                                        UndefValue::get(barrierType), "cupbop.wgmma.groups", nullptr,
+                                        GlobalValue::NotThreadLocal, 3);
+    Value *inputs[] = {scratch, barriers};
+    const OperandBundleDef bundle(bundleName, ArrayRef<Value *>(inputs));
+    for (auto *call : calls) {
+      auto *replacement = CallBase::addOperandBundle(call, bundleID, bundle, call->getIterator());
+      replacement->copyMetadata(*call);
+      call->replaceAllUsesWith(replacement);
+      call->eraseFromParent();
+    }
+  }
+}
+
+static void emit_wgmma_group_call(IRBuilder<> &builder, Module *M, Value *groups, const char *name) {
+  auto *ptr = PointerType::get(builder.getContext(), 0);
+  auto *type = FunctionType::get(builder.getVoidTy(), {ptr}, false);
+  tensor_set_convergent(builder.CreateCall(M->getOrInsertFunction(name, type),
+                                          {builder.CreatePointerCast(groups, ptr)}));
+}
+
+static Value *wgmma_input(CallInst *call, StringRef operand, unsigned outputs) {
+  operand = operand.trim();
+  if (!operand.consume_front("$")) return nullptr;
+  if (operand.consume_front("{")) {
+    if (!operand.consume_back("}")) return nullptr;
+    operand = operand.split(':').first;
+  }
+  unsigned index = 0;
+  if (operand.getAsInteger(10, index) || index < outputs || index - outputs >= call->arg_size())
+    return nullptr;
+  return call->getArgOperand(index - outputs);
+}
+
+// Global memory PTX uses the LLVM operand order shown below. In particular,
+// parse the modifiers and operands together so an unrecognized ordering,
+// scope, offset or instruction sequence cannot become a weaker operation.
+static bool lower_inline_global_memory(CallInst *call, StringRef text, bool rv64) {
+  text = text.trim();
+  text.consume_back(";");
+  const size_t separator = text.find_first_of(" \t\r\n");
+  SmallVector<StringRef, 8> modifiers;
+  text.take_front(separator).split(modifiers, '.');
+  if (modifiers.empty()) return false;
+  const StringRef instruction = modifiers.front();
+  ArrayRef<StringRef> parts = ArrayRef(modifiers).drop_front();
+
+  std::string operands;
+  if (separator != StringRef::npos) {
+    for (char c : text.drop_front(separator))
+      if (!std::isspace(static_cast<unsigned char>(c))) operands += c;
+  }
+  IRBuilder<> b(call);
+  if (instruction == "fence" || instruction == "membar") {
+    if (!call->getType()->isVoidTy() || call->arg_size() || !operands.empty()) return false;
+    if (instruction == "membar") {
+      if (parts.size() != 1 || (parts[0] != "cta" && parts[0] != "gl")) return false;
+      b.CreateFence(AtomicOrdering::SequentiallyConsistent);
+    } else {
+      const bool sc = parts.size() == 2 && parts[0] == "sc";
+      if (parts.empty() || parts.size() > 2 ||
+          (parts.size() == 2 && !sc && parts[0] != "acq_rel") ||
+          (parts.back() != "cta" && parts.back() != "gpu")) return false;
+      b.CreateFence(sc ? AtomicOrdering::SequentiallyConsistent : AtomicOrdering::AcquireRelease);
+    }
+    return true;
+  }
+
+  const bool load = instruction == "ld", store = instruction == "st";
+  const bool atom = instruction == "atom", reduction = instruction == "red";
+  if (!(load || store || atom || reduction) || parts.empty()) return false;
+  const StringRef type = parts.back();
+  const bool wide = type == "b64" || type == "s64" || type == "u64";
+  if (wide ? !rv64 : (type != "b32" && type != "s32" && type != "u32")) return false;
+  parts = parts.drop_back();
+  Type *word = wide ? b.getInt64Ty() : b.getInt32Ty();
+  AtomicOrdering order = AtomicOrdering::Monotonic;
+  bool ordered = false;
+  if ((load || store) && !parts.empty() && parts.front() == "volatile") {
+    // CuLifter represents a SASS STRONG scalar access with volatile PTX.
+    order = load ? AtomicOrdering::Acquire : AtomicOrdering::Release;
+    ordered = true;
+    parts = parts.drop_front();
+  } else if (parts.size() >= 2 && (parts[1] == "cta" || parts[1] == "gpu")) {
+    order = StringSwitch<AtomicOrdering>(parts[0])
+        .Case("relaxed", AtomicOrdering::Monotonic)
+        .Case("acquire", AtomicOrdering::Acquire)
+        .Case("release", AtomicOrdering::Release)
+        .Case("acq_rel", AtomicOrdering::AcquireRelease)
+        .Default(AtomicOrdering::NotAtomic);
+    if (order == AtomicOrdering::NotAtomic ||
+        (load && (order == AtomicOrdering::Release || order == AtomicOrdering::AcquireRelease)) ||
+        (store && (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease)) ||
+        (reduction && (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease))) return false;
+    ordered = true;
+    parts = parts.drop_front(2);
+  }
+  if (parts.empty() || parts.front() != "global") return false;
+  parts = parts.drop_front();
+
+  StringRef operation;
+  if (atom || reduction) {
+    if (parts.size() != 1) return false;
+    operation = parts.front();
+  } else if (!parts.empty()) {
+    // CUDA cache operators are performance hints. Keep the memory access.
+    if (ordered || parts.size() != 1 ||
+        (parts.front() != "ca" && parts.front() != "cg" && parts.front() != "cs" &&
+         parts.front() != "wb" && parts.front() != "wt")) return false;
+  }
+  const bool cas = operation == "cas";
+  const unsigned arity = load ? 1 : (cas ? 3 : 2);
+  const StringRef expected = load ? "$0,[$1]" : (atom ? (cas ? "$0,[$1],$2,$3" : "$0,[$1],$2") : "[$0],$1");
+  if (operands != expected || call->arg_size() != arity ||
+      (load || atom ? call->getType() != word : !call->getType()->isVoidTy())) return false;
+  Value *address = call->getArgOperand(0);
+  if (!address->getType()->isIntOrPtrTy()) return false;
+  for (unsigned i = 1; i < arity; ++i)
+    if (call->getArgOperand(i)->getType() != word) return false;
+
+  const auto pointer = PointerType::getUnqual(call->getContext());
+  auto addressValue = [&]() {
+    return address->getType()->isPointerTy() ? b.CreatePointerCast(address, pointer)
+                                          : b.CreateIntToPtr(address, pointer);
+  };
+  const Align alignment(wide ? 8 : 4);
+  if (load) {
+    // Vortex's ordered global accesses use the shared LLC path. LR does not
+    // write the location and can observe another core's publication.
+    if (ordered) {
+      StringRef encoding = wide ? (order == AtomicOrdering::Acquire ? "lr.d.aq $0, ($1)" : "lr.d $0, ($1)")
+                                : (order == AtomicOrdering::Acquire ? "lr.w.aq $0, ($1)" : "lr.w $0, ($1)");
+      auto *lr = InlineAsm::get(FunctionType::get(word, {pointer}, false), encoding, "=r,r,~{memory}", true);
+      call->replaceAllUsesWith(b.CreateCall(lr, {addressValue()}, "ld.global.coherent"));
+    } else {
+      auto *read = b.CreateAlignedLoad(word, addressValue(), alignment);
+      read->setVolatile(true);
+      call->replaceAllUsesWith(read);
+    }
+    return true;
+  }
+  if (store && !ordered) {
+    b.CreateAlignedStore(call->getArgOperand(1), addressValue(), alignment)->setVolatile(true);
+    return true;
+  }
+  if (cas) {
+    if (!atom) return false;
+    const auto failure = (order == AtomicOrdering::Acquire || order == AtomicOrdering::AcquireRelease)
+                             ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic;
+    auto *cmp = b.CreateAtomicCmpXchg(addressValue(), call->getArgOperand(1), call->getArgOperand(2),
+                                      alignment, order, failure);
+    cmp->setVolatile(true);
+    call->replaceAllUsesWith(b.CreateExtractValue(cmp, 0));
+    return true;
+  }
+
+  const bool signedType = type.starts_with("s");
+  const auto op = store ? AtomicRMWInst::Xchg : StringSwitch<AtomicRMWInst::BinOp>(operation)
+      .Case("exch", atom ? AtomicRMWInst::Xchg : AtomicRMWInst::BAD_BINOP)
+      .Case("add", AtomicRMWInst::Add).Case("and", AtomicRMWInst::And)
+      .Case("or", AtomicRMWInst::Or).Case("xor", AtomicRMWInst::Xor)
+      .Case("min", signedType ? AtomicRMWInst::Min : AtomicRMWInst::UMin)
+      .Case("max", signedType ? AtomicRMWInst::Max : AtomicRMWInst::UMax)
+      .Default(AtomicRMWInst::BAD_BINOP);
+  if (op == AtomicRMWInst::BAD_BINOP) return false;
+  auto *rmw = b.CreateAtomicRMW(op, addressValue(), call->getArgOperand(1), alignment, order);
+  rmw->setVolatile(true);
+  if (atom) call->replaceAllUsesWith(rmw);
+  return true;
+}
+
+static bool compound_global_memory_asm(StringRef text) {
+  text = text.trim();
+  text.consume_back(";");
+  if (!text.contains(';')) return false;
+  SmallVector<StringRef, 8> statements;
+  text.split(statements, ';');
+  for (StringRef statement : statements) {
+    statement = statement.ltrim(" \t\r\n{");
+    if (statement.starts_with("@")) {
+      const size_t predicate = statement.find_first_of(" \t\r\n");
+      if (predicate == StringRef::npos) continue;
+      statement = statement.drop_front(predicate).ltrim();
+    }
+    const StringRef opcode = statement.take_front(statement.find_first_of(" \t\r\n"));
+    // Async PTX with shared/proxy instructions and mixed declarations has a
+    // dedicated parser earlier. These scalar recognizers consume one instruction.
+    if (opcode.starts_with("atom.") || opcode.starts_with("red.") ||
+        opcode.starts_with("fence.") || opcode.starts_with("membar.") ||
+        ((opcode.starts_with("ld.") || opcode.starts_with("st.")) && opcode.contains(".global")))
+      return true;
+  }
+  return false;
+}
+
 void replace_asm_call(llvm::Module *M) {
+  const char *architecture = std::getenv("VORTEX_ARCHITECTURE");
+  const bool rv64 = architecture && StringRef(architecture) == "64";
   // clang (CUDA 12, sm_90) emits __activemask() as the llvm.nvvm.activemask intrinsic,
   // not the `activemask.b32` asm the lifter uses; lower it the same way here so the
   // schedule-1 staging sees a __cupbop_activemask call and the backend never sees the
@@ -2593,51 +3066,22 @@ void replace_asm_call(llvm::Module *M) {
   auto HalfTy = llvm::Type::getHalfTy(context);
   auto PtrTy = PointerType::getUnqual(context);
   std::vector<CallInst *> need_remove;
-
-  // TCU: Track ldmatrix results → shared memory pointers
-  // Key: the ldmatrix CallInst result (struct {i32,i32,i32,i32})
-  // Value: {smem_ptr, is_transposed}
-  struct LdMatrixInfo {
-    Value *smem_ptr;    // ptr addrspace(3) operand
-    bool is_transposed; // .trans variant (B tile)
-  };
-  std::map<Value *, LdMatrixInfo> ldmatrix_map;
-
-  // Helper: strip thread-dependent GEP indices to get the tile base address.
-  // Triton IR pattern:
-  //   %ptr = GEP @global_smem, %thread_dep_offset   ← strip variable index
-  //   %ptr2 = GEP %ptr, 0                           ← strip constant-zero index
-  // Returns: @global_smem (for A) or ConstExpr GEP(@global_smem + offset) (for
-  // B)
-  auto getSmemTileBase = [](Value *smem_ptr) -> Value * {
-    Value *cur = smem_ptr;
-    while (auto *GEP = dyn_cast<GetElementPtrInst>(cur)) {
-      bool all_const = true;
-      for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-        if (!isa<ConstantInt>(*idx)) {
-          all_const = false;
-          break;
-        }
+  std::set<Function *> initializedWgmmaGroups;
+  std::set<CallInst *> earlyWgmmaCommits;
+  auto wgmmaGroups = [&](CallInst *call) -> Value * {
+    auto scratch = call->getOperandBundle("cupbop.wgmma.scratch");
+    if (!scratch) return nullptr;
+    Value *groups = scratch->Inputs[1];
+    if (initializedWgmmaGroups.insert(call->getFunction()).second) {
+      auto *base = dyn_cast<Instruction>(groups);
+      if (!base || !base->getNextNode()) {
+        errs() << "error: missing WGMMA group state allocation in " << call->getFunction()->getName() << '\n';
+        exit(1);
       }
-      if (all_const) {
-        // Check if it's a no-op GEP (constant 0 index) — strip it too
-        bool all_zero = true;
-        for (auto idx = GEP->idx_begin(); idx != GEP->idx_end(); ++idx) {
-          if (!cast<ConstantInt>(*idx)->isZero()) {
-            all_zero = false;
-            break;
-          }
-        }
-        if (all_zero) {
-          cur = GEP->getPointerOperand();
-          continue;
-        }
-        break; // Non-zero constant offset — keep it (e.g., B tile offset)
-      }
-      // Variable index — strip this GEP (thread-dependent offset)
-      cur = GEP->getPointerOperand();
+      IRBuilder<> entry(base->getNextNode());
+      emit_wgmma_group_call(entry, M, groups, "__cupbop_wgmma_group_init");
     }
-    return cur;
+    return groups;
   };
 
   for (Module::iterator i = M->begin(), e = M->end(); i != e; ++i) {
@@ -2655,6 +3099,19 @@ void replace_asm_call(llvm::Module *M) {
             if (asm_str.rfind("csrr ", 0) == 0)
               continue;
 
+            if (compound_global_memory_asm(asm_str)) {
+              errs() << "error: unsupported compound PTX memory asm in " << F->getName() << ": " << asm_str << '\n';
+              exit(1);
+            }
+            if (lower_inline_global_memory(Call, asm_str, rv64)) {
+              need_remove.push_back(Call);
+              continue;
+            }
+            if (StringRef(asm_str).trim().contains("mma.sp")) {
+              lower_inline_mma_sp(Call, M, asm_str);
+              need_remove.push_back(Call);
+              continue;
+            }
             if (lower_inline_mma_sync(Call, M)) { // mma.sync (all element types) -> cupbop.mma.*
               need_remove.push_back(Call);
               continue;
@@ -2713,305 +3170,6 @@ void replace_asm_call(llvm::Module *M) {
               result = builder.CreateInsertValue(result, hi, 1);
               Call->replaceAllUsesWith(result);
               need_remove.push_back(Call);
-            } else if (asm_str.find("ldmatrix.sync") != std::string::npos) {
-              // ── Triton ldmatrix: loads from shared memory into MMA register
-              // fragments ── Pattern:
-              // ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {$0,$1,$2,$3},
-              // [$4] Operands: 4 output i32 (packed fp16), 1 input ptr
-              // addrspace(3)
-              //
-              // For WGMMA_SS TCU path: ldmatrix is NOT needed — TCU reads
-              // directly from shared memory. But we save the shared memory
-              // pointer for later use by mma.sync conversion.
-              //
-              // TODO(TCU): Instead of removing, save the smem pointer and
-              // associate
-              //            it with the mma.sync that consumes these fragments.
-              //            For now, replace with undef (TCU conversion
-              //            pending).
-              bool is_trans = asm_str.find(".trans.") != std::string::npos;
-              Value *smem_ptr = Call->getArgOperand(0); // ptr addrspace(3)
-              if (cupbop_debug())
-                printf("[TCU] detected ldmatrix%s: smem_ptr operand found\n",
-                       is_trans ? " (transposed, B tile)" : " (A tile)");
-              // Save ldmatrix result → smem pointer mapping
-              // Don't replace with undef yet — mma.sync needs to trace operands
-              // back through extractvalue to this ldmatrix call.
-              ldmatrix_map[Call] = {smem_ptr, is_trans};
-
-            } else if (asm_str.find("mma.sync.aligned") != std::string::npos) {
-              // ── Triton mma.sync → Vortex TCU conversion ──
-              //
-              // Triton IR pattern (Turing fp16, one asm block = m16n8k16):
-              //   %result = call {f32,f32,f32,f32} asm "
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
-              //     {$0,$1,$2,$3},{$8,$9},{$10},{$4,$5,$6,$7};
-              //     mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
-              //     {$0,$1,$2,$3},{$11,$12},{$13},{$4,$5,$6,$7};"
-              //   constraints: "=f,=f,=f,=f, 0,1,2,3, r,r,r,r,r,r"
-              //   operands: (C0,C1,C2,C3, A0_k0,A1_k0,B_k0, A0_k1,A1_k1,B_k1)
-              //
-              // Upstream chain:
-              //   A regs ← ldmatrix(@global_smem + offset_A)
-              //   B regs ← ldmatrix.trans(@global_smem + 1024 + offset_B)
-              //   C regs ← previous accumulator or zero
-              //
-              // Vortex TCU (NT=32, NR=8): m16n16k16
-              //   - Needs 2 mma.sync blocks in N direction (each covers n=8)
-              //   - Uses WGMMA_SS (flags=6): TCU reads A,B from shared memory
-              //   - Register layout differs: NVIDIA 2x2 block vs Vortex
-              //   quadrant
-              //   - C/D need layout shuffle between NVIDIA and Vortex
-              //
-              // NOTE: If Vortex NR changes, tile sizes change:
-              //   NR=8 → m16n16k16 (need 2 mma.sync blocks in N)
-              //   NR=4 → m16n8k8 (1:1 mapping, but still layout mismatch)
-              //
-              // Implementation plan:
-              //   1. Collect consecutive mma.sync calls covering full N
-              //   dimension
-              //   2. Find shared memory base for A and B from ldmatrix trace
-              //   3. Build WGMMA descriptors (smem addr, stride, layout)
-              //   4. Emit Vortex TCU: .insn r 0x0b, 0, 2, x0, x1, x6
-              //   5. Shuffle C/D between NVIDIA ↔ Vortex layout via shared
-              //   memory
-              //
-              // TODO(TCU): Replace undef with actual TCU instruction emission.
-
-              // Trace A/B operands back to ldmatrix → shared memory pointers
-              // mma.sync operands: (C0-C3, A0_k0, A1_k0, B_k0, A0_k1, A1_k1,
-              // B_k1) A operands come from extractvalue of ldmatrix result B
-              // operands come from extractvalue of ldmatrix.trans result
-              Value *smem_A = nullptr, *smem_B = nullptr;
-
-              // Trace operand 4 (first A reg) back to ldmatrix
-              if (Call->arg_size() >= 5) {
-                Value *a0 = Call->getArgOperand(4);
-                if (auto *EV = dyn_cast<ExtractValueInst>(a0)) {
-                  Value *agg = EV->getAggregateOperand();
-                  if (ldmatrix_map.count(agg)) {
-                    smem_A = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug())
-                      printf("[TCU] traced A to shared memory\n");
-                  }
-                }
-              }
-              // Trace operand 6 (first B reg) back to ldmatrix.trans
-              if (Call->arg_size() >= 7) {
-                Value *b0 = Call->getArgOperand(6);
-                if (auto *EV = dyn_cast<ExtractValueInst>(b0)) {
-                  Value *agg = EV->getAggregateOperand();
-                  if (ldmatrix_map.count(agg)) {
-                    smem_B = ldmatrix_map[agg].smem_ptr;
-                    if (cupbop_debug())
-                      printf("[TCU] traced B to shared memory (transposed)\n");
-                  }
-                }
-              }
-
-              if (cupbop_debug()) {
-                printf("[TCU] mma.sync: smem_A=%s, smem_B=%s\n",
-                       smem_A ? "found" : "NOT FOUND",
-                       smem_B ? "found" : "NOT FOUND");
-              }
-
-              // Parse operand info for logging
-              unsigned num_args = Call->arg_size();
-              if (cupbop_debug()) {
-                printf("[TCU] detected mma.sync (%u operands):\n", num_args);
-                // C/D: first 4 operands (tied float)
-                // A: operands 4-7 (i32 packed fp16)
-                // B: operands 8-9 (i32 packed fp16)
-                for (unsigned j = 0; j < num_args; j++) {
-                  Value *op = Call->getArgOperand(j);
-                  printf("  arg[%u]: ", j);
-                  op->getType()->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                }
-              }
-
-              // ── TCU instruction emission via WGMMA_SS ──
-              // Declare external functions from cudaKernelImpl.cpp (linked at
-              // kernel.elf time)
-              auto *VoidTy = Type::getVoidTy(context);
-              auto *wgmma_encode_fn =
-                  M->getOrInsertFunction(
-                       "_Z22__vx_wgmma_encode_descyjjjjjj",
-                       FunctionType::get(
-                           I32, {I64, I32, I32, I32, I32, I32, I32}, false))
-                      .getCallee();
-              auto *wgmma_mma_fn =
-                  M->getOrInsertFunction(
-                       "_Z17__vx_wgmma_mma_ssPfS_S_",
-                       FunctionType::get(VoidTy, {PtrTy, PtrTy, PtrTy}, false))
-                      .getCallee();
-
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-
-              if (smem_A && smem_B) {
-                // ── Strip per-thread GEP to get tile base address ──
-                // ldmatrix operand is per-thread: GEP @global_smem,
-                // %thread_offset WGMMA needs tile base: @global_smem (A) or
-                // @global_smem+1024 (B)
-                Value *tile_base_A = getSmemTileBase(smem_A);
-                Value *tile_base_B = getSmemTileBase(smem_B);
-
-                if (cupbop_debug()) {
-                  printf("[TCU] A tile base: ");
-                  tile_base_A->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                  printf("[TCU] B tile base: ");
-                  tile_base_B->print(errs());
-                  errs() << "\n";
-                  errs().flush();
-                }
-
-                // Allocate stack arrays for TCU fragments (8 floats each for
-                // NR=8) NOTE: Vortex TCU is m16n16k16. This mma.sync covers
-                // m16n8k16. We compute the full m16n16k16 but only use first 4
-                // results.
-                // TODO: combine 2 mma.sync calls for full N=16.
-                auto *fragC_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragC");
-                auto *fragA_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragA");
-                auto *fragB_arr = builder.CreateAlloca(
-                    F32, ConstantInt::get(I32, 8), "tcu_fragB");
-
-                // Initialize C accumulator from mma.sync input (first 4
-                // operands) Remaining 4 slots zeroed (for the n=8..15 half that
-                // this mma.sync doesn't cover)
-                for (int ci = 0; ci < 4; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ci));
-                  builder.CreateStore(Call->getArgOperand(ci), gep);
-                }
-                for (int ci = 4; ci < 8; ci++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ci));
-                  builder.CreateStore(ConstantFP::get(F32, 0.0), gep);
-                }
-
-                // ── Encode A descriptor metadata ──
-                // Use TILE BASE (not per-thread) address for WGMMA descriptor.
-                // For fp16 A tile [M_tile × K_tile] stored row-major:
-                //   ldm = K_tile (leading dimension in elements)
-                //   TCU load_smem_word: addr = base + (row * ldm + col) *
-                //   sizeof(half)
-                // For 16x16 tile: ldm=16, is_col_major=0
-                Value *smem_A_base_i64 =
-                    builder.CreatePtrToInt(tile_base_A, I64);
-                Value *a_word = builder.CreateCall(
-                    cast<Function>(wgmma_encode_fn),
-                    {
-                        smem_A_base_i64,
-                        ConstantInt::get(I32,
-                                         32), // leading_bytes (unused by bugfix
-                                              // TCU, kept for compat)
-                        ConstantInt::get(I32,
-                                         512), // stride_bytes (unused by bugfix
-                                               // TCU, kept for compat)
-                        ConstantInt::get(I32, 0), // mn_idx (tile at position 0)
-                        ConstantInt::get(I32, 0), // k_idx (tile at position 0)
-                        ConstantInt::get(I32, 16), // ldm (K_tile = 16 elements)
-                        ConstantInt::get(I32,
-                                         0) // is_col_major (A is row-major)
-                    },
-                    "a_desc_word");
-
-                // Fill all 8 A fragment regs with the same metadata word
-                Value *a_meta_f =
-                    builder.CreateBitCast(a_word, F32, "a_meta_f");
-                for (int ai = 0; ai < 8; ai++) {
-                  auto *gep = builder.CreateGEP(F32, fragA_arr,
-                                                ConstantInt::get(I32, ai));
-                  builder.CreateStore(a_meta_f, gep);
-                }
-
-                // ── Encode B descriptor metadata ──
-                // B tile stored as [K_tile × N_tile] row-major in shared
-                // memory. Triton ldmatrix.trans transposes during load, but
-                // physical storage is K-major (rows = K, cols = N). TCU
-                // accesses B as: load_smem_word(meta_b, k, n, ...) With
-                // is_col_major=0: addr = base + (k * ldm + n) * sizeof(half)
-                // ldm = N_tile = 16 for [K=16 × N=16] tile
-                Value *smem_B_base_i64 =
-                    builder.CreatePtrToInt(tile_base_B, I64);
-                Value *b_word = builder.CreateCall(
-                    cast<Function>(wgmma_encode_fn),
-                    {
-                        smem_B_base_i64,
-                        ConstantInt::get(
-                            I32, 32), // leading_bytes (unused by bugfix TCU)
-                        ConstantInt::get(
-                            I32, 512), // stride_bytes (unused by bugfix TCU)
-                        ConstantInt::get(I32, 0),  // mn_idx
-                        ConstantInt::get(I32, 0),  // k_idx
-                        ConstantInt::get(I32, 16), // ldm (N_tile = 16 elements)
-                        ConstantInt::get(
-                            I32, 0) // is_col_major (B stored row-major [K×N])
-                    },
-                    "b_desc_word");
-
-                Value *b_meta_f =
-                    builder.CreateBitCast(b_word, F32, "b_meta_f");
-                for (int bi = 0; bi < 8; bi++) {
-                  auto *gep = builder.CreateGEP(F32, fragB_arr,
-                                                ConstantInt::get(I32, bi));
-                  builder.CreateStore(b_meta_f, gep);
-                }
-
-                // Call WGMMA_SS: TCU reads A,B from shared memory via
-                // descriptors
-                builder.CreateCall(cast<Function>(wgmma_mma_fn),
-                                   {fragC_arr, fragA_arr, fragB_arr});
-
-                // Extract results: first 4 floats from fragC (Vortex layout)
-                // Vortex TCU C/D layout: thread t owns elements:
-                //   fragC[i*tcN + j] for i in [0,tcM), j in [0,tcN)
-                //   where thread t is at row=(t/tcN), col=(t%tcN) in the output
-                //   tile
-                // NVIDIA mma.sync m16n8 layout: each thread owns 4 elements
-                //   mapped to specific (row,col) positions in the output
-                // TODO: C/D layout shuffle NVIDIA ↔ Vortex (for now, take
-                // as-is)
-                Value *result = UndefValue::get(Call->getType());
-                for (int ri = 0; ri < 4; ri++) {
-                  auto *gep = builder.CreateGEP(F32, fragC_arr,
-                                                ConstantInt::get(I32, ri));
-                  Value *val = builder.CreateLoad(F32, gep, "tcu_result");
-                  result = builder.CreateInsertValue(result, val, ri);
-                }
-                Call->replaceAllUsesWith(result);
-
-                if (cupbop_debug())
-                  printf("[TCU] Emitted WGMMA_SS TCU instruction for mma.sync "
-                         "(tile base fixed)\n");
-              } else {
-                // Fallback: smem pointers not found, replace with undef
-                if (cupbop_debug())
-                  printf(
-                      "[TCU] WARNING: smem pointers not found, using undef\n");
-                if (!Call->getType()->isVoidTy()) {
-                  Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
-                }
-              }
-              need_remove.push_back(Call);
-
-              // Now clean up the ldmatrix calls that fed this mma.sync
-              for (auto &[ldCall, info] : ldmatrix_map) {
-                if (auto *CI = dyn_cast<CallInst>(ldCall)) {
-                  if (!CI->getType()->isVoidTy() && CI->getParent()) {
-                    CI->replaceAllUsesWith(UndefValue::get(CI->getType()));
-                    need_remove.push_back(CI);
-                  }
-                }
-              }
-              ldmatrix_map.clear();
-
             } else if (asm_str.find("cvt.rn.f16.f32") != std::string::npos) {
               // float → half conversion: replace with fptrunc
               IRBuilder<> builder(Call);
@@ -3063,18 +3221,78 @@ void replace_asm_call(llvm::Module *M) {
               need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.fence") != std::string::npos ||
                        asm_str.find("wgmma.commit_group") != std::string::npos ||
-                       asm_str.find("wgmma.wait_group") != std::string::npos ||
-                       asm_str.find("fence.proxy.async") != std::string::npos) {
-              // the wgmma lowering below is synchronous and reads shared memory through the
-              // ordinary load path, so the async-proxy fences and group bookkeeping are no-ops
+                       asm_str.find("wgmma.wait_group") != std::string::npos) {
+              const StringRef code(asm_str);
+              if (!Call->getType()->isVoidTy() || code.contains("wgmma.mma_async")) {
+                errs() << "error: WGMMA control and MMA need separate inline asm calls: " << code << '\n';
+                exit(1);
+              }
+              {
+                Value *groups = wgmmaGroups(Call);
+                const auto *gsb = Call->getMetadata("cupbop.wgmma.gsb");
+                SmallVector<StringRef, 2> instructions;
+                code.split(instructions, ';', -1, false);
+                IRBuilder<> builder(Call);
+                for (StringRef instruction : instructions) {
+                  instruction = instruction.trim(" \t\n\r{}");
+                  if (instruction.empty()) continue;
+                  unsigned operation = 0, pending = 0;
+                  if (instruction == "wgmma.commit_group.sync.aligned") {
+                    operation = 1;
+                  } else if (instruction.consume_front("wgmma.wait_group.sync.aligned")) {
+                    operation = 2;
+                    instruction = instruction.trim();
+                    bool invalid = false;
+                    if (instruction.starts_with("$")) {
+                      const auto *value = dyn_cast_or_null<ConstantInt>(wgmma_input(Call, instruction, 0));
+                      invalid = !value || value->getValue().ugt(7);
+                      if (!invalid) pending = value->getZExtValue();
+                    } else {
+                      invalid = instruction.getAsInteger(0, pending) || pending > 7;
+                    }
+                    if (invalid) {
+                      errs() << "error: unsupported wgmma.wait_group operand: " << code << '\n';
+                      exit(1);
+                    }
+                  } else if (instruction != "wgmma.fence.sync.aligned") {
+                    errs() << "error: unsupported WGMMA control inline asm: " << code << '\n';
+                    exit(1);
+                  }
+                  unsigned board = 0;
+                  if (gsb) {
+                    const auto *index = gsb->getNumOperands() > 0
+                        ? mdconst::dyn_extract_or_null<ConstantInt>(gsb->getOperand(0)) : nullptr;
+                    const auto *count = gsb->getNumOperands() == 2
+                        ? mdconst::dyn_extract_or_null<ConstantInt>(gsb->getOperand(1)) : nullptr;
+                    if (instructions.size() != 1 || operation == 0 || gsb->getNumOperands() != operation ||
+                        !index || !index->getType()->isIntegerTy(32) || index->getValue().ugt(7) ||
+                        (operation == 2 && (!count || !count->getType()->isIntegerTy(32) || count->getValue().ugt(7)))) {
+                      errs() << "error: invalid !cupbop.wgmma.gsb metadata on " << code << '\n';
+                      exit(1);
+                    }
+                    // Native queue zero is the untagged PTX sequence. SASS gsb0 starts at queue one.
+                    board = index->getZExtValue() + 1;
+                    if (count) pending = count->getZExtValue();
+                  }
+                  if (!groups) continue; // The synchronous MMA helpers already completed the operation.
+                  if (!earlyWgmmaCommits.count(Call)) {
+                    const std::string encoding = ".insn r 0x0b, 4, 2, x" + std::to_string(board) +
+                                                 ", x" + std::to_string(operation) + ", x" + std::to_string(pending);
+                    auto *type = FunctionType::get(Type::getVoidTy(context), false);
+                    auto *native = InlineAsm::get(type, encoding, "~{memory}", true);
+                    tensor_set_convergent(builder.CreateCall(type, native));
+                  }
+                  emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
+                }
+              }
               need_remove.push_back(Call);
             } else if (asm_str.find("wgmma.mma_async") != std::string::npos) {
               // wgmma.mma_async.sync.aligned.m64n<N>k<K>[.satfinite].<d>.<a>.<b> {d0..d(N/2-1)}, desc-a, desc-b, <tail>
               //   f16/bf16 (k16, f32): tail = scale-d, scale-a, scale-b, trans-a, trans-b
               //   tf32 (k8) / e4m3|e5m2 (k32), f32: tail = scale-d, scale-a, scale-b   (K-major only)
               //   s8|u8 (k32, s32):                tail = scale-d
-              // LLVM operands: [0] desc_a (i64), [1] desc_b (i64), [2] scale-d (i32, when it is a register), then the
-              // N/2 tied accumulators. -> __cupbop_wgmma_m64nNk<K>_<tag>[_sw|_tcu](N, desc_a, desc_b, scale_d, warp_in_wg, acc[N/2])
+              // LLVM inputs include two i64 descriptors in the order listed by the asm constraints, optional i32
+              // scale-d, and the N/2 tied accumulators. PTX operand placeholders specify which descriptor is A or B.
               size_t sp = asm_str.find("m64n");
               int N = (sp == std::string::npos) ? 0 : atoi(asm_str.c_str() + sp + 4);
               std::string opc;
@@ -3084,6 +3302,7 @@ void replace_asm_call(llvm::Module *M) {
               }
               std::vector<std::string> otk; // m64nNkK [satfinite] d a b
               { size_t p = 0; while (!opc.empty()) { size_t q = opc.find('.', p); otk.push_back(opc.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; } }
+              const bool sparse = StringRef(asm_str).contains("wgmma.mma_async.sp.");
               bool wsat = false;
               for (size_t i = 1; i < otk.size(); ++i) if (otk[i] == "satfinite") { wsat = true; otk.erase(otk.begin() + i); break; }
               std::string wd = otk.size() == 4 ? otk[1] : "", wa = otk.size() == 4 ? otk[2] : "", wb = otk.size() == 4 ? otk[3] : "";
@@ -3095,32 +3314,56 @@ void replace_asm_call(llvm::Module *M) {
               bool wint = tensor_is_int8(wa);
               if (otk.size() != 4) werr = "unrecognized opcode";
               else if (tensor_is_f16ish(wa)) {
-                if (wb != wa || wd != "f32" || wK != 16 || wsat) werr = "f16/bf16 wgmma needs m64nNk16 .f32 with equal A/B types";
+                if (wb != wa || (wd != "f32" && !(sparse && wd == "f16" && wa == "f16")) || wK != (sparse ? 32 : 16) || wsat) werr = "f16/bf16 wgmma needs m64nNk16 .f32 with equal A/B types";
                 wtag = wa + "f32"; ntrail = 4;
               } else if (wa == "tf32") {
-                if (wb != wa || wd != "f32" || wK != 8 || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
+                if (wb != wa || wd != "f32" || wK != (sparse ? 16 : 8) || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
                 wtag = "tf32f32"; ntrail = 2;
               } else if (tensor_is_fp8(wa)) {
-                if (!tensor_is_fp8(wb) || wd != "f32" || wK != 32 || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
+                if (!tensor_is_fp8(wb) || (wd != "f32" && !(sparse && wd == "f16")) || wK != (sparse ? 64 : 32) || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
                 wtag = wa + (wb != wa ? wb : std::string("")) + "f32"; ntrail = 2;
               } else if (wint) {
-                if (wb != wa || wd != "s32" || wK != 32) werr = "int8 wgmma needs m64nNk32 .s32 with equal A/B types (PTX has no mixed s8/u8 wgmma)";
+                if ((!sparse && wb != wa) || !tensor_is_int8(wb) || wd != "s32" || wK != (sparse ? 64 : 32)) werr = "unsupported int8 WGMMA input types, accumulator or K dimension";
                 wtag = wa + "s32" + (wsat ? "sat" : ""); ntrail = 0;
               } else werr = "element type " + wa + " not lowered (f16, bf16, tf32, e4m3, e5m2, s8, u8)";
-              bool ok = werr.empty() && N >= 16 && N <= 256 && (N % 16) == 0;
-              if (werr.empty() && !ok) werr = "N must be a multiple of 16";
-              unsigned nacc = ok ? (unsigned)N / 2 : 0;
-              unsigned firstAcc = Call->arg_size() >= nacc ? Call->arg_size() - nacc : 0;
+              const int nStep = (sparse || tensor_is_f16ish(wa)) ? 8 : 16;
+              bool ok = werr.empty() && N >= nStep && N <= 256 && (N % nStep) == 0;
+              if (werr.empty() && !ok) werr = "N must be a supported multiple of " + std::to_string(nStep);
+              const bool packed = sparse && wd == "f16";
+              unsigned nacc = ok ? (unsigned)N / (packed ? 4 : 2) : 0;
+              SparseWgmmaOperands sparseOps;
+              if (sparse) sparseOps = parse_sparse_wgmma(Call, nacc);
+              const bool hasTiedAccumulator = sparse ? sparseOps.tied : Call->arg_size() != 2;
+              unsigned firstAcc = hasTiedAccumulator && Call->arg_size() >= nacc ? Call->arg_size() - nacc : 2;
               // operands before the accumulators: desc_a, desc_b and, when scale-d is a register ("r" operand,
               // clang/CUTLASS form) rather than a literal in the string (CuLifter form: "..., $32, $33, 1, 1, 1, 0, 0;"),
               // the i32 scale-d
-              ok = ok && (firstAcc == 2 || firstAcc == 3) &&
+              if (sparse) firstAcc = sparseOps.firstAcc;
+              else ok = ok && (firstAcc == 2 || firstAcc == 3) &&
+                   Call->arg_size() == firstAcc + (hasTiedAccumulator ? nacc : 0) &&
                    Call->getArgOperand(0)->getType()->isIntegerTy(64) &&
                    Call->getArgOperand(1)->getType()->isIntegerTy(64);
-              for (unsigned i = firstAcc; ok && i < Call->arg_size(); i++)
-                if (Call->getArgOperand(i)->getType()->getPrimitiveSizeInBits() != 32) ok = false;
+              auto *resultType = dyn_cast<StructType>(Call->getType());
+              const auto constraints = cast<InlineAsm>(Call->getCalledOperand())->ParseConstraints();
+              ok = ok && resultType && resultType->getNumElements() == nacc && constraints.size() >= nacc;
+              for (unsigned i = 0; ok && i < nacc; ++i) {
+                const auto &constraint = constraints[i];
+                const int tied = hasTiedAccumulator ? static_cast<int>(nacc + firstAcc + i) : -1;
+                ok = constraint.Type == InlineAsm::isOutput && !constraint.isIndirect &&
+                     constraint.MatchingInput == tied && resultType->getElementType(i)->getPrimitiveSizeInBits() == 32 &&
+                     (!hasTiedAccumulator || Call->getArgOperand(firstAcc + i)->getType()->getPrimitiveSizeInBits() == 32);
+              }
+              Value *descriptorA = nullptr, *descriptorB = nullptr;
               Value *scaleD = nullptr; // nullptr -> literal, resolved below
-              if (ok) {
+              unsigned transpose = 0;
+              if (sparse) {
+                descriptorA = sparseOps.a ? sparseOps.a : ConstantInt::get(I64, 0);
+                descriptorB = sparseOps.b;
+                scaleD = sparseOps.scale;
+                transpose = sparseOps.flags;
+                if (getVirtGeom().nt != 32 || getVirtGeom().lanes != 32 || getVirtGeom().schedule != 2)
+                  report_fatal_error("sparse WGMMA requires 32 lanes and CTA scheduling");
+              } else if (ok) {
                 size_t kpos = asm_str.find(opc);
                 size_t semi = asm_str.find(';', kpos);
                 std::string tail = asm_str.substr(kpos, semi - kpos);
@@ -3132,23 +3375,27 @@ void replace_asm_call(llvm::Module *M) {
                 auto resolve = [&](std::string tk, long &v, Value *&reg) {
                   tk.erase(0, tk.find_first_not_of(" \t\n")); tk.erase(tk.find_last_not_of(" \t\n;") + 1);
                   v = -999; reg = nullptr;
-                  if (!tk.empty() && tk[0] == '$') { // operand placeholder: outputs come first
-                    unsigned ph = (unsigned)atoi(tk.c_str() + 1);
-                    if (ph >= nacc && ph - nacc < Call->arg_size()) {
-                      Value *op = Call->getArgOperand(ph - nacc);
+                  if (!tk.empty() && tk[0] == '$') {
+                    if (Value *op = wgmma_input(Call, tk, nacc)) {
                       if (auto *CI = dyn_cast<ConstantInt>(op)) v = CI->getSExtValue(); else reg = op;
                     }
                   } else if (tk == "p") {
                     reg = (firstAcc >= 3) ? Call->getArgOperand(2) : nullptr; // predicate set from the "r" operand
-                  } else if (!tk.empty() && (isdigit(tk[0]) || tk[0] == '-')) {
-                    v = atol(tk.c_str());
+                  } else {
+                    long literal = 0;
+                    if (!StringRef(tk).getAsInteger(0, literal)) v = literal;
                   }
                 };
-                if ((int)toks.size() >= ntrail + 1 + 2) {
+                if (toks.size() == nacc + 3 + ntrail) {
+                  descriptorA = wgmma_input(Call, toks[nacc], nacc);
+                  descriptorB = wgmma_input(Call, toks[nacc + 1], nacc);
+                  ok = descriptorA && descriptorB && descriptorA->getType()->isIntegerTy(64) &&
+                       descriptorB->getType()->isIntegerTy(64);
                   long v; Value *reg;
                   for (int i = 0; i < ntrail; i++) {
                     resolve(toks[toks.size() - ntrail + i], v, reg);
-                    if (v != want[i]) ok = false;
+                    if (i >= 2 && (v == 0 || v == 1)) transpose |= (unsigned)v << (i - 2);
+                    else if (v != want[i]) ok = false;
                   }
                   resolve(toks[toks.size() - ntrail - 1], v, reg); // scale-d
                   if (reg) scaleD = reg;
@@ -3158,20 +3405,33 @@ void replace_asm_call(llvm::Module *M) {
                   ok = false;
                 }
               }
+              if (ok) {
+                const auto *constantScale = dyn_cast_or_null<ConstantInt>(scaleD);
+                ok = scaleD && scaleD->getType()->isIntegerTy(32) &&
+                     (hasTiedAccumulator || (constantScale && constantScale->isZero()));
+              }
               if (!ok) {
                 fprintf(stderr, "error: unsupported wgmma form (%u operands): %s\n"
-                        "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (K-major A and B, trans 0,0, scale 1,1), "
+                        "  %s; lowered: m64nNk16 .f32.f16.f16 / .f32.bf16.bf16 (trans 0 or 1, scale 1,1), "
                         "m64nNk8 .f32.tf32.tf32 and m64nNk32 .f32.e4m3|e5m2 (scale 1,1), m64nNk32 [.satfinite].s32.s8.s8 / .u8.u8\n",
                         (unsigned)Call->arg_size(), asm_str.c_str(), werr.empty() ? "operands" : werr.c_str());
                 exit(1);
               }
+              auto scratch = Call->getOperandBundle("cupbop.wgmma.scratch");
               const std::string wbase = "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wtag;
               std::string wname;
-              if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
+              if (sparse) {
+                std::string reason;
+                const bool native = scratch && vortexConfigHasFlag("-DVX_CFG_TCU_SPARSE_ENABLE") &&
+                                    tensor_build_enables(wa == wb ? wa : "f16", reason);
+                wname = "__cupbop_sparse_wgmma_" + wa + (wa == wb ? "" : wb) + (native ? "_native" : "_sw");
+              } else if (scratch)
+                wname = wbase + "_native";
+              else if (tensor_is_f16ish(wa) && tensor_lowering_mode() != "sw")
                 wname = wbase; // f16/bf16: the TCU wrappers as before (TCU builds)
               else
                 wname = tensor_pick_symbol("wgmma " + opc, wbase, "__cupbop_wgmma_m64nNk" + std::to_string(wK) + "_" + wa + "s32", wa, wb, wsat);
-              Type *AccT = wint ? I32 : F32;
+              Type *AccT = (wint || packed) ? I32 : F32;
               IRBuilder<> builder(Call);
               auto sreg = [&](const char *name) -> Value * {
                 return builder.CreateCall(
@@ -3186,23 +3446,66 @@ void replace_asm_call(llvm::Module *M) {
               lin = builder.CreateAdd(lin, builder.CreateMul(sreg("llvm.nvvm.read.ptx.sreg.tid.z"),
                                                              builder.CreateMul(ntx, nty)));
               Value *wig = builder.CreateAnd(builder.CreateLShr(lin, 5), 3, "warp.in.wg");
-              Type *AccTy = ArrayType::get(AccT, nacc);
+              Type *AccTy = ArrayType::get(AccT, packed ? 2 * nacc : nacc);
               IRBuilder<> AB(&Call->getFunction()->getEntryBlock().front());
               Value *Acc = AB.CreateAlloca(AccTy, nullptr, "wgmma.acc");
-              for (unsigned i = 0; i < nacc; i++) {
+              for (unsigned i = 0; hasTiedAccumulator && i < nacc; i++) {
                 Value *v = Call->getArgOperand(firstAcc + i);
                 if (v->getType() != AccT) v = builder.CreateBitCast(v, AccT);
                 builder.CreateStore(v, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
               }
+              SmallVector<Type *, 8> argumentTypes{I32, I64, I64, I32, I32, PtrTy};
+              SmallVector<Value *, 8> arguments{ConstantInt::get(I32, N), descriptorA, descriptorB, scaleD, wig, Acc};
+              if (sparse || tensor_is_f16ish(wa)) {
+                argumentTypes.push_back(I32);
+                arguments.push_back(ConstantInt::get(I32, transpose));
+              }
+              if (sparse) {
+                arguments.push_back(sparseOps.meta);
+                argumentTypes.push_back(I32);
+                for (unsigned r = 0; r < 4; ++r) {
+                  arguments.push_back(sparseOps.aRegs.empty() ? ConstantInt::get(I32, 0) : sparseOps.aRegs[r]);
+                  argumentTypes.push_back(I32);
+                }
+              }
+              if (scratch && (!sparse || StringRef(wname).ends_with("_native"))) {
+                argumentTypes.push_back(PtrTy);
+                arguments.push_back(builder.CreatePointerCast(scratch->Inputs[0], PtrTy));
+                unsigned commitQueue = 0;
+                const auto *tag = Call->getMetadata("cupbop.wgmma.gsb");
+                Instruction *next = Call->getNextNonDebugInstruction();
+                // The lift optimizer can hoist fragment extraction and bit
+                // packing before the commit. These instructions carry SSA
+                // values only and cannot affect the WGMMA group sequence.
+                while (next && (isa<ExtractValueInst, BitCastInst, ZExtInst>(next) ||
+                                next->getOpcode() == Instruction::Shl || next->getOpcode() == Instruction::Or))
+                  next = next->getNextNonDebugInstruction();
+                auto *commit = dyn_cast_or_null<CallInst>(next);
+                const auto *commitAsm = commit ? dyn_cast<InlineAsm>(commit->getCalledOperand()) : nullptr;
+                // Only the tagged commit from the same SASS operation moves.
+                // No intervening call, executable memory op or CFG edge.
+                if (tag && tag->getNumOperands() == 1 && commitAsm && commit->getType()->isVoidTy() &&
+                    commit->getMetadata("cupbop.wgmma.gsb") == tag &&
+                    StringRef(commitAsm->getAsmString()).trim() == "wgmma.commit_group.sync.aligned;") {
+                  const auto *board = mdconst::dyn_extract_or_null<ConstantInt>(tag->getOperand(0));
+                  if (board && board->getType()->isIntegerTy(32) && board->getValue().ule(7)) {
+                    commitQueue = board->getZExtValue() + 1;
+                    earlyWgmmaCommits.insert(commit);
+                  }
+                }
+                argumentTypes.push_back(I32);
+                arguments.push_back(builder.getInt32(commitQueue));
+              }
               FunctionCallee FC = M->getOrInsertFunction(
-                  wname, FunctionType::get(Type::getVoidTy(context), {I32, I64, I64, I32, I32, PtrTy}, false));
-              tensor_set_convergent(builder.CreateCall(FC, {ConstantInt::get(I32, N), Call->getArgOperand(0),
-                                                            Call->getArgOperand(1), scaleD, wig, Acc}));
+                  wname, FunctionType::get(Type::getVoidTy(context), argumentTypes, false));
+              Value *groups = wgmmaGroups(Call);
+              if (groups) emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
+              tensor_set_convergent(builder.CreateCall(FC, arguments));
+              if (groups) emit_wgmma_group_call(builder, M, groups, "__cupbop_wgmma_group_sync");
               Value *Res = UndefValue::get(Call->getType());
-              auto *RST = dyn_cast<StructType>(Call->getType());
               for (unsigned i = 0; i < nacc; i++) {
                 Value *v = builder.CreateLoad(AccT, builder.CreateConstInBoundsGEP2_32(AccTy, Acc, 0, i));
-                Type *ET = RST ? RST->getElementType(i) : Call->getType();
+                Type *ET = resultType->getElementType(i);
                 if (v->getType() != ET) v = builder.CreateBitCast(v, ET);
                 Res = builder.CreateInsertValue(Res, v, i);
               }
@@ -3225,7 +3528,40 @@ void replace_asm_call(llvm::Module *M) {
                 res = builder.CreateBitCast(res, Call->getType());
               Call->replaceAllUsesWith(res);
               need_remove.push_back(Call);
-            } else if (asm_str.find(".f32.u32") != std::string::npos &&
+            } else if (asm_str.rfind("ld.volatile.global.", 0) == 0 ||
+                       asm_str.rfind("ld.volatile.v", 0) == 0 ||
+                       asm_str.rfind("ld.volatile.b", 0) == 0) {
+              // CuLifter keeps SASS strong global reads visible across blocks.
+              // Vector inline PTX returns a struct of register lanes.
+              IRBuilder<> b(Call);
+              StructType *lanes = dyn_cast<StructType>(Call->getType());
+              const unsigned count = lanes ? lanes->getNumElements() : 1;
+              const std::string prefix = asm_str.rfind("ld.volatile.global.", 0) == 0
+                                         ? "ld.volatile.global." : "ld.volatile.";
+              const bool vectorForm = lanes && (count == 2 || count == 4) &&
+                  asm_str.rfind(prefix + "v" + std::to_string(count) + ".b32 ", 0) == 0;
+              const bool scalarForm = !lanes && Call->getType()->isIntegerTy() &&
+                  asm_str.rfind(prefix + "b" +
+                      std::to_string(Call->getType()->getIntegerBitWidth()) + " ",0) == 0;
+              if (Call->arg_size() != 1 || (!scalarForm && !vectorForm))
+                report_fatal_error("unsupported volatile load signature");
+              Type *valueTy = vectorForm ? static_cast<Type*>(FixedVectorType::get(I32,count)) : Call->getType();
+              Value *ptr = b.CreateIntToPtr(Call->getArgOperand(0),PointerType::getUnqual(valueTy));
+              LoadInst *load = b.CreateLoad(valueTy,ptr,"ld.global");
+              load->setVolatile(true);
+              Value *result = load;
+              if (lanes) {
+                result = UndefValue::get(lanes);
+                for (unsigned i=0; i<count; ++i) {
+                  if (lanes->getElementType(i) != I32)
+                    report_fatal_error("volatile global load expects b32 lanes");
+                  result = b.CreateInsertValue(result,b.CreateExtractElement(load,i),{i});
+                }
+              }
+              Call->replaceAllUsesWith(result);
+              need_remove.push_back(Call);
+            } else if ((asm_str.find(".f32.u32") != std::string::npos ||
+                        asm_str.find(".f32.s32") != std::string::npos) &&
                        (asm_str.find("cvt.rn.") != std::string::npos ||
                         asm_str.find("cvt.rz.") != std::string::npos ||
                         asm_str.find("cvt.rm.") != std::string::npos ||
@@ -3240,19 +3576,23 @@ void replace_asm_call(llvm::Module *M) {
               Value *x = Call->getArgOperand(0);
               if (!x->getType()->isIntegerTy(32))
                 x = builder.CreateBitCast(x, I32);
-              Value *f = builder.CreateUIToFP(x, F32, "cvt.u32.f32");
-              bool up = asm_str.find("cvt.rp.") != std::string::npos;
+              const bool signedInput = asm_str.find(".f32.s32") != std::string::npos;
+              Value *f = signedInput ? builder.CreateSIToFP(x,F32) : builder.CreateUIToFP(x,F32);
               if (asm_str.find("cvt.rn.") == std::string::npos) {
-                Value *back = builder.CreateFPToUI(f, I64);
-                Value *x64 = builder.CreateZExt(x, I64);
-                Value *wrong = up ? builder.CreateICmpULT(back, x64)
-                                  : builder.CreateICmpUGT(back, x64);
-                Value *bits = builder.CreateBitCast(f, I32);
-                Value *step = builder.CreateBitCast(
-                    up ? builder.CreateAdd(bits, ConstantInt::get(I32, 1))
-                       : builder.CreateSub(bits, ConstantInt::get(I32, 1)),
-                    F32);
-                f = builder.CreateSelect(wrong, step, f, "cvt.u32.f32.dir");
+                Value *back = signedInput ? builder.CreateFPToSI(f,I64) : builder.CreateFPToUI(f,I64);
+                Value *wide = signedInput ? builder.CreateSExt(x,I64) : builder.CreateZExt(x,I64);
+                Value *neg = signedInput ? builder.CreateICmpSLT(x,ConstantInt::get(I32,0))
+                                         : ConstantInt::getFalse(context);
+                Value *up = asm_str.find("cvt.rz.") != std::string::npos
+                            ? neg : ConstantInt::get(Type::getInt1Ty(context),asm_str.find("cvt.rp.") != std::string::npos);
+                // All u32 and s32 inputs fit in i64. FP bit ordering reverses at negative values.
+                Value *wrong = builder.CreateSelect(up,builder.CreateICmpSLT(back,wide),
+                                                        builder.CreateICmpSGT(back,wide));
+                Value *bits = builder.CreateBitCast(f,I32);
+                Value *one = ConstantInt::get(I32,1);
+                Value *step = builder.CreateSelect(builder.CreateXor(up,neg),builder.CreateAdd(bits,one),
+                                                                              builder.CreateSub(bits,one));
+                f = builder.CreateSelect(wrong,builder.CreateBitCast(step,F32),f);
               }
               if (Call->getType() != F32)
                 f = builder.CreateBitCast(f, Call->getType());
@@ -3265,15 +3605,19 @@ void replace_asm_call(llvm::Module *M) {
                       asm_str.c_str());
               exit(1);
             } else {
-              // Anything left is dropped. A dropped asm that produces a value leaves undef
-              // behind, which silently changes the program, so say so on every run.
-              fprintf(stderr, "warning: unknown PTX InlineAsm: %s (removing%s)\n",
-                      asm_str.c_str(),
-                      Call->getType()->isVoidTy() ? "" : "; its result becomes undef");
-              IRBuilder<> builder(context);
-              builder.SetInsertPoint(Call);
-              if (!Call->getType()->isVoidTy()) {
-                Call->replaceAllUsesWith(UndefValue::get(Call->getType()));
+              StringRef text = StringRef(asm_str).trim();
+              text.consume_back(";");
+              if (text.empty() && Call->getType()->isVoidTy() && Call->arg_empty()) {
+                // clang lowers an empty asm with a memory clobber as a compiler barrier.
+                if (asm_inst->getConstraintString().find("~{memory}") != std::string::npos)
+                  IRBuilder<>(Call).CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
+              } else if (Call->getType()->isVoidTy() && !text.contains(';') &&
+                         (text.starts_with("prefetch.global.") || text.starts_with("prefetch.local.") ||
+                          text.starts_with("prefetchu."))) {
+                // Standalone PTX cache prefetch is a hint, with no value or memory update.
+              } else {
+                errs() << "error: unsupported PTX inline asm in " << F->getName() << ": " << asm_str << '\n';
+                exit(1);
               }
               need_remove.push_back(Call);
             }

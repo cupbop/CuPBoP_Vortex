@@ -7,6 +7,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -102,8 +103,7 @@ void lower_barrier_reductions(Module *M) {
 //   "ldmatrix.sync.aligned.m8n8.x4[.trans].shared.b16 {...}, [$4];"          "=r,..,l,~{memory}" (64-bit address)
 //   "stmatrix.sync.aligned.x4.m8n8[.trans].shared.b16 [$0], {$1,..};"        "l|r,r,..[,~{memory}]"
 // -> __cupbop_ldmatrix_m8n8_b16(i32 a, i32 num, i32 trans, ptr d) / __cupbop_stmatrix_m8n8_b16(i32 a, num, trans, ptr v)
-// (cudaKernelImpl_dtypes.inc). Only integer address operands: Triton's ldmatrix (a ptr addrspace(3) operand) is left
-// to replace_asm_call's TCU path.
+// (cudaKernelImpl_dtypes.inc). A shared pointer operand uses the same low 32 bits as CuLifter's ptrtoint form.
 void lower_ldmatrix_asm(Module *M) {
   static const std::regex ld(R"(^\s*ldmatrix\.sync\.aligned\.(?:x([124])\.m8n8|m8n8\.x([124]))(\.trans)?\.shared(?:::cta)?\.b16\s*\{([^}]*)\}\s*,\s*\[\s*\$(\d+)\s*\]\s*;?\s*$)");
   static const std::regex st(R"(^\s*stmatrix\.sync\.aligned\.(?:x([124])\.m8n8|m8n8\.x([124]))(\.trans)?\.shared(?:::cta)?\.b16\s*\[\s*\$(\d+)\s*\]\s*,\s*\{([^}]*)\}\s*;?\s*$)");
@@ -128,20 +128,43 @@ void lower_ldmatrix_asm(Module *M) {
     const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
     std::smatch m;
     const bool isLd = std::regex_match(a, m, ld);
-    if (!isLd && !std::regex_match(a, m, st)) continue; // other forms: replace_asm_call (Triton) / reported there
+    if (!isLd && !std::regex_match(a, m, st)) continue; // unsupported forms are diagnosed by replace_asm_call
     const int num = std::stoi(m[1].matched ? m[1].str() : m[2].str());
     const bool trans = m[3].matched;
     // operand numbering: outputs first, then inputs (the CuLifter forms list the registers in order)
     const int addrOp = std::stoi(isLd ? m[5].str() : m[4].str());
-    const int nOut = isLd ? num : 0;
-    if (CI->arg_size() != (unsigned)(isLd ? 1 : 1 + num) || addrOp != (isLd ? num : 0)) {
+    const std::string regList = (isLd ? m[4] : m[5]).str();
+    SmallVector<StringRef, 4> regs;
+    StringRef(regList).split(regs, ',');
+    bool registerOrder = regs.size() == static_cast<unsigned>(num);
+    for (unsigned i = 0; registerOrder && i < regs.size(); ++i)
+      registerOrder = regs[i].trim() == "$" + std::to_string(i + (isLd ? 0 : 1));
+    if (CI->arg_size() != (unsigned)(isLd ? 1 : 1 + num) || addrOp != (isLd ? num : 0) || !registerOrder) {
       fprintf(stderr, "error: %s asm with unexpected operands: %s\n", isLd ? "ldmatrix" : "stmatrix", a.c_str());
       exit(1);
     }
-    Value *Addr = CI->getArgOperand(isLd ? 0 : 0);
-    if (!Addr->getType()->isIntegerTy()) continue; // Triton: ptr addrspace(3)
+    const auto isFragment = [I32](Type *T) { return CastInst::isBitCastable(T, I32); };
+    if (isLd) {
+      Type *result = CI->getType();
+      auto *fields = dyn_cast<StructType>(result);
+      const bool valid = fields ? fields->getNumElements() == static_cast<unsigned>(num) &&
+                                   llvm::all_of(fields->elements(), isFragment)
+                                : num == 1 && isFragment(result);
+      if (!valid) report_fatal_error("unsupported ldmatrix result format");
+    } else {
+      if (!CI->getType()->isVoidTy()) report_fatal_error("stmatrix expects no result");
+      for (int i = 1; i <= num; ++i)
+        if (!isFragment(CI->getArgOperand(i)->getType()))
+          report_fatal_error("unsupported stmatrix fragment format");
+    }
+    Value *Addr = CI->getArgOperand(0);
+    const auto *addressType = dyn_cast<PointerType>(Addr->getType());
+    if (!Addr->getType()->isIntOrPtrTy() ||
+        (addressType && addressType->getAddressSpace() != 0 && addressType->getAddressSpace() != 3))
+      report_fatal_error("ldmatrix/stmatrix requires a shared address");
     IRBuilder<> B(CI);
-    Value *A32 = B.CreateZExtOrTrunc(Addr, I32, "smem.win");
+    Value *A32 = Addr->getType()->isPointerTy() ? B.CreatePtrToInt(Addr, I32, "smem.win")
+                                               : B.CreateZExtOrTrunc(Addr, I32, "smem.win");
     IRBuilder<> AB(&CI->getFunction()->getEntryBlock().front());
     AllocaInst *Buf = AB.CreateAlloca(ArrayType::get(I32, num), nullptr, isLd ? "ldsm.d" : "stsm.v");
     if (isLd) {
@@ -170,7 +193,6 @@ void lower_ldmatrix_asm(Module *M) {
       B.CreateCall(helper("__cupbop_stmatrix_m8n8_b16"), {A32, ConstantInt::get(I32, num), ConstantInt::get(I32, trans), Buf});
       nst++;
     }
-    (void)nOut;
     CI->eraseFromParent();
   }
   if (nld || nst) fprintf(stderr, "[CuPBoP] ldmatrix / stmatrix asm lowered: %u / %u\n", nld, nst);

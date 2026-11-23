@@ -26,6 +26,34 @@ if [ ! -x build/compilation/kernelTranslator ]; then
 fi
 make -C build kernelTranslator hostTranslator vortexRuntime ThreadPool -j8 > ci/logs_v3/async_test_build_$SLURM_JOB_ID.log 2>&1 || { echo BUILD FAILED; grep -n error ci/logs_v3/async_test_build_$SLURM_JOB_ID.log | head; exit 1; }
 OUT=$CuPBoP_PATH/ci/logs_v3/async_test_$SLURM_JOB_ID; mkdir -p $OUT
+if ! bash ci/cluster_launch_control_translation_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/cluster_launch_control_translation.log" 2>&1; then
+  cat "$OUT/cluster_launch_control_translation.log"
+  exit 1
+fi
+if ! bash ci/tma_self_arrive_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_self_arrive.log" 2>&1; then
+  cat "$OUT/tma_self_arrive.log"
+  exit 1
+fi
+if ! bash ci/tma_param_bank_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_param_bank.log" 2>&1; then
+  cat "$OUT/tma_param_bank.log"
+  exit 1
+fi
+if ! bash ci/inline_ptx_validation_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/inline_ptx_validation.log" 2>&1; then
+  cat "$OUT/inline_ptx_validation.log"
+  exit 1
+fi
+if [[ "$VORTEX_NUM_THREADS" == 32 ]] && ! bash ci/sparse_mma_test.sh > "$OUT/sparse_mma.log" 2>&1; then
+  cat "$OUT/sparse_mma.log"
+  exit 1
+fi
+if ! bash ci/tma_nvvm_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tma_nvvm.log" 2>&1; then
+  cat "$OUT/tma_nvvm.log"
+  exit 1
+fi
+if ! bash ci/dxa_layout_metadata_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/dxa_layout_metadata.log" 2>&1; then
+  cat "$OUT/dxa_layout_metadata.log"
+  exit 1
+fi
 run() { # tag example sched [make vars...]
   local tag=$1 ex=$2 sched=$3; shift 3
   ( cd examples/$ex && make clean > /dev/null 2>&1; rm -f ci_output.txt cupbop_async_kernels.txt
@@ -40,6 +68,26 @@ expect_refused() { # tag pattern example sched [make vars...]
 for ex in async_mbar_ws async_tma2d async_bulk1d async_tma_store async_cpasync_mbar async_misc; do
   expect_pass s2_$ex $ex 2
 done
+run s2_async_tma_publish async_tma_publish 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_async_tma_publish.out" || { echo "s2_async_tma_publish: FAIL"; exit 1; }
+echo "s2_async_tma_publish: PASS"
+run s2_splitk_serial splitk_serial 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_splitk_serial.out" || { echo "s2_splitk_serial: FAIL"; exit 1; }
+echo "s2_splitk_serial: PASS"
+run s2_inline_ptx_memory inline_ptx_memory 2 LOCALMEM=1
+grep -q '^PASSED!' "$OUT/s2_inline_ptx_memory.out" || { echo "s2_inline_ptx_memory: FAIL"; exit 1; }
+echo "s2_inline_ptx_memory: PASS"
+for ex in cluster_group cluster_async cluster_reduce; do
+  run s2_$ex $ex 2 LOCALMEM=1
+  grep -q '^PASSED!' "$OUT/s2_$ex.out" || { echo "s2_$ex: FAIL"; exit 1; }
+  echo "s2_$ex: PASS"
+done
+if [[ "$VORTEX_NUM_THREADS" == 32 && -f "$VORTEX_HOME/sw/kernel/include/vx_simx_clc.h" ]] &&
+   grep -q '^#define VX_SIMX_CSR_CANCEL_SUBMIT ' "$VORTEX_PATH/sw/VX_types.h"; then
+  run s2_cluster_cancel cluster_cancel 2 LOCALMEM=1
+  [[ $(grep -c '^PASSED!' "$OUT/s2_cluster_cancel.out") == 4 ]] || { echo "s2_cluster_cancel: FAIL"; exit 1; }
+  echo "s2_cluster_cancel: PASS"
+fi
 expect_pass    s2_async_mbar_ws_nolto async_mbar_ws 2 CUPBOP_LTO=0
 expect_pass    s1_async_mbar_ws  async_mbar_ws 1        # CUPBOP_VIRT_WARPS unset: one physical warp per CUDA warp
 expect_pass    s1_async_tma2d    async_tma2d 1
@@ -53,6 +101,12 @@ expect_fail    s2_control_no_move async_tma2d 2 CUPBOP_ASYNC_NO_MOVE=1
 # stage 3: TMA in DXA mode (CUPBOP_TMA_DXA=1, a 64-byte-row tensor) on the TCU+DXA SimX build; must PASS and be
 # far faster than the software copies (about 3.6M cycles), i.e. the DXA really carried the boxes
 cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU" > /dev/null || { echo "SIMX (TCU/DXA) BUILD FAILED"; exit 1; }
+if ! env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" \
+    bash ci/tma_dxa_layouts_test.sh > "$OUT/tma_dxa_layouts.log" 2>&1; then
+  cat "$OUT/tma_dxa_layouts.log"
+  exit 1
+fi
+echo "tma_dxa_layouts: PASS"
 for sch in 2 1; do
   tag=s${sch}_async_tma2d_dxa
   ( cd examples/async_tma2d && make clean > /dev/null 2>&1; rm -f ci_output.txt
@@ -62,4 +116,33 @@ for sch in 2 1; do
   if grep -q '^PASSED!' $OUT/$tag.out 2>/dev/null && [ -n "$cyc" ] && [ "$cyc" -lt 1000000 ]; then echo "$tag: PASS (cycles=$cyc)"
   else echo "$tag: FAIL (unexpected; cycles=${cyc:-?}, see $OUT/$tag.log)"; fi
 done
+if grep -q '^#define VX_DXA_SWIZZLE_128B ' "$VORTEX_PATH_TCU/sw/VX_types.h"; then
+  results=$(realpath "$OUT")
+  tag=s2_tma_pipeline_swizzle
+  (
+    cd examples/async_tma2d
+    make clean >/dev/null 2>&1
+    env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" make build SCHEDULE=2 \
+        EXTRA_CLANG_FLAGS=-DASYNC_PIPELINE
+    for dxa in 0 1; do
+      env LD_LIBRARY_PATH="../../build/runtime/threadPool:$VORTEX_PATH_TCU/sw/runtime:../../build/runtime:$LD_LIBRARY_PATH" \
+          CUPBOP_TMA_DXA="$dxa" CUPBOP_PERF_KERNEL_FILE="$results/$tag-$dxa.jsonl" \
+          ./host.out -b 2 -t 4 -w 48 -s 1 > "$results/$tag-$dxa.out" 2>&1 || exit 1
+      grep -q '^PASSED!' "$results/$tag-$dxa.out" || exit 1
+    done
+  ) > "$results/$tag.log" 2>&1 && python3 - "$results" "$tag" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results, tag = sys.argv[1:]
+for offload, expected in enumerate((0, 8)):
+    log = Path(results) / f'{tag}-{offload}.jsonl'
+    record = json.loads(log.read_text().splitlines()[-1])
+    assert record['val']['dxa.transfers'] == expected, record['val']['dxa.transfers']
+PY
+  if [ "$?" -eq 0 ]; then echo "$tag: PASS"
+  else echo "$tag: FAIL (unexpected; see $results/$tag.log)"; exit 1
+  fi
+fi
 INNER

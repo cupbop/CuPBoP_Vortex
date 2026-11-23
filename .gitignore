@@ -94,3 +94,5 @@ ci/logs_runner/
 
 # work dirs of ci/lift_test.sh
 examples/_lit_*
+
+.cupbop-cuda-headers/

@@ -1,7 +1,18 @@
 #ifndef __CUPBOP_ASYNC_PTX__
 #define __CUPBOP_ASYNC_PTX__
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Module.h"
+
+namespace llvm { class CallBase; class CallInst; }
+
+struct SparseWgmmaOperands {
+  llvm::Value *a = nullptr, *b = nullptr, *meta = nullptr, *scale = nullptr;
+  llvm::SmallVector<llvm::Value *, 4> aRegs;
+  unsigned flags = 0, firstAcc = 0;
+  bool tied = false;
+};
+SparseWgmmaOperands parse_sparse_wgmma(llvm::CallInst *, unsigned outputs);
 
 // Hopper / Ampere asynchronous PTX -> CuPBoP internal calls, software mode (async design, stages 1-2).
 // Runs first in the translator (before lower_named_barriers and lower_cp_async), on CUDA-source inline asm,
@@ -22,6 +33,9 @@
 // loop, an arrive.expect_tx without its copies, sm_80 CuLifter mbarrier forms, the flat schedule, the core
 // mapping unless it is de facto 1:1 (checked again at launch), warps narrower than 32 lanes.
 void lower_async_ptx(llvm::Module *M);
+
+// The descriptor operand of a lowered tensor load, store or reduction.
+llvm::Value *async_tensor_map_operand(llvm::CallBase &call);
 
 // Vortex barrier numbers for the mbarriers (after lower_named_barriers, whose ids must not be reused):
 // an mbarrier.init at a constant shared-memory offset gets its own number; a __shared__ variable initialized

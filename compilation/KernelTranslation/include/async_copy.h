@@ -4,8 +4,9 @@
 #include "llvm/IR/Module.h"
 
 // cp.async family (Ampere async global->shared copies; CUDA __pipeline_memcpy_async, inline PTX,
-// llvm.nvvm.cp.async.* and CuLifter's LDGSTS lift) lowered to synchronous copies: a global load and a
-// shared store at the issue point, src-size zero-fill included; commit_group / wait_group / wait_all
+// llvm.nvvm.cp.async.* and CuLifter's LDGSTS lift) complete at the issue point. The default uses a global
+// load and a shared store with src-size zero-fill. The optional NT8 path coalesces contiguous full copies
+// through DXA and waits for completion. In both paths commit_group / wait_group / wait_all
 // become no-ops (a compiler-only fence for the waits). This is correct whatever the waits say, so it
 // also holds for lifted IR, where the lifter drops LDGDEPBAR/DEPBAR. Refused with a translation error
 // instead of being dropped: cp.async.mbarrier.arrive*, cp.async.bulk*, mbarrier* and any other cp.async

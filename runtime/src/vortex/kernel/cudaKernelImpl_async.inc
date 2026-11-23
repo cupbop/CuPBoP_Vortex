@@ -25,6 +25,21 @@ static __attribute__((noinline)) void cupbop_async_fail(const char *what, uint32
   (void)what; (void)a; (void)b; // (vx_printf from many lanes at once did not come out before the stop)
   __asm__ volatile("unimp" ::: "memory");
 }
+extern "C" uint64_t __cupbop_time_ns() {
+  const uint64_t ticks = vx_rdcycle();
+  constexpr uint64_t mhz = VX_CFG_PLATFORM_CLOCK_RATE;
+  return ticks / mhz * 1000 + ticks % mhz * 1000 / mhz;
+}
+extern "C" void __cupbop_sleep_ns(uint32_t ns) {
+  uint64_t start = vx_rdcycle();
+  uint64_t delay = (uint64_t(ns) * VX_CFG_PLATFORM_CLOCK_RATE) / 1000;
+  while (vx_rdcycle() - start < delay) {}
+}
+extern "C" void __cupbop_device_trap() {
+  cupbop_async_fail("CUDA device trap", 0, 0);
+}
+#include "cudaKernelImpl_reduce.inc"
+
 static __attribute__((always_inline)) inline uint32_t cupbop_mbar_hw(uint32_t rec) {
   return ((rec & 7u) << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID);
 }
@@ -150,6 +165,38 @@ static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t 
                                                                       uint32_t c2, uint32_t c3, uint32_t c4) {
   cupbop_tma_dxa_issue_meta((bar << 4) | slot, smem, rank, c0, c1, c2, c3, c4);
 }
+#if defined(VX_CFG_EXT_DXA_ENABLE) && VX_CFG_NUM_THREADS == 8
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_cp_async_dxa16(
+    void *dst, const void *src, uint32_t read_source) {
+  const unsigned cta_warps = csr_read_nv(VX_CSR_CTA_SIZE);
+  const unsigned barriers = vx_num_barriers();
+  if (vx_active_threads() == 0xff && cta_warps < barriers) {
+    const uintptr_t source = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t destination = reinterpret_cast<uintptr_t>(dst);
+    const uintptr_t source_base = vx_shfl_idx(source, 0, 7, 0);
+    const uintptr_t destination_base = vx_shfl_idx(destination, 0, 7, 0);
+    constexpr unsigned copy_bytes = CUPBOP_CP_ASYNC_DXA_WORDS * sizeof(uint32_t);
+    const unsigned lane_offset = vx_thread_id() * 16;
+    const bool contiguous = (read_source != 0) & (source == source_base + lane_offset) &
+                            (destination == destination_base + lane_offset);
+    if (((source_base | destination_base) % 16 == 0) && source_base <= UINT32_MAX - (copy_bytes - 1) &&
+        vx_vote_all(contiguous)) {
+      const unsigned barrier_number = barriers - cta_warps + csr_read_nv(VX_CSR_CTA_RANK);
+      const unsigned barrier = (barrier_number << 8) + csr_read_nv(VX_CSR_CTA_ID);
+      vx_fence();
+      vx_barrier_expect_tx(barrier, 1);
+      cupbop_tma_dxa_issue(CUPBOP_CP_ASYNC_DXA_SLOT, barrier, reinterpret_cast<void *>(destination_base),
+                           1, source_base / sizeof(uint32_t), 0, 0, 0, 0);
+      vx_barrier(barrier, 1);
+      return;
+    }
+  }
+  const auto *input = static_cast<const volatile uint32_t *>(src);
+  auto *output = static_cast<volatile uint32_t *>(dst);
+  for (int word = 0; word < 4; ++word)
+    output[word] = read_source ? input[word] : 0;
+}
+#endif
 static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, const void *s, uint32_t e) {
   switch (e) {
   case 1: *(uint8_t *)d = *(const uint8_t *)s; break;
@@ -157,6 +204,17 @@ static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, cons
   case 4: *(uint32_t *)d = *(const uint32_t *)s; break;
   default: *(uint64_t *)d = *(const uint64_t *)s; break;
   }
+}
+// A TMA swizzle permutes 16-byte sectors without changing the bytes in a sector.
+static inline bool cupbop_copy_tma_sectors(uintptr_t dst, uintptr_t src, unsigned bytes,
+                                         uintptr_t dst_phase, uintptr_t src_phase) {
+  if ((dst | src | bytes) & 15u) return false;
+  for (unsigned off = 0; off < bytes; off += 16) {
+    void *out = __builtin_assume_aligned(reinterpret_cast<void *>((dst + off) ^ dst_phase), 16);
+    const void *in = __builtin_assume_aligned(reinterpret_cast<const void *>((src + off) ^ src_phase), 16);
+    __builtin_memcpy(out, in, 16);
+  }
+  return true;
 }
 static __attribute__((always_inline)) inline void cupbop_fill_elem(void *d, uint32_t e, uint32_t nan) {
   switch (e) {
@@ -166,11 +224,33 @@ static __attribute__((always_inline)) inline void cupbop_fill_elem(void *d, uint
   default: *(uint64_t *)d = nan ? 0x7FFFFFFFFFFFFFFFull : 0; break;
   }
 }
-// One box of the tensor <-> a dense box in shared memory (innermost dimension first, no swizzle). Load: out-of-
+
+static inline uint32_t cupbop_tma_permuted_index(const cupbop_tmap &t, uint32_t n, uint32_t k) {
+  if (t.layout == CUPBOP_DXA_LAYOUT_K_MAJOR) return n * (t.rank > 1 ? t.box[1] : 1u) + k;
+
+  const uint32_t tc_n = t.geometry & 0xffffu;
+  const uint32_t n_blocks = t.box[0] / tc_n;
+  const uint32_t n_block = n / tc_n;
+  const uint32_t n_in = n % tc_n;
+  if (t.layout == CUPBOP_DXA_LAYOUT_FLAT) {
+    const uint32_t ratio = t.elem < 4 ? 4 / t.elem : 1;
+    const uint32_t k_words = 2 * tc_n;
+    const uint32_t k_word = k / ratio;
+    const uint32_t block = (k_word / k_words) * n_blocks + n_block;
+    return ((block * k_words + k_word % k_words) * tc_n + n_in) * ratio + k % ratio;
+  }
+  const uint32_t block_k = t.geometry >> 16;
+  const uint32_t block = (k / block_k) * n_blocks + n_block;
+  return (block * tc_n + n_in) * block_k + k % block_k;
+}
+
+// One box of the tensor <-> a box in shared memory (innermost dimension first). Load: out-of-
 // bounds elements are filled (0, or NaN); store: out-of-bounds elements are not written.
 static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *desc, uint32_t rank, int32_t c0,
                                                     int32_t c1, int32_t c2, int32_t c3, int32_t c4, int store) {
   const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
+  if (t->swizzle && (reinterpret_cast<uintptr_t>(smem) & 127u))
+    cupbop_async_fail("unaligned shared destination for a swizzled tensor map", (uintptr_t)smem, t->swizzle);
   const int32_t c[5] = {c0, c1, c2, c3, c4};
   uint32_t b[5], dm[5];
   for (int i = 0; i < 5; ++i) {
@@ -178,6 +258,7 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
     dm[i] = i < (int)rank ? t->dim[i] : 1u;
   }
   const uint32_t e = t->elem;
+  const bool row_major = t->layout == CUPBOP_DXA_LAYOUT_ROW_MAJOR;
   char *s = (char *)smem;
   for (uint32_t j4 = 0; j4 < b[4]; ++j4)
     for (uint32_t j3 = 0; j3 < b[3]; ++j3)
@@ -194,15 +275,29 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
             if (rank > 3) row += (uint64_t)g3 * t->stride[2];
             if (rank > 4) row += (uint64_t)g4 * t->stride[3];
           }
+          // For a 128-byte row the absolute row address supplies the swizzle phase.
+          uintptr_t flip = t->swizzle ? (((uintptr_t)s >> 7) & 7u) << 4 : 0;
+          const unsigned row_bytes = b[0] * e;
+          if (row_major && !store && row_in && c0 >= 0 && uint64_t(c0) + b[0] <= dm[0] &&
+              cupbop_copy_tma_sectors(uintptr_t(s), uintptr_t(row + uint64_t(c0) * e), row_bytes, flip, 0)) {
+            s += row_bytes;
+            continue;
+          }
           for (uint32_t j0 = 0; j0 < b[0]; ++j0, s += e) {
+            char *shared = row_major ? (char *)((uintptr_t)s ^ flip)
+                : static_cast<char *>(smem) + size_t(cupbop_tma_permuted_index(*t, j0, j1)) * e;
             const int64_t g0 = (int64_t)c[0] + j0;
             const bool in = row_in && g0 >= 0 && g0 < (int64_t)dm[0];
             if (store) {
-              if (in) cupbop_copy_elem((void *)(row + (uint64_t)g0 * e), s, e);
+              if (in) {
+                void *destination = (void *)(row + (uint64_t)g0 * e);
+                if (store == 1) cupbop_copy_elem(destination, shared, e);
+                else cupbop_reduce_element(destination, shared, t->dtype, store - 2);
+              }
             } else if (in) {
-              cupbop_copy_elem(s, row + (uint64_t)g0 * e, e);
+              cupbop_copy_elem(shared, row + (uint64_t)g0 * e, e);
             } else {
-              cupbop_fill_elem(s, e, t->oob_nan);
+              cupbop_fill_elem(shared, e, t->oob_nan);
             }
           }
         }
@@ -210,9 +305,20 @@ static __attribute__((noinline)) void cupbop_tma_box(void *smem, const void *des
 // The DXA path of a TMA load: the host gives a DXA slot (< 16) at launch to DXA-mode tensor maps only (a software-mode
 // map keeps 0xFFFFFFFF), the DXA gathers its operands from lane 0, and it takes unsigned coordinates. Bitwise, not
 // short-circuit: one branch.
-static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok(uint32_t slot, int32_t c0, int32_t c1, int32_t c2,
-                                                                   int32_t c3, int32_t c4) {
-  return (slot < 16u) & (vx_thread_id() == 0) & ((c0 | c1 | c2 | c3 | c4) >= 0);
+static constexpr uint32_t cupbop_dxa_swizzle_flag = 16u;
+
+static __attribute__((always_inline)) inline uint32_t cupbop_tma_slot(const cupbop_tmap *t) {
+#ifdef VX_DXA_SWIZZLE_128B
+  return t->dxa_slot | (t->swizzle ? cupbop_dxa_swizzle_flag : 0u);
+#else
+  return t->swizzle ? UINT32_MAX : t->dxa_slot;
+#endif
+}
+
+static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok(uint32_t slot, const void *smem, int32_t c0,
+                                                                  int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+  const bool aligned = !(slot & cupbop_dxa_swizzle_flag) || !(reinterpret_cast<uintptr_t>(smem) & 127u);
+  return (slot < 32u) & aligned & (vx_thread_id() == 0) & ((c0 | c1 | c2 | c3 | c4) >= 0);
 }
 // cp.async.bulk.tensor.<rank>d global -> shared: one copy by each calling thread (the elected one). DXA mode
 // (the host gave the tensor map a DXA slot at launch): an asynchronous DXA transfer completing on the mbarrier's
@@ -224,11 +330,12 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load(voi
                                                                            int32_t c4) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
-  const uint32_t slot = t->dxa_slot;
-  if (cupbop_tma_dxa_ok(slot, c0, c1, c2, c3, c4)) {
+  const uint32_t slot = cupbop_tma_slot(t);
+  if (cupbop_tma_dxa_ok(slot, smem, c0, c1, c2, c3, c4)) {
     const uint32_t hw = cupbop_mbar_hw(cupbop_mbar_rec(mbar));
     vx_barrier_expect_tx((int)hw, 1);
-    cupbop_tma_dxa_issue(slot, hw, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3, (uint32_t)c4);
+    cupbop_tma_dxa_issue(slot & 15u, hw, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3,
+                         (uint32_t)c4);
     return;
   }
 #endif
@@ -242,24 +349,25 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load(voi
 // therefore only registers its event here and queues the issue; that arrive arrives first (__cupbop_mbar_arrive*_m),
 // and then the whole warp, converged again after the arrive's region, issues the queue (__cupbop_txq_issue, placed by
 // the translator: async_ptx.cpp, placeIssue): every expect_tx, then the arrival, then the transfers.
-// The queue is a per-thread stack object the translator allocates (192 bytes) and whose valid words it zeroes at function
-// entry (async_ptx.cpp txQueue: the layout below, valid at byte 16 of each 40-byte entry). The translator numbers
+// The queue is a per-thread stack object the translator allocates and initializes (async_ptx.cpp txQueue).
+// The translator numbers
 // the TMA loads of one moved arrive 0..K-1 (async_ptx.cpp, queueCopies): load j fills entry j, and the issue after the
 // arrive issues the valid entries among 0..K-1 and clears them. Every access has a constant offset, so after inlining SROA
 // keeps the queue in registers: no stack traffic and no loop on the path of a transfer. An entry past the queue (also
-// async_ptx.cpp kTxqSync, when the translator finds no converged issue point), or a load the DXA cannot take, copies
+// when the translator finds no converged issue point), or a load the DXA cannot take, copies
 // synchronously.
 #define CUPBOP_TXQ_N 4
 typedef struct cupbop_txq {
-  struct { void *smem; uint32_t meta, rank_unused, valid; int32_t c[5]; } e[CUPBOP_TXQ_N]; // rank: the issue's `wide`
+  struct { void *smem; uint32_t meta, bytes, valid; int32_t c[5]; void *mbar; } e[CUPBOP_TXQ_N];
 } cupbop_txq;
-static_assert(__builtin_offsetof(cupbop_txq, e[0].valid) == 16 && sizeof(cupbop_txq) == 160,
+static_assert(__builtin_offsetof(cupbop_txq, e[0].bytes) == 12 &&
+              __builtin_offsetof(cupbop_txq, e[0].valid) == 16 && sizeof(cupbop_txq) == 192,
               "cupbop_txq: the translator's queue layout (async_ptx.cpp txQueue)");
 // The DXA slot of a tensor map (0xFFFFFFFF: none), which the host sets at launch: the translator reads it once, at the
 // kernel's entry, when the tensor map is a kernel parameter, so that a transfer does not wait on the loads of the record.
 extern "C" __attribute__((always_inline)) uint32_t __cupbop_tma_slot(const void *desc, uint32_t rank) {
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
-  return cupbop_tmap_of(desc, rank)->dxa_slot;
+  return cupbop_tma_slot(cupbop_tmap_of(desc, rank));
 #else
   (void)desc; (void)rank;
   return 0xFFFFFFFFu;
@@ -272,19 +380,43 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(
                                                                               const void *desc, void *mbar,
                                                                               uint32_t rank, int32_t c0, int32_t c1,
                                                                               int32_t c2, int32_t c3, int32_t c4) {
+  cupbop_txq *q = static_cast<cupbop_txq *>(q_);
+  if (j < CUPBOP_TXQ_N) {
+    const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
+    uint64_t bytes = t->elem;
+    for (uint32_t dim = 0; dim < rank; ++dim) bytes *= t->box[dim];
+    if (bytes > UINT32_MAX) cupbop_async_fail("tensor copy bytes overflow mbarrier transaction", j, rank);
+    q->e[j].mbar = mbar;
+    q->e[j].bytes = (uint32_t)bytes;
+  }
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
-  cupbop_txq *q = (cupbop_txq *)q_;
-  if ((j < CUPBOP_TXQ_N) & cupbop_tma_dxa_ok(slot, c0, c1, c2, c3, c4)) {
+  if ((j < CUPBOP_TXQ_N) & cupbop_tma_dxa_ok(slot, smem, c0, c1, c2, c3, c4)) {
     const uint32_t hw = id != 0xFFFFFFFFu ? (id << 8) + (uint32_t)csr_read_nv(VX_CSR_CTA_ID) : cupbop_mbar_hw(cupbop_mbar_rec(mbar));
     vx_barrier_expect_tx((int)hw, 1);
     auto &e = q->e[j < CUPBOP_TXQ_N ? j : 0];
-    e.smem = smem; e.meta = (hw << 4) | slot; e.valid = 1;
+    e.smem = smem; e.meta = (hw << 4) | (slot & 15u); e.valid = 1;
     e.c[0] = c0; e.c[1] = c1; e.c[2] = c2; e.c[3] = c3; e.c[4] = c4;
     return;
   }
 #endif
   (void)q_; (void)j; (void)id; (void)slot; (void)mbar;
   cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
+}
+
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_check(void *q_, uint32_t count, void *mbar,
+                                                                               uint32_t expected, uint32_t counted) {
+  cupbop_txq *q = static_cast<cupbop_txq *>(q_);
+  uint64_t bytes = 0;
+  for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j) {
+    if (j >= count) break;
+    const auto entry_bytes = q->e[j].bytes;
+    if (counted && entry_bytes && q->e[j].mbar != mbar)
+      cupbop_async_fail("TMA copy and mbarrier.arrive.expect_tx target different barriers", j, count);
+    bytes += entry_bytes;
+    q->e[j].bytes = 0;
+  }
+  if (counted && bytes != expected)
+    cupbop_async_fail("TMA copies do not balance mbarrier.arrive.expect_tx bytes", bytes, expected);
 }
 // The DXA issue of a moved arrive's queued copies (entries 0..K-1), by every lane of a converged warp: the translator
 // calls it where the warp is converged after the arrive's region (async_ptx.cpp, placeIssue). Only lane 0 queues a DXA
@@ -363,4 +495,32 @@ extern "C" __attribute__((noinline)) void __cupbop_bulk_copy(void *dst, const vo
   uint64_t *d = (uint64_t *)dst;
   const uint64_t *s = (const uint64_t *)src;
   for (uint32_t i = 0; i < bytes / 8; ++i) d[i] = s[i];
+}
+
+extern "C" __attribute__((noinline, convergent)) void __cupbop_tensormap_publish(void *dst, const void *src) {
+  static_assert(sizeof(cupbop_tmap) == 128, "TMA descriptors are 128 bytes");
+  if (!__cupbop_elect_sync(UINT32_MAX)) return;
+  if (!dst || !src || (((uintptr_t)dst | (uintptr_t)src) & 15u))
+    cupbop_async_fail("tensor-map publication needs aligned shared and global addresses",
+                      (uint32_t)(uintptr_t)dst, (uint32_t)(uintptr_t)src);
+  const auto *source = static_cast<const cupbop_tmap *>(src);
+  if (source->magic != CUPBOP_TMAP_MAGIC || source->rank < 1 || source->rank > 5 ||
+      (source->mode != CUPBOP_TMAP_MODE_SW && source->mode != CUPBOP_TMAP_MODE_DXA))
+    cupbop_async_fail("tensor-map publication needs a complete CuPBoP tensor-map record", source->magic, source->rank);
+  __cupbop_bulk_copy(dst, src, sizeof(cupbop_tmap));
+  auto *published = static_cast<cupbop_tmap *>(dst);
+  // Consumers follow self. A dynamically published map has no host-registered DXA slot.
+  published->self = (uintptr_t)published;
+  published->mode = CUPBOP_TMAP_MODE_SW;
+  published->dxa_slot = UINT32_MAX;
+  vx_fence();
+}
+
+extern "C" void __cupbop_tensor_reduce(const void *desc,void *src,unsigned rank,int c0,int c1,int c2,int c3,int c4,unsigned op) {
+  const unsigned t = cupbop_tmap_of(desc,rank)->dtype;
+  const bool supported = op == ReduceAdd ? (t == 2 || t == 3 || t == 4 || t == 6 || t == 7 || t == 9) :
+                         op == ReduceMin || op == ReduceMax ? (t >= 2 && t <= 6) || t == 9 :
+                         op == ReduceInc || op == ReduceDec ? t == 2 : t >= 2 && t <= 5;
+  if (!supported) cupbop_async_fail("invalid tensor reduction operation or element type",op,t);
+  cupbop_tma_box(src,desc,rank,c0,c1,c2,c3,c4,int(op)+2);
 }

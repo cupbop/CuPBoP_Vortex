@@ -12,6 +12,9 @@ PROJECT := cupbop_kernel
 SRCS := $(CUPBOP_WORK)/dummy_host.cpp
 CUPBOP_RT_SRCS := $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp \
                   $(CuPBoP_PATH)/runtime/src/vortex/kernel/nv_libdevice_compat.cpp
+CUPBOP_RT_INCLUDES := $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) \
+                      $(CuPBoP_PATH)/runtime/include/cupbop_launch_context.h $(ROOT_DIR)/sw/VX_types.h \
+                      $(wildcard $(VORTEX_HOME)/sw/kernel/include/vx_simx_clc.h)
 CUPBOP_LTO ?= 0
 ifeq ($(CUPBOP_LTO),1)
 # Link-time inlining (lowering-recipe knob): the device runtime is compiled to bitcode with the
@@ -30,7 +33,7 @@ VX_SRCS := $(CUPBOP_WORK)/kernel_lto.bc $(CUPBOP_WORK)/kernel_wrapper.cpp
 # libvortex, libc/libm) defines __nv_*, so the ODR promise holds. CUPBOP_NV_COMPAT_NOINLINE=1 keeps
 # them weak (the old calls).
 CUPBOP_NV_COMPAT_NOINLINE ?= 0
-$(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS)
+$(CUPBOP_WORK)/kernel_lto.bc: $(CUPBOP_WORK)/kernel.bc $(CUPBOP_RT_SRCS) $(CUPBOP_RT_INCLUDES)
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 1,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/cudaKernelImpl.lto.bc
 	$(VX_CXX) $(VX_CFLAGS) -emit-llvm -c $(word 2,$(CUPBOP_RT_SRCS)) -o $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc
 ifneq ($(CUPBOP_NV_COMPAT_NOINLINE),1)
@@ -40,6 +43,7 @@ ifneq ($(CUPBOP_NV_COMPAT_NOINLINE),1)
 endif
 	$(LLVM_PATH)/bin/llvm-link $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/cudaKernelImpl.lto.bc $(CUPBOP_WORK)/nv_libdevice_compat.lto.bc -o $@
 else
+VX_HDRS += $(CUPBOP_RT_INCLUDES)
 VX_SRCS := $(CUPBOP_WORK)/kernel.bc $(CUPBOP_WORK)/kernel_wrapper.cpp $(CUPBOP_RT_SRCS)
 endif
 # Vortex 3.0 KMU launch path (CUPBOP_LAUNCH2): vx_start.S built with KMU_ENABLE (__vx_cta_entry), kernel_main entry
@@ -65,7 +69,12 @@ VX_CFLAGS += -mllvm -vortex-divergence-max-bbs=$(CUPBOP_DIV_MAX_BBS)
 # token that was never pushed ("IPDOM stack is empty!"): lifted cuDNN ctc_loss compute_grads_deterministic and the
 # CUTLASS 00_basic_gemm SIMT sgemm (2026-10-29; both PASS with the limit raised).
 CUPBOP_STRUCT_MAX_BBS ?= 1000000
+# vortexgpgpu/llvm vortex_3.x from 2188e6640727 (2026-10-13) has no -structurizecfg-max-bbs: StructurizeCFG there skips exactly
+# the functions VortexBranchDivergence0 skips, which -vortex-divergence-max-bbs above already raises. Pass the flag only to an
+# LLVM that still has it (an unknown -mllvm option aborts the compile).
+ifneq ($(shell $(LLVM_PATH)/bin/llc -help-hidden 2>/dev/null | grep -c -- '-structurizecfg-max-bbs='),0)
 VX_CFLAGS += -mllvm -structurizecfg-max-bbs=$(CUPBOP_STRUCT_MAX_BBS)
+endif
 # Extra kernel-compile flags from the environment (empty by default), e.g. CUPBOP_VX_EXTRA_CFLAGS="-mllvm
 # -split-spill-mode=size" works around an LLVM 20 RAGreedy crash (SplitEditor::deleteRematVictims) seen on the
 # lifted PyTorch reduce_kernel (global_avgpool).

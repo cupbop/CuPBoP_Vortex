@@ -1158,6 +1158,10 @@ static void lowerWgmma(Function &F, Lanes &LN, std::set<Value *> &bPerm) {
   unsigned n = 0;
   for (CallInst *W : todo) {
     const unsigned nacc = W->arg_size() - 2, N = 2 * nacc; if (N % 16) continue;
+    const APInt swizzleMask = APInt::getHighBitsSet(64, 2);
+    if (!MaskedValueIsZero(W->getArgOperand(0), swizzleMask, M->getDataLayout()) ||
+        !MaskedValueIsZero(W->getArgOperand(1), swizzleMask, M->getDataLayout()))
+      continue;
     IRBuilder<> Q(W); auto &P = LN.get(W->getParent());
     Value *tx = sreg(Q, "llvm.nvvm.read.ptx.sreg.tid.x"), *nx = sreg(Q, "llvm.nvvm.read.ptx.sreg.ntid.x"), *ny = sreg(Q, "llvm.nvvm.read.ptx.sreg.ntid.y");
     Value *lin = Q.CreateAdd(tx, Q.CreateMul(sreg(Q, "llvm.nvvm.read.ptx.sreg.tid.y"), nx)); lin = Q.CreateAdd(lin, Q.CreateMul(sreg(Q, "llvm.nvvm.read.ptx.sreg.tid.z"), Q.CreateMul(nx, ny)));

@@ -1,5 +1,6 @@
 // cp.async family and DXA (Vortex tile-copy engine) support in the kernel translator. See async_copy.h.
 #include "async_copy.h"
+#include "../../../runtime/include/cupbop_dxa_layout.h"
 #include "tool.h"
 
 #include "llvm/ADT/MapVector.h"
@@ -191,7 +192,7 @@ static Value *zfillReadAddress(IRBuilder<> &B, Module *M, Value *dst) {
 
 // Emit the synchronous copy of one cp.async in front of S.call.
 void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> &DTs, unsigned &n_traced,
-              unsigned &n_inttoptr) {
+              unsigned &n_inttoptr, bool coalescedDxa, unsigned &nDxa) {
   LLVMContext &ctx = S.call->getContext();
   IRBuilder<> B(S.call);
   Type *I8 = Type::getInt8Ty(ctx), *I32 = Type::getInt32Ty(ctx), *I64 = Type::getInt64Ty(ctx);
@@ -254,6 +255,17 @@ void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> 
     }
   }
 
+  if (coalescedDxa && S.cp == 16 && (is_const ? const_size == 16 : !partial_possible)) {
+    auto *module = S.call->getModule();
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto helper = module->getOrInsertFunction("__cupbop_cp_async_dxa16",
+        FunctionType::get(Type::getVoidTy(ctx), {ptr, ptr, I32}, false));
+    cast<Function>(helper.getCallee())->addFnAttr(Attribute::Convergent);
+    Value *readSource = is_const ? ConstantInt::get(I32, 1) : B.CreateZExt(full, I32);
+    B.CreateCall(helper, {toGeneric(B, dst), src, readSource})->addFnAttr(Attribute::Convergent);
+    ++nDxa;
+    return;
+  }
   if (is_const) {
     if (const_size == 0) {
       B.CreateAlignedStore(zero, dst, al);
@@ -327,6 +339,26 @@ bool mentionsAsync(const std::string &s) {
 } // namespace
 
 void lower_cp_async(Module *M) {
+  std::remove("cupbop_cp_async_dxa.txt");
+  const char *requested = std::getenv("CUPBOP_CP_ASYNC_COALESCED_DXA");
+  const char *configs = std::getenv("VORTEX_CONFIGS");
+  const char *localMemory = std::getenv("VORTEX_LOCALMEM_FLAG");
+  const VirtGeom geometry = getVirtGeom();
+  bool coalescedDxa = requested && std::atoi(requested) && geometry.schedule == 1 &&
+      geometry.nt == 8 && geometry.lanes == 8 && (!localMemory || std::atoi(localMemory) == 1) && configs &&
+      vortexConfigHasFlag("-DVX_CFG_EXT_DXA_ENABLE") &&
+      !vortexConfigHasFlag("-DVX_CFG_VM_ENABLE") &&
+      !M->getNamedMetadata("vx.dxa.desc") && !cupbop_dxa_sidecar_written;
+  if (coalescedDxa) {
+    for (const Function &function : *M) {
+      StringRef name = function.getName();
+      if (!function.use_empty() && (name.starts_with("__cupbop_bar_") || name.starts_with("__cupbop_mbar_") ||
+          name.starts_with("__cupbop_tma_") || name.contains("__vx_dxa_") || name.contains("__vx_barrier_"))) {
+        coalescedDxa = false;
+        break;
+      }
+    }
+  }
   std::map<Function *, std::unique_ptr<DominatorTree>> DTs;
   std::vector<CopySite> copies;
   std::vector<CallInst *> commits, waits;
@@ -428,9 +460,9 @@ void lower_cp_async(Module *M) {
       }
 
   if (copies.empty() && commits.empty() && waits.empty()) return;
-  unsigned n_traced = 0, n_i2p = 0;
+  unsigned n_traced = 0, n_i2p = 0, nDxa = 0;
   for (auto &S : copies) {
-    emitCopy(S, DTs, n_traced, n_i2p);
+    emitCopy(S, DTs, n_traced, n_i2p, coalescedDxa, nDxa);
     S.call->eraseFromParent();
   }
   for (auto *C : commits) C->eraseFromParent();
@@ -440,9 +472,19 @@ void lower_cp_async(Module *M) {
     B.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
     C->eraseFromParent();
   }
-  fprintf(stderr, "[CuPBoP] cp.async lowered to synchronous copies: %zu copies (%u pointer operands traced, %u "
+  fprintf(stderr, "[CuPBoP] cp.async lowered%s: %zu copies (%u pointer operands traced, %u "
                   "integer addresses), %zu commit_group, %zu wait_group/wait_all\n",
-          copies.size(), n_traced, n_i2p, commits.size(), waits.size());
+          nDxa ? "" : " to synchronous copies", copies.size(), n_traced, n_i2p, commits.size(), waits.size());
+  if (nDxa) {
+    std::ofstream marker("cupbop_cp_async_dxa.txt");
+    marker << "8\n";
+    marker.close();
+    if (!marker) {
+      fprintf(stderr, "error: could not write cupbop_cp_async_dxa.txt\n");
+      exit(1);
+    }
+    fprintf(stderr, "[CuPBoP] cp.async: %u sites can use coalesced DXA\n", nDxa);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -600,8 +642,8 @@ void virt_dxa_cta_once(Module *M) {
 // !vx.dxa.desc -> dxa_descriptors.txt
 //
 //   !vx.dxa.desc = !{!0, ...}
-//   !0 = !{ptr @kernel, !"slot=0 base=arg1 size=arg2,arg3 stride=arg2*4 box=16,16 elem=4 [rank=2] [layout=row|kmajor]
-//                         [smem_stride=0] [fill=0 | fillf=1.5]"}
+//   !0 = !{ptr @kernel, !"slot=0 base=arg1 size=arg2,arg3 stride=arg2*4 box=16,16 elem=4 [rank=2]
+//                         [layout=row|kmajor|flat|blockmajor] [tc_n=N] [block_k=K] [smem_stride=0] [fill=0 | fillf=1.5]"}
 // (the kernel may also be named by a string). Each value is an integer literal, argK (kernel argument K) or
 // a product of those with '*'; base is argK[+bytes]. stride lists the byte strides of dims 1..rank-1 (default:
 // dense), box the tile (elements per dim), fill the 32-bit out-of-bounds pattern (lane-replicated).
@@ -669,7 +711,7 @@ void emit_dxa_desc_sidecar(Module *M) {
       kv[tok.substr(0, eq)] = tok.substr(eq + 1);
     }
     static const std::set<std::string> keys = {"slot", "base", "rank", "size", "stride", "box", "elem",
-                                               "layout", "smem_stride", "fill", "fillf"};
+                                               "layout", "tc_n", "block_k", "smem_stride", "fill", "fillf"};
     for (auto &p : kv)
       if (!keys.count(p.first)) bad(i, "unknown key `" + p.first + "`");
     for (const char *req : {"slot", "base", "size", "box", "elem"})
@@ -694,19 +736,27 @@ void emit_dxa_desc_sidecar(Module *M) {
     if (sizes.size() != rank || box.size() != rank) bad(i, "size= and box= need rank entries each");
     std::string why;
     for (auto &v : sizes) if (!validValueExpr(v, nargs, why)) bad(i, "size: " + why);
-    for (auto &v : box) {
-      long t = std::strtol(v.c_str(), nullptr, 0);
-      if (t < 1 || t > 65535) bad(i, "box entries must be integer literals 1..65535");
-    }
+    uint32_t tiles[5] = {1, 1, 1, 1, 1};
+    for (unsigned d = 0; d < rank; ++d)
+      if (StringRef(box[d]).getAsInteger(0, tiles[d]) || tiles[d] < 1 || tiles[d] > 65535)
+        bad(i, "box entries must be integer literals 1..65535");
     if (kv.count("stride")) {
       auto st = splitList(kv["stride"]);
       if (st.size() != rank - 1) bad(i, "stride= needs rank-1 entries (byte strides of dims 1..rank-1)");
       for (auto &v : st) if (!validValueExpr(v, nargs, why)) bad(i, "stride: " + why);
     }
-    long elem = std::strtol(kv["elem"].c_str(), nullptr, 0);
-    if (elem != 1 && elem != 2 && elem != 4 && elem != 8) bad(i, "elem must be 1, 2, 4 or 8");
-    if (kv.count("layout") && kv["layout"] != "row" && kv["layout"] != "kmajor") bad(i, "layout must be row or kmajor");
-    if (kv["layout"] == "kmajor" && rank > 2) bad(i, "layout=kmajor needs rank <= 2");
+    uint32_t elem = 0;
+    if (StringRef(kv["elem"]).getAsInteger(0, elem) || (elem != 1 && elem != 2 && elem != 4 && elem != 8))
+      bad(i, "elem must be 1, 2, 4 or 8");
+    const int layout = cupbop_dxa_parse_layout(kv.count("layout") ? kv["layout"].c_str() : "row");
+    if (layout < 0) bad(i, "layout must be row, kmajor, flat or blockmajor");
+    uint32_t tc_n = 0, block_k = 0;
+    if (kv.count("tc_n") && StringRef(kv["tc_n"]).getAsInteger(0, tc_n))
+      bad(i, "tc_n must be an unsigned 32-bit integer literal");
+    if (kv.count("block_k") && StringRef(kv["block_k"]).getAsInteger(0, block_k))
+      bad(i, "block_k must be an unsigned 32-bit integer literal");
+    if (const char *error = cupbop_dxa_check_layout(layout, rank, elem, tiles[0], tiles[1], tc_n, block_k))
+      bad(i, error);
     if (kv.count("fill") && kv.count("fillf")) bad(i, "give fill= or fillf=, not both");
     lines.push_back("desc " + kname + " " + trim(Spec->getString().str()));
   }
@@ -717,8 +767,8 @@ void emit_dxa_desc_sidecar(Module *M) {
   }
   if (!cupbop_dxa_sidecar_written)
     out << "# DXA descriptors for the CuPBoP host runtime (written by kernelTranslator from !vx.dxa.desc)\n"
-           "# desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R] [layout=row|kmajor]"
-           " [smem_stride=B] [fill=P|fillf=F]\n";
+           "# desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R]"
+           " [layout=row|kmajor|flat|blockmajor] [tc_n=N] [block_k=K] [smem_stride=B] [fill=P|fillf=F]\n";
   for (auto &l : lines) out << l << "\n";
   cupbop_dxa_sidecar_written = true;
   N->eraseFromParent(); // the descriptors live in the sidecar now

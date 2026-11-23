@@ -1,0 +1,86 @@
+.version 8.7
+.target CLUSTER_TARGET
+.address_size 64
+
+.extern .shared .align 16 .b8 arena[];
+
+.visible .entry cancel_probe(.param .u64 output,.param .u32 mask_x,.param .u32 mask_y) .reqntid 1,1,1 {
+    .reg .pred issuer,ready,success;
+    .reg .b32 x,y,z,nx,ny,tile,rank,sm,bar,v,ox,oy,oz,a,b,c,d;
+    .reg .b64 ptr,off;
+    .reg .b128 response;
+    ld.param.u64 ptr,[output];
+    mov.u32 x,%ctaid.x;
+    mov.u32 y,%ctaid.y;
+    mov.u32 z,%ctaid.z;
+    mov.u32 nx,%nctaid.x;
+    mov.u32 ny,%nctaid.y;
+    mad.lo.u32 tile,z,ny,y;
+    mad.lo.u32 tile,tile,nx,x;
+    mul.wide.u32 off,tile,48;
+    add.u64 ptr,ptr,off;
+    mov.u32 rank,%cluster_ctarank;
+    setp.eq.u32 issuer,rank,1;
+    mov.u32 sm,arena;
+    add.u32 bar,sm,16;
+    mov.b32 a,0x11223344;
+    mov.b32 b,0x55667788;
+    mov.b32 c,0xaabbccdd;
+    mov.b32 d,0xeeff0011;
+    st.shared.v4.b32 [sm],{a,b,c,d};
+    fence.proxy.async.shared::cta;
+    mbarrier.init.shared::cta.b64 [bar],1;
+    fence.mbarrier_init.release.cluster;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _,[bar],16;
+    barrier.cluster.arrive;
+    barrier.cluster.wait;
+    @!issuer bra issued;
+#if MULTICAST
+    clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [sm],[bar];
+#else
+    clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [sm],[bar];
+#endif
+issued:
+#if !MULTICAST
+    @!issuer bra join;
+#endif
+wait_response:
+    mbarrier.try_wait.parity.shared::cta.b64 ready,[bar],0;
+    @!ready bra wait_response;
+join:
+    barrier.cluster.arrive;
+    barrier.cluster.wait;
+    mad.lo.u32 v,tile,7,3;
+    st.global.b32 [ptr],v;
+    mbarrier.test_wait.parity.shared::cta.b64 ready,[bar],0;
+    selp.u32 v,1,0,ready;
+    st.global.b32 [ptr+4],v;
+    ld.shared.b128 response,[sm];
+    mov.b128 {a,b,c,d},response;
+    st.global.v4.b32 [ptr+32],{a,b,c,d};
+    @!ready ret;
+    clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 success,response;
+    selp.u32 v,1,0,success;
+    st.global.b32 [ptr+8],v;
+    @!success ret;
+    clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {ox,oy,oz,_},response;
+    st.global.u32 [ptr+12],ox;
+    st.global.u32 [ptr+16],oy;
+    st.global.u32 [ptr+20],oz;
+    mad.lo.u32 tile,oz,ny,oy;
+    mad.lo.u32 tile,tile,nx,ox;
+    mad.lo.u32 v,tile,7,3;
+    st.global.u32 [ptr+24],v;
+#if MULTICAST
+    ld.param.u32 a,[mask_x];
+    ld.param.u32 b,[mask_y];
+    and.b32 a,x,a;
+    and.b32 b,y,b;
+    mad.lo.u32 a,b,nx,a;
+    mad.lo.u32 v,a,7,v;
+#else
+    add.u32 v,v,7;
+#endif
+    st.global.u32 [ptr+28],v;
+    ret;
+}

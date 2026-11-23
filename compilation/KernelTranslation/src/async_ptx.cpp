@@ -1,25 +1,31 @@
 // Hopper / Ampere asynchronous PTX (mbarrier, TMA, bulk copy, elect, cluster registers, proxy fences) lowered
 // to CuPBoP internal calls in software mode. See async_ptx.h and 2026-10-28_ASYNC_DESIGN_KO.md (§4-§6).
 #include "async_ptx.h"
+#include "../../../runtime/include/cupbop_reduce.h"
 #include "async_copy.h"
 #include "tool.h"
 
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -38,18 +44,20 @@ const char *kInit = "__cupbop_mbar_init", *kArrive = "__cupbop_mbar_arrive", *kA
            *kWaitPar = "__cupbop_mbar_wait_parity", *kTestPar = "__cupbop_mbar_test_parity",
            *kWaitSt = "__cupbop_mbar_wait_state", *kTestSt = "__cupbop_mbar_test_state",
            *kElect = "__cupbop_elect_sync", *kElectLane = "__cupbop_elect_lane", *kTmaLoad = "__cupbop_tma_load",
-           *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy", *kRankFail = "__cupbop_cluster_rank_fail",
+           *kTmaStore = "__cupbop_tma_store", *kBulk = "__cupbop_bulk_copy",
            *kActive = "__cupbop_activemask", *kTmaLoadQi = "__cupbop_tma_load_qi",
            *kArriveM = "__cupbop_mbar_arrive_m", *kArriveTxM = "__cupbop_mbar_arrive_tx_m", *kTmaSlot = "__cupbop_tma_slot",
-           *kTxqIssue = "__cupbop_txq_issue";
+           *kTxqIssue = "__cupbop_txq_issue", *kTxqCheck = "__cupbop_txq_check";
 const uint32_t kIdPlaceholder = 0xFFFFFFFFu;
-// the runtime's queue entries (CUPBOP_TXQ_N), and an entry past them: the TMA load copies synchronously (no converged DXA
-// issue point)
-const uint32_t kTxqN = 4, kTxqSync = 0xFFu;
+const uint32_t kTxqN = 4, kTxqEntrySize = 48;
 
 int schedule() {
   const char *e = std::getenv("VORTEX_SCHEDULE_FLAG");
   return e ? std::atoi(e) : 0;
+}
+
+bool tensorMapScope(StringRef scope) {
+  return scope == "cta" || scope == "cluster" || scope == "gpu" || scope == "sys";
 }
 
 std::string str(const Value *V) {
@@ -186,14 +194,68 @@ bool parsePtx(const std::string &in, std::vector<Stmt> &out, std::string &err) {
   return true;
 }
 
+static bool isWgmmaMma(const Stmt &s) {
+  return StringRef(s.op).starts_with("wgmma.mma_async");
+}
+
+static void validateWgmmaMma(CallInst *C, ArrayRef<Stmt> statements) {
+  const Stmt &mma = statements.back();
+  const bool sparse = mma.has("sp") || mma.hasPrefix("sp::");
+  const auto *result = dyn_cast<StructType>(C->getType());
+  const StringRef op(mma.op);
+  const bool validOpcode = op.starts_with("wgmma.mma_async.sync.aligned.m64n") ||
+                           op.starts_with("wgmma.mma_async.sp.sync.aligned.m64n");
+  if (!validOpcode || !mma.pred.empty() ||
+      !mma.label.empty() || !result || mma.ops.size() < 4)
+    fail_at(C, "WGMMA MMA requires a single unpredicated instruction and a register tuple result");
+
+  StringRef outputs(mma.ops[0]);
+  if (!outputs.consume_front("{") || !outputs.consume_back("}"))
+    fail_at(C, "WGMMA MMA is missing its accumulator register tuple");
+  auto registers = splitTop(outputs.str(), ',');
+  if (registers.size() != result->getNumElements())
+    fail_at(C, "WGMMA MMA accumulator count differs from its LLVM result");
+  for (unsigned i = 0; i < registers.size(); ++i) {
+    StringRef reg(registers[i]);
+    if (reg.consume_front("$")) {
+      if (reg.consume_front("{") && reg.consume_back("}")) reg = reg.split(':').first;
+      unsigned index = 0;
+      if (!reg.getAsInteger(10, index) && index == i) continue;
+    }
+    fail_at(C, "WGMMA MMA accumulator output operands must be in LLVM result order");
+  }
+
+  if (sparse) return; // parse_sparse_wgmma validates the SS/RS operands at lowering.
+
+  // CUTLASS defines its scale-D predicate with `setp.ne.b32 p, $input, 0` immediately before MMA.
+  if (statements.size() == 1 && mma.ops[3] != "p") return;
+  if (statements.size() == 2 && mma.ops[3] == "p") {
+    const Stmt &set = statements.front();
+    if (set.op == "setp.ne.b32" && set.pred.empty() && set.label.empty() && set.ops.size() == 3 &&
+        set.ops[0] == "p" && set.ops[1] == "$" + std::to_string(registers.size() + 2) && set.ops[2] == "0")
+      return;
+  }
+  fail_at(C, "WGMMA MMA inline asm must contain just the MMA and its optional scale-D setp.ne.b32");
+}
+
+// Scoped scalar atomics emitted by libcudacxx's barrier and pipeline state.
+static bool isCtaAtomic(const Stmt &s) {
+  return s.op == "ld.acquire.cta.b64" || s.op == "ld.relaxed.cta.b32" ||
+         s.op == "st.relaxed.cta.b32" || s.op == "atom.add.acquire.cta.u32" ||
+         s.op == "atom.add.relaxed.cta.u32" || s.op == "atom.add.acq_rel.cta.u64" ||
+         s.op == "atom.add.relaxed.cta.u64";
+}
+
 // Is this statement one lower_async_ptx owns?
 bool ownedOp(const Stmt &s) {
   const std::string &o = s.op;
   auto sw = [&](const char *p) { return o.rfind(p, 0) == 0; };
-  if (sw("mbarrier.") || sw("cp.async.bulk") || sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") ||
-      sw("elect.sync") || sw("fence.mbarrier_init") || sw("mapa") || sw("barrier.cluster.") ||
-      sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") || sw("cvta.param") ||
-      sw("multimem.") || sw("tensormap."))
+  if (sw("clusterlaunchcontrol.") || sw("tcgen05.") || sw("mbarrier.") || sw("cp.async.bulk") ||
+      sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
+      sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
+      sw("cvta.param") || sw("multimem.") || sw("tensormap.") || sw("fence.proxy."))
+    return true;
+  if (isCtaAtomic(s) || o == "fence.sc.cta")
     return true;
   if ((sw("fence.") && o.find(".cluster") != std::string::npos)) return true;
   for (auto &x : s.ops)
@@ -204,8 +266,9 @@ bool ownedOp(const Stmt &s) {
 }
 
 bool mentionsAsyncText(const std::string &s) {
-  for (const char *k : {"mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
-                        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param"})
+  for (const char *k :
+       {"clusterlaunchcontrol.", "tcgen05.", "mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
+        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param", "fence.proxy.", "fence.mbarrier_init"})
     if (s.find(k) != std::string::npos) return true;
   return false;
 }
@@ -229,11 +292,13 @@ struct PassState {
   PointerType *Ptr;
   std::map<Function *, std::vector<CallInst *>> arrives; // candidates for the §5.3 move
   std::set<CallInst *> txCopies;                          // copies that complete on an mbarrier
+  std::set<Function *> tcgenFunctions;                    // use a byte-counted software barrier for TCGEN/TMA kernels
   std::set<Function *> needWarps;                         // functions with ops that need real warps
-  std::map<Function *, Value *> txq;                      // per-function DXA issue queue (§5.3 moved arrives)
+  std::map<BasicBlock *, WeakTrackingVH> txqIssueAnchors;
   std::map<std::pair<Function *, Value *>, Value *> slots; // DXA slot of a tensor-map parameter, read at the entry
   std::set<CallInst *> orderedCopies;                     // copies some arrive of the same thread was moved after
-  std::set<std::pair<Function *, unsigned>> paramAddrArgs; // kernel parameters whose address cvta.param takes
+  std::set<std::pair<Function *, unsigned>> tensorMapArgs;
+  std::map<Function *, std::pair<AllocaInst *, unsigned>> paramImages;
   unsigned n_asm = 0, n_intr = 0, n_moved = 0, n_issue = 0;
   explicit PassState(Module *m)
       : M(m), ctx(m->getContext()), I1(Type::getInt1Ty(ctx)), I32(Type::getInt32Ty(ctx)), I64(Type::getInt64Ty(ctx)),
@@ -242,6 +307,7 @@ struct PassState {
     FunctionCallee f = M->getOrInsertFunction(name, FunctionType::get(ret, args, false));
     if (auto *Fn = dyn_cast<Function>(f.getCallee())) {
       if (convergent) Fn->addFnAttr(Attribute::Convergent);
+      if (StringRef(name) == "__cupbop_cluster_sync") Fn->addFnAttr(Attribute::NoDuplicate);
       if (noreturn) Fn->addFnAttr(Attribute::NoReturn);
     }
     return f;
@@ -255,6 +321,15 @@ struct PassState {
   }
 };
 
+// CUDA CTA coordinates are relative to the recorded launch geometry.
+static Value *clusterRegister(PassState &S, IRBuilder<> &B, StringRef reg) {
+  unsigned axis = reg.ends_with(".z") ? 2 : reg.ends_with(".y") ? 1 : 0;
+  unsigned which = reg.contains("is_explicit_cluster") || reg.contains("is.explicit.cluster") ? 6 :
+                   reg.contains("nclusterid") ? 5 : reg.contains("clusterid") ? 4 :
+                   reg.contains("nctaid") ? 3 : reg.contains("ctaid") ? 2 : reg.contains("nctarank") ? 1 : 0;
+  return S.call(B, "__cupbop_cluster_register", S.I32, {B.getInt32(which), B.getInt32(axis)});
+}
+
 // A pointer (generic address space) for an address operand value.
 Value *toPointer(IRBuilder<> &B, PassState &S, Value *V, Instruction *at, const char *what) {
   Value *P = nullptr;
@@ -265,6 +340,8 @@ Value *toPointer(IRBuilder<> &B, PassState &S, Value *V, Instruction *at, const 
     return P;
   }
   if (V->getType()->isIntegerTy(64)) return B.CreateIntToPtr(V, S.Ptr, "async_i2p"); // flat memory
+  if (V->getType()->isIntegerTy(32) && (StringRef(what).contains("shared") || StringRef(what).contains("barrier")))
+    return S.call(B,"__cupbop_cluster_shared_ptr",S.Ptr,{V});
   fail_at(at, std::string("cannot recover the ") + what +
                   " pointer from its 32-bit operand (expected a cvta / ptrtoint of a pointer)");
 }
@@ -312,10 +389,8 @@ struct AsmLowering {
         if (k - nout >= C->arg_size()) fail("operand `" + t + "` out of range");
         v = C->getArgOperand(k - nout);
       }
-    } else if (t == "%cluster_ctarank" || t.rfind("%cluster_ctaid", 0) == 0 || t == "%is_explicit_cluster") {
-      v = ConstantInt::get(S.I32, 0);
-    } else if (t == "%cluster_nctarank" || t.rfind("%cluster_nctaid", 0) == 0) {
-      v = ConstantInt::get(S.I32, 1);
+    } else if (t.rfind("%cluster", 0) == 0 || t.rfind("%nclusterid", 0) == 0 || t == "%is_explicit_cluster") {
+      v = clusterRegister(S,B,t);
     } else if (t[0] == '%') {
       fail("special register `" + t + "` in async asm is not supported");
     } else if (isdigit((unsigned char)t[0]) || t[0] == '-') {
@@ -331,6 +406,7 @@ struct AsmLowering {
     if (want && v->getType() != want) {
       if (v->getType()->isPointerTy() && want->isIntegerTy()) v = B.CreatePtrToInt(v, want);
       else if (v->getType()->isIntegerTy() && want->isIntegerTy()) v = B.CreateZExtOrTrunc(v, want);
+      else if (v->getType()->isFloatingPointTy() && want->isIntegerTy() && v->getType()->getPrimitiveSizeInBits() == want->getPrimitiveSizeInBits()) v = B.CreateBitCast(v,want);
       else fail("operand `" + t + "` has an unexpected type");
     }
     return v;
@@ -373,6 +449,7 @@ struct AsmLowering {
       if (v->getType() != T) {
         if (v->getType()->isIntegerTy() && T->isIntegerTy()) v = B.CreateZExtOrTrunc(v, T);
         else if (v->getType()->isPointerTy() && T->isIntegerTy()) v = B.CreatePtrToInt(v, T);
+        else if (T->isFloatingPointTy() && v->getType()->getPrimitiveSizeInBits() == T->getPrimitiveSizeInBits()) v = B.CreateBitCast(v,T);
         else fail("cannot assign to output `" + d + "`");
       }
       outVal[k] = v;
@@ -486,14 +563,149 @@ struct AsmLowering {
     };
     auto width = [&]() -> Type * {
       for (auto &t : s.tok)
-        if (t.size() >= 2 && (t[0] == 'u' || t[0] == 's' || t[0] == 'b') && isdigit((unsigned char)t[1]))
+        if (t.size() >= 2 && (t[0] == 'u' || t[0] == 's' || t[0] == 'b' || t[0] == 'f') && isdigit((unsigned char)t[1]))
           return IntegerType::get(S.ctx, std::atoi(t.c_str() + 1));
       return S.I32;
     };
+    if (isCtaAtomic(s)) {
+      bool add = sw("atom."), store = sw("st.");
+      nops(add ? 3 : 2, add ? 3 : 2);
+      Type *ty = width();
+      auto align = Align(ty->getIntegerBitWidth() / 8);
+      Value *result = underPred(pred, [&]() -> Value * {
+        Value *ptr = addr(s.ops[store ? 0 : 1], "CTA atomic address");
+        if (add) {
+          auto order = s.has("acq_rel") ? AtomicOrdering::AcquireRelease :
+                       s.has("acquire") ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic;
+          return B.CreateAtomicRMW(AtomicRMWInst::Add, ptr, val(s.ops[2], ty), align, order);
+        }
+        if (store) {
+          B.CreateAlignedStore(val(s.ops[1], ty), ptr, align)->setAtomic(AtomicOrdering::Monotonic);
+          return nullptr;
+        }
+        auto *load = B.CreateAlignedLoad(ty, ptr, align);
+        load->setAtomic(s.has("acquire") ? AtomicOrdering::Acquire : AtomicOrdering::Monotonic);
+        return load;
+      });
+      if (!store && result) setReg(s.ops[0], result, pred);
+      return;
+    }
+    if (o == "fence.sc.cta") {
+      underPred(pred, [&]() -> Value * { return B.CreateFence(AtomicOrdering::SequentiallyConsistent); });
+      return;
+    }
+    if (sw("clusterlaunchcontrol.try_cancel.")) {
+      nops(2, 2);
+      StringRef modifiers(o);
+      if (!modifiers.consume_front("clusterlaunchcontrol.try_cancel.async."))
+        fail("unsupported cluster launch control operation: " + s.text);
+      modifiers.consume_front("shared::cta.");
+      if (!modifiers.consume_front("mbarrier::complete_tx::bytes."))
+        fail("unsupported cluster launch control operation: " + s.text);
+      bool multicast = modifiers.consume_front("multicast::cluster::all.");
+      if (modifiers != "b128") fail("unsupported cluster launch control operation: " + s.text);
+      needWarps();
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, "__cupbop_cluster_try_cancel", S.Void,
+                      {addr(s.ops[0], "shared cancellation response"), addr(s.ops[1], "completion barrier"),
+                       B.getInt32(multicast)});
+      });
+      return;
+    }
+    if (sw("clusterlaunchcontrol.query_cancel.")) {
+      nops(2, 2);
+      auto *response = val(s.ops[1], nullptr);
+      if (!response->getType()->isIntegerTy(128)) fail("expected a b128 cancellation response: " + s.text);
+      // The lifted Blackwell SASS also decodes these response fields directly.
+      auto field = [&](unsigned offset, unsigned bits) {
+        return B.CreateTrunc(B.CreateLShr(response, offset), B.getIntNTy(bits));
+      };
+      StringRef query(o);
+      query.consume_front("clusterlaunchcontrol.query_cancel.");
+      if (query == "is_canceled.pred.b128") {
+        setReg(s.ops[0], field(64, 1), pred);
+        return;
+      }
+      auto coordinate = [&](unsigned axis) -> Value * {
+        if (axis == 0) return field(0, 32);
+        return B.CreateZExt(field(axis == 1 ? 32 : 48, 16), S.I32);
+      };
+      if (query == "get_first_ctaid.v4.b32.b128") {
+        StringRef tuple(s.ops[0]);
+        if (!tuple.consume_front("{") || !tuple.consume_back("}")) fail("expected a v4 destination: " + s.text);
+        auto regs = splitTop(tuple.str(), ',');
+        if (regs.size() != 4) fail("expected four destination registers: " + s.text);
+        for (unsigned i = 0; i < 3; ++i) setReg(regs[i], coordinate(i), pred);
+        setReg(regs[3], B.getInt32(0), pred); // PTX leaves the fourth element unspecified.
+        return;
+      }
+      if (query.consume_front("get_first_ctaid::") && query.consume_back(".b32.b128")) {
+        for (unsigned i = 0; i < 3; ++i) {
+          if (query.size() == 1 && query.front() == "xyz"[i]) {
+            setReg(s.ops[0], coordinate(i), pred);
+            return;
+          }
+        }
+      }
+      fail("unsupported cluster launch control operation: " + s.text);
+    }
+    if (sw("tcgen05.")) {
+      lowerTcgen(s, pred);
+      return;
+    }
+    // CuLifter emits these address calculations inside its tcgen05 allocation bundles.
+    if (o == "not.b32" || o == "brev.b32" || o == "clz.b32") {
+      nops(2, 2);
+      Value *src = val(s.ops[1], S.I32);
+      Value *v = o == "not.b32"    ? B.CreateNot(src)
+                 : o == "brev.b32" ? B.CreateUnaryIntrinsic(Intrinsic::bitreverse, src)
+                                   : B.CreateBinaryIntrinsic(Intrinsic::ctlz, src, B.getFalse());
+      setReg(s.ops[0], v, pred);
+      return;
+    }
+    if (o == "shr.u32" || o == "shl.b32") {
+      nops(3, 3);
+      Value *v = val(s.ops[1], S.I32), *shift = val(s.ops[2], S.I32);
+      Value *inRange = B.CreateICmpULT(shift, B.getInt32(32));
+      Value *bits = o == "shr.u32" ? B.CreateLShr(v, shift) : B.CreateShl(v, shift);
+      setReg(s.ops[0], B.CreateSelect(inRange, bits, B.getInt32(0)), pred);
+      return;
+    }
+    if (o == "bar.warp.sync") {
+      nops(1, 1);
+      needWarps();
+      if (pred || !isa<ConstantInt>(val(s.ops[0], S.I32)) || !cast<ConstantInt>(val(s.ops[0], S.I32))->isMinusOne())
+        fail("only unpredicated full-warp sync is supported in an async bundle");
+      B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+      return;
+    }
+    if (o == "ld.shared.b32" || o == "ld.shared.b128" || o == "ld.shared::cta.b128" || o == "ld.global.b128") {
+      nops(2, 2);
+      Value *v = underPred(pred, [&]() -> Value * {
+        return B.CreateLoad(width(), addr(s.ops[1], s.has("global") ? "global" : "shared"));
+      });
+      if (v) setReg(s.ops[0], v, pred);
+      return;
+    }
     // --- plain data movement and predicates
     if (o == "mov" || sw("mov.")) {
       nops(2, 2);
       std::string src = trim(s.ops[1]);
+      StringRef tuple(src);
+      if (o == "mov.b128" && tuple.consume_front("{") && tuple.consume_back("}")) {
+        auto parts = splitTop(tuple.str(), ',');
+        if (parts.size() != 2 && parts.size() != 4) fail("expected two b64 or four b32 registers: " + s.text);
+        unsigned bits = 128 / parts.size();
+        Value *packed = ConstantInt::get(B.getInt128Ty(), 0);
+        for (unsigned i = 0; i < parts.size(); ++i) {
+          auto *part = val(parts[i], nullptr);
+          if (!part->getType()->isIntegerTy(bits)) fail("incorrect register width in mov.b128: " + s.text);
+          auto *wide = B.CreateZExt(part, B.getInt128Ty());
+          packed = B.CreateOr(packed, B.CreateShl(wide, i * bits));
+        }
+        setReg(s.ops[0], packed, pred);
+        return;
+      }
       if (src.find("_param_") != std::string::npos && src[0] != '$' && src[0] != '%') {
         paramSym[trim(s.ops[0])] = src;
         return;
@@ -564,33 +776,113 @@ struct AsmLowering {
       return;
     }
     if (sw("mapa")) {
-      nops(3, 3);
-      // clusters of one CTA: mapa(a, 0) = a; any other rank traps (and the predicate is false afterwards)
-      Value *a = val(s.ops[1], nullptr);
-      Value *rank = val(s.ops[2], S.I32);
-      bool known0 = isa<ConstantInt>(rank) && cast<ConstantInt>(rank)->isZero();
-      if (!known0) {
-        Value *bad = B.CreateICmpNE(rank, ConstantInt::get(S.I32, 0));
-        if (pred && !isa<ConstantInt>(pred)) bad = B.CreateAnd(bad, pred);
-        if (!(pred && isa<ConstantInt>(pred) && cast<ConstantInt>(pred)->isZero())) {
-          // a normal join, not `unreachable`: the Vortex back end inserts no split/join for a divergent branch
-          // whose immediate post-dominator is unreachable, and the warp then never reconverges (lifted tma2d hung)
-          Instruction *T = SplitBlockAndInsertIfThen(bad, C->getIterator(), /*Unreachable=*/false);
-          IRBuilder<> TB(T);
-          TB.CreateCall(S.fn(kRankFail, S.Void, {S.I32}, false, false), {rank});
-          B.SetInsertPoint(C);
-        }
-        // past the check the predicate cannot hold (a rank != 0 trapped)
-        if (!s.pred.empty() && !s.neg && pred && !isa<ConstantInt>(pred)) regs[s.pred] = ConstantInt::getFalse(S.ctx);
+      nops(3,3);
+      Value *mapped = underPred(pred, [&]() -> Value * {
+        auto *a = toPointer(B,S,val(s.ops[1],nullptr),C,"shared");
+        return S.call(B,"__cupbop_cluster_map",S.Ptr,{a,val(s.ops[2],S.I32)});
+      });
+      if (mapped) setReg(trim(s.ops[0]),mapped,pred);
+      return;
+    }
+    if (sw("st.async.")) {
+      if (!s.has("shared::cluster") || !s.has("mbarrier::complete_tx::bytes") ||
+          s.has("v2") || s.has("v4")) fail("unsupported async store form");
+      nops(3,3);
+      Type *ty = width();
+      underPred(pred,[&]() -> Value * {
+        B.CreateStore(val(s.ops[1],ty),addr(s.ops[0],"shared destination"));
+        return S.call(B,"__cupbop_tcgen_arrive",S.I64,{addr(s.ops[2],"completion barrier"),
+                        B.getInt32(0),B.getInt32(-int(ty->getIntegerBitWidth()/8))});
+      });
+      return;
+    }
+    if (sw("getctarank") || sw("isspacep.shared::cluster")) {
+      nops(2,2);
+      Value *value = underPred(pred,[&]() -> Value * {
+        auto *ptr = toPointer(B,S,val(s.ops[1],nullptr),C,"shared");
+        return S.call(B,sw("getctarank") ? "__cupbop_cluster_query_rank" : "__cupbop_cluster_contains",
+                      S.I32,{ptr});
+      });
+      if (value) setReg(s.ops[0],value,pred);
+      return;
+    }
+    if (sw("ld.shared::cluster.") || sw("st.shared::cluster.")) {
+      bool load = sw("ld.");
+      nops(2,2);
+      const unsigned count = s.has("v4") ? 4 : s.has("v2") ? 2 : 1;
+      Type *ty = width();
+      std::string reg = trim(s.ops[load ? 0 : 1]);
+      std::vector<std::string> regs = {reg};
+      if (count > 1) {
+        if (reg.size() < 2 || reg.front() != '{' || reg.back() != '}') fail("expected a shared vector operand");
+        regs = splitTop(reg.substr(1,reg.size()-2), ',');
+        if (regs.size() != count) fail("wrong number of shared vector elements");
       }
-      setReg(trim(s.ops[0]), a, nullptr);
+      for (unsigned i=0; i<count; ++i) {
+        Value *value = underPred(pred,[&]() -> Value * {
+          auto *ptr = addr(s.ops[load ? 1 : 0],"shared::cluster");
+          if (i) ptr = B.CreateGEP(ty,ptr,B.getInt32(i));
+          if (load) {
+            Value *v = B.CreateLoad(ty,ptr);
+            if (ty->getIntegerBitWidth()<32 && (s.has("s8") || s.has("s16")))
+              v = B.CreateSExt(v,S.I32);
+            return v;
+          }
+          B.CreateStore(val(regs[i],ty),ptr);
+          return nullptr;
+        });
+        if (load && value) setReg(trim(regs[i]),value,pred);
+      }
+      return;
+    }
+    // Both proxies use the same record and memory on Vortex. Publication copies
+    // the record before the releasing warp resumes, and consumers use a memory fence.
+    if (sw("tensormap.cp_fenceproxy.")) {
+      nops(3, 3);
+      if (!sw("tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.") ||
+          s.tok.size() != 9 || s.tok[7] != "sync" || s.tok[8] != "aligned")
+        fail("unsupported tensor-map proxy operation");
+      if (!tensorMapScope(s.tok[6])) fail("unsupported tensor-map proxy scope");
+      auto *size = dyn_cast<ConstantInt>(val(s.ops.back(), S.I64));
+      if (!size || !size->equalsInt(128)) fail("tensor-map proxy operation requires immediate size 128");
+      needWarps();
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, "__cupbop_tensormap_publish", S.Void,
+                      {addr(s.ops[0], "tensor-map address"), addr(s.ops[1], "shared")});
+      });
+      return;
+    }
+    if (sw("fence.proxy.tensormap::generic.")) {
+      const bool acquire = sw("fence.proxy.tensormap::generic.acquire.");
+      if ((!acquire && !sw("fence.proxy.tensormap::generic.release.")) || s.tok.size() != 5)
+        fail("unsupported tensor-map proxy operation");
+      if (!tensorMapScope(s.tok[4])) fail("unsupported tensor-map proxy scope");
+      nops(acquire ? 2 : 0, acquire ? 2 : 0);
+      underPred(pred, [&]() -> Value * {
+        if (acquire) {
+          addr(s.ops[0], "tensor-map address");
+          auto *size = dyn_cast<ConstantInt>(val(s.ops[1], S.I64));
+          if (!size || !size->equalsInt(128)) fail("tensor-map proxy operation requires immediate size 128");
+        }
+        return B.CreateFence(acquire ? AtomicOrdering::Acquire : AtomicOrdering::Release);
+      });
       return;
     }
     // --- fences and hints
-    if (sw("fence.proxy.") || sw("fence.mbarrier_init") || sw("setmaxnreg.") || sw("griddepcontrol.") ||
+    if (sw("fence.proxy.") || sw("fence.mbarrier_init")) {
+      const bool init = o == "fence.mbarrier_init.release.cluster";
+      if (!s.ops.empty() || !(init || o == "fence.proxy.async" || o == "fence.proxy.async.global" ||
+                             o == "fence.proxy.async.shared::cta" || o == "fence.proxy.async.shared::cluster"))
+        fail("unsupported proxy or mbarrier initialization fence: " + s.text);
+      underPred(pred, [&]() -> Value * {
+        // Order the issuing thread's accesses before DXA/TCU can consume the data.
+        return B.CreateFence(init ? AtomicOrdering::Release : AtomicOrdering::SequentiallyConsistent);
+      });
+      return;
+    }
+    if (sw("setmaxnreg.") || sw("griddepcontrol.") ||
         sw("prefetch.tensormap") || sw("cp.async.bulk.prefetch") || sw("cp.async.bulk.commit_group") ||
-        sw("cp.async.bulk.wait_group") || sw("barrier.cluster.arrive") || sw("tensormap.cp_fenceproxy") ||
-        sw("wgmma.fence") || sw("wgmma.commit_group") || sw("wgmma.wait_group")) {
+        sw("cp.async.bulk.wait_group")) {
       return; // synchronous software copies: nothing to order beyond the compiler fence
     }
     if (sw("fence.") && o.find(".cluster") != std::string::npos) {
@@ -600,9 +892,10 @@ struct AsmLowering {
       });
       return;
     }
-    if (sw("barrier.cluster.wait")) {
-      if (pred) fail("predicated barrier.cluster.wait");
-      B.CreateCall(S.M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(S.Void, false)), {});
+    if (sw("barrier.cluster.")) {
+      underPred(pred,[&]() -> Value * {
+        return S.call(B,"__cupbop_cluster_sync",S.Void,{B.getInt32(sw("barrier.cluster.wait") ? 1 : 0)});
+      });
       return;
     }
     // --- mbarrier
@@ -620,6 +913,8 @@ struct AsmLowering {
         needWarps();
         underPred(pred, [&]() -> Value * {
           Value *P = addr(s.ops[0], "mbarrier");
+          if (S.tcgenFunctions.count(F))
+            return S.call(B, "__cupbop_tcgen_arrive", S.I64, {P, B.getInt32(1), B.getInt32(0)});
           CallInst *a = S.call(B, kArrive, S.I32, {P, ConstantInt::get(S.I32, 1)});
           S.arrives[F].push_back(a);
           return nullptr;
@@ -629,7 +924,10 @@ struct AsmLowering {
       // lower_cp_async makes the copies synchronous
       return;
     }
-    if (sw("cp.reduce.async.bulk")) fail("cp.reduce.async.bulk (bulk reductions) is not supported");
+    if (sw("cp.reduce.async.bulk")) {
+      lowerBulk(idx,pred,true);
+      return;
+    }
     if (sw("cp.async.bulk")) {
       lowerBulk(idx, pred);
       return;
@@ -637,11 +935,124 @@ struct AsmLowering {
     fail("unsupported statement in async asm: `" + s.text + "`");
   }
 
+  void lowerTcgen(const Stmt &s, Value *pred) {
+    needWarps();
+    const bool pair = s.has("cta_group::2");
+    if (pair && (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
+                 !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_ENABLE")))
+      fail("TCGEN CTA pairs require -DVX_CFG_EXT_TCU_ENABLE and -DVX_CFG_TCU_TMEM_ENABLE");
+    auto taddr = [&](const std::string &op) -> Value * {
+      if (op.size() < 3 || op.front() != '[' || op.back() != ']') fail("expected [tmem address]");
+      return val(op.substr(1, op.size() - 2), S.I32);
+    };
+    if (s.op == "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32" ||
+        s.op == "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32" ||
+        s.op == "tcgen05.dealloc.cta_group::1.sync.aligned.b32" ||
+        s.op == "tcgen05.dealloc.cta_group::2.sync.aligned.b32") {
+      if (pred || s.ops.size() != 2) fail("unsupported predicated or malformed TCGEN allocation");
+      auto *cols = dyn_cast<ConstantInt>(val(s.ops[1], S.I32));
+      if (!cols || cols->getZExtValue() != 512) fail("only full 512-column TMEM allocations are supported");
+      if (s.tok[1] == "alloc")
+        S.call(B, pair ? "__cupbop_tmem_alloc512_pair" : "__cupbop_tmem_alloc512", S.Void,
+               {addr(s.ops[0], "TMEM allocation result")});
+      else
+        S.call(B, pair ? "__cupbop_tmem_free512_pair" : "__cupbop_tmem_free512", S.Void, {val(s.ops[0], S.I32)});
+      return;
+    }
+    if (s.op == "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned" ||
+        s.op == "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned" ||
+        s.op == "tcgen05.wait::ld.sync.aligned" || s.op == "tcgen05.fence::before_thread_sync" ||
+        s.op == "tcgen05.fence::after_thread_sync") {
+      if (pred || !s.ops.empty()) fail("malformed TCGEN synchronization");
+      // Each CTA occupies a full slot; loads retire synchronously.
+      B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+      return;
+    }
+    if (s.op == "tcgen05.mma.cta_group::1.kind::i8" || s.op == "tcgen05.mma.cta_group::2.kind::i8") {
+      if (s.ops.size() != 5) fail("expected dense SMEM/SMEM i8 MMA");
+      auto *desc = dyn_cast<ConstantInt>(val(s.ops[3], S.I32));
+      if (!desc || desc->getZExtValue() != (pair ? 0x104004a0u : 0x084004a0u))
+        fail("unsupported i8 MMA instruction descriptor");
+      underPred(pred, [&]() -> Value * {
+        return S.call(B, pair ? "__cupbop_tmem_mma_s8_256x256x32" : "__cupbop_tmem_mma_s8_128x256x32", S.Void,
+                      {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64), val(s.ops[4], S.I32)});
+      });
+      return;
+    }
+    if (s.op == "tcgen05.ld.sync.aligned.32x32b.x2.b32" || s.op == "tcgen05.ld.sync.aligned.32x32b.x4.b32") {
+      if (pred || s.ops.size() != 2 || s.ops[0].front() != '{' || s.ops[0].back() != '}')
+        fail("expected unpredicated TCGEN register tuple load");
+      auto dst = splitTop(s.ops[0].substr(1, s.ops[0].size() - 2), ',');
+      if (dst.size() != (s.has("x2") ? 2u : 4u)) fail("TCGEN load tuple width mismatch");
+      Value *base = taddr(s.ops[1]);
+      for (size_t i = 0; i < dst.size(); ++i)
+        setReg(dst[i], S.call(B, "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
+      return;
+    }
+    if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64" ||
+        s.op == "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64") {
+      if (s.ops.size() != 2) fail("expected TCGEN completion barrier and CTA mask");
+      underPred(pred,[&]() -> Value * {
+        return S.call(B,"__cupbop_cluster_commit",S.Void,{addr(s.ops[0],"barrier"),val(s.ops[1],S.I32)});
+      });
+      return;
+    }
+    if ((s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64" ||
+         s.op == "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64") && s.ops.size() == 1) {
+      underPred(pred, [&]() -> Value * {
+        B.CreateFence(AtomicOrdering::Release);
+        return S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                      {addr(s.ops[0], "TCGEN completion barrier"), B.getInt32(1), B.getInt32(0)});
+      });
+      return;
+    }
+    fail("unsupported TCGEN form: " + s.text);
+  }
+
   void lowerMbarrier(size_t idx, Value *pred) {
     const Stmt &s = st[idx];
     const std::string what = s.tok.size() > 1 ? s.tok[1] : "";
-    if (s.has("shared::cluster") && what != "arrive")
+    if (s.has("shared::cluster") && !S.tcgenFunctions.count(F) && what != "arrive")
       fail("`" + s.op + "` on a shared::cluster address (clusters are not supported)");
+    if (S.tcgenFunctions.count(F)) {
+      if (what == "init" && s.ops.size() == 2) {
+        underPred(pred, [&]() -> Value * {
+          return S.call(B, "__cupbop_tcgen_mbar_init", S.Void, {addr(s.ops[0], "barrier"), val(s.ops[1], S.I32)});
+        });
+        return;
+      }
+      if ((what == "expect_tx" || what == "complete_tx") && s.ops.size() == 2) {
+        underPred(pred, [&]() -> Value * {
+          Value *bytes = val(s.ops[1], S.I32);
+          if (what == "complete_tx") bytes = B.CreateNeg(bytes);
+          return S.call(B, "__cupbop_tcgen_arrive", S.I64, {addr(s.ops[0], "barrier"), B.getInt32(0), bytes});
+        });
+        return;
+      }
+      if (what == "arrive" && !s.has("noComplete") &&
+          (s.ops.size() == 3 || (s.ops.size() == 2 && !s.has("expect_tx")))) {
+        Value *token = underPred(pred, [&]() -> Value * {
+          Value *arg = s.ops.size() == 3 ? val(s.ops[2], S.I32) : B.getInt32(1);
+          return S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                        {addr(s.ops[1], "barrier"), s.has("expect_tx") ? B.getInt32(1) : arg,
+                         s.has("expect_tx") ? arg : B.getInt32(0)});
+        });
+        if (token) setReg(s.ops[0], token, pred);
+        return;
+      }
+      if ((what == "try_wait" || what == "test_wait") && (s.ops.size() == 3 || s.ops.size() == 4)) {
+        Value *ok = underPred(pred, [&]() -> Value * {
+          Value *phase =
+              s.has("parity") ? val(s.ops[2], S.I32) : B.CreateTrunc(B.CreateLShr(val(s.ops[2], S.I64), 63), S.I32);
+          return S.call(B, "__cupbop_tcgen_wait", S.I32,
+                        {addr(s.ops[1], "barrier"), phase, B.getInt32(blocking.count(idx))});
+        });
+        if (ok) setReg(s.ops[0], B.CreateICmpNE(ok, B.getInt32(0)), pred);
+        return;
+      }
+      if (what == "inval") return;
+      fail("unsupported mbarrier form in TCGEN kernel: " + s.text);
+    }
     if (what == "init") {
       if (s.ops.size() != 2) fail("mbarrier.init needs [addr], count");
       underPred(pred, [&]() -> Value * {
@@ -692,10 +1103,18 @@ struct AsmLowering {
     fail("unsupported mbarrier operation `" + s.op + "`");
   }
 
-  void lowerBulk(size_t idx, Value *pred) {
-    const Stmt &s = st[idx];
+  void lowerBulk(size_t idx, Value *pred, bool reduction = false) {
+    Stmt s = st[idx];
+    unsigned op = ReduceAdd;
+    if (reduction) {
+      s.tok.erase(s.tok.begin()+1);
+      const std::vector<std::string> names = {"add","min","max","inc","dec","and","or","xor"};
+      auto it = std::find_if(names.begin(),names.end(),[&](const auto &name){return s.has(name);});
+      if (it == names.end()) fail("unknown bulk reduction operation");
+      op = it - names.begin();
+    }
     needWarps();
-    for (const char *bad : {"multicast::cluster", "cta_group::1", "cta_group::2", "cp_mask", "im2col", "im2col::w",
+    for (const char *bad : {"cta_group::1", "cta_group::2", "cp_mask", "im2col", "im2col::w",
                             "im2col::w::128", "tile::gather4", "tile::scatter4", "im2col_no_offs"})
       if (s.has(bad)) fail("`" + s.op + "`: ." + bad + " is not supported");
     std::vector<std::string> ops = s.ops;
@@ -729,15 +1148,18 @@ struct AsmLowering {
       };
       if (load) {
         if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: a tensor load must complete on an mbarrier");
-        if (ops.size() != 3) fail("`" + s.op + "`: expected [dst], [tmap, {coords}], [mbar]");
+        if (ops.size() != (s.has("multicast::cluster") ? 4 : 3)) fail("invalid tensor-load operand count");
         underPred(pred, [&]() -> Value * {
           Value *dst = addr(ops[0], "shared destination");
           Value *desc = nullptr;
           std::vector<Value *> c = coords(ops[1], desc);
           Value *mb = addr(ops[2], "mbarrier"); // DXA mode completes the transfer there; software mode ignores it
-          CallInst *k = S.call(B, kTmaLoad, S.Void,
+          if (s.has("multicast::cluster"))
+            return S.call(B,"__cupbop_tma_multicast",S.Void,{dst,desc,mb,B.getInt32(rank),c[0],c[1],c[2],c[3],c[4],val(ops[3],S.I32)});
+          bool tcgen = S.tcgenFunctions.count(F);
+          CallInst *k = S.call(B, tcgen ? "__cupbop_tcgen_tma_load" : kTmaLoad, S.Void,
                                {dst, desc, mb, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
-          S.txCopies.insert(k);
+          if (!tcgen) S.txCopies.insert(k);
           return nullptr;
         });
         return;
@@ -749,6 +1171,8 @@ struct AsmLowering {
           Value *desc = nullptr;
           std::vector<Value *> c = coords(ops[0], desc);
           Value *src = addr(ops[1], "shared source");
+          if (reduction)
+            return S.call(B,"__cupbop_tensor_reduce",S.Void,{desc,src,B.getInt32(rank),c[0],c[1],c[2],c[3],c[4],B.getInt32(op)});
           S.call(B, kTmaStore, S.Void, {desc, src, ConstantInt::get(S.I32, rank), c[0], c[1], c[2], c[3], c[4]}, false);
           return nullptr;
         });
@@ -762,15 +1186,39 @@ struct AsmLowering {
     const bool g2s = dsp.rfind("shared::", 0) == 0 && ssp == "global";
     const bool s2s = dsp == "shared::cluster" && ssp == "shared::cta";
     const bool s2g = dsp == "global" && ssp == "shared::cta";
+    if (reduction) {
+      const bool remote = s.has("shared::cluster") && s.has("mbarrier::complete_tx::bytes");
+      if (!(remote || (s.has("global") && s.has("bulk_group"))) || !s.has("shared::cta") ||
+          ops.size() != (remote ? 4 : 3)) fail("invalid bulk reduction direction or operands");
+      const std::map<std::string,unsigned> types = {{"b32",2},{"u32",2},{"s32",3},{"b64",4},{"u64",4},
+          {"s64",5},{"f16",6},{"f32",7},{"f64",8},{"bf16",9}};
+      auto ty = types.find(s.tok.back());
+      if (ty == types.end()) fail("unsupported bulk reduction type");
+      underPred(pred,[&]() -> Value * {
+        auto *size = val(ops[2],S.I32);
+        S.call(B,"__cupbop_bulk_reduce",S.Void,{addr(ops[0],remote?"shared destination":"global destination"),
+               addr(ops[1],"shared source"),size,B.getInt32(ty->second),B.getInt32(op)});
+        if (remote) S.call(B,"__cupbop_tcgen_arrive",S.I64,{addr(ops[3],"barrier"),B.getInt32(0),B.CreateNeg(size)});
+        return nullptr;
+      });
+      return;
+    }
     if (g2s || s2s) {
       if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: expected mbarrier::complete_tx::bytes");
-      if (ops.size() != 4) fail("`" + s.op + "`: expected [dst], [src], size, [mbar]");
+      const bool multicast = s.has("multicast::cluster");
+      if (ops.size() != (multicast ? 5 : 4)) fail("invalid bulk copy operand count");
       underPred(pred, [&]() -> Value * {
         Value *dst = addr(ops[0], "shared destination");
         Value *src = addr(ops[1], "source");
         Value *n = val(ops[2], S.I32);
+        if (multicast)
+          return S.call(B,"__cupbop_bulk_multicast",S.Void,{dst,src,n,addr(ops[3],"completion barrier"),val(ops[4],S.I32)});
         CallInst *k = S.call(B, kBulk, S.Void, {dst, src, n}, false);
-        S.txCopies.insert(k);
+        if (S.tcgenFunctions.count(F))
+          S.call(B, "__cupbop_tcgen_arrive", S.I64,
+                 {addr(ops[3], "completion barrier"), B.getInt32(0), B.CreateNeg(n)});
+        else
+          S.txCopies.insert(k);
         return nullptr;
       });
       return;
@@ -790,8 +1238,8 @@ struct AsmLowering {
     fail("unsupported bulk copy `" + s.op + "`");
   }
 
-  // `<fn>_param_N`: the address of kernel parameter N in the CUDA parameter image. CuLifter keeps that image
-  // in the `param_local` alloca, indexed by constant-bank offset (argument `arg_<offset>`).
+  // `cvta.param` exposes a position in the CUDA parameter bank. NVCC can reach other arguments by
+  // adding an offset to that position, even if the lifted program has no explicit loads from param_local.
   Value *paramAddress(const std::string &sym) {
     size_t p = sym.rfind("_param_");
     std::string fname = sym.substr(0, p);
@@ -799,40 +1247,87 @@ struct AsmLowering {
     if (fname != F->getName() && fname != F->getName().str().substr(F->getName().starts_with("__src_") ? 6 : 0))
       fail("cvta.param of another function's parameter (" + sym + ")");
     if (n >= F->arg_size()) fail("cvta.param of a parameter the function does not have (" + sym + ")");
-    S.paramAddrArgs.insert({F, n});
     Argument *A = F->getArg(n);
-    AllocaInst *img = nullptr;
-    for (auto &I : F->getEntryBlock())
-      if (auto *AI = dyn_cast<AllocaInst>(&I))
-        if (AI->getName() == "param_local") img = AI;
-    unsigned off = 0;
-    if (img && A->getName().starts_with("arg_")) {
-      off = std::atoi(A->getName().str().c_str() + 4);
-      // the image must hold this argument at that offset
-      bool stored = false;
-      for (User *U : A->users())
-        if (auto *SI = dyn_cast<StoreInst>(U)) {
-          APInt o(64, 0);
-          Value *base = SI->getPointerOperand()->stripAndAccumulateConstantOffsets(S.M->getDataLayout(), o, true);
-          if (base == img && o.getZExtValue() == off) stored = true;
-        }
-      if (!stored) img = nullptr;
-    } else {
-      img = nullptr;
-    }
     IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
-    if (!img) { // a private image of this one argument
+    StringRef name = A->getName();
+    unsigned off;
+    if (!name.consume_front("arg_") || name.getAsInteger(10, off)) {
       AllocaInst *one = EB.CreateAlloca(A->getType(), nullptr, "param_img");
       one->setAlignment(Align(64));
       EB.CreateStore(A, one);
       return one;
     }
-    return B.CreateGEP(Type::getInt8Ty(S.ctx), img, ConstantInt::get(S.I64, off), "param_addr");
+    auto &[img, base] = S.paramImages[F];
+    if (!img) {
+      const DataLayout &DL = S.M->getDataLayout();
+      std::vector<unsigned> offsets;
+      unsigned first = UINT32_MAX;
+      uint64_t end = 0;
+      for (Argument &arg : F->args()) {
+        StringRef word = arg.getName();
+        unsigned offset;
+        if (!word.consume_front("arg_") || word.getAsInteger(10, offset))
+          fail("cvta.param requires an offset for every lifted kernel parameter");
+        first = std::min(first, offset);
+        end = std::max(end, offset + DL.getTypeStoreSize(arg.getType()).getFixedValue());
+        offsets.push_back(offset);
+      }
+      base = first & ~63u;
+      img = EB.CreateAlloca(ArrayType::get(EB.getInt8Ty(), end - base), nullptr, "param_bank");
+      img->setAlignment(Align(64));
+      for (Argument &arg : F->args()) {
+        Value *dst = EB.CreateConstGEP1_64(EB.getInt8Ty(), img, offsets[arg.getArgNo()] - base);
+        EB.CreateAlignedStore(&arg, dst, Align(1));
+      }
+    }
+    return B.CreateConstGEP1_64(B.getInt8Ty(), img, off - base, "param_addr");
   }
 };
 
 // ---------------------------------------------------------------------------------------------------------
 // NVVM intrinsics
+
+static bool isOrdinaryTmaLoad(const CallInst &C) {
+  const Function *F = C.getCalledFunction();
+  if (!F || C.arg_size() < 2 || !F->getName().starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.tile.")) return false;
+  // The tile intrinsics end with the constant `has multicast` and `has cache hint` flags.
+  const auto *multicast = dyn_cast<ConstantInt>(C.getArgOperand(C.arg_size() - 2));
+  return multicast && multicast->isZero();
+}
+
+// Use the hardware-mbarrier ABI only for a structured load paired with an earlier local arrive in
+// the same producer block. Split byte accounting and other patterns keep the existing software ABI.
+static bool hasLocalTmaArrive(const CallInst &C, const DataLayout &DL) {
+  int64_t loadOffset = 0;
+  const Value *loadBar = GetPointerBaseWithConstantOffset(C.getArgOperand(1), loadOffset, DL);
+  for (const Instruction *I = C.getPrevNonDebugInstruction(); I; I = I->getPrevNonDebugInstruction()) {
+    const auto *A = dyn_cast<CallInst>(I);
+    if (!A) {
+      if (I->mayHaveSideEffects()) return false;
+      continue;
+    }
+    if (isOrdinaryTmaLoad(*A)) continue;
+    const auto *assembly = dyn_cast<InlineAsm>(A->getCalledOperand());
+    if (!assembly || !A->getType()->isVoidTy()) return false;
+    std::vector<Stmt> statements;
+    std::string error;
+    if (!parsePtx(assembly->getAsmString(), statements, error) || statements.size() != 1) return false;
+    const Stmt &s = statements.front();
+    if (!s.label.empty() || !s.pred.empty() || s.op.rfind("mbarrier.arrive.", 0) != 0 ||
+        !s.has("expect_tx") || !s.has("shared::cta") || s.ops.size() != 3 || s.ops[0] != "_")
+      return false;
+    StringRef operand(s.ops[1]);
+    if (!operand.consume_front("[$") || !operand.consume_back("]")) return false;
+    unsigned index;
+    if (operand.getAsInteger(10, index) || index >= A->arg_size()) return false;
+    Value *bar = A->getArgOperand(index);
+    if (!bar->getType()->isPointerTy()) bar = cupbop_trace_pointer(bar);
+    if (!bar || !bar->getType()->isPointerTy()) return false;
+    int64_t arriveOffset = 0;
+    return GetPointerBaseWithConstantOffset(bar, arriveOffset, DL) == loadBar && arriveOffset == loadOffset;
+  }
+  return false;
+}
 
 bool lowerIntrinsic(PassState &S, CallInst *C) {
   Function *Fn = C->getCalledFunction();
@@ -851,17 +1346,50 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctarank") || n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.ctaid") ||
+  if (n.starts_with("llvm.nvvm.mapa")) {
+    Value *mapped = S.call(B,"__cupbop_cluster_map",S.Ptr,{P(0),C->getArgOperand(1)});
+    return done(B.CreatePointerCast(mapped,C->getType()));
+  }
+  if (n == "llvm.nvvm.isspacep.shared" || n == "llvm.nvvm.isspacep.global") {
+    auto *object = getUnderlyingObject(C->getArgOperand(0));
+    if (isa<AllocaInst>(object)) return done(B.getFalse());
+    if (auto *global = dyn_cast<GlobalVariable>(object)) {
+      unsigned space = global->getAddressSpace();
+      if (space == 1 || space == 3 || space == 4)
+        return done(B.getInt1(n.ends_with(".shared") ? space == 3 : space == 1));
+    }
+    return done(S.call(B, n.ends_with(".shared") ? "__cupbop_is_cta_shared" : "__cupbop_is_global",
+                       S.I32, {P(0)}));
+  }
+  if (n == "llvm.nvvm.match.any.sync.i32" || n == "llvm.nvvm.match.any.sync.i64") {
+    S.needWarps.insert(F);
+    return done(S.call(B, "__cupbop_match_any", S.I32,
+                       {C->getArgOperand(0), B.CreateZExtOrTrunc(C->getArgOperand(1), S.I64)}));
+  }
+  if (n == "llvm.nvvm.isspacep.shared.cluster")
+    return done(S.call(B,"__cupbop_cluster_contains",S.I32,{P(0)}));
+  if (n.starts_with("llvm.nvvm.getctarank"))
+    return done(S.call(B,"__cupbop_cluster_query_rank",S.I32,{P(0)}));
+  if (n == "llvm.nvvm.is_explicit_cluster")
+    return done(clusterRegister(S,B,"is_explicit_cluster"));
+  if (n == "llvm.nvvm.read.ptx.sreg.smid") return done(S.call(B, "__cupbop_smid", S.I32, {}));
+  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster") || n.starts_with("llvm.nvvm.read.ptx.sreg.nclusterid") ||
       n.starts_with("llvm.nvvm.read.ptx.sreg.is.explicit.cluster"))
-    return done(ConstantInt::get(C->getType(), 0));
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.nctarank") || n.starts_with("llvm.nvvm.read.ptx.sreg.cluster.nctaid"))
-    return done(ConstantInt::get(C->getType(), 1));
-  if (n.starts_with("llvm.nvvm.read.ptx.sreg.clusterid.") || n.starts_with("llvm.nvvm.read.ptx.sreg.nclusterid.")) {
-    std::string d = n.str().substr(n.rfind('.') + 1);
-    bool nc = n.contains("nclusterid");
-    Function *G = S.M->getFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d);
-    FunctionCallee GC = G ? FunctionCallee(G) : S.M->getOrInsertFunction(std::string("llvm.nvvm.read.ptx.sreg.") + (nc ? "nctaid." : "ctaid.") + d, FunctionType::get(S.I32, false));
-    return done(B.CreateCall(GC, {}));
+    return done(clusterRegister(S,B,n));
+  if (S.tcgenFunctions.count(F) && n.starts_with("llvm.nvvm.mbarrier.")) {
+    auto *zero = B.getInt32(0);
+    if (n.starts_with("llvm.nvvm.mbarrier.init")) {
+      S.call(B, "__cupbop_tcgen_mbar_init", S.Void, {P(0), C->getArgOperand(1)});
+      return done(nullptr);
+    }
+    if (n.starts_with("llvm.nvvm.mbarrier.inval")) return done(nullptr);
+    if (n == "llvm.nvvm.mbarrier.arrive" || n == "llvm.nvvm.mbarrier.arrive.shared")
+      return done(S.call(B, "__cupbop_tcgen_arrive", S.I64, {P(0), B.getInt32(1), zero}));
+    if (n == "llvm.nvvm.mbarrier.test.wait" || n == "llvm.nvvm.mbarrier.test.wait.shared") {
+      Value *phase = B.CreateTrunc(B.CreateLShr(C->getArgOperand(1), 63), S.I32);
+      return done(B.CreateICmpNE(S.call(B, "__cupbop_tcgen_wait", S.I32, {P(0), phase, zero}), zero));
+    }
+    fail_at(C, "unsupported mbarrier intrinsic in a TCGEN kernel: " + n.str());
   }
   if (n.starts_with("llvm.nvvm.mbarrier.")) {
     if (n.starts_with("llvm.nvvm.mbarrier.init")) {
@@ -883,6 +1411,10 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     fail_at(C, "mbarrier intrinsic " + n.str() + " is not supported (noComplete / drop / pending_count)");
   }
   if (n.starts_with("llvm.nvvm.cp.async.mbarrier.arrive")) {
+    if (n.contains("noinc") && S.tcgenFunctions.count(F)) {
+      S.call(B, "__cupbop_tcgen_arrive", S.I64, {P(0), B.getInt32(1), B.getInt32(0)});
+      return done(nullptr);
+    }
     if (n.contains("noinc")) {
       S.needWarps.insert(F);
       CallInst *a = S.call(B, kArrive, S.I32, {P(0), ConstantInt::get(S.I32, 1)});
@@ -890,16 +1422,77 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     }
     return done(nullptr);
   }
+  StringRef fence = n;
+  if (fence.consume_front("llvm.nvvm.fence.proxy.tensormap_generic.")) {
+    const bool acquire = fence.consume_front("acquire.");
+    if ((!acquire && !fence.consume_front("release.")) || !tensorMapScope(fence) ||
+        C->arg_size() != (acquire ? 2u : 0u))
+      fail_at(C, "unsupported tensor-map proxy intrinsic");
+    if (acquire) {
+      auto *size = dyn_cast<ConstantInt>(C->getArgOperand(1));
+      if (!size || !size->equalsInt(128)) fail_at(C, "tensor-map proxy operation requires immediate size 128");
+    }
+    return done(B.CreateFence(acquire ? AtomicOrdering::Acquire : AtomicOrdering::Release));
+  }
   if (n == "llvm.nvvm.cp.async.bulk.commit.group" || n.starts_with("llvm.nvvm.cp.async.bulk.wait.group") ||
       n.starts_with("llvm.nvvm.cp.async.bulk.prefetch") || n.starts_with("llvm.nvvm.cp.async.bulk.tensor.prefetch") ||
       n.starts_with("llvm.nvvm.fence.proxy") || n.starts_with("llvm.nvvm.setmaxnreg") ||
-      n.starts_with("llvm.nvvm.griddepcontrol") || n.starts_with("llvm.nvvm.prefetch.tensormap") ||
-      n.starts_with("llvm.nvvm.barrier.cluster.arrive")) {
+      n.starts_with("llvm.nvvm.griddepcontrol") || n.starts_with("llvm.nvvm.prefetch.tensormap")) {
     B.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
     return done(nullptr);
   }
-  if (n.starts_with("llvm.nvvm.barrier.cluster.wait")) {
-    B.CreateCall(S.M->getOrInsertFunction("llvm.nvvm.barrier0", FunctionType::get(S.Void, false)), {});
+  if (n.starts_with("llvm.nvvm.fence.") && n.ends_with(".cluster")) {
+    B.CreateFence(AtomicOrdering::SequentiallyConsistent);
+    return done(nullptr);
+  }
+  if (n == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
+      n == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") {
+    S.needWarps.insert(F);
+    Value *bytes = C->getArgOperand(3);
+    const bool multicast = C->arg_size() == 8 && !cast<ConstantInt>(C->getArgOperand(6))->isZero();
+    if (multicast)
+      S.call(B,"__cupbop_bulk_multicast",S.Void,{P(0),P(2),bytes,P(1),B.CreateZExt(C->getArgOperand(4),S.I32)});
+    else {
+      S.call(B,kBulk,S.Void,{P(0),P(2),bytes});
+      S.call(B,"__cupbop_tcgen_arrive",S.I64,{P(1),B.getInt32(0),B.CreateNeg(bytes)});
+    }
+    return done(nullptr);
+  }
+  if (n == "llvm.nvvm.cp.async.bulk.shared.cta.to.global") {
+    S.call(B,kBulk,S.Void,{P(0),P(1),C->getArgOperand(2)});
+    return done(nullptr);
+  }
+  if (n.starts_with("llvm.nvvm.cp.async.bulk.tensor.") && n.contains(".tile.")) {
+    S.needWarps.insert(F);
+    bool load = n.contains(".g2s.");
+    unsigned rank = n.rsplit('.').second.front() - '0';
+    SmallVector<Value *,10> args;
+    if (load) args = {P(0),P(2),P(1)};
+    else args = {P(1),P(0)};
+    args.push_back(B.getInt32(rank));
+    for (unsigned d=0; d<5; ++d)
+      args.push_back(d < rank ? C->getArgOperand((load ? 3 : 2) + d) : B.getInt32(0));
+    if (load) {
+      bool multicast = !cast<ConstantInt>(C->getArgOperand(rank+5))->isZero();
+      if (multicast) args.push_back(B.CreateZExt(C->getArgOperand(rank+3),S.I32));
+      if (multicast)
+        S.call(B, "__cupbop_tma_multicast", S.Void, args);
+      else if (S.tcgenFunctions.count(F))
+        S.call(B, "__cupbop_tcgen_tma_load", S.Void, args);
+      else
+        S.txCopies.insert(S.call(B, kTmaLoad, S.Void, args, false));
+    } else if (n.contains(".reduce.")) {
+      StringRef op = n.split(".reduce.").second.split('.').first;
+      static const StringRef names[] = {"add","min","max","inc","dec","and","or","xor"};
+      auto id = llvm::find(names,op) - std::begin(names);
+      if (id == std::size(names)) fail_at(C,"unknown tensor reduction operation");
+      args.push_back(B.getInt32(id));
+      S.call(B,"__cupbop_tensor_reduce",S.Void,args);
+    } else S.call(B,kTmaStore,S.Void,args);
+    return done(nullptr);
+  }
+  if (n.starts_with("llvm.nvvm.barrier.cluster.")) {
+    S.call(B,"__cupbop_cluster_sync",S.Void,{B.getInt32(n.contains("wait") ? 1 : 0)});
     return done(nullptr);
   }
   if (n == "llvm.nvvm.elect.sync") {
@@ -960,25 +1553,21 @@ bool isWaitLike(Instruction *I, std::set<Function *> &visiting) {
   return functionWaits(F, visiting);
 }
 
-// The per-function DXA issue queue of the moved arrives (see __cupbop_tma_load_qi in cudaKernelImpl_async.inc).
+// Separate transaction queues let multiple stages register copies in the
+// same elected-lane region before the warp reconverges and submits them.
 Value *txQueue(PassState &S, Function *F) {
-  Value *&Q = S.txq[F];
-  if (!Q) {
-    IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
-    AllocaInst *AI = EB.CreateAlloca(ArrayType::get(Type::getInt8Ty(S.ctx), 192), nullptr, "cupbop_txq");
-    AI->setAlignment(Align(8));
-    // every entry invalid, after the entry block's allocas (the core-mapping passes expect them contiguous at the top): the
-    // valid word of each entry (cupbop_txq in cudaKernelImpl_async.inc: 4 entries of 40 bytes, valid at byte 16), the rest
-    // is written before it is read. On the core mapping the queue is per-thread context memory, where a memset of the whole
-    // queue was 24 stores per thread.
-    Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
-    while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
-    IRBuilder<> IB(firstNonAlloca);
-    for (unsigned j = 0; j < 4; ++j)
-      IB.CreateAlignedStore(ConstantInt::get(S.I32, 0), IB.CreateConstGEP1_32(Type::getInt8Ty(S.ctx), AI, 40 * j + 16), Align(8));
-    Q = AI;
-  }
-  return Q;
+  IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+  AllocaInst *AI = EB.CreateAlloca(ArrayType::get(EB.getInt8Ty(), kTxqN * kTxqEntrySize), nullptr, "cupbop_txq");
+  AI->setAlignment(Align(8));
+  // The core-mapping passes expect the entry block's allocas contiguous. Initialize
+  // each entry's byte count and valid flag after them; the copy writes the rest.
+  Instruction *firstNonAlloca = &*F->getEntryBlock().getFirstInsertionPt();
+  while (isa<AllocaInst>(firstNonAlloca)) firstNonAlloca = firstNonAlloca->getNextNode();
+  IRBuilder<> IB(firstNonAlloca);
+  for (unsigned j = 0; j < kTxqN; ++j)
+    for (unsigned off : {12u, 16u})
+      IB.CreateAlignedStore(IB.getInt32(0), IB.CreateConstGEP1_32(IB.getInt8Ty(), AI, kTxqEntrySize * j + off), Align(4));
+  return AI;
 }
 
 // CUPBOP_TMA_STATIC=0: no slot read at the entry and no barrier number from the translator (the queued loads read both
@@ -988,16 +1577,16 @@ bool tmaStatic() {
   return !e || std::atoi(e) != 0;
 }
 
-// The DXA slot of a TMA load's tensor map: on the 1:1 schedule read once at the function's entry when the tensor map is a
-// parameter (the host sets the slot before the launch, the record does not change during it), else right before the copy.
-// The core mapping would carry the entry's value through every thread's context.
+// A by-value tensor map keeps its launch-time slot. A descriptor reached
+// through a pointer may be published during the kernel, so read it at the copy.
+// The core mapping would carry an entry value through every thread's context.
 Value *tmaSlot(PassState &S, CallInst *Cp) {
   Function *F = Cp->getFunction();
   Value *desc = Cp->getArgOperand(1), *rank = Cp->getArgOperand(3);
-  if (tmaStatic() && schedule() == 2 && isa<Argument>(desc) && isa<ConstantInt>(rank)) {
+  auto *arg = dyn_cast<Argument>(desc);
+  if (tmaStatic() && schedule() == 2 && arg && arg->hasByValAttr() && isa<ConstantInt>(rank)) {
     Value *&V = S.slots[{F, desc}];
     if (!V) {
-      txQueue(S, F); // the queue's initialization first, so that the entry's allocas stay contiguous
       Instruction *IP = &*F->getEntryBlock().getFirstInsertionPt();
       while (isa<AllocaInst>(IP)) IP = IP->getNextNode();
       IRBuilder<> EB(IP);
@@ -1016,8 +1605,11 @@ unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies,
   unsigned K = 0;
   for (CallInst *Cp : copies)
     if (Cp->getCalledFunction() && Cp->getCalledFunction()->getName() == kTmaLoadQi) {
+      Value *oldQueue = Cp->getArgOperand(0);
+      if (Q && Q != oldQueue) fail_at(Cp, "TMA copies shared by disjoint mbarrier transactions");
+      Q = oldQueue;
       const uint64_t j = cast<ConstantInt>(Cp->getArgOperand(1))->getZExtValue();
-      if (j != kTxqSync) K = std::max<unsigned>(K, j + 1);
+      K = std::max<unsigned>(K, j + 1);
     }
   for (CallInst *&Cp : copies) {
     if (!Cp->getCalledFunction() || Cp->getCalledFunction()->getName() != kTmaLoad) continue;
@@ -1036,6 +1628,16 @@ unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies,
     Cp = N;
   }
   return K;
+}
+
+void checkTmaBytes(PassState &S, IRBuilder<> &B, Value *Q, unsigned K, Value *bar, Value *bytes,
+                   const std::vector<CallInst *> &copies) {
+  const bool counted = bytes && K <= kTxqN &&
+      std::all_of(copies.begin(), copies.end(), [](CallInst *C) {
+        return C->getCalledFunction() && C->getCalledFunction()->getName() == kTmaLoadQi;
+      });
+  S.call(B, kTxqCheck, S.Void,
+         {Q, B.getInt32(std::min<unsigned>(K, kTxqN)), bar, counted ? bytes : B.getInt32(0), B.getInt32(counted)});
 }
 
 // ---- which threads of the block can satisfy a predicate (the arrive of Triton's TMA issue and its copies)
@@ -1061,8 +1663,9 @@ bool isUniformValue(Value *V, std::set<Value *> &visiting, LoopInfo &LI, const s
            n.starts_with("llvm.nvvm.read.ptx.sreg.ntid.");
   }
   if (auto *L = dyn_cast<LoadInst>(I))
-    if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()))
-      if (UA && UA->count(A) && !L->isVolatile()) return true;
+    if (UA && L->isSimple())
+      if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(L->getPointerOperand())))
+        if (UA->count(A)) return true;
   if (isa<LoadInst>(I) || isa<AllocaInst>(I) || I->mayHaveSideEffects()) return false;
   if (auto *P = dyn_cast<PHINode>(I)) { // a loop header's: the iteration all threads of the block are in
     Loop *L = LI.getLoopFor(P->getParent());
@@ -1184,7 +1787,7 @@ Value *guardOf(BasicBlock *BB) {
 // executes it, as the compiler's per-lane model assumes. The point: out of every region whose branch is not uniform
 // (isUniformValue), in the arrive's loop, with no wait and no other queue access (a TMA load, an arrive, an issue) on the
 // way from the arrive. nullptr (why) when there is none.
-Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
+Instruction *convergedIssuePoint(PassState &S, Function *F, CallInst *Ar, std::string &why) {
   // a device function may be called under a partial mask: only a kernel's entry has the whole warp
   if (!isKernelFunction(F->getParent(), F)) { why = "the arrive is in a device function, not a kernel"; return nullptr; }
   DominatorTree DT(*F);
@@ -1204,18 +1807,34 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
     }
     return v;
   };
-  // CUDA input is unoptimized IR: loop counters and parameters live in allocas. An alloca that does not escape, and whose
-  // stores all store a uniform value at a point where no non-uniform branch decides (optimistic fixpoint), is uniform.
+  // Loop counters and parameters live in allocas. CuLifter copies parameters
+  // into a byte array and accesses them through fixed offsets. Track those
+  // addresses as well as scalar slots, and require uniform values and control
+  // for every store to an alloca before treating its loads as uniform.
   std::set<AllocaInst *> UA;
+  std::map<AllocaInst *, SmallVector<StoreInst *, 4>> stores;
   for (Instruction &I : F->getEntryBlock()) {
     auto *A = dyn_cast<AllocaInst>(&I);
     if (!A) continue;
     bool ok = true;
-    for (User *U : A->users()) {
-      if (auto *L = dyn_cast<LoadInst>(U)) ok &= L->getPointerOperand() == A;
-      else if (auto *St = dyn_cast<StoreInst>(U)) ok &= St->getPointerOperand() == A && St->getValueOperand() != A;
-      else if (auto *II = dyn_cast<IntrinsicInst>(U)) ok &= II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II);
-      else ok = false;
+    SmallVector<Value *, 4> pointers{A};
+    while (ok && !pointers.empty()) {
+      Value *pointer = pointers.pop_back_val();
+      for (User *U : pointer->users()) {
+        if (auto *L = dyn_cast<LoadInst>(U)) {
+          ok &= L->getPointerOperand() == pointer && L->isSimple();
+        } else if (auto *St = dyn_cast<StoreInst>(U)) {
+          ok &= St->getPointerOperand() == pointer && St->getValueOperand() != pointer && St->isSimple();
+          stores[A].push_back(St);
+        } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          ok &= GEP->getPointerOperand() == pointer && GEP->hasAllConstantIndices();
+          pointers.push_back(GEP);
+        } else if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+          ok &= II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II);
+        } else {
+          ok = false;
+        }
+      }
     }
     if (ok) UA.insert(A);
   }
@@ -1247,14 +1866,13 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
     changed = false;
     for (auto it = UA.begin(); it != UA.end();) {
       bool ok = true;
-      for (User *U : (*it)->users())
-        if (auto *St = dyn_cast<StoreInst>(U)) {
-          std::set<Value *> visiting;
-          if (St->isVolatile() || !isUniformValue(St->getValueOperand(), visiting, LI, &UA) || divergentBranch(St->getParent())) {
-            ok = false;
-            break;
-          }
+      for (StoreInst *St : stores[*it]) {
+        std::set<Value *> visiting;
+        if (!isUniformValue(St->getValueOperand(), visiting, LI, &UA) || divergentBranch(St->getParent())) {
+          ok = false;
+          break;
         }
+      }
       if (ok) { ++it; continue; }
       it = UA.erase(it);
       changed = true;
@@ -1282,6 +1900,11 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
     moved = true;
   }
   Instruction *IP = moved ? &*P->getFirstInsertionPt() : Ar->getNextNode();
+  if (moved) {
+    auto &anchor = S.txqIssueAnchors[P];
+    if (Value *original = anchor) IP = cast<Instruction>(original);
+    else anchor = IP;
+  }
   std::set<Function *> visiting;
   std::set<BasicBlock *> seen;
   std::vector<std::pair<BasicBlock *, Instruction *>> w{{Ar->getParent(), Ar->getNextNode()}};
@@ -1295,11 +1918,6 @@ Instruction *convergedIssuePoint(Function *F, CallInst *Ar, std::string &why) {
       if (!C) continue;
       visiting.clear();
       if (isWaitLike(C, visiting)) { why = "a wait lies between the arrive and the end of its region"; return nullptr; }
-      StringRef n = C->getCalledFunction() ? C->getCalledFunction()->getName() : "";
-      if (n == kTmaLoad || n == kTmaLoadQi || n == kArriveM || n == kArriveTxM || n == kTxqIssue) {
-        why = "another TMA load or moved arrive lies between the arrive and the end of its region";
-        return nullptr;
-      }
     }
     if (stop) continue;
     for (BasicBlock *Sc : successors(BB))
@@ -1315,7 +1933,7 @@ bool tmaIssueForcedSync() {
 
 // The issue of the K queued copies of a moved arrive Ars (one call, or one per insertion point): one
 // __cupbop_txq_issue(Q, K, wide) at each call's converged point (deduplicated). Without such a point for every call, the
-// copies of these entries copy synchronously (kTxqSync) and nothing is issued: correct, slower, and warned.
+// copies of these entries copy synchronously and count their bytes, but do not issue DXA.
 // CUPBOP_TMA_ISSUE=sync forces that (tests).
 void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, Value *Q, unsigned K,
                 const std::vector<CallInst *> &copies) {
@@ -1336,11 +1954,11 @@ void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, V
   if (why.empty() && tmaIssueForcedSync()) why = "CUPBOP_TMA_ISSUE=sync";
   for (CallInst *Ar : Ars) {
     if (!why.empty()) break;
-    Instruction *IP = convergedIssuePoint(F, Ar, why);
+    Instruction *IP = convergedIssuePoint(S, F, Ar, why);
     if (IP && std::find(IPs.begin(), IPs.end(), IP) == IPs.end()) IPs.push_back(IP);
   }
   if (!why.empty()) {
-    for (CallInst *Cp : mine) Cp->setArgOperand(1, ConstantInt::get(S.I32, kTxqSync));
+    for (CallInst *Cp : mine) Cp->setArgOperand(3, ConstantInt::get(S.I32, UINT32_MAX));
     fprintf(stderr, "[CuPBoP] warning: %s: no point where the warp is converged after an mbarrier arrive for the DXA issue "
                     "of its %zu TMA copies (%s): they copy synchronously\n", F->getName().str().c_str(), mine.size(),
             why.c_str());
@@ -1355,9 +1973,9 @@ void placeIssue(PassState &S, Function *F, const std::vector<CallInst *> &Ars, V
     IRBuilder<> IB(IP);
     S.call(IB, kTxqIssue, S.Void, {Q, ConstantInt::get(S.I32, K), ConstantInt::get(S.I32, wide)});
     for (unsigned j = 0; j < K && j < kTxqN; ++j) {
-      IB.CreateAlignedStore(PoisonValue::get(S.Ptr), IB.CreateConstGEP1_32(I8, Q, 40 * j), Align(8));
+      IB.CreateAlignedStore(PoisonValue::get(S.Ptr), IB.CreateConstGEP1_32(I8, Q, kTxqEntrySize * j), Align(8));
       for (unsigned off : {8u, 20u, 24u, 28u, 32u, 36u})
-        IB.CreateAlignedStore(PoisonValue::get(S.I32), IB.CreateConstGEP1_32(I8, Q, 40 * j + off), Align(4));
+        IB.CreateAlignedStore(PoisonValue::get(S.I32), IB.CreateConstGEP1_32(I8, Q, kTxqEntrySize * j + off), Align(4));
     }
   }
   S.n_issue += IPs.size();
@@ -1486,6 +2104,7 @@ bool moveArriveOverCtaBarriers(PassState &S, Function *F, CallInst *A, std::stri
   IRBuilder<> IB(thenT);
   Value *P = bar->getType()->getPointerAddressSpace() ? IB.CreateAddrSpaceCast(bar, S.Ptr, "async_gen") : bar;
   const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+  checkTmaBytes(S, IB, Q, K, P, isTx ? A->getArgOperand(1) : nullptr, copies);
   CallInst *Ar = S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32, {ConstantInt::get(S.I32, 1), P, A->getArgOperand(1)});
   fprintf(stderr, "[CuPBoP] %s: an mbarrier arrive of thread %u moved after its %zu TMA copies, over CTA barriers (§5.3)\n",
           F->getName().str().c_str(), (*tA)[0], copies.size());
@@ -1526,8 +2145,13 @@ void moveArrives(PassState &S, Function *F) {
       work.pop_back();
       bool stop = false;
       for (Instruction *I = from; I; I = I->getNextNode()) {
-        if (auto *CI = dyn_cast<CallInst>(I))
+        if (auto *CI = dyn_cast<CallInst>(I)) {
+          Function *callee = CI->getCalledFunction();
+          // Another producer phase owns its own TMA sites. A pipeline's
+          // prologue can reach the next tile's issue before the first wait.
+          if (callee && callee->getName() == kArriveTx) { stop = true; break; }
           if (S.txCopies.count(CI)) copies.push_back(CI);
+        }
         if (waits(I)) { stop = true; break; }
       }
       if (stop) continue;
@@ -1643,6 +2267,7 @@ void moveArrives(PassState &S, Function *F) {
       if (Q) {
         IRBuilder<> IB(IP);
         const bool isTx = A->getCalledFunction()->getName() == kArriveTx;
+        checkTmaBytes(S, IB, Q, K, A->getArgOperand(0), isTx ? A->getArgOperand(1) : nullptr, copies);
         moved.push_back(S.call(IB, isTx ? kArriveTxM : kArriveM, S.I32,
                                {ConstantInt::get(S.I32, 0), A->getArgOperand(0), A->getArgOperand(1)}));
       } else {
@@ -1681,9 +2306,8 @@ void foldIntegers(Function &F) {
 // cvta.param) becomes an i64: the CUDA host passes it in one 8-byte launch slot (cudaLaunchKernel_vortex), which
 // holds the device address of its record (cuTensorMapEncodeTiled shim). The body sees the old value rebuilt from
 // those 8 bytes, the rest zero.
-// Only vector-typed parameters reached through cvta.param: CuLifter types EVERY 64-byte-multiple parameter as
-// [N/64 x <8 x i64>] (for the .align 64 of the PTX parameter), e.g. a 448-byte CUTLASS Kernel::Params, and those
-// keep all their bytes through pass_wide_kernel_args_by_slot (generate_wrapper.cpp) like the [N x i8] ones.
+// CuLifter also uses vectors to represent aligned by-value structs. Taking the address of one does
+// not make it a standalone tensor map: a CUTLASS Kernel::Params may contain several embedded maps.
 // CUPBOP_NARROW_VECTOR_ARGS=1: the earlier rule (every vector-typed parameter wider than 8 bytes).
 static bool hasVectorType(Type *T) {
   if (T->isVectorTy()) return true;
@@ -1692,12 +2316,60 @@ static bool hasVectorType(Type *T) {
     for (Type *E : ST->elements()) if (hasVectorType(E)) return true;
   return false;
 }
-static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &paramAddrArgs) {
+
+static std::optional<uint64_t> paramBankOffset(Value *V, AllocaInst *bank, const DataLayout &DL) {
+  if (V == bank) return 0;
+  if (isa<PtrToIntInst, IntToPtrInst>(V))
+    return paramBankOffset(cast<Instruction>(V)->getOperand(0), bank, DL);
+  if (auto *op = dyn_cast<BinaryOperator>(V)) {
+    if (op->getOpcode() != Instruction::Add && op->getOpcode() != Instruction::Sub) return {};
+    if (auto *amount = dyn_cast<ConstantInt>(op->getOperand(1)))
+      if (auto base = paramBankOffset(op->getOperand(0), bank, DL))
+        return op->getOpcode() == Instruction::Add ? *base + amount->getZExtValue() : *base - amount->getZExtValue();
+  }
+  if (V->getType()->isPointerTy()) {
+    APInt offset(64, 0);
+    Value *base = V->stripAndAccumulateConstantOffsets(DL, offset, true);
+    if (base != V)
+      if (auto start = paramBankOffset(base, bank, DL)) return *start + offset.getZExtValue();
+  }
+  return {};
+}
+
+// The host passes a CUDA tensor map as one device-address slot, even when NVCC derived
+// its parameter address by adding an offset to another tensor map's cvta.param.
+static void markTensorMapParameters(PassState &S) {
+  const DataLayout &DL = S.M->getDataLayout();
+  for (const auto &[F, image] : S.paramImages) {
+    auto [bank, bankBase] = image;
+    std::map<uint64_t, unsigned> tensorMaps;
+    for (Argument &arg : F->args()) {
+      unsigned off;
+      StringRef name = arg.getName();
+      if (hasVectorType(arg.getType()) && DL.getTypeStoreSize(arg.getType()) == 128 &&
+          name.consume_front("arg_") && !name.getAsInteger(10, off))
+        tensorMaps.emplace(off - bankBase, arg.getArgNo());
+    }
+    if (tensorMaps.empty()) continue;
+    for (BasicBlock &bb : *F)
+      for (Instruction &I : bb) {
+        auto *call = dyn_cast<CallInst>(&I);
+        Value *descriptor = call ? async_tensor_map_operand(*call) : nullptr;
+        if (!descriptor) continue;
+        if (auto off = paramBankOffset(descriptor, bank, DL)) {
+          auto map = tensorMaps.find(*off);
+          if (map != tensorMaps.end()) S.tensorMapArgs.insert({F, map->second});
+        }
+      }
+  }
+}
+
+static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *, unsigned>> &tensorMapArgs) {
   const DataLayout &DL = M->getDataLayout();
   const bool all = std::getenv("CUPBOP_NARROW_VECTOR_ARGS") != nullptr;
   auto isWide = [&](Argument &A) {
     return !A.getType()->isPointerTy() && hasVectorType(A.getType()) && DL.getTypeStoreSize(A.getType()) > 8 &&
-           (all || paramAddrArgs.count({A.getParent(), A.getArgNo()}));
+           (all || tensorMapArgs.count({A.getParent(), A.getArgNo()}));
   };
   std::vector<Function *> todo;
   for (auto &F : *M)
@@ -1749,17 +2421,250 @@ static void narrowWideKernelArgs(Module *M, const std::set<std::pair<Function *,
 
 } // namespace
 
+SparseWgmmaOperands parse_sparse_wgmma(CallInst *call, unsigned outputs) {
+  auto *assembly = cast<InlineAsm>(call->getCalledOperand());
+  std::vector<Stmt> statements;
+  std::string error;
+  if (!parsePtx(assembly->getAsmString(), statements, error) || statements.empty())
+    fail_at(call, "invalid sparse WGMMA instruction");
+  const auto &mma = statements.back();
+  const auto &op = mma.ops;
+  StringRef shape(mma.op);
+  unsigned n;
+  if (!shape.consume_front("wgmma.mma_async.sp.sync.aligned.m64n") || shape.consumeInteger(10, n) ||
+      !n || n > 256 || n % 8)
+    fail_at(call, "invalid sparse WGMMA shape or accumulator width");
+  bool packed = shape.split('.').second.starts_with("f16.");
+  if (outputs != n / (packed ? 4 : 2)) fail_at(call, "invalid sparse WGMMA accumulator width");
+  bool half = shape == "k32.f32.f16.f16" || shape == "k32.f16.f16.f16" || shape == "k32.f32.bf16.bf16";
+  bool tf32 = shape == "k16.f32.tf32.tf32";
+  bool fp8 = shape == "k64.f32.e4m3.e4m3" || shape == "k64.f32.e5m2.e5m2" ||
+             shape == "k64.f32.e4m3.e5m2" || shape == "k64.f32.e5m2.e4m3" ||
+             shape == "k64.f16.e4m3.e4m3" || shape == "k64.f16.e5m2.e5m2" ||
+             shape == "k64.f16.e4m3.e5m2" || shape == "k64.f16.e5m2.e4m3";
+  StringRef intTypes = shape;
+  bool saturate = intTypes.consume_front("k64.satfinite.s32.");
+  bool integer = (saturate || intTypes.consume_front("k64.s32.")) &&
+                 (intTypes == "s8.s8" || intTypes == "u8.u8" || intTypes == "s8.u8" || intTypes == "u8.s8");
+  if (!(half || tf32 || fp8 || integer) || (integer && n > 32 && n % 16))
+    fail_at(call, "unsupported sparse WGMMA shape or element types");
+  const bool regA = op.size() > 1 && StringRef(op[1]).starts_with("{");
+  if (op.size() != (half ? (regA ? 9u : 10u) : integer ? 6u : 8u))
+    fail_at(call, "sparse WGMMA operand count differs from the SS or RS form");
+
+  auto resolve = [&](StringRef token, unsigned bits) -> Value * {
+    token = token.trim();
+    unsigned index;
+    if (token.consume_front("$")) {
+      if (token.consume_front("{") && token.consume_back("}")) token = token.split(':').first;
+      if (!token.getAsInteger(10, index) && index >= outputs && index - outputs < call->arg_size()) {
+        auto *v = call->getArgOperand(index - outputs);
+        if (v->getType()->isIntegerTy(bits)) return v;
+      }
+    } else {
+      int64_t value;
+      if (!token.getAsInteger(0, value))
+        return ConstantInt::get(IntegerType::get(call->getContext(), bits), value);
+    }
+    fail_at(call, "invalid sparse WGMMA operand " + token.str());
+  };
+  auto imm = [&](unsigned i, int lo, int hi) {
+    auto *ci = dyn_cast<ConstantInt>(resolve(op[i], 32));
+    if (!ci || ci->getSExtValue() < lo || ci->getSExtValue() > hi)
+      fail_at(call, "invalid sparse WGMMA immediate");
+    return static_cast<int>(ci->getSExtValue());
+  };
+  SparseWgmmaOperands result;
+  if (regA) {
+    StringRef tuple(op[1]);
+    if (!tuple.consume_front("{") || !tuple.consume_back("}")) fail_at(call, "invalid sparse WGMMA register A");
+    for (const auto &reg : splitTop(tuple.str(), ',')) result.aRegs.push_back(resolve(reg, 32));
+    if (result.aRegs.size() != 4) fail_at(call, "sparse WGMMA requires four packed A registers");
+  } else result.a = resolve(op[1], 64);
+  result.b = resolve(op[2], 64);
+  result.meta = resolve(op[3], 32);
+  int selector = imm(4, 0, (half || tf32) ? 1 : 0);
+  int scaleA = integer ? 1 : imm(6, -1, 1), scaleB = integer ? 1 : imm(7, -1, 1);
+  if (!scaleA || !scaleB) fail_at(call, "sparse WGMMA input scales must be +1 or -1");
+  result.flags = (half && !regA ? imm(8, 0, 1) : 0) | (half ? imm(regA ? 8 : 9, 0, 1) << 1 : 0) |
+                 (selector << 2) | ((scaleA < 0) << 3) | ((scaleB < 0) << 4) | (regA << 5) | (packed << 6) | (saturate << 7);
+  if (statements.size() == 1) {
+    result.scale = resolve(op[5], 32);
+  } else {
+    const auto &set = statements.front();
+    if (statements.size() != 2 || set.op != "setp.ne.b32" || !set.pred.empty() || !set.label.empty() ||
+        set.ops.size() != 3 || set.ops[0] != op[5] || set.ops[2] != "0")
+      fail_at(call, "unexpected sparse WGMMA scale-D predicate or bundled instruction");
+    result.scale = resolve(set.ops[1], 32);
+  }
+  auto constraints = assembly->ParseConstraints();
+  if (constraints.size() < outputs) fail_at(call, "missing sparse WGMMA outputs");
+  result.tied = constraints[0].MatchingInput >= 0;
+  if (result.tied && call->arg_size() < outputs) fail_at(call, "missing sparse WGMMA input accumulators");
+  result.firstAcc = call->arg_size() - (result.tied ? outputs : 0);
+  for (unsigned i = 0; i < outputs; ++i) {
+    int tie = result.tied ? outputs + result.firstAcc + i : -1;
+    Type *expected = (integer || packed) ? Type::getInt32Ty(call->getContext()) : Type::getFloatTy(call->getContext());
+    if (constraints[i].MatchingInput != tie || cast<StructType>(call->getType())->getElementType(i) != expected ||
+        (result.tied && call->getArgOperand(result.firstAcc + i)->getType() != expected))
+      fail_at(call, "invalid sparse WGMMA accumulator ties");
+  }
+  if (!result.tied && !(isa<ConstantInt>(result.scale) && cast<ConstantInt>(result.scale)->isZero()))
+    fail_at(call, "sparse WGMMA with scale-D requires incoming accumulators");
+  return result;
+}
+
+Value *async_tensor_map_operand(CallBase &call) {
+  const Function *callee = call.getCalledFunction();
+  if (!callee) return nullptr;
+  StringRef name = callee->getName();
+  if (name == kTmaLoad || name == "__cupbop_tcgen_tma_load" || name == "__cupbop_tma_multicast")
+    return call.getArgOperand(1);
+  if (name == kTmaLoadQi) return call.getArgOperand(5);
+  if (name == kTmaStore || name == "__cupbop_tensor_reduce") return call.getArgOperand(0);
+  return nullptr;
+}
+
+// CuLifter emits both CTA-local and peer paths for SASS ARRIVES. A direct read
+// of the current CTA rank, including its low byte from the SASS address, proves
+// that the peer path cannot execute for any supported CUDA cluster size.
+static void simplifySelfClusterArrive(CallInst &call) {
+  auto *assembly = cast<InlineAsm>(call.getCalledOperand());
+  StringRef body(assembly->getAsmString());
+  if (!body.consume_front("{.reg .pred p; .reg .u32 r; .reg .u32 m; .reg .b64 s; "
+                           "mov.u32 r, %cluster_ctarank; setp.ne.u32 p, r, $2; "
+                           "@p mapa.shared::cluster.u32 m, $0, $2; "))
+    return;
+
+  StringRef local;
+  if (call.arg_size() == 4 &&
+      body == "@p mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [m], $3; "
+              "@!p mbarrier.arrive.expect_tx.shared::cta.b64 s, [$1], $3;}") {
+    local = "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$1], $3;";
+  } else if (call.arg_size() == 3 &&
+             body == "@p mbarrier.arrive.release.cluster.shared::cluster.b64 _, [m]; "
+                     "@!p mbarrier.arrive.shared::cta.b64 s, [$1];}") {
+    local = "mbarrier.arrive.shared::cta.b64 _, [$1];";
+  } else {
+    return;
+  }
+
+  using namespace llvm::PatternMatch;
+  Value *rank = call.getArgOperand(2);
+  Value *unmasked;
+  if (match(rank, m_c_And(m_Value(unmasked), m_SpecificInt(255))))
+    rank = unmasked;
+  const auto *read = dyn_cast<CallInst>(rank);
+  const Function *reg = read ? read->getCalledFunction() : nullptr;
+  if (!reg || reg->getIntrinsicID() != Intrinsic::nvvm_read_ptx_sreg_cluster_ctarank)
+    return;
+  call.setCalledOperand(InlineAsm::get(assembly->getFunctionType(), local,
+                                       assembly->getConstraintString(), assembly->hasSideEffects()));
+}
+
+// Fixed SDK sequences that return a pointer, read a timer, or suspend/trap.
+// Leave mixed or otherwise different PTX bundles to the statement parser.
+static bool lowerSdkBuiltin(PassState &s, CallInst *call, ArrayRef<Stmt> statements) {
+  IRBuilder<> b(call);
+  Value *value = nullptr;
+  if (statements.size() == 3 && statements[0].op == "mov.u32" &&
+      statements[0].ops.size() == 2 && statements[0].ops[1] == "%reserved_smem_offset_1" &&
+      statements[1].op == "cvt.u64.u32" && statements[2].op == "cvta.shared.u64" &&
+      statements[1].ops.size() == 2 && statements[2].ops.size() == 2 &&
+      statements[1].ops[1] == statements[0].ops[0] && statements[2].ops[1] == statements[1].ops[0] &&
+      statements[2].ops[0] == "$0" && call->getType()->isPointerTy()) {
+    // cooperative_groups/details/memory.h specifies 288 bytes per CTA.
+    auto *scratch = s.M->getNamedGlobal("__cupbop_cg_reserved_shared");
+    if (!scratch) {
+      auto *type = ArrayType::get(b.getInt8Ty(), 288);
+      scratch = new GlobalVariable(*s.M, type, false, GlobalValue::InternalLinkage, UndefValue::get(type),
+                                   "__cupbop_cg_reserved_shared", nullptr, GlobalValue::NotThreadLocal, 3);
+      scratch->setAlignment(Align(16));
+    }
+    value = b.CreatePointerCast(scratch, call->getType());
+  } else if (statements.size() == 1 && statements[0].pred.empty()) {
+    const auto &st = statements[0];
+    if (st.op == "mov.u64" && st.ops == std::vector<std::string>{"$0", "%globaltimer"})
+      value = s.call(b, "__cupbop_time_ns", s.I64, {});
+    else if (st.op == "nanosleep.u32" && st.ops == std::vector<std::string>{"$0"} && call->arg_size() == 1)
+      s.call(b, "__cupbop_sleep_ns", s.Void, {call->getArgOperand(0)});
+    else if (st.op == "trap" && st.ops.empty())
+      s.call(b, "__cupbop_device_trap", s.Void, {});
+    else return false;
+  } else return false;
+  if (value) call->replaceAllUsesWith(value);
+  call->eraseFromParent();
+  return true;
+}
+
 void lower_async_ptx(Module *M) {
   PassState S(M);
   const int sched = schedule();
   // 1. NVVM intrinsics (cluster registers first: CuLifter mbarrier addresses fold to constants after that)
   std::vector<CallInst *> calls;
+  std::map<Function *, std::vector<Function *>> callers, callees;
+  std::set<Function *> barrierFunctions;
+  std::set<Function *> structuredTma, splitByteTransactions;
   for (auto &F : *M)
     for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *C = dyn_cast<CallInst>(&I))
-          if (!C->isInlineAsm() && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with("llvm.nvvm."))
+      for (auto &I : BB) {
+        auto *C = dyn_cast<CallInst>(&I);
+        if (!C) continue;
+        if (C->isInlineAsm()) {
+          simplifySelfClusterArrive(*C);
+          const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
+          if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
+          if (body.find("mbarrier.expect_tx.") != std::string::npos || body.find("mbarrier.complete_tx.") != std::string::npos)
+            splitByteTransactions.insert(&F);
+          if (body.find("tcgen05.") != std::string::npos ||
+              body.find("clusterlaunchcontrol.try_cancel") != std::string::npos ||
+              body.find("multicast::cluster") != std::string::npos || body.find("cp.reduce.async.bulk") != std::string::npos ||
+              body.find("st.async.") != std::string::npos ||
+              (body.find("mbarrier.") != std::string::npos && body.find("shared::cluster") != std::string::npos) ||
+              body.find("shared::cluster.shared::cta") != std::string::npos || body.find("mapa.") != std::string::npos)
+            S.tcgenFunctions.insert(&F);
+        } else if (auto *callee = C->getCalledFunction()) {
+          if (callee->getName().starts_with("llvm.nvvm.")) {
             calls.push_back(C);
+            if (callee->getName().contains("mbarrier")) barrierFunctions.insert(&F);
+            StringRef name = callee->getName();
+            if (name.starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.")) {
+              barrierFunctions.insert(&F);
+              structuredTma.insert(&F);
+              if (!isOrdinaryTmaLoad(*C) || !hasLocalTmaArrive(*C, M->getDataLayout())) S.tcgenFunctions.insert(&F);
+            }
+            if (name.starts_with("llvm.nvvm.mapa") ||
+                name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
+                name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
+          } else if (!callee->isDeclaration()) {
+            callers[callee].push_back(&F);
+            callees[&F].push_back(callee);
+          }
+        }
+      }
+  for (auto *F : structuredTma)
+    if (splitByteTransactions.count(F)) S.tcgenFunctions.insert(F);
+  if (!S.tcgenFunctions.empty()) {
+    // A noinline helper must agree with all callers on the 8-byte barrier ABI.
+    // Only follow edges into helpers that actually use a barrier (transitively).
+    barrierFunctions.insert(S.tcgenFunctions.begin(), S.tcgenFunctions.end());
+    std::vector<Function *> pending(barrierFunctions.begin(), barrierFunctions.end());
+    while (!pending.empty()) {
+      auto *f = pending.back();
+      pending.pop_back();
+      for (auto *caller : callers[f])
+        if (barrierFunctions.insert(caller).second) pending.push_back(caller);
+    }
+    pending.assign(S.tcgenFunctions.begin(), S.tcgenFunctions.end());
+    while (!pending.empty()) {
+      auto *f = pending.back();
+      pending.pop_back();
+      for (auto *caller : callers[f])
+        if (S.tcgenFunctions.insert(caller).second) pending.push_back(caller);
+      for (auto *callee : callees[f])
+        if (barrierFunctions.count(callee) && S.tcgenFunctions.insert(callee).second) pending.push_back(callee);
+    }
+  }
   for (auto *C : calls) lowerIntrinsic(S, C);
   // 2. inline asm
   std::vector<CallInst *> asms;
@@ -1774,9 +2679,24 @@ void lower_async_ptx(Module *M) {
     std::vector<Stmt> st;
     std::string err;
     if (!parsePtx(a, st, err)) {
-      if (mentionsAsyncText(a)) fail_at(C, "cannot parse async asm (" + err + ")");
+      if (mentionsAsyncText(a) || StringRef(a).contains("wgmma."))
+        fail_at(C, "cannot parse async asm (" + err + ")");
       continue;
     }
+    auto isWgmmaControl = [](const Stmt &s) {
+      StringRef op(s.op);
+      return op.starts_with("wgmma.fence") || op.starts_with("wgmma.commit_group") || op.starts_with("wgmma.wait_group");
+    };
+    if (llvm::any_of(st, isWgmmaControl)) {
+      if (!llvm::all_of(st, [&](const Stmt &s) { return isWgmmaControl(s) && s.pred.empty() && s.label.empty(); }))
+        fail_at(C, "WGMMA control must use unpredicated inline asm containing only fence/commit_group/wait_group");
+      continue; // Retain the call for the WGMMA lowering, including all of its group controls.
+    }
+    if (llvm::any_of(st, isWgmmaMma)) {
+      validateWgmmaMma(C, st);
+      continue;
+    }
+    if (lowerSdkBuiltin(S, C, st)) continue;
     bool owned = false;
     for (auto &s : st) owned |= ownedOp(s);
     if (!owned) {
@@ -1789,6 +2709,70 @@ void lower_async_ptx(Module *M) {
     L.st = st;
     L.run();
     S.n_asm++;
+  }
+  // Record fixed geometry and the kernels whose threads participate in a split
+  // barrier (including through a callee). Retired threads no longer owe an arrival.
+  std::set<Function *> syncKernels;
+  if (auto *sync = M->getFunction("__cupbop_cluster_sync")) {
+    std::vector<Function *> pending;
+    for (auto *u : sync->users())
+      if (auto *call = dyn_cast<CallInst>(u)) pending.push_back(call->getFunction());
+    while (!pending.empty()) {
+      auto *f = pending.back(); pending.pop_back();
+      if (!syncKernels.insert(f).second) continue;
+      pending.insert(pending.end(),callers[f].begin(),callers[f].end());
+    }
+  }
+  std::map<Function *, std::array<unsigned,3>> sourceShapes;
+  if (auto *annotations = M->getGlobalVariable("llvm.global.annotations")) {
+    for (auto &operand : annotations->getInitializer()->operands()) {
+      auto *record = dyn_cast<ConstantStruct>(operand.get());
+      StringRef tag;
+      if (!record || record->getNumOperands() < 5 || !getConstantStringInfo(record->getOperand(1), tag) ||
+          tag != "cupbop.cluster_dims") continue;
+      auto *kernel = cast<Function>(record->getOperand(0)->stripPointerCasts());
+      auto *args = cast<GlobalVariable>(record->getOperand(4)->stripPointerCasts())->getInitializer();
+      if (args->getNumOperands() == 0 || args->getNumOperands() > 3)
+        report_fatal_error("invalid __cluster_dims__ argument count");
+      auto &dims = sourceShapes[kernel];
+      dims = {1,1,1};
+      for (unsigned d=0; d<args->getNumOperands(); ++d) {
+        auto *value = dyn_cast<ConstantInt>(args->getOperand(d));
+        if (!value || value->isZero() || value->getLimitedValue() > 16)
+          report_fatal_error("invalid __cluster_dims__ dimension");
+        dims[d] = value->getZExtValue();
+      }
+    }
+  }
+  std::ofstream shapes("cupbop_cluster_dims.txt");
+  for (auto &F : *M) {
+    if (!isKernelFunction(M,&F)) continue;
+    auto dims = sourceShapes[&F];
+    if (auto *metadata = M->getNamedMetadata("nvvm.annotations"))
+      for (auto *node : metadata->operands()) {
+        auto *v = dyn_cast<ValueAsMetadata>(node->getOperand(0));
+        if (!v || v->getValue() != &F) continue;
+        for (unsigned i=1; i+1<node->getNumOperands(); i+=2) {
+          auto *key = dyn_cast<MDString>(node->getOperand(i));
+          auto *number = mdconst::dyn_extract<ConstantInt>(node->getOperand(i+1));
+          if (!key || !number) continue;
+          StringRef k = key->getString();
+          if (k == "cluster_dim_x" || k == "cluster_dim_y" || k == "cluster_dim_z")
+            dims[k.back()-'x'] = number->getZExtValue();
+        }
+      }
+    if (dims[0]) {
+      if (!dims[1]) dims[1] = 1;
+      if (!dims[2]) dims[2] = 1;
+    }
+    const bool sync = syncKernels.count(&F);
+    if (sync || dims[0]) shapes << cupbop_kernel_lookup_name(F.getName().str()) << ' ' << dims[0] << ' ' << dims[1]
+                                << ' ' << dims[2] << ' ' << sync << '\n';
+    if (sync) for (auto &BB : F)
+      if (auto *ret = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        IRBuilder<> rb(ret);
+        S.call(rb,"__cupbop_cluster_sync",S.Void,{rb.getInt32(2)});
+      }
   }
   if (!S.n_asm && !S.n_intr) {
     std::remove("cupbop_async_kernels.txt");
@@ -1847,7 +2831,8 @@ void lower_async_ptx(Module *M) {
     std::remove("cupbop_async_kernels.txt");
   }
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
-  narrowWideKernelArgs(M, S.paramAddrArgs);
+  markTensorMapParameters(S);
+  narrowWideKernelArgs(M, S.tensorMapArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "
                   "copies, %u converged DXA issue point(s)\n", S.n_asm, S.n_intr, S.n_moved, S.n_issue);
 }

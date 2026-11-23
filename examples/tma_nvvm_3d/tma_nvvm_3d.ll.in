@@ -1,0 +1,49 @@
+; One CTA loads a 32x8x2 tile with the structured NVVM TMA intrinsic.
+target triple = "nvptx64-nvidia-cuda"
+
+%struct.CUtensorMap_st = type { [16 x i64] }
+@tile = internal addrspace(3) global [512 x float] undef, align 128
+@full = internal addrspace(3) global i64 undef, align 8
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare void @llvm.nvvm.barrier0()
+declare void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile.3d(ptr addrspace(3), ptr addrspace(3), ptr, i32, i32, i32, i16, i64, i1 immarg, i1 immarg)
+
+define ptx_kernel void @tma_nvvm_3d(ptr byval(%struct.CUtensorMap_st) align 64 %map, ptr %out) {
+entry:
+  %lane = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %leader = icmp eq i32 %lane, 0
+  %bar = ptrtoint ptr addrspace(3) @full to i64
+  br i1 %leader, label %init, label %initialized
+
+init:
+  call void asm sideeffect "mbarrier.init.shared::cta.b64 [$0], 1;", "l,~{memory}"(i64 %bar)
+  call void asm sideeffect "fence.mbarrier_init.release.cluster;", "~{memory}"()
+  br label %initialized
+
+initialized:
+  call void @llvm.nvvm.barrier0()
+  br i1 %leader, label %issue, label %ready
+
+issue:
+  call void asm sideeffect "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], 2048;", "l,~{memory}"(i64 %bar)
+  call void @llvm.nvvm.cp.async.bulk.tensor.g2s.tile.3d(ptr addrspace(3) @tile, ptr addrspace(3) @full, ptr %map, i32 0, i32 0, i32 0, i16 0, i64 0, i1 false, i1 false)
+  br label %ready
+
+ready:
+  call void asm sideeffect "{ .reg .pred p; WAIT_%=: mbarrier.try_wait.parity.shared::cta.b64 p, [$0], 0; @!p bra WAIT_%=; }", "l,~{memory}"(i64 %bar)
+  br label %copy
+
+copy:
+  %i = phi i32 [ %lane, %ready ], [ %next, %copy ]
+  %src = getelementptr inbounds [512 x float], ptr addrspace(3) @tile, i32 0, i32 %i
+  %dst = getelementptr inbounds float, ptr %out, i32 %i
+  %v = load float, ptr addrspace(3) %src, align 4
+  store float %v, ptr %dst, align 4
+  %next = add nuw i32 %i, 32
+  %more = icmp ult i32 %next, 512
+  br i1 %more, label %copy, label %exit
+
+exit:
+  ret void
+}

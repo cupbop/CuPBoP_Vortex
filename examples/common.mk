@@ -1,3 +1,4 @@
+KERNEL_TRANSLATOR ?= $(CuPBoP_PATH)/build/compilation/kernelTranslator
 # common.mk — Shared CuPBoP build pipeline for Vortex examples
 #
 # Usage in per-example Makefile:
@@ -101,6 +102,10 @@ ifeq ($(VORTEX_VER),3)
   VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(notdir $(CURDIR))_s$(SCHEDULE)_l$(LOCALMEM)
   VX3_RT_DIR = $(VORTEX_PATH)/sw/runtime
   export VORTEX_DRIVER ?= simx
+  # Older SimX builds and other drivers use the fixed-count CTA barrier.
+  export CUPBOP_SIMX_LIVE_CTA_BARRIER ?= $(strip $(if $(filter simx,$(VORTEX_DRIVER)),\
+    $(shell grep -q '^\#define VX_BAR_LIVE_CTA ' "$(VORTEX_PATH)/sw/VX_types.h" 2>/dev/null && echo 1)))
+  LIVE_CTA_SETTING := .cupbop-live-cta-barrier
 endif
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
@@ -198,9 +203,11 @@ rebuild-ir:
 
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
+	rm -f .cupbop-live-cta-barrier
+	rm -rf .cupbop-cuda-headers
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_async_kernels.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_cluster_dims.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:
@@ -217,20 +224,23 @@ ifeq ($(VORTEX_VER),3)
 # With -nocudalib this clang no longer reports the SDK version, which would select the pre-CUDA-9
 # cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
 # DEVICE_BC_SRC: the examples/lift.mk examples have their device bitcode from a lifted IR file and use this one at most for the source kernels of the program.
-$(DEVICE_BC_SRC): $(KERNEL_CU)
+CUDA_OVERLAY := .cupbop-cuda-headers/overlay.json
+$(CUDA_OVERLAY): $(CuPBoP_PATH)/compilation/cuda_header_overlay.py $(wildcard $(CUDA_PATH)/include/cuda/std/barrier $(CUDA_PATH)/include/cuda.h)
+	python3 $< "$(CUDA_PATH)" "$@"
+$(DEVICE_BC_SRC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h $(CUDA_OVERLAY)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 -ivfsoverlay $(CUDA_OVERLAY) $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-gpu-arch=$(CUDA_GPU_ARCH) --cuda-device-only -nocudalib -Xclang -target-sdk-version=12.1 \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
-$(HOST_BC): $(KERNEL_CU)
+$(HOST_BC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h $(CUDA_OVERLAY)
 	@echo "--- Generate host bitcode (clang --cuda-host-only)"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 -ivfsoverlay $(CUDA_OVERLAY) $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		-x cuda --cuda-path=$(CUDA_PATH) --cuda-host-only --sysroot=/ --target=x86_64-linux-gnu \
 		-emit-llvm -c ./$(KERNEL_CU) -o $@
 else
 $(DEVICE_BC): $(KERNEL_CU)
 	@echo "--- Generate bitcode files for host and device"
-	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -DVORTEX_SCHE=$(SCHEDULE) \
+	$(LLVM_BIN)/clang++ -O0 -g -std=c++11 $(EXTRA_CLANG_FLAGS) -D_CG_CLUSTER_INTRINSICS_AVAILABLE -include $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h -DVORTEX_SCHE=$(SCHEDULE) \
 		./$(KERNEL_CU) --sysroot=/ --target=x86_64-linux-gnu \
 		-L$(CUDA_PATH)/lib64 --cuda-gpu-arch=$(CUDA_GPU_ARCH) \
 		-lcudart_static -ldl -lrt -pthread -save-temps -v 2>&1 || true
@@ -241,9 +251,16 @@ $(HOST_BC): $(DEVICE_BC)
 # ─── Step 2: kernelTranslator -> kernel.bc + kernel_wrapper.cpp ──────────────
 endif
 
-kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC)
+ifneq ($(LIVE_CTA_SETTING),)
+.PHONY: check-live-cta-setting
+$(LIVE_CTA_SETTING): check-live-cta-setting
+	@setting='$(if $(filter simx:1,$(VORTEX_DRIVER):$(strip $(CUPBOP_SIMX_LIVE_CTA_BARRIER))),1,0)'; \
+	if [ "$$setting" != "$$(cat $@ 2>/dev/null)" ]; then printf '%s\n' "$$setting" > $@; fi
+endif
+
+kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC) $(KERNEL_TRANSLATOR) $(LIVE_CTA_SETTING)
 	@echo "--- Translate kernel bitcode"
-	$(CuPBoP_PATH)/build/compilation/kernelTranslator $< kernel.bc
+	$(KERNEL_TRANSLATOR) $< kernel.bc
 	llvm-dis kernel.bc
 
 # ─── Step 3: hostTranslator -> host.bc -> host.o ─────────────────────────────
@@ -266,7 +283,7 @@ host.o: host.bc
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 ifeq ($(VORTEX_VER),3)
 # Vortex 3.0: delegate the kernel ELF to Vortex's own regression makefile (see examples/v3_cell.mk).
-kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
+kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) $(addprefix $(CuPBoP_PATH)/runtime/include/,cupbop_launch_context.h cupbop_reduce.h) $(VORTEX_PATH)/sw/VX_types.h $(wildcard $(VORTEX_HOME)/sw/kernel/include/vx_simx_clc.h)
 	@echo "--- Building kernel ELF with Vortex 3.0 tests/regression/common.mk in $(VX3_CELL)"
 	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
 	printf 'int main(){return 0;}\n' > dummy_host.cpp
@@ -276,7 +293,7 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS) \
 	|| MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh --build-failed \
-		$(CuPBoP_PATH)/build/compilation/kernelTranslator $(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" \
+		$(KERNEL_TRANSLATOR) $(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" \
 		VORTEX_HOME=$(VORTEX_HOME) CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
@@ -284,7 +301,7 @@ kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp
 	@# 8 KB hardware stack is rebuilt with the dynamic trip count (core mapping with fixed trips) or run on a software
 	@# stack; every schedule, the sp skew modulus is lowered to fit the frame (CUPBOP_SP_SKEW) and the kernel ABI calls
 	@# are checked (CUPBOP_KABI, examples/abi_check.py; UNSAFE fails the build). No-op when nothing applies.
-	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(CuPBoP_PATH)/build/compilation/kernelTranslator \
+	@MAKE="$(MAKE)" bash $(CuPBoP_PATH)/examples/stack_fallback.sh $(KERNEL_TRANSLATOR) \
 		$(DEVICE_BC) $(VX3_CELL) CONFIGS="$(VORTEX_CONFIGS)" VORTEX_HOME=$(VORTEX_HOME) \
 		CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)

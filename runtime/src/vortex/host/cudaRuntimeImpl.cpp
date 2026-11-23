@@ -1,4 +1,7 @@
 #include "cudaRuntimeImpl.h"
+#include "cupbop_async.h"
+#include "cupbop_dxa_layout.h"
+#include "cupbop_launch_context.h"
 #include "base_address.h"
 #include "api.h"
 #include "cuda_runtime.h"
@@ -117,8 +120,8 @@ static void cupbop_switch_module(const std::string &from, const std::string &to)
 
 // ── DXA descriptors (programmed into the DXA DCRs before each kernel launch) ─────────────────────────
 // Field layout: vortex sw/runtime/include/dxa.h (VX_DCR_DXA_DESC_* offsets, META = rank | log2(elem)<<3 |
-// layout<<5). Rank 1-5; sizes in elements; strides in bytes for dims 1..rank-1; box = elements per dim of
-// one transfer; layout 0 = row-major box in shared memory, 1 = K-major (transposed, rank <= 2);
+// layout<<5 | swizzle<<7). Rank 1-5; sizes in elements; strides in bytes for dims 1..rank-1; box = elements per dim of
+// one transfer; destination layouts 0..3 are row-major, K-major, flat and block-major.
 // smem_stride = multicast shared-memory stride between CTAs; fill = 32-bit pattern written for
 // out-of-bounds elements (lane-replicated per 4 bytes).
 struct DxaDescEntry {
@@ -130,6 +133,8 @@ struct DxaDescEntry {
   uint32_t box[5];
   uint32_t elem_bytes;
   uint32_t layout;
+  uint32_t tc_n, block_k;
+  uint32_t swizzle;
   uint32_t smem_stride;
   uint32_t fill;
 };
@@ -140,8 +145,11 @@ static std::string dxa_desc_check(const DxaDescEntry &d) {
   if (d.slot >= 16) return "slot must be 0..15";
   if (d.rank < 1 || d.rank > 5) return "rank must be 1..5";
   if (d.elem_bytes != 1 && d.elem_bytes != 2 && d.elem_bytes != 4 && d.elem_bytes != 8) return "elem_bytes must be 1, 2, 4 or 8";
-  if (d.layout > 1) return "layout must be 0 (row-major) or 1 (K-major)";
-  if (d.layout == 1 && d.rank > 2) return "K-major layout needs rank <= 2";
+  if (const char *why = cupbop_dxa_check_layout(d.layout, d.rank, d.elem_bytes, d.box[0], d.box[1],
+                                                 d.tc_n, d.block_k)) return why;
+  if (d.swizzle && (d.swizzle != CUPBOP_TMAP_SWIZZLE_128B || d.layout != 0 ||
+                    uint64_t(d.box[0]) * d.elem_bytes != 128))
+    return "128B swizzle needs a row-major 128-byte innermost box";
   for (uint32_t i = 0; i < d.rank; ++i)
     if (d.box[i] < 1 || d.box[i] > 0xffff) return "box sizes must be 1..65535";
   return "";
@@ -176,13 +184,15 @@ static void dxa_program(vx_device_h dev, const DxaDescEntry &d) {
   const uint32_t dcr = 0x100 + d.slot * 24; // VX_DCR_DXA_DESC_BASE + slot * VX_DCR_DXA_DESC_STRIDE
   uint32_t esz = 0;
   for (uint32_t b = d.elem_bytes; b > 1; b >>= 1) esz++;
-  const uint32_t meta = (d.rank & 7) | (esz << 3) | ((d.layout & 3) << 5);
+  const uint32_t meta = (d.rank & 7) | (esz << 3) | ((d.layout & 3) << 5) | ((d.swizzle & 3) << 7);
   vx_dcr_write(dev, dcr + 0, (uint32_t)(d.base_addr & 0xFFFFFFFF)); // BASE_LO
   vx_dcr_write(dev, dcr + 1, (uint32_t)(d.base_addr >> 32));        // BASE_HI
   for (uint32_t i = 0; i < d.rank; ++i) vx_dcr_write(dev, dcr + 2 + i, d.size[i]);       // SIZE0..4
   for (uint32_t i = 0; i + 1 < d.rank; ++i) vx_dcr_write(dev, dcr + 7 + i, d.stride[i]); // STRIDE0..3
   vx_dcr_write(dev, dcr + 11, meta);                                                     // META
   for (uint32_t i = 0; i < d.rank; ++i) vx_dcr_write(dev, dcr + 12 + i, 1);              // ESTRIDE0..4
+  if (d.layout == CUPBOP_DXA_LAYOUT_FLAT || d.layout == CUPBOP_DXA_LAYOUT_BLOCK_MAJOR)
+    vx_dcr_write(dev, dcr + 14, (d.block_k << 16) | d.tc_n); // ESTRIDE2 is unused by rank-2 source addressing
   vx_dcr_write(dev, dcr + 17, (d.box[0] & 0xFFFF) | ((d.rank > 1 ? d.box[1] & 0xFFFF : 0) << 16)); // TILESIZE01
   if (d.rank > 2)
     vx_dcr_write(dev, dcr + 18, (d.box[2] & 0xFFFF) | ((d.rank > 3 ? d.box[3] & 0xFFFF : 0) << 16)); // TILESIZE23
@@ -213,21 +223,30 @@ extern "C" void cudaDxaProgramDesc2D(uint32_t slot, uint64_t base_addr,
 }
 
 // General form: rank 1-5. strides_bytes (rank-1 entries) may be NULL for a dense tensor.
-extern "C" int cudaDxaProgramDescNd(uint32_t slot, uint64_t base_addr, uint32_t rank,
+extern "C" int cudaDxaProgramDescNdTiled(uint32_t slot, uint64_t base_addr, uint32_t rank,
                                     const uint32_t *sizes, const uint32_t *strides_bytes,
                                     const uint32_t *box, uint32_t elem_bytes, uint32_t layout,
-                                    uint32_t smem_stride_bytes, uint32_t fill) {
+                                    uint32_t smem_stride_bytes, uint32_t fill, uint32_t tc_n, uint32_t block_k) {
   DxaDescEntry d{};
   d.slot = slot; d.base_addr = base_addr; d.rank = rank;
   d.elem_bytes = elem_bytes; d.layout = layout; d.smem_stride = smem_stride_bytes; d.fill = fill;
+  d.tc_n = tc_n; d.block_k = block_k;
   if (rank < 1 || rank > 5 || !sizes || !box) {
-    fprintf(stderr, "cudaDxaProgramDescNd: rank must be 1..5 and sizes/box non-NULL\n");
+    fprintf(stderr, "cudaDxaProgramDescNdTiled: rank must be 1..5 and sizes/box non-NULL\n");
     return 1;
   }
   for (uint32_t i = 0; i < rank; ++i) { d.size[i] = sizes[i]; d.box[i] = box[i]; }
   if (strides_bytes) for (uint32_t i = 0; i + 1 < rank; ++i) d.stride[i] = strides_bytes[i];
   else dxa_fill_dense_strides(d);
-  return dxa_queue(d, "cudaDxaProgramDescNd");
+  return dxa_queue(d, "cudaDxaProgramDescNdTiled");
+}
+
+extern "C" int cudaDxaProgramDescNd(uint32_t slot, uint64_t base_addr, uint32_t rank,
+                                    const uint32_t *sizes, const uint32_t *strides_bytes,
+                                    const uint32_t *box, uint32_t elem_bytes, uint32_t layout,
+                                    uint32_t smem_stride_bytes, uint32_t fill) {
+  return cudaDxaProgramDescNdTiled(slot, base_addr, rank, sizes, strides_bytes, box, elem_bytes,
+                                   layout, smem_stride_bytes, fill, 0, 0);
 }
 
 extern "C" int cudaDxaProgramDesc1D(uint32_t slot, uint64_t base_addr, uint32_t size0, uint32_t tile0,
@@ -249,7 +268,6 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 // The device helpers (cudaKernelImpl_async.inc) copy boxes in software. Refused with an error (returned
 // CUDA_ERROR_INVALID_VALUE = 1 and a message), never encoded approximately: swizzle, interleave, element
 // strides other than 1, misaligned addresses or strides. Signature as in cuda.h (enums are int-sized).
-#include "cupbop_async.h"
 // MPM counter ids for the per-launch record (CUPBOP_PERF_KERNEL_FILE): from the build's VX_types.h when the include
 // path has it ($VORTEX_PATH/sw), else these values (the same in Vortex v3.0 and upstream master 50cb17454).
 #if __has_include(<VX_types.h>)
@@ -486,7 +504,24 @@ extern "C" int cudaDxaProgramDesc3D(uint32_t slot, uint64_t base_addr, uint32_t 
 #ifndef VX_DCR_MPM_CLASS_TCU
 #define VX_DCR_MPM_CLASS_TCU 11
 #endif
-static_assert(sizeof(cupbop_tmap) <= 128, "cupbop_tmap must fit in a CUtensorMap");
+static_assert(sizeof(cupbop_tmap) == 128, "cupbop_tmap must match the CUtensorMap image");
+static std::map<uint64_t, cupbop_tmap> dxa_tensor_maps;
+
+static const char *upload_tensor_map(void *tensor_map, cupbop_tmap &record) {
+  void *device_record = nullptr;
+  if (cudaMalloc(&device_record, sizeof(record)) != cudaSuccess || !device_record)
+    return "cudaMalloc of the device record failed";
+  record.self = reinterpret_cast<uintptr_t>(device_record);
+  record.dxa_slot = UINT32_MAX;
+  if (cudaMemcpy(device_record, &record, sizeof(record), cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(device_record);
+    return "upload of the device record failed";
+  }
+  if (record.mode == CUPBOP_TMAP_MODE_DXA) dxa_tensor_maps.emplace(record.self, record);
+  memcpy(tensor_map, &record, sizeof(record));
+  return nullptr;
+}
+
 extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint32_t tensorRank, void *globalAddress,
                                       const uint64_t *globalDim, const uint64_t *globalStrides,
                                       const uint32_t *boxDim, const uint32_t *elementStrides, int interleave,
@@ -504,13 +539,16 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   if (!globalAddress || ((uintptr_t)globalAddress & 15)) return bad("globalAddress must be 16-byte aligned");
   if (!globalDim || !boxDim || (tensorRank > 1 && !globalStrides)) return bad("NULL globalDim / globalStrides / boxDim");
   if (interleave != 0) return bad("interleave other than CU_TENSOR_MAP_INTERLEAVE_NONE is not supported");
-  if (swizzle != 0)
-    return bad("swizzle other than CU_TENSOR_MAP_SWIZZLE_NONE is not supported yet (async design stage 4)");
+  if (swizzle != 0 && swizzle != CUPBOP_TMAP_SWIZZLE_128B)
+    return bad("supported tensor map swizzles are NONE and 128B");
+  if (swizzle && uint64_t(boxDim[0]) * elem_of[tensorDataType] != 128)
+    return bad("128B swizzle requires a 128-byte innermost box in CuPBoP");
   if (oobFill != 0 && oobFill != 1) return bad("unknown oobFill");
   cupbop_tmap r;
   memset(&r, 0, sizeof(r));
   r.magic = CUPBOP_TMAP_MAGIC;
   r.rank = tensorRank;
+  r.swizzle = swizzle;
   r.gaddr = (uint64_t)(uintptr_t)globalAddress;
   r.elem = elem_of[tensorDataType];
   r.dtype = (uint32_t)tensorDataType;
@@ -533,8 +571,11 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
   }
   // DXA mode (stage 3, opt-in CUPBOP_TMA_DXA=1): only for tensor maps the SimX DXA copies exactly -- it decides
   // out-of-bounds per 64-byte span from the span's first element, so every row must end on a 64-byte line
-  r.dxa_slot = 0xFFFFFFFFu;
-  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e)) {
+  bool dxa_layout = r.swizzle == 0;
+#ifdef VX_DXA_SWIZZLE_128B
+  dxa_layout |= r.swizzle == VX_DXA_SWIZZLE_128B;
+#endif
+  if (const char *e = getenv("CUPBOP_TMA_DXA"); e && atoi(e) && dxa_layout) {
     bool ok = (r.gaddr % 64 == 0) && ((uint64_t)r.dim[0] * r.elem % 64 == 0);
     for (uint32_t i = 0; i + 1 < tensorRank; ++i) ok = ok && r.stride[i] % 64 == 0 && r.stride[i] <= 0xFFFFFFFFull;
     if (ok) r.mode = CUPBOP_TMAP_MODE_DXA;
@@ -542,15 +583,32 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
       fprintf(stderr, "cuTensorMapEncodeTiled (CuPBoP): DXA mode needs 64-byte aligned rows (base, dim0 * element "
                       "size and strides multiples of 64); software copies for this tensor map\n");
   }
-  void *dev = nullptr;
-  if (cudaMalloc(&dev, 128) != cudaSuccess || !dev) return bad("cudaMalloc of the device record failed");
-  r.self = (uint64_t)(uintptr_t)dev;
-  uint8_t img[128];
-  memset(img, 0, sizeof(img));
-  memcpy(img, &r, sizeof(r));
-  if (cudaMemcpy(dev, img, sizeof(img), cudaMemcpyHostToDevice) != cudaSuccess) return bad("upload of the record failed");
-  memcpy(tensorMap, img, sizeof(img));
+  if (const char *why = upload_tensor_map(tensorMap, r)) return bad(why);
   return 0; // CUDA_SUCCESS
+}
+
+extern "C" int cudaDxaSetTensorMapLayout(void *tensor_map, uint32_t layout, uint32_t tc_n, uint32_t block_k) {
+  const auto bad = [](const char *why) {
+    fprintf(stderr, "cudaDxaSetTensorMapLayout (CuPBoP): %s\n", why);
+    return 1;
+  };
+  if (!tensor_map || (reinterpret_cast<uintptr_t>(tensor_map) & 63u))
+    return bad("tensor map must be a 64-byte aligned CUtensorMap");
+  cupbop_tmap r;
+  memcpy(&r, tensor_map, sizeof(r));
+  if (r.magic != CUPBOP_TMAP_MAGIC || !r.self)
+    return bad("tensor map was not encoded by CuPBoP's cuTensorMapEncodeTiled");
+  if (layout != CUPBOP_DXA_LAYOUT_ROW_MAJOR && r.swizzle)
+    return bad("non-row-major tensor maps need swizzle none");
+  if (const char *why = cupbop_dxa_check_layout(layout, r.rank, r.elem, r.box[0], r.box[1], tc_n, block_k))
+    return bad(why);
+  const uint32_t geometry = tc_n | (block_k << 16);
+  if (r.layout == layout && r.geometry == geometry) return 0;
+  r.layout = layout;
+  r.geometry = geometry;
+  // Copies of the original opaque tensor map still refer to its previous device record.
+  if (const char *why = upload_tensor_map(tensor_map, r)) return bad(why);
+  return 0;
 }
 extern "C" int cuTensorMapEncodeIm2col(void *, int, uint32_t, void *, const uint64_t *, const uint64_t *, const int *,
                                        const int *, uint32_t, uint32_t, const uint32_t *, int, int, int, int) {
@@ -579,7 +637,7 @@ static bool cupbop_async_kernel(const std::string &kname) {
 // Legacy line (the automatic cp.async conversion): kernel slot ptr_arg dim0_arg dim1_arg tile0 tile1 elem_bytes
 //   -> rank 2, sizes from the integer arguments, dense row stride.
 // v2 line (kernelTranslator from !vx.dxa.desc, or by hand):
-//   desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R] [layout=row|kmajor]
+//   desc <kernel> slot=S base=argK[+B] size=v,.. [stride=v,..] box=t,.. elem=E [rank=R] [layout=row|kmajor|flat|blockmajor] [tc_n=T] [block_k=K]
 //        [smem_stride=B] [fill=P | fillf=F]
 //   v = integer literal, argK (kernel argument K, read as 32 bits) or a '*' product of those;
 //   base = argK (64-bit pointer argument) plus an optional byte offset.
@@ -701,10 +759,23 @@ static bool dxa_v2_resolve(const DxaAutoDescEntry &e, void **args, int num_args,
     dxa_fill_dense_strides(d);
   }
   if (const std::string *l = get("layout")) {
-    if (*l == "row") d.layout = 0;
-    else if (*l == "kmajor") d.layout = 1;
-    else { err = "layout must be row or kmajor"; return false; }
+    int layout = cupbop_dxa_parse_layout(l->c_str());
+    if (layout < 0) { err = "layout must be row, kmajor, flat or blockmajor"; return false; }
+    d.layout = static_cast<uint32_t>(layout);
   }
+  auto geometry = [&](const char *key, uint32_t &value) {
+    const std::string *v = get(key);
+    if (!v) return true;
+    char *end = nullptr;
+    unsigned long number = std::strtoul(v->c_str(), &end, 0);
+    if (end == v->c_str() || *end || number > 0xffffu) {
+      err = std::string(key) + " must be an unsigned 16-bit literal";
+      return false;
+    }
+    value = static_cast<uint32_t>(number);
+    return true;
+  };
+  if (!geometry("tc_n", d.tc_n) || !geometry("block_k", d.block_k)) return false;
   if (const std::string *v = get("smem_stride")) d.smem_stride = (uint32_t)std::strtoul(v->c_str(), nullptr, 0);
   if (const std::string *v = get("fill")) d.fill = (uint32_t)std::strtoll(v->c_str(), nullptr, 0);
   if (const std::string *v = get("fillf")) { float f = std::strtof(v->c_str(), nullptr); memcpy(&d.fill, &f, 4); }
@@ -730,32 +801,11 @@ static bool cupbop_debug_enabled() {
    } while (false)
 
 
-// Different structure based on the architecture
 #ifdef VORTEX_ARCHITECTURE_64
-  struct alignas(4) context_t {
-    uint32_t num_groups[3];
-    uint32_t global_offset[3];
-    uint32_t local_size[3];
-    char * printf_buffer;
-    uint32_t printf_buffer_position;
-    uint32_t printf_buffer_capacity;
-    uint32_t work_dim;
-    uint32_t dyn_shared_mem_size;
-  };
-
+using context_t = cupbop_launch_context<uint64_t>;
 #else
-  struct alignas(4) context_t {
-    uint32_t num_groups[3];
-    uint32_t global_offset[3];
-    uint32_t local_size[3];
-    uint32_t printf_buffer;
-    uint32_t printf_buffer_position;
-    uint32_t printf_buffer_capacity;
-    uint32_t work_dim;
-    uint32_t dyn_shared_mem_size;
-  };
+using context_t = cupbop_launch_context<uint32_t>;
 #endif
-
 
 struct alignas(64) kernel_arg_t {
   context_t ctx;
@@ -786,6 +836,8 @@ private:
     , queue_(nullptr)
   {
     RT_CHECK(vx_dev_open(&device_));
+    const char *driver = std::getenv("VORTEX_DRIVER");
+    simx_ = !driver || strcmp(driver, "simx") == 0;
     // CUPBOP_LAUNCH2: one in-order queue for kernel launches (vx_enqueue_launch).
     vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
     RT_CHECK((int)vx_queue_create(device_, &qi, &queue_));
@@ -807,6 +859,8 @@ private:
   }
 
 public:
+  bool is_simx() const { return simx_; }
+
   void cleanup_args() {
     if (args_buffer_ != nullptr) {
       vx_mem_free(args_buffer_);
@@ -856,6 +910,7 @@ private:
   vx_kernel_h kernel_;
   vx_kernel_h service_kernel_;
   vx_queue_h  queue_;
+  bool simx_;
 
   // Pointer manager
   struct MemoryInfo {
@@ -1127,11 +1182,11 @@ static uint64_t cupbop_frame_scratch_bytes(const std::string &lookup_name) {
   }
   return 0;
 }
-// By-value struct parameters (translator: generate_wrapper.cpp decode_input, cupbop_byval_args.txt: <name as in
-// lookup.txt> <parameters> <bytes of each by-value parameter, 0 = not by-value>): such a parameter takes
-// ceil(bytes / 8) consecutive launch slots holding all its bytes (zero-padded), every other one slot as before.
+// By-value parameters in cupbop_byval_args.txt: kernel name, logical parameter
+// count, one size per parameter (0 for a scalar), and an optional lifted-slots
+// marker for a kernel whose replay callers may already supply physical slots.
 // Returns false (one 8-byte slot per argument) when the kernel is not listed.
-static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint64_t> &bytes) {
+static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint64_t> &bytes, bool &lifted_slots) {
   std::ifstream f("cupbop_byval_args.txt");
   if (!f.is_open()) return false;
   std::string line;
@@ -1144,6 +1199,8 @@ static bool cupbop_byval_layout(const std::string &lookup_name, std::vector<uint
     bytes.assign(n, 0);
     for (size_t i = 0; i < n; ++i)
       if (!(is >> bytes[i])) return false;
+    std::string layout;
+    lifted_slots = (is >> layout) && layout == "lifted-slots";
     return true;
   }
   return false;
@@ -1577,7 +1634,7 @@ static std::string cupbop_json_str(const std::string &x) {
 }
 static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int kernel_idx, int schedule,
                              const uint32_t grid[3], const uint32_t block[3], uint32_t ndim, uint32_t lmem,
-                             const dim3 &cgrid, const dim3 &cblock, size_t dyn_smem) {
+                             const dim3 &cgrid, const dim3 &cblock, size_t dyn_smem, const dim3 &cluster = dim3(1,1,1)) {
   const char *pk = getenv("CUPBOP_PERF_KERNEL_FILE");
   if (!pk || !*pk) return;
   FILE *pf = fopen(pk, "a");
@@ -1623,10 +1680,11 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
   };
   auto d3 = [](const uint32_t *x) { return "[" + std::to_string(x[0]) + "," + std::to_string(x[1]) + "," + std::to_string(x[2]) + "]"; };
   const uint32_t cg[3] = {cgrid.x, cgrid.y, cgrid.z}, cb[3] = {cblock.x, cblock.y, cblock.z};
+  const uint32_t cd[3] = {cluster.x, cluster.y, cluster.z};
   std::string line = "{\"v\":1,\"pid\":" + std::to_string((long)getpid()) + ",\"launch\":" + std::to_string(launch_no) +
       ",\"kernel\":" + cupbop_json_str(kernel) + ",\"kernel_idx\":" + std::to_string(kernel_idx) +
       ",\"sched\":" + std::to_string(schedule) + ",\"ndim\":" + std::to_string(ndim) + ",\"grid\":" + d3(grid) +
-      ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) +
+      ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) + ",\"cluster\":" + d3(cd) +
       ",\"lmem\":" + std::to_string(lmem) + ",\"dyn_smem\":" + std::to_string(dyn_smem) +
       ",\"service_launches\":" + std::to_string(g_cupbop_service_launches - last_service) +
       ",\"cycles\":" + std::to_string(cyc_delta) +
@@ -1641,7 +1699,7 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
 // service: a service launch (kernel_idx -1 / -2), which goes to cupbop_service_main when the module has it
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
                                const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes,
-                               bool service = false) {
+                               bool service = false, dim3 cluster = dim3(1,1,1)) {
   vx_launch_info_t li = {};
   li.struct_size = sizeof(li);
   li.kernel      = service ? DC->service_kernel() : DC->kernel();
@@ -1649,7 +1707,10 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   li.args_host   = blob;
   li.args_size   = size;
   li.ndim        = ndim;
-  for (int i = 0; i < 3; ++i) { li.grid_dim[i] = grid[i]; li.block_dim[i] = block[i]; li.cluster_dim[i] = 1; }
+  for (int i = 0; i < 3; ++i) { li.grid_dim[i] = grid[i]; li.block_dim[i] = block[i];  }
+  li.cluster_dim[0] = cluster.x;
+  li.cluster_dim[1] = cluster.y;
+  li.cluster_dim[2] = cluster.z;
   li.lmem_size   = lmem_bytes;
   vx_event_h ev = nullptr;
   RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
@@ -1689,11 +1750,11 @@ static void cupbop_cta_loop_launch(kernel_arg_t *ka, uint32_t dims, uint32_t inn
   const uint64_t resident = per_core * nc;
   const uint32_t k = cupbop_env_u32("CUPBOP_CTA_K", 0);
   const uint64_t target = k ? std::max<uint64_t>((blocks + k - 1) / k, resident) : resident * std::max<uint32_t>(cupbop_env_u32("CUPBOP_CTA_WAVES", 1), 1);
-  uint32_t *w = &ka->ctx.printf_buffer_position;   // w[d]: printf_buffer_position, printf_buffer_capacity, work_dim
+  uint32_t *w = &ka->ctx.cluster_shape;   // CTA-loop geometry overlays cluster_shape, cluster_stride, work_dim
   w[0] = w[1] = w[2] = 0;
-  ka->ctx.printf_buffer = nullptr;                 // its low word: 1 = this launch loops
+  ka->ctx.cluster_barriers = 0;                 // its low word: 1 = this launch loops
   if (target * cupbop_env_u32("CUPBOP_CTA_MIN_TRIPS", 2) > blocks) return;   // the old code, the grid as launched
-  ka->ctx.printf_buffer = (char *)1;
+  ka->ctx.cluster_barriers = 1;
   if (linear && !chunk) {
     uint64_t looped = 1, other = 1;
     for (int d = 0; d < 3; ++d) (dims >> d & 1 ? looped : other) *= cg[d];
@@ -1830,6 +1891,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 cudaError_t cudaFree(void *devPtr) {
   auto DC = DeviceContext::instance(); 
   uint64_t mem_addr = (uint64_t)devPtr;  
+  dxa_tensor_maps.erase(mem_addr);
   // vx_mem_free(DC->device(), mem_addr);
   DC->dev_mem_free(devPtr);
   
@@ -2164,10 +2226,33 @@ cudaError_t cudaGetDeviceCount(int *count) {
   return cudaSuccess;
 }
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+static bool cupbop_supports_cluster_launch() {
+  const char *lmem = getenv("VORTEX_LOCALMEM_FLAG");
+  if (cupbop_schedule_flag() != 2 || (lmem && atoi(lmem) != 1)) return false;
+  uint64_t capacity = 0;
+  return vx_dev_caps(DeviceContext::instance()->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity) == 0 && capacity != 0;
+}
+
+cudaError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
+  if (!value) return cudaErrorInvalidValue;
+  if (device != 0) return cudaErrorInvalidDevice;
+  if (attr != cudaDevAttrClusterLaunch) return cudaErrorNotSupported;
+  *value = cupbop_supports_cluster_launch();
+  return cudaSuccess;
+}
+#endif
+
 cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
 
-  // dummy values
-  if (device == 0) {
+  if (!deviceProp) return cudaErrorInvalidValue;
+  if (device != 0) return cudaErrorInvalidDevice;
+  // Legacy properties of this runtime.
+  {
+    *deviceProp = {};
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    deviceProp->clusterLaunch = cupbop_supports_cluster_launch();
+#endif
     strcpy(deviceProp->name, "pthread");
     deviceProp->totalGlobalMem = 0;
     deviceProp->sharedMemPerBlock = 0;
@@ -2276,28 +2361,14 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 }
 } // extern C
 
-cudaError_t cudaLaunchKernel_vortex(                          
-                             const char *func, //-> kernel_name
-                             dim3 gridDim, 
-                             dim3 blockDim,
-                             void **args, 
-                             size_t sharedMem,
-                             cudaStream_t stream,
-                             const int num_args
-                             ) {
-
-  //open the file lookup.txt and load the content in the memory
-  //cpp hash table, look for the kernel name, and retrieve the kerenl index
-  
-  //DEBUG PURPOSE
+static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blockDim, void **args,
+                                        size_t sharedMem, cudaStream_t stream, int num_args,
+                                        dim3 cluster, bool explicit_cluster) {
+  if (!func || !*func) return cudaErrorInvalidDeviceFunction;
+  const bool launch_by_path = strchr(func, '/') != nullptr;
   DBG_COUT("RUNTIME FUNCTION" << std::endl);
   DBG_COUT("kernel_name: " << func << std::endl);
   DBG_COUT("number of arguments: " << num_args << std::endl);
-  //reading lookup.txt
-  std::fstream readfile;
-  readfile.open("lookup.txt", std::ios::in);
-  std::string kernel_idx_tmp;
-  std::string kernel_name_tmp;
 
   // Strip mangling prefix to get the bare function name for matching.
   // Host func: _ZL19initiPKiS0_Pi → strip _Z, L, digits → initiPKiS0_Pi
@@ -2308,35 +2379,81 @@ cudaError_t cudaLaunchKernel_vortex(
     while (i < s.size() && (s[i] == 'L' || (s[i] >= '0' && s[i] <= '9'))) i++;
     return s.substr(i);
   };
-  std::string func_stripped = stripPrefix(std::string(func));
-  DBG_COUT("func_stripped: " << func_stripped << std::endl);
-  cupbop_cta_fix cta_fix;
-
-  while(readfile >> kernel_idx_tmp) {
-    readfile >> kernel_name_tmp;
-    readfile.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    std::string lookup_stripped = stripPrefix(kernel_name_tmp);
-    DBG_COUT("debug : " << func_stripped << " vs " << lookup_stripped << std::endl);
-    if(func_stripped == lookup_stripped) {
-      DBG_COUT("found the kernel name in the lookup file, it is " << func << " with the index of " << std::stoi(kernel_idx_tmp) << std::endl);
-      break;
+  const std::string func_stripped = stripPrefix(func);
+  int kernel_index = -1;
+  std::string kernel_name_tmp;
+  {
+    std::ifstream lookup("lookup.txt");
+    int index, legacy_index = -1;
+    std::string entry, legacy_name;
+    bool ambiguous = false;
+    while (lookup >> index >> entry) {
+      lookup.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+      if (index < 0) continue;
+      // A by-path launch uses the selected module and its lookup table in the
+      // caller's working directory. Preserve its last-entry convention.
+      if (launch_by_path || entry == func) {
+        kernel_index = index;
+        kernel_name_tmp = entry;
+        if (!launch_by_path) break;
+      } else if (stripPrefix(entry) == func_stripped) {
+        if (legacy_index >= 0 && legacy_index != index) ambiguous = true;
+        legacy_index = index;
+        legacy_name = entry;
+      }
+    }
+    if (kernel_index < 0 && !ambiguous) {
+      kernel_index = legacy_index;
+      kernel_name_tmp = std::move(legacy_name);
     }
   }
-  readfile.close();                    
-  // The side-file tables hold kernel names. A launch by path names the module, and its kernel is what lookup.txt gave.
-  const std::string table_name = strchr(func, '/') ? stripPrefix(kernel_name_tmp) : func_stripped;
+  if (kernel_index < 0) return cudaErrorInvalidDeviceFunction;
+  DBG_COUT("kernel lookup matched " << kernel_name_tmp << " at index " << kernel_index << std::endl);
+  const std::string table_name = stripPrefix(kernel_name_tmp);
+  cupbop_cta_fix cta_fix;
                       
+  std::ifstream shapes("cupbop_cluster_dims.txt");
+  std::string name;
+  unsigned x, y, z;
+  bool split_barrier = false;
+  unsigned uses_barrier;
+  while (shapes >> name >> x >> y >> z >> uses_barrier) {
+    if (stripPrefix(name) != table_name) continue;
+    split_barrier = uses_barrier;
+    if (x) {
+      if (explicit_cluster && (x != cluster.x || y != cluster.y || z != cluster.z))
+        return cudaErrorInvalidValue;
+      cluster = dim3(x,y,z);
+      explicit_cluster = true;
+    }
+    break;
+  }
+  if (!gridDim.x || !gridDim.y || !gridDim.z || !blockDim.x || !blockDim.y || !blockDim.z ||
+      ((explicit_cluster || split_barrier) && uint64_t(blockDim.x) * blockDim.y > 1024 / blockDim.z) || sharedMem > UINT32_MAX)
+    return cudaErrorInvalidConfiguration;
+  if (!cluster.x || !cluster.y || !cluster.z || cluster.x > 16 || cluster.y > 16 || cluster.z > 16 ||
+      cluster.x * cluster.y * cluster.z > 16 || gridDim.x % cluster.x || gridDim.y % cluster.y ||
+      gridDim.z % cluster.z) return cudaErrorInvalidConfiguration;
+  const unsigned members = cluster.x * cluster.y * cluster.z;
+  const char *local_memory = getenv("VORTEX_LOCALMEM_FLAG");
+  if (members > 1 && local_memory && atoi(local_memory) != 1) return cudaErrorInvalidConfiguration;
+  if ((members > 1 || split_barrier) && cupbop_schedule_flag() != 2) return cudaErrorInvalidConfiguration;
   DBG_PRINT("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
     gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, num_args);
 
   auto DC = DeviceContext::instance();
+  if (explicit_cluster && sharedMem) {
+    uint64_t max_shared = 0;
+    if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &max_shared) || sharedMem > max_shared)
+      return cudaErrorInvalidConfiguration;
+  }
   DC->cleanup_args();
 
   int status = C_RUN;
   // upload kernel to device (reload when binary path changes)
   {
     // Use func as path if it looks like a file path (absolute or relative with /), else fallback
-    std::string krnl_path = (strchr(func, '/') != nullptr) ? std::string(func) : "./kernel.vxbin";
+    std::string krnl_path = launch_by_path ? std::string(func) : "./kernel.vxbin";
     if (DC->module() == nullptr || krnl_path != DC->last_krnl_path()) {
       cupbop_switch_module(DC->last_krnl_path(), krnl_path);
       DC->cleanup_krnl();
@@ -2433,18 +2550,22 @@ cudaError_t cudaLaunchKernel_vortex(
 
   // launch slots: one per argument, or ceil(bytes / 8) for a by-value struct parameter (cupbop_byval_layout)
   std::vector<uint64_t> byval_bytes;
-  const bool byval = cupbop_byval_layout(kernel_name_tmp, byval_bytes);
+  bool lifted_slots = false;
+  const bool byval = cupbop_byval_layout(kernel_name_tmp, byval_bytes, lifted_slots);
   int num_slots = num_args;
-  // host arguments: clang's launch stub passes one pointer per kernel parameter, but its own parameter count
-  // (num_args, from the host translator) counts a struct the x86-64 ABI splits in two (e.g. 16 bytes of floats) twice
-  const int nargs = byval ? (int)byval_bytes.size() : num_args;
   if (byval) {
-    if ((int)byval_bytes.size() != num_args)
-      DBG_PRINT("cudaLaunchKernel: %s: %zu kernel parameters, %d host arguments: using the kernel's\n",
-                kernel_name_tmp.c_str(), byval_bytes.size(), num_args);
     num_slots = 0;
     for (uint64_t b : byval_bytes) num_slots += b ? (int)((b + 7) / 8) : 1;
   }
+  // Binary replay can already supply a pointer to each physical launch slot
+  // for lifted kernels, including replay by name. Source launch stubs supply
+  // one pointer per logical parameter,
+  // even if the host translator's count includes x86-64 ABI fragments.
+  const bool flat_args = !byval || (lifted_slots && num_args == num_slots && size_t(num_slots) != byval_bytes.size());
+  const int nargs = flat_args ? num_args : (int)byval_bytes.size();
+  if (nargs != num_args)
+    DBG_PRINT("cudaLaunchKernel: %s: %zu kernel parameters, %d host arguments: using the kernel's\n",
+              kernel_name_tmp.c_str(), byval_bytes.size(), num_args);
 
   // allocate staging buffer for kernel arguments
   size_t abuf_size = sizeof(kernel_arg_t) + ((num_slots > 1) ? (sizeof(uint64_t) * (num_slots - 1)) : 0);
@@ -2484,7 +2605,7 @@ cudaError_t cudaLaunchKernel_vortex(
   memcpy(&abuf_ptr->ctx, &ctx, sizeof(context_t));
   
   // write the kerenel index here it retrives
-  abuf_ptr->kernel_idx = std::stoi(kernel_idx_tmp);
+  abuf_ptr->kernel_idx = kernel_index;
   abuf_ptr->num_args = num_slots;
   
   // Mark Debug Check 
@@ -2496,7 +2617,7 @@ cudaError_t cudaLaunchKernel_vortex(
   DBG_PRINT("*** kernel ctx: num_groups[0]=%d, num_groups[1]=%d\n", abuf_ptr->ctx.num_groups[0],abuf_ptr->ctx.num_groups[1]);
 
   // write arguments
-  if (!byval) {
+  if (flat_args) {
     for (int i = 0; i < nargs; ++i) {
       memcpy(&abuf_ptr->args[i], args[i], sizeof(uint64_t)); // 여기 체크 필요
       DBG_PRINT("*** cuda kernel args[%d]=0x%llx\n", i, (uint64_t)abuf_ptr->args[i]);
@@ -2577,11 +2698,36 @@ cudaError_t cudaLaunchKernel_vortex(
   // ── DXA descriptor programming (before kernel launch) ──────────────────
   // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
   // for this kernel (resolved against this launch's arguments).
+  const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
+  std::set<uint32_t> dxa_slots;
+  if (coalesced_cp_async) {
+    uint64_t isa = 0, threads = 0, vm = 0;
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &threads));
+    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
+    if (threads != 8 || !(isa & VX_ISA_EXT_DXA) || vm) {
+      fprintf(stderr, "cudaLaunchKernel: coalesced cp.async requires an 8-lane DXA device with flat global memory\n");
+      std::abort();
+    }
+    DxaDescEntry descriptor{};
+    descriptor.slot = CUPBOP_CP_ASYNC_DXA_SLOT;
+    descriptor.rank = 1;
+    descriptor.elem_bytes = sizeof(uint32_t);
+    descriptor.size[0] = 1u << 30;
+    descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
+    dxa_program(DC->device(), descriptor);
+    dxa_slots.insert(descriptor.slot);
+  }
   for (auto &desc : dxa_descriptors) {
+    if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", desc.slot);
+      std::abort();
+    }
     DBG_PRINT("[DXA] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
               desc.slot, desc.base_addr, desc.rank, desc.size[0], desc.size[1], desc.size[2], desc.stride[0],
               desc.stride[1], desc.box[0], desc.box[1], desc.box[2], desc.elem_bytes, desc.layout, desc.fill);
     dxa_program(DC->device(), desc);
+    dxa_slots.insert(desc.slot);
   }
   dxa_descriptors.clear();
 
@@ -2609,39 +2755,43 @@ cudaError_t cudaLaunchKernel_vortex(
       d.stride[0] = d.size[0] * adesc.elem_bytes;
       d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
     }
+    if (coalesced_cp_async && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", d.slot);
+      std::abort();
+    }
     DBG_PRINT("[DXA-auto] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
               d.slot, d.base_addr, d.rank, d.size[0], d.size[1], d.size[2], d.stride[0], d.stride[1],
               d.box[0], d.box[1], d.box[2], d.elem_bytes, d.layout, d.fill);
     dxa_program(DC->device(), d);
+    dxa_slots.insert(d.slot);
   }
 
 
-  // ── TMA tensor maps in DXA mode (cuTensorMapEncodeTiled with CUPBOP_TMA_DXA=1): a DXA slot per by-value
-  // CUtensorMap argument of this launch, from slot 15 down (explicit descriptors use the low slots); the device
-  // record learns its slot. A tensor map reached otherwise (e.g. through a pointer) keeps no slot and is copied
-  // in software by the device helper.
-  {
-    uint32_t next_slot = 15;
-    std::map<uint64_t, uint32_t> given;
-    for (int i = 0; i < nargs; ++i) {
-      cupbop_tmap r;
-      memcpy(&r, args[i], sizeof(r)); // args[i] points at the argument's host value (128 bytes for a CUtensorMap)
-      if (r.magic != CUPBOP_TMAP_MAGIC || r.mode != CUPBOP_TMAP_MODE_DXA || !r.self || given.count(r.self)) continue;
+  // A tensor map's first word is its registered device address, including maps inside a by-value parameter.
+  std::set<uint64_t> launch_tensor_maps;
+  if (!dxa_tensor_maps.empty()) {
+    int next_slot = 15;
+    for (int i = 0; i < num_slots; ++i) {
+      auto map = dxa_tensor_maps.find(abuf_ptr->args[i]);
+      if (map == dxa_tensor_maps.end() || launch_tensor_maps.count(map->first)) continue;
+      while (next_slot >= 8 && dxa_slots.count(next_slot)) --next_slot;
       if (next_slot < 8) {
-        fprintf(stderr, "cudaLaunchKernel: more than 8 DXA-mode tensor maps; the rest are copied in software\n");
+        fprintf(stderr, "cudaLaunchKernel: no free TMA descriptor slots; remaining tensor maps use software copies\n");
         break;
       }
+      const auto &r = map->second;
       DxaDescEntry d{};
-      d.slot = next_slot--; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem;
+      d.slot = next_slot; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem; d.swizzle = r.swizzle;
+      d.layout = r.layout; d.tc_n = r.geometry & 0xffffu; d.block_k = r.geometry >> 16;
       for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
       for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
       d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
       std::string err = dxa_desc_check(d);
       if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
       dxa_program(DC->device(), d);
-      given[r.self] = d.slot;
-      cudaMemcpy((void *)(uintptr_t)(r.self + offsetof(cupbop_tmap, dxa_slot)), &d.slot, sizeof(uint32_t),
-                 cudaMemcpyHostToDevice);
+      DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
+      launch_tensor_maps.insert(r.self);
+      --next_slot;
       DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
     }
   }
@@ -2664,6 +2814,7 @@ cudaError_t cudaLaunchKernel_vortex(
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
       const uint64_t core_threads = (uint64_t)CUPBOP_EFF_NUM_WARPS() * CUPBOP_EFF_NUM_THREADS();   // VX_RT_NUM_WARPS/SIMD_WIDTH-aware
       if (block_threads > core_threads) {
+        if (explicit_cluster) return cudaErrorInvalidConfiguration;
         printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
                (unsigned long)block_threads, (unsigned long)core_threads);
         std::abort();
@@ -2672,11 +2823,6 @@ cudaError_t cudaLaunchKernel_vortex(
       block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
       ndim = 3;
       lmem = cupbop_lmem_touched(table_name, cupbop_static_lmem_bytes(table_name) + (uint32_t)sharedMem, blockDim);
-      uint64_t lmem_cap = 0;
-      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
-        printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
-        std::abort();
-      }
     } else if (schedule == 1) {
       // core mapping (virt): CTA == CUDA block, but only P physical warps
       // (CUPBOP_VIRT_WARPS, default = all block warps). The kernel loops over
@@ -2753,15 +2899,67 @@ cudaError_t cudaLaunchKernel_vortex(
     if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
       cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, cta_fix.linear, grid, block, lmem);
     cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
+    if (schedule == 1 || schedule == 2) {
+      uint64_t lmem_cap = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
+        if (explicit_cluster) return cudaErrorInvalidConfiguration;
+        printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
+        std::abort();
+      }
+    }
+    // Match the KMU slot pitch (CtaDispatcher::step).
+#ifdef VX_CFG_MEM_BLOCK_SIZE
+    constexpr uint64_t alignment = VX_CFG_MEM_BLOCK_SIZE;
+#else
+    constexpr uint64_t alignment = 64;
+#endif
+    const uint64_t stride = (uint64_t(lmem) + alignment - 1) & ~(alignment - 1);
+    const uint64_t threads = uint64_t(blockDim.x) * blockDim.y * blockDim.z;
+    const uint32_t lanes = CUPBOP_EFF_NUM_THREADS();
+    if (members > 1) {
+      uint64_t capacity = 0;
+      if (cta_fix.dims || vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity) ||
+          members * stride > capacity ||
+          members * ((threads + lanes - 1) / lanes) > CUPBOP_EFF_NUM_WARPS())
+        return cudaErrorInvalidConfiguration;
+    }
+    if (cta_fix.dims && split_barrier) return cudaErrorInvalidConfiguration;
+    if (!cta_fix.dims) {
+      abuf_ptr->ctx.cluster_shape = cluster.x | (cluster.y << 8) | (cluster.z << 16) |
+                                  (uint32_t(explicit_cluster) << 24);
+      abuf_ptr->ctx.cluster_stride = stride;
+      // Blackwell's opaque response packs the Y and Z coordinates into 16 bits each.
+      if (DC->is_simx() && (schedule == 1 || schedule == 2) && grid[1] <= 65536 && grid[2] <= 65536)
+        abuf_ptr->ctx.direct_launch_flags = CUPBOP_LAUNCH_SIMX_CLC;
+    }
+    void *barriers = nullptr;
+    if (split_barrier) {
+      const size_t groups = size_t(gridDim.x / cluster.x) * (gridDim.y / cluster.y);
+      const size_t nz = gridDim.z / cluster.z;
+      const size_t bytes = (8 + 4 * threads * members + 7) & ~size_t(7);
+      if (!nz || groups > SIZE_MAX / nz / bytes) return cudaErrorInvalidConfiguration;
+      const size_t storage = groups * nz * bytes;
+      cudaError_t error = cudaMalloc(&barriers, storage);
+      if (error != cudaSuccess) return error;
+      error = cudaMemset(barriers, 0, storage);
+      if (error != cudaSuccess) { cudaFree(barriers); return error; }
+      abuf_ptr->ctx.cluster_barriers = uintptr_t(barriers);
+    }
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
-    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem);
+    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, cluster);
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
     // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
     // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
     // SimX v3.0 resets its memory, L2 and LMEM counters at every launch, so for a program with __device__ variables that
     // dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
-    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem);
+    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem, cluster);
+    if (barriers) cudaFree(barriers);
   }
+
+  // Descriptor DCRs are reused at the next launch, including launches that access a map indirectly.
+  uint32_t invalid_slot = UINT32_MAX;
+  for (uint64_t address : launch_tensor_maps)
+    DC->copy_to_dev(address + offsetof(cupbop_tmap, dxa_slot), &invalid_slot, sizeof(invalid_slot));
 
   // Read back __device__ variables from device memory after kernel execution.
   // These are registered as memcpy_symbol entries so they get restored
@@ -2884,5 +3082,40 @@ cudaError_t cudaLaunchKernel_vortex(
   
   return cudaSuccess;
 }
+
+cudaError_t cudaLaunchKernel_vortex(const char *func, dim3 grid, dim3 block, void **args,
+                                    size_t shared, cudaStream_t stream, int nargs) {
+  return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, dim3(1,1,1), false);
+}
+
+// Used by cubin replay with the geometry captured by the CUDA driver.
+cudaError_t cupbopLaunchClusterKernel(const char *func, dim3 grid, dim3 block, void **args,
+                                      size_t shared, cudaStream_t stream, int nargs, dim3 cluster) {
+  return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, cluster, true);
+}
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+cudaError_t cupbopLaunchKernelEx(const cudaLaunchConfig_t *config, const char *func, void **args, int nargs) {
+  if (!config || (nargs && !args) || (config->numAttrs && !config->attrs)) return cudaErrorInvalidValue;
+  dim3 cluster(1,1,1);
+  bool has_cluster = false;
+  for (unsigned i = 0; i < config->numAttrs; ++i) {
+    const auto &a = config->attrs[i];
+    if (a.id == cudaLaunchAttributeIgnore) continue;
+    if (a.id == cudaLaunchAttributeClusterSchedulingPolicyPreference) {
+      // A preference is a hint. KMU always keeps a cluster resident on one core.
+      auto policy = a.val.clusterSchedulingPolicyPreference;
+      if (policy != cudaClusterSchedulingPolicyDefault && policy != cudaClusterSchedulingPolicySpread &&
+          policy != cudaClusterSchedulingPolicyLoadBalancing) return cudaErrorInvalidValue;
+      continue;
+    }
+    if (a.id != cudaLaunchAttributeClusterDimension) return cudaErrorNotSupported;
+    if (has_cluster) return cudaErrorInvalidValue;
+    cluster = dim3(a.val.clusterDim.x, a.val.clusterDim.y, a.val.clusterDim.z);
+    has_cluster = true;
+  }
+  return cupbop_launch_kernel(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes,
+                              config->stream, nargs, cluster, has_cluster);
+}
+#endif
 
 }
