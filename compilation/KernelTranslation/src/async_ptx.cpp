@@ -1630,8 +1630,18 @@ unsigned queueCopies(PassState &S, Function *F, std::vector<CallInst *> &copies,
   return K;
 }
 
+// CUPBOP_TMA_BYTE_CHECK=1: after a moved arrive, check at run time that its queued TMA copies target the arrive's
+// mbarrier and that their bytes add up to the arrive's expect_tx (__cupbop_txq_check traps otherwise). Off by default:
+// the check reads every copy's tensor map and costs the Triton TensorDescriptor matmul 15-31% on the G2 main build
+// (experiments/pcmerge/README_KO.md). Without the call the queue's byte fields are dead and the runtime's bookkeeping folds away.
+bool tmaByteCheck() {
+  const char *e = std::getenv("CUPBOP_TMA_BYTE_CHECK");
+  return e && std::atoi(e) != 0;
+}
+
 void checkTmaBytes(PassState &S, IRBuilder<> &B, Value *Q, unsigned K, Value *bar, Value *bytes,
                    const std::vector<CallInst *> &copies) {
+  if (!tmaByteCheck()) return;
   const bool counted = bytes && K <= kTxqN &&
       std::all_of(copies.begin(), copies.end(), [](CallInst *C) {
         return C->getCalledFunction() && C->getCalledFunction()->getName() == kTmaLoadQi;

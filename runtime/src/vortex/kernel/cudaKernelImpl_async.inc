@@ -382,12 +382,13 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_load_qi(
                                                                               int32_t c2, int32_t c3, int32_t c4) {
   cupbop_txq *q = static_cast<cupbop_txq *>(q_);
   if (j < CUPBOP_TXQ_N) {
+    // For __cupbop_txq_check only (CUPBOP_TMA_BYTE_CHECK=1 at translation). An overflow saturates and the check reports
+    // it; without the check these stores are dead and the tensor-map reads fold away.
     const cupbop_tmap *t = cupbop_tmap_of(desc, rank);
     uint64_t bytes = t->elem;
     for (uint32_t dim = 0; dim < rank; ++dim) bytes *= t->box[dim];
-    if (bytes > UINT32_MAX) cupbop_async_fail("tensor copy bytes overflow mbarrier transaction", j, rank);
     q->e[j].mbar = mbar;
-    q->e[j].bytes = (uint32_t)bytes;
+    q->e[j].bytes = bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
   }
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
   if ((j < CUPBOP_TXQ_N) & cupbop_tma_dxa_ok(slot, smem, c0, c1, c2, c3, c4)) {
@@ -410,6 +411,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_check(vo
   for (uint32_t j = 0; j < CUPBOP_TXQ_N; ++j) {
     if (j >= count) break;
     const auto entry_bytes = q->e[j].bytes;
+    if (entry_bytes == UINT32_MAX) cupbop_async_fail("tensor copy bytes overflow mbarrier transaction", j, count);
     if (counted && entry_bytes && q->e[j].mbar != mbar)
       cupbop_async_fail("TMA copy and mbarrier.arrive.expect_tx target different barriers", j, count);
     bytes += entry_bytes;
