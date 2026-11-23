@@ -317,8 +317,14 @@ static __attribute__((always_inline)) inline uint32_t cupbop_tma_slot(const cupb
 
 static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok(uint32_t slot, const void *smem, int32_t c0,
                                                                   int32_t c1, int32_t c2, int32_t c3, int32_t c4) {
+#ifdef VX_DXA_SWIZZLE_128B
   const bool aligned = !(slot & cupbop_dxa_swizzle_flag) || !(reinterpret_cast<uintptr_t>(smem) & 127u);
   return (slot < 32u) & aligned & (vx_thread_id() == 0) & ((c0 | c1 | c2 | c3 | c4) >= 0);
+#else
+  // Without the 128B-swizzle DXA, cupbop_tma_slot never sets the swizzle flag: the slot is < 16 or none (0xFFFFFFFF).
+  (void)smem;
+  return (slot < 16u) & (vx_thread_id() == 0) & ((c0 | c1 | c2 | c3 | c4) >= 0);
+#endif
 }
 // cp.async.bulk.tensor.<rank>d global -> shared: one copy by each calling thread (the elected one). DXA mode
 // (the host gave the tensor map a DXA slot at launch): an asynchronous DXA transfer completing on the mbarrier's
