@@ -2615,6 +2615,10 @@ void lower_async_ptx(Module *M) {
   std::map<Function *, std::vector<Function *>> callers, callees;
   std::set<Function *> barrierFunctions;
   std::set<Function *> structuredTma, splitByteTransactions;
+  // A lifted producer may issue several elected TMA loads and account for
+  // all of their bytes from another lane. The counted software mbarrier ABI
+  // supports that case without moving arrivals across divergent control flow.
+  const char *countedTma = std::getenv("CUPBOP_TMA_COUNTED_INLINE");
   for (auto &F : *M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -2623,6 +2627,10 @@ void lower_async_ptx(Module *M) {
         if (C->isInlineAsm()) {
           simplifySelfClusterArrive(*C);
           const auto &body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
+          if (countedTma && StringRef(countedTma) == "1" &&
+              body.find("cp.async.bulk.tensor.") != std::string::npos &&
+              body.find("mbarrier::complete_tx::bytes") != std::string::npos)
+            S.tcgenFunctions.insert(&F);
           if (body.find("mbarrier") != std::string::npos) barrierFunctions.insert(&F);
           if (body.find("mbarrier.expect_tx.") != std::string::npos || body.find("mbarrier.complete_tx.") != std::string::npos)
             splitByteTransactions.insert(&F);
