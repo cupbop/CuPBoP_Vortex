@@ -2531,6 +2531,7 @@ Value *async_tensor_map_operand(CallBase &call) {
   if (name == kTmaLoad || name == "__cupbop_tcgen_tma_load" || name == "__cupbop_tma_multicast")
     return call.getArgOperand(1);
   if (name == kTmaLoadQi) return call.getArgOperand(5);
+  if (name == "__cupbop_tma_direct") return call.getArgOperand(4); // async_direct.cpp
   if (name == kTmaStore || name == "__cupbop_tensor_reduce") return call.getArgOperand(0);
   return nullptr;
 }

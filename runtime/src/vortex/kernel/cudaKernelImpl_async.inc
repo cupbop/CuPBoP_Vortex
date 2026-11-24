@@ -456,6 +456,52 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_issue(vo
   (void)q_; (void)K; (void)wide;
 #endif
 }
+// ---- the direct DXA form of an elected TMA load (translator async_direct.cpp, CUPBOP_TMA_DIRECT=1) ----------------------
+// Every thread of the CTA calls it, with its warp converged, and `when`, the slot (__cupbop_tma_slot), the barrier
+// (__vx_dxa_barrier_id), the destination and the coordinates are the same in every thread: the translator checked.
+// When `when` holds, the CTA's first warp makes the one transfer and registers it on the barrier; every warp then waits
+// with __vx_dxa_wait(bar). There is no mbarrier record: the barrier's number is the translator's constant, and the
+// hardware barrier holds the phase and the pending transfers.
+// A tensor map without a DXA slot (software mode), or a negative coordinate (the DXA takes unsigned ones): lane 0 of
+// that warp copies the box in place of the transfer. The warp arrives at the wait only after it, so the wait still
+// orders the copy before every read.
+// Both tests have one value in every lane of a warp, which the back end cannot see through the CSR read and the
+// arguments: without the marks it puts a split/join around each. CUPBOP_TMA_DIRECT_UNIFORM=0 at the kernel compile
+// leaves them unmarked (measurement).
+#if !defined(CUPBOP_TMA_DIRECT_UNIFORM) || CUPBOP_TMA_DIRECT_UNIFORM
+#define CUPBOP_TMA_DIRECT_U(c) cupbop_vx_uniform(c)
+#else
+#define CUPBOP_TMA_DIRECT_U(c) (c)
+#endif
+// cupbop_tma_dxa_ok for a converged warp: without the lane test (lane 0 is WGATHER's source lane)
+static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok_warp(uint32_t slot, const void *smem, int32_t c0,
+                                                                       int32_t c1, int32_t c2, int32_t c3,
+                                                                       int32_t c4) {
+#ifdef VX_DXA_SWIZZLE_128B
+  const bool aligned = !(slot & cupbop_dxa_swizzle_flag) || !(reinterpret_cast<uintptr_t>(smem) & 127u);
+  return (slot < 32u) & aligned & ((c0 | c1 | c2 | c3 | c4) >= 0);
+#else
+  (void)smem;
+  return (slot < 16u) & ((c0 | c1 | c2 | c3 | c4) >= 0);
+#endif
+}
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_direct(uint32_t when, uint32_t slot,
+                                                                             uint32_t bar, void *smem,
+                                                                             const void *desc, uint32_t rank,
+                                                                             int32_t c0, int32_t c1, int32_t c2,
+                                                                             int32_t c3, int32_t c4) {
+  if (CUPBOP_TMA_DIRECT_U((when == 0) | ((uint32_t)csr_read_nv(VX_CSR_CTA_RANK) != 0))) return;
+#if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
+  if (CUPBOP_TMA_DIRECT_U(cupbop_tma_dxa_ok_warp(slot, smem, c0, c1, c2, c3, c4))) {
+    vx_barrier_expect_tx((int)bar, 1);
+    cupbop_tma_dxa_issue(slot & 15u, bar, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3,
+                         (uint32_t)c4);
+    return;
+  }
+#endif
+  (void)slot; (void)bar;
+  if (vx_thread_id() == 0) cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
+}
 // p active threads arriving cnt times each, of a warp: the general case of __cupbop_mbar_arrive (popcount, which is a
 // sequence of ALU operations on a core without Zbb), out of line so that the one-thread path does not compute it
 static __attribute__((noinline)) uint32_t cupbop_mbar_arrivals(uint32_t m, uint32_t cnt) {

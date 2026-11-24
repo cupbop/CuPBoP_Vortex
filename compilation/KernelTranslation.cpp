@@ -3,6 +3,7 @@
 #include "handle_sync.h"
 #include "init.h"
 #include "async_copy.h"
+#include "async_direct.h"
 #include "async_ptx.h"
 #include "insert_sync.h"
 #include "insert_warp_loop.h"
@@ -150,6 +151,9 @@ int main(int argc, char **argv) {
   // lower_named_barriers and lower_cp_async only see what is left, and every later pass sees plain calls
   DBG_LOG("lower_async_ptx\n");
   inlineCudaAsyncHeaders(*program);
+  // CUPBOP_TMA_DIRECT (default 0): an elected TMA pipeline in its direct DXA form (async_direct.h); what it does not
+  // rewrite reaches lower_async_ptx unchanged
+  lower_tma_direct(program);
   lower_async_ptx(program);
   // wide by-value parameters (CuLifter parameter structs) -> pointer to their consecutive launch slots
   pass_wide_kernel_args_by_slot(program);
