@@ -13,9 +13,9 @@
 //  - every asm of the kernel that mentions mbarrier or cp.async is one of the five statements of async_direct.h, and the
 //    kernel has no mbarrier / cp.async intrinsic, named barrier or DXA call of its own;
 //  - the block is 1-D with a known size (nvvm.reqntid);
-//  - each mbarrier is an 8-byte word of one shared variable: the inits at constant offsets, the words in a row, count 1
-//    (a word may be initialized more than once); the other statements at one of those words, or at word [an index that
-//    is the same in every thread];
+//  - each mbarrier is an 8-byte word of one shared variable: the inits at constant offsets with count 1 (a word may be
+//    initialized more than once); the other statements at one of those words, or at word [an index that is the same in
+//    every thread] counted from one of them;
 //  - the predicate of an arrive and of a load is (one thread of the block) and (a condition that is the same in every
 //    thread of the CTA);
 //  - a load's tensor map is a kernel parameter, and its destination and coordinates are the same in every thread;
@@ -482,17 +482,24 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
       inits.insert(refs[i].off); // a word can be initialized again (Triton without a pipeline: init, arrive, load, wait, inval per load)
     }
   if (inits.empty()) return no("no mbarrier.init");
-  const int64_t base = *inits.begin();
   const unsigned words = inits.size();
-  if (*inits.rbegin() != base + 8 * (int64_t)(words - 1)) return no("mbarrier words that are not in a row");
   if (words > numBarriers - 1)
     return no(std::to_string(words) + " mbarriers, the CTA has " + std::to_string(numBarriers - 1) + " Vortex barriers for them");
+  // Vortex barrier 1 + k for the k-th word in address order: the words need not follow each other (an attention kernel has
+  // one mbarrier behind its Q tile and two behind its K / V stages). A statement at word [index] counts from its base
+  // word, which is right for words that do follow each other, as the elements of an mbarrier array do.
+  std::map<int64_t, unsigned> number;
+  for (int64_t o : inits) number.emplace(o, (unsigned)number.size());
   for (size_t i = 0; i < sites.size(); ++i) {
-    const int64_t d = refs[i].off - base;
-    if (d < 0 || d % 8 || d / 8 >= (int64_t)words) return no("an mbarrier statement on a word without mbarrier.init");
-    sites[i].word = (unsigned)(d / 8);
+    auto it = number.find(refs[i].off);
+    if (it == number.end()) return no("an mbarrier statement on a word without mbarrier.init");
+    sites[i].word = it->second;
     sites[i].index = refs[i].index;
   }
+  // the last words that follow each other: the tail of the shared memory when the kernel's buffers end before them
+  int64_t tail = *inits.rbegin();
+  while (inits.count(tail - 8)) tail -= 8;
+  const uint64_t tailBytes = (uint64_t)(*inits.rbegin() + 8 - tail);
 
   // who executes what
   Divergence A(F);
@@ -582,17 +589,19 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
   if (auto *AT = dyn_cast<ArrayType>(refs[0].G->getValueType()); AT && AT->getNumElements() == 0 && !refs[0].G->hasInitializer()) {
     const char *e = std::getenv("CUPBOP_TMA_DIRECT_SHRINK");
     if (!e || std::atoi(e) != 0) {
-      launch_fix_note(M, F.getName(), "mbar_off", (uint64_t)base);
-      launch_fix_note(M, F.getName(), "mbar_bytes", 8 * (uint64_t)words);
+      launch_fix_note(M, F.getName(), "mbar_off", (uint64_t)tail);
+      launch_fix_note(M, F.getName(), "mbar_bytes", tailBytes);
       shrink = true;
     }
   }
   done = std::to_string(count[Load]) + " TMA load(s) issue their DXA transfer directly, " + std::to_string(count[Wait]) +
          " wait(s) on Vortex barrier(s) 1.." + std::to_string(words) + "; dropped " + std::to_string(count[Init]) + " init, " +
          std::to_string(count[Arrive]) + " arrive.expect_tx, " + std::to_string(count[Inval]) + " inval, " +
-         std::to_string(elects.size()) + " elect.sync; " + var + "+" + std::to_string(base) + ".." +
-         std::to_string(base + 8 * words - 1) + " (the mbarrier words) has no access left" +
-         (shrink ? ", and a launch that ends its shared memory there leaves them out" : "");
+         std::to_string(elects.size()) + " elect.sync; the " + std::to_string(words) + " mbarrier word(s) of " + var +
+         " have no access left" +
+         (shrink ? ", and a launch that ends its shared memory behind " + var + "+" + std::to_string(tail) + ".." +
+                       std::to_string(tail + (int64_t)tailBytes - 1) + " leaves those out"
+                 : "");
   return true;
 }
 
