@@ -1221,6 +1221,7 @@ static std::string cupbop_strip_prefix(const std::string &s) {
 // A new key goes into cupbop_apply_launch_fix: a key this runtime does not know stops the launch, because a transformed kernel
 // launched without its rewrite runs wrongly.
 // cta_*: CUPBOP_CTA_LOOP; what the launched grid becomes is decided with the block's local memory, cupbop_cta_loop_launch.
+// mbar_off, mbar_bytes: CUPBOP_TMA_DIRECT; the dynamic shared size loses the kernel's unused mbarrier words when they are its end.
 struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false, linear = false; };
 static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem, cupbop_cta_fix &cta) {
   static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
@@ -1247,8 +1248,13 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
   }
   auto it = table.find(func_stripped);
   if (it == table.end()) return;
+  uint64_t mbar_off = 0, mbar_bytes = 0;
   for (auto &[key, v] : it->second) {
-    if (key == "dyn_smem") {
+    if (key == "mbar_off") {
+      mbar_off = v;
+    } else if (key == "mbar_bytes") {
+      mbar_bytes = v;
+    } else if (key == "dyn_smem") {
       DBG_PRINT("cudaLaunchKernel: %s: dynamic shared size %lu -> %lu (cupbop_launch_fix.txt)\n", func_stripped.c_str(), (unsigned long)sharedMem, (unsigned long)v);
       sharedMem = v;
     } else if (key == "cta_dims") {
@@ -1263,6 +1269,12 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
       fprintf(stderr, "cudaLaunchKernel: %s: unknown launch rewrite `%s` in cupbop_launch_fix.txt\n", func_stripped.c_str(), key.c_str());
       std::abort();
     }
+  }
+  // mbar_*: the kernel's mbarrier words, the last bytes of this launch's dynamic shared memory, have no access left
+  // (CUPBOP_TMA_DIRECT). Only a launch that ends exactly behind them: with any other size the tail is not known to be theirs.
+  if (mbar_bytes && sharedMem == mbar_off + mbar_bytes) {
+    DBG_PRINT("cudaLaunchKernel: %s: dynamic shared size %lu -> %lu (unused mbarrier words, cupbop_launch_fix.txt)\n", func_stripped.c_str(), (unsigned long)sharedMem, (unsigned long)mbar_off);
+    sharedMem = mbar_off;
   }
 }
 // Per-kernel static __shared__ bytes, written by mem_share2local into kernel_lmem.log.

@@ -30,6 +30,7 @@
 // arrived in. For the same reason a second mbarrier.init of a word needs nothing: it restarts the PTX phase count, which
 // the barrier does not keep.
 #include "async_direct.h"
+#include "launch_fix.h"
 #include "tool.h"
 
 #include "llvm/ADT/MapVector.h"
@@ -564,13 +565,27 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
   for (CallInst *C : elects) C->eraseFromParent();
 
   const std::string var = refs[0].G->getName().str();
-  // for the shared-memory size: these bytes of the variable have no access left
-  F.addFnAttr("cupbop-tma-direct-mbar", var + ":" + std::to_string(base) + ":" + std::to_string(8 * words));
+  // The mbarrier words have no access left. When they are the end of the kernel's dynamic shared memory (Triton puts
+  // them after its buffers), the launch can leave them out of the CTA's local memory: mbar_off / mbar_bytes
+  // (launch_fix.h), which the runtime applies only to a launch whose dynamic size is exactly off + bytes. A CTA area
+  // 16 bytes over a power of two costs a whole CTA per core (4 x 4096-byte tiles + 2 mbarriers: 3 CTAs in 64 KB, not 4).
+  // The program itself guarantees that nothing else is in those bytes: an mbarrier word is not ordinary memory in PTX.
+  // CUPBOP_TMA_DIRECT_SHRINK=0 leaves the launch as it is (measurement).
+  bool shrink = false;
+  if (auto *AT = dyn_cast<ArrayType>(refs[0].G->getValueType()); AT && AT->getNumElements() == 0 && !refs[0].G->hasInitializer()) {
+    const char *e = std::getenv("CUPBOP_TMA_DIRECT_SHRINK");
+    if (!e || std::atoi(e) != 0) {
+      launch_fix_note(M, F.getName(), "mbar_off", (uint64_t)base);
+      launch_fix_note(M, F.getName(), "mbar_bytes", 8 * (uint64_t)words);
+      shrink = true;
+    }
+  }
   done = std::to_string(count[Load]) + " TMA load(s) issue their DXA transfer directly, " + std::to_string(count[Wait]) +
          " wait(s) on Vortex barrier(s) 1.." + std::to_string(words) + "; dropped " + std::to_string(count[Init]) + " init, " +
          std::to_string(count[Arrive]) + " arrive.expect_tx, " + std::to_string(count[Inval]) + " inval, " +
          std::to_string(elects.size()) + " elect.sync; " + var + "+" + std::to_string(base) + ".." +
-         std::to_string(base + 8 * words - 1) + " (the mbarrier words) has no access left";
+         std::to_string(base + 8 * words - 1) + " (the mbarrier words) has no access left" +
+         (shrink ? ", and a launch that ends its shared memory there leaves them out" : "");
   return true;
 }
 

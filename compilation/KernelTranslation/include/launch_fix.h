@@ -17,6 +17,8 @@
 // Keys the runtime knows: see cupbop_apply_launch_fix. An unknown key is an error at launch: a rewrite that a transformed kernel
 // needs and the runtime ignores would run the kernel wrongly.
 // dyn_smem=<bytes>: the launch's dynamic shared size is replaced (a folded @shared_mem holds the whole CTA area: 0).
+// mbar_off=<bytes>, mbar_bytes=<bytes>: CUPBOP_TMA_DIRECT (async_direct.cpp) left bytes [off, off + bytes) of the dynamic shared memory,
+// the kernel's mbarrier words, without any access; a launch whose dynamic size is exactly off + bytes gets off bytes.
 // cta_dims=<mask>, cta_inner=<d>, cta_chunk=1: the kernel has the block loop of CUPBOP_CTA_LOOP (cta_loop.cpp); the runtime chooses the
 // launched grid and the context word that selects the loop.
 
