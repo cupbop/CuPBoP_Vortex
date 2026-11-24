@@ -2958,13 +2958,40 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       abuf_ptr->ctx.cluster_barriers = uintptr_t(barriers);
     }
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
-    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, cluster);
+    // CUPBOP_PLACE=x,y,z (measurement, default off; experiments/cluster README 1k): hand the dispatcher a cluster shape for
+    // placement only. The kernel still sees a cluster of one CTA (ctx.cluster_shape stays 1,1,1); the dispatcher keeps the
+    // x*y*z neighbouring CTAs resident on one core together, which changes the order the grid is walked in and nothing
+    // else. Applied only to a launch with no cluster of its own, no cluster barrier and no CTA loop, on schedule 2, when
+    // the shape divides the launched grid and fits one core's warps and local memory. Otherwise the launch goes as it is.
+    // One line on stderr either way.
+    dim3 place = cluster;
+    if (const char *pe = getenv("CUPBOP_PLACE")) {
+      unsigned px = 1, py = 1, pz = 1;
+      const bool parsed = sscanf(pe, "%u,%u,%u", &px, &py, &pz) == 3 && px && py && pz;
+      const uint64_t pm = (uint64_t)px * py * pz;
+      const uint64_t cta_warps = (threads + lanes - 1) / lanes;
+      uint64_t capacity = 0;
+      const char *why = nullptr;
+      if (!parsed) why = "not x,y,z";
+      else if (pm == 1) why = "one CTA";
+      else if (members > 1 || split_barrier || explicit_cluster) why = "the kernel has a cluster of its own";
+      else if (cta_fix.dims) why = "CTA loop";
+      else if (schedule != 2) why = "not schedule 2";
+      else if (px > 16 || py > 16 || pz > 16 || pm > 16) why = "more than 16 CTAs";
+      else if (grid[0] % px || grid[1] % py || grid[2] % pz) why = "does not divide the grid";
+      else if (pm * cta_warps > CUPBOP_EFF_NUM_WARPS()) why = "more warps than a core has";
+      else if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity) || pm * stride > capacity) why = "more local memory than a core has";
+      if (!why) place = dim3(px, py, pz);
+      fprintf(stderr, "cupbop: place %s: %s %s%s (grid %u,%u,%u, %lu warps and %lu bytes per CTA)\n", func_stripped.c_str(), pe,
+              why ? "not applied: " : "applied", why ? why : "", grid[0], grid[1], grid[2], (unsigned long)cta_warps, (unsigned long)stride);
+    }
+    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, place);
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
     // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
     // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
     // SimX v3.0 resets its memory, L2 and LMEM counters at every launch, so for a program with __device__ variables that
     // dump shows the read-back copy's traffic (lifted CUTLASS: ~38 DRAM requests).
-    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem, cluster);
+    cupbop_perf_post(DC, func_stripped, kernel_idx, schedule, grid, block, ndim, lmem, gridDim, blockDim, sharedMem, place);
     if (barriers) cudaFree(barriers);
   }
 
