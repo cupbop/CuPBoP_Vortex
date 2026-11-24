@@ -8,6 +8,8 @@ jobs:
     runs-on: [self-hosted]
     steps:
       - run: |
-          du -sh /projects/ci-runners/CuPBoP-Vortex/logs
-          rm -rf /projects/ci-runners/CuPBoP-Vortex/logs/*
-          du -sh /projects/ci-runners/CuPBoP-Vortex/logs
+          LOG_DIR=/projects/ci-runners/CuPBoP-Vortex/logs
+          du -sh "$LOG_DIR"
+          find "$LOG_DIR" -mindepth 1 -type f -mtime +7 -delete
+          find "$LOG_DIR" -mindepth 1 -type d -empty -delete
+          du -sh "$LOG_DIR"
