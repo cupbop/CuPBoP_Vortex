@@ -486,13 +486,6 @@ static __attribute__((always_inline)) inline bool cupbop_tma_dxa_ok_warp(uint32_
   return (slot < 16u) & ((c0 | c1 | c2 | c3 | c4) >= 0);
 #endif
 }
-// The software copy, out of line and cold: with the call and its lane test (a split/join) inline, the kernel's loop kept
-// more values on the stack and jumped over the block on every transfer (experiments/cpasync README 8.5: about 3%).
-static __attribute__((noinline, cold)) void cupbop_tma_direct_soft(void *smem, const void *desc, uint32_t rank,
-                                                                  int32_t c0, int32_t c1, int32_t c2, int32_t c3,
-                                                                  int32_t c4) {
-  if (vx_thread_id() == 0) cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
-}
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_direct(uint32_t when, uint32_t slot,
                                                                              uint32_t bar, void *smem,
                                                                              const void *desc, uint32_t rank,
@@ -500,7 +493,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_direct(u
                                                                              int32_t c3, int32_t c4) {
   if (CUPBOP_TMA_DIRECT_U((when == 0) | ((uint32_t)csr_read_nv(VX_CSR_CTA_RANK) != 0))) return;
 #if defined(VX_CFG_EXT_DXA_ENABLE) || defined(VX_CFG_EXT_DXA_ENABLED)
-  if (__builtin_expect(CUPBOP_TMA_DIRECT_U(cupbop_tma_dxa_ok_warp(slot, smem, c0, c1, c2, c3, c4)), 1)) {
+  if (CUPBOP_TMA_DIRECT_U(cupbop_tma_dxa_ok_warp(slot, smem, c0, c1, c2, c3, c4))) {
     vx_barrier_expect_tx((int)bar, 1);
     cupbop_tma_dxa_issue(slot & 15u, bar, smem, rank, (uint32_t)c0, (uint32_t)c1, (uint32_t)c2, (uint32_t)c3,
                          (uint32_t)c4);
@@ -509,7 +502,7 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_direct(u
 #endif
   (void)slot; (void)bar;
 #if !defined(CUPBOP_TMA_DIRECT_SOFT) || CUPBOP_TMA_DIRECT_SOFT
-  cupbop_tma_direct_soft(smem, desc, rank, c0, c1, c2, c3, c4);
+  if (vx_thread_id() == 0) cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
 #else
   (void)desc;
 #endif
