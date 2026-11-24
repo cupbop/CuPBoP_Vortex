@@ -1,0 +1,15 @@
+name: Clean runner logs
+on:
+  schedule:
+    - cron: "0 8 * * 0"   # Sundays 08:00 UTC
+  workflow_dispatch:
+jobs:
+  clean:
+    runs-on: [self-hosted]
+    steps:
+      - run: |
+          LOG_DIR=/projects/ci-runners/CuPBoP-Vortex/logs
+          du -sh "$LOG_DIR"
+          find "$LOG_DIR" -mindepth 1 -type f -mtime +7 -delete
+          find "$LOG_DIR" -mindepth 1 -type d -empty -delete
+          du -sh "$LOG_DIR"

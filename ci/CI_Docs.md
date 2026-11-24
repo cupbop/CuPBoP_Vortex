@@ -68,7 +68,7 @@ cd /projects/ci-runners/CuPBoP-Vortex/temp-runner/_work/CuPBoP_Vortex/CuPBoP_Vor
 * Supporting libraries (i.e. Vortex and LLVM-Vortex) can be recompiled/updated using regular instructions, but this recompilation has to happen in the Apptainer environment (see above for how to enter Apptainer manually)
 * **CI needs to run at least once every 2 weeks or Self-Hosted runner will need to be reactivated**
 ## Troubleshooting
-* Log output can be found at ```/tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-test-SLURM_NUMBER.out``` for tests and ```/tools/ci-reports/CuPBoP_logs/CuPBoP-cuda-SLURM_NUMBER.out``` for builds
+* Log output can be found at ```/projects/ci-runners/CuPBoP-Vortex/logs/CuPBoP-cuda-test-SLURM_NUMBER.out``` for tests and ```/projects/ci-runners/CuPBoP-Vortex/logs/CuPBoP-cuda-SLURM_NUMBER.out``` for builds
     * SLURM_NUMBER can be found in the GitHub Actions console log
 ## Future Improvements
 * Parallelize running tests by adding more runners
