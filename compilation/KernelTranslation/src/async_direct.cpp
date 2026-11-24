@@ -421,6 +421,7 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
   const DataLayout &DL = M->getDataLayout();
   std::vector<Site> sites;
   std::string other;
+  bool tmaElsewhere = false; // a TMA load in a form the pass does not take: worth a line in the log
   for (BasicBlock &BB : F)
     for (Instruction &I : BB) {
       auto *C = dyn_cast<CallInst>(&I);
@@ -429,15 +430,21 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
         Site S;
         const int r = match(C, S);
         const std::string a = squeeze(cast<InlineAsm>(C->getCalledOperand())->getAsmString());
-        if (r > 0) sites.push_back(S);
-        else if (r < 0 && other.empty()) other = "an async statement of another form: " + a.substr(0, 96);
-        else if (r == 0 && other.empty() && (a.find("bar.") != std::string::npos || a.find("barrier.") != std::string::npos))
+        if (r > 0) {
+          sites.push_back(S);
+        } else if (r < 0) {
+          if (other.empty()) other = "an async statement of another form: " + a.substr(0, 96);
+          if (a.find("cp.async.bulk.tensor") != std::string::npos) tmaElsewhere = true;
+        } else if (other.empty() && (a.find("bar.") != std::string::npos || a.find("barrier.") != std::string::npos)) {
           other = "a named barrier";
+        }
         continue;
       }
       const Function *G = C->getCalledFunction();
-      if (!G || !other.empty()) continue;
+      if (!G) continue;
       StringRef n = G->getName();
+      if (n.starts_with("llvm.nvvm.cp.async.bulk.tensor")) tmaElsewhere = true;
+      if (!other.empty()) continue;
       if (n.starts_with("llvm.nvvm.mbarrier") || n.starts_with("llvm.nvvm.cp.async")) other = "an mbarrier / cp.async intrinsic";
       if (n.starts_with("llvm.nvvm.barrier") && C->arg_size() >= 1) {
         auto *K = dyn_cast<ConstantInt>(C->getArgOperand(0));
@@ -449,7 +456,7 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
     }
   unsigned count[5] = {0, 0, 0, 0, 0};
   for (const Site &S : sites) count[S.kind]++;
-  if (!count[Load]) return false; // no TMA load: not this pass's business
+  if (!count[Load] && !tmaElsewhere) return false; // no TMA load: not this pass's business
   auto no = [&](const std::string &w) {
     why = w;
     return false;
