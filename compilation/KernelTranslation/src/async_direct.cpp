@@ -13,8 +13,9 @@
 //  - every asm of the kernel that mentions mbarrier or cp.async is one of the five statements of async_direct.h, and the
 //    kernel has no mbarrier / cp.async intrinsic, named barrier or DXA call of its own;
 //  - the block is 1-D with a known size (nvvm.reqntid);
-//  - each mbarrier is an 8-byte word of one shared variable: the inits at constant offsets, in a row, with count 1; the
-//    other statements at one of those words, or at word [an index that is the same in every thread];
+//  - each mbarrier is an 8-byte word of one shared variable: the inits at constant offsets, the words in a row, count 1
+//    (a word may be initialized more than once); the other statements at one of those words, or at word [an index that
+//    is the same in every thread];
 //  - the predicate of an arrive and of a load is (one thread of the block) and (a condition that is the same in every
 //    thread of the CTA);
 //  - a load's tensor map is a kernel parameter, and its destination and coordinates are the same in every thread;
@@ -26,7 +27,8 @@
 // the transfers registered on it have landed; the first warp registers a transfer when it issues it, which is before it
 // arrives. So a wait returns no earlier than the PTX one, and every warp passes the same waits in the same order,
 // because the control flow around them is uniform. The parity operand is not needed: a warp waits for the phase it
-// arrived in.
+// arrived in. For the same reason a second mbarrier.init of a word needs nothing: it restarts the PTX phase count, which
+// the barrier does not keep.
 #include "async_direct.h"
 #include "tool.h"
 
@@ -469,7 +471,7 @@ bool rewrite(Module *M, Function &F, std::string &why, std::string &done) {
     if (sites[i].kind == Init) {
       if (refs[i].index) return no("an mbarrier.init at a computed address");
       if (sites[i].count != 1) return no("an mbarrier.init with count " + std::to_string(sites[i].count));
-      if (!inits.insert(refs[i].off).second) return no("two mbarrier.init of one word");
+      inits.insert(refs[i].off); // a word can be initialized again (Triton without a pipeline: init, arrive, load, wait, inval per load)
     }
   if (inits.empty()) return no("no mbarrier.init");
   const int64_t base = *inits.begin();

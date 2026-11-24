@@ -467,7 +467,8 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_txq_issue(vo
 // orders the copy before every read.
 // Both tests have one value in every lane of a warp, which the back end cannot see through the CSR read and the
 // arguments: without the marks it puts a split/join around each. CUPBOP_TMA_DIRECT_UNIFORM=0 at the kernel compile
-// leaves them unmarked (measurement).
+// leaves them unmarked (measurement). CUPBOP_TMA_DIRECT_SOFT=0 compiles the software copy out, to measure what its
+// presence costs the DXA path: such a kernel is wrong on a tensor map without a slot.
 #if !defined(CUPBOP_TMA_DIRECT_UNIFORM) || CUPBOP_TMA_DIRECT_UNIFORM
 #define CUPBOP_TMA_DIRECT_U(c) cupbop_vx_uniform(c)
 #else
@@ -500,7 +501,11 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_tma_direct(u
   }
 #endif
   (void)slot; (void)bar;
+#if !defined(CUPBOP_TMA_DIRECT_SOFT) || CUPBOP_TMA_DIRECT_SOFT
   if (vx_thread_id() == 0) cupbop_tma_box(smem, desc, rank, c0, c1, c2, c3, c4, 0);
+#else
+  (void)desc;
+#endif
 }
 // p active threads arriving cnt times each, of a warp: the general case of __cupbop_mbar_arrive (popcount, which is a
 // sequence of ALU operations on a core without Zbb), out of line so that the one-thread path does not compute it
