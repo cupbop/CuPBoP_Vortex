@@ -36,6 +36,8 @@ void check_lifted_column_tmem(llvm::Module *M);
 // loop, an arrive.expect_tx without its copies, sm_80 CuLifter mbarrier forms, the flat schedule, the core
 // mapping unless it is de facto 1:1 (checked again at launch), warps narrower than 32 lanes.
 void lower_async_ptx(llvm::Module *M);
+// Recognize exclusive instruction sequences after the CUDA helper calls have been inlined.
+void fuse_mx_scale_copies(llvm::Module *M);
 
 // The descriptor operand of a lowered tensor load, store or reduction.
 llvm::Value *async_tensor_map_operand(llvm::CallBase &call);

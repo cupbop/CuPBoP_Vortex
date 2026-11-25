@@ -381,6 +381,7 @@ int main(int argc, char **argv) {
   fold_bitreverse_i1(program); // after the -O3 of performance_optimization, which creates them
   scalarize_i1_vector_bitcasts(program); // after that -O3 too (lifted_ir.cpp)
   fuse_wmma_k16_pairs(program); // CUPBOP_WMMA_FUSE: two CUDA wmma k16 steps -> one k32 TCU op (tool.cpp)
+  fuse_mx_scale_copies(program);
   merge_adjacent_barriers(program); // CUPBOP_BAR_MERGE: back-to-back CTA barriers (tool.cpp)
   inline_vx_barrier_calls(program); // CUPBOP_BAR_INLINE: vx_barrier calls -> the instruction (tool.cpp)
   protect_dxa_operand_registers(program); // x30 / x31 hold nothing across a TMA copy (uniform_branch.cpp)

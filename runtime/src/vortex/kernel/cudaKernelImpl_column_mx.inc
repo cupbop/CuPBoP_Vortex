@@ -117,10 +117,69 @@ static void column_mx_restore(unsigned p, uint32_t *image, unsigned warp) {
   column_wait(warp);
 }
 
-template <typename Input>
+// The two warpx4 producers each read 32 rows of four CUDA scale words.
+// Keep their exact input in the unused part of the issuer's LMEM slab,
+// between the B staging tile and the bank-row-aligned copy image.
+struct ColumnScaleCopies {
+  uint32_t words[2][32][4];
+};
+
+// A dense homogeneous FP8 operand already has the TCU's byte encoding.
+// K-major rows consist of aligned 16-byte CUDA core vectors. tcgen_chunk
+// applies the descriptor's leading/stride and SW128 address swizzle.
+template <unsigned nativeBytes>
+static void column_stage_mx_fp8(uint8_t *dst, const TcgenOperand &src, unsigned row, unsigned k,
+                                bool transpose, bool negate) {
+  constexpr unsigned liveBytes = nativeBytes < 32 ? nativeBytes : 32;
+  constexpr unsigned chunk = liveBytes < 16 ? liveBytes : 16;
+  if (transpose) {
+    for (unsigned i = 0; i < liveBytes; ++i)
+      dst[i] = column_element<uint8_t>(src, row, k + i, true) ^ (negate ? 0x80 : 0);
+  } else {
+    for (unsigned i = 0; i < liveBytes; i += chunk) {
+      const auto *data = static_cast<const uint8_t *>(__builtin_assume_aligned(
+          tcgen_chunk(src, row, (k + i) / 16) + (k + i) % 16, chunk));
+      if (negate) {
+        for (unsigned j = 0; j < chunk; j += 4) {
+          uint32_t word;
+          __builtin_memcpy(&word, data + j, 4);
+          word ^= 0x80808080u;
+          __builtin_memcpy(dst + i + j, &word, 4);
+        }
+      } else {
+        __builtin_memcpy(dst + i, data, chunk);
+      }
+    }
+  }
+  if constexpr (nativeBytes > liveBytes) __builtin_memset(dst + liveBytes, 0, nativeBytes - liveBytes);
+}
+
+static void column_publish_scale_copies(unsigned col, unsigned side, const ColumnScaleCopies &copies,
+                                        uint32_t *image, unsigned warp) {
+  auto &m = __cupbop_column_meta_table()[vx_core_id()];
+  for (unsigned panel = 0; panel < 2; ++panel) {
+    for (unsigned group = 0; group < 2; ++group) {
+      for (unsigned lane = 0; lane < 64; ++lane) {
+        unsigned row = lane / 16 * 32 + panel * 16 + lane % 16;
+        const uint32_t *words = copies.words[group][row % 32];
+        __builtin_memcpy(image + (group * 64 + lane) * 4, words, 16);
+        for (unsigned j = 0; j < 4; ++j) {
+          unsigned dst = col + 4 * group + j;
+          m.words[dst][row] = {words[j], m.generation[dst]};
+        }
+      }
+    }
+    vx_fence();
+    tmcol::cp(side + 16 * panel, image, 8);
+    column_wait(warp);
+  }
+}
+
+template <typename Input, bool placedCopies = false>
 static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOperand peer_b, bool pair,
                            unsigned desc, unsigned sfa, unsigned sfb, unsigned use_d, uint8_t *scratch,
-                           unsigned vec, unsigned meta, unsigned workspace, int aCol, bool borrowed) {
+                           unsigned vec, unsigned meta, unsigned workspace, int aCol, bool borrowed,
+                           const ColumnScaleCopies *copies = nullptr) {
   using G = tensor::wgmma_config_t<32, Input, tensor::fp32>;
   constexpr unsigned stepBytes = G::fedpK * 4, stepElements = stepBytes * (8 / Input::bits);
   constexpr unsigned sfCount = tensor::mx_max_fedp_sf(G::fedpK);
@@ -163,9 +222,19 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
   // such half-warps consecutively in a 64-row physical panel.
   for (unsigned k0 = 0; k0 < cudaK; k0 += step) {
     unsigned sfIndex = k0 / scaleK;
+    auto readScale = [&](bool isB, unsigned row) {
+      unsigned selector = ((desc >> (isB ? 4 : 29)) & 3) + sfIndex;
+      if constexpr (placedCopies)
+        return (copies->words[isB][row % 32][row / 32] >> (8 * selector)) & 255;
+      return column_scale_byte(isB ? sfb : sfa, row, selector);
+    };
     for (unsigned panel = 0; panel < 2; ++panel) {
       for (unsigned lane = 0; !direct && lane < 64; ++lane) {
         unsigned row = lane / 16 * 32 + panel * 16 + lane % 16;
+        if constexpr (placedCopies) {
+          column_stage_mx_fp8<stepBytes>(astage + lane * stepBytes, a, row, k0, desc & (1u << 15), desc & (1u << 13));
+          continue;
+        }
         for (unsigned i = 0; i < stepBytes; ++i) {
           unsigned byte = 0;
           for (unsigned f = 0; f < packed; ++f) {
@@ -207,20 +276,33 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
       }
       for (unsigned tile = 0; tile < n; tile += 16) {
         unsigned columns = n - tile < 16 ? n - tile : 16;
-        __builtin_memset(image, 0, 64 * 8 * sizeof(*image));
-        for (unsigned l = 0; l < 64; ++l) {
-          unsigned row = l / 16 * 32 + panel * 16 + l % 16;
-          unsigned scale = column_scale_byte(sfa, row, ((desc >> 29) & 3) + sfIndex);
-          for (unsigned s = 0; s < sfCount; ++s)
-            put(l, s / 4, s % 4, scale);
+        // Two fused scale copies supply both halves of a single N tile.
+        // Vec1 selects the same bytes for all K steps, so each half can
+        // stay in its own eight native columns until the final MMA.
+        unsigned side = placedCopies ? workspace + 16 * panel : workspace;
+        const bool packScales = !placedCopies || k0 == 0;
+        if (packScales) {
+          __builtin_memset(image, 0, 64 * 8 * sizeof(*image));
+          for (unsigned l = 0; l < 64; ++l) {
+            unsigned row = l / 16 * 32 + panel * 16 + l % 16;
+            unsigned scale = readScale(false, row);
+            for (unsigned s = 0; s < sfCount; ++s)
+              put(l, s / 4, s % 4, scale);
+          }
         }
         for (unsigned j = 0; j < columns; ++j) {
           unsigned out = tile + j, row = pair ? out % (n / 2) : out;
           const auto &src = pair && out >= n / 2 ? peer_b : b;
-          unsigned scale = column_scale_byte(sfb, out, ((desc >> 4) & 3) + sfIndex);
-          for (unsigned s = 0; s < sfCount; ++s) {
-            unsigned q = j * sfCount + s, r = q / 128, w = q % 128 / 4;
-            put((r % 4) * 16 + 8 + w / 4, (1 + r / 4) * 4 + w % 4, q % 4, scale);
+          if (packScales) {
+            unsigned scale = readScale(true, out);
+            for (unsigned s = 0; s < sfCount; ++s) {
+              unsigned q = j * sfCount + s, r = q / 128, w = q % 128 / 4;
+              put((r % 4) * 16 + 8 + w / 4, (1 + r / 4) * 4 + w % 4, q % 4, scale);
+            }
+          }
+          if constexpr (placedCopies) {
+            column_stage_mx_fp8<stepBytes>(bstage + j * stepBytes, src, row, k0, desc & (1u << 16), desc & (1u << 14));
+            continue;
           }
           for (unsigned i = 0; i < stepBytes; ++i) {
             unsigned byte = 0;
@@ -238,9 +320,9 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
           }
         }
         vx_fence();
-        tmcol::cp(workspace, image, 8);
+        if (packScales) tmcol::cp(side, image, 8);
         auto idesc = tmcol::make_idesc<Input>(columns / tmcol::frag_cols(), column_panel(col + tile, panel),
-                                              !use_d && !k0, false, workspace);
+                                              !use_d && !k0, false, side);
         auto bdesc = tmcol::smem_desc(bOffset, stepBytes);
         if (direct || (aCol >= 0 && !borrowed))
           tmcol::mma(idesc, tmcol::tmem_col{tileA}, bdesc);
@@ -250,7 +332,10 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
       }
     }
   }
-  if (borrowed) column_mx_restore(workspace, image, warp);
+  if constexpr (placedCopies)
+    column_publish_scale_copies(sfa, workspace, *copies, image, warp);
+  else if (borrowed)
+    column_mx_restore(workspace, image, warp);
   column_meta_invalidate(col, n);
 }
 
@@ -318,5 +403,48 @@ extern "C" void __cupbop_column_mma_mx(unsigned addr, uint64_t ad, uint64_t bd, 
 #undef MX_TILE
   }
   if (allocated >= 0) column_sparse_release(allocated);
+}
+
+// Keep the constant CUDA descriptor visible to native tile selection after
+// the translated kernel links the device runtime. On false the caller issues
+// the two original CUDA copies followed by the ordinary MMA.
+extern "C" __attribute__((always_inline)) bool __cupbop_column_mma_mx_scale_copies(
+    unsigned copyA, uint64_t sourceA, unsigned copyB, uint64_t sourceB, unsigned dst,
+    uint64_t ad, uint64_t bd, unsigned desc, unsigned sfa, unsigned sfb, unsigned use_d, uint8_t *scratch) {
+  // The translator matched two group-1 producers and one shared-A, dense,
+  // vec1 consumer. Repeated reads of CUDA TMEM handles can have different
+  // SSA values: verify their actual addresses before using either copy.
+  const unsigned n = ((desc >> 17) & 63) * 8;
+  constexpr unsigned logicalCols = VX_CFG_TCU_TMEM_COLS / 2;
+  const unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
+  if (copyA == sfa && copyB == sfb && sfa <= logicalCols - 8 && sfb == sfa + 4 && !(sfa % 8) &&
+      dst <= logicalCols - n && !(dst % 16) && (sfa + 8 <= dst || dst + n <= sfa) &&
+      !vx_thread_id() && warp < 4 && vx_num_barriers() >= 5 && __cupbop_column_meta_table) {
+    const unsigned side = column_panel(sfa, 0) + sfa % 16;
+    ColumnAccess access;
+    auto &m = __cupbop_column_meta_table()[vx_core_id()];
+    // Both native panels occupy the same allocator chunk. Only overwrite
+    // this CTA's freshly produced words, including when all TMEM is owned.
+    if (side + 16 < column_side_limit && m.owner[side / 32] == 1 + csr_read_nv(VX_CSR_CTA_ID)) {
+      auto *copies = reinterpret_cast<ColumnScaleCopies *>(scratch + warp * (128 + 256) * 32 + 6144);
+      for (unsigned group = 0; group < 2; ++group) {
+        auto src = tcgen_operand(group ? sourceB : sourceA);
+        for (unsigned row = 0; row < 32; ++row)
+          __builtin_memcpy(copies->words[group][row], tcgen_chunk(src, row, 0), 16);
+      }
+      auto a = tcgen_operand(ad), b = tcgen_operand(bd);
+      if (((desc >> 7) & 7) == 1 || ((desc >> 10) & 7) == 1) {
+        [[clang::always_inline]]
+        column_mx_tile<tensor::mxbf8, true>(dst, a, b, b, false, desc, sfa, sfb, use_d,
+                                            scratch, 1, 0, side, -1, false, copies);
+      } else {
+        [[clang::always_inline]]
+        column_mx_tile<tensor::mxfp8, true>(dst, a, b, b, false, desc, sfa, sfb, use_d,
+                                            scratch, 1, 0, side, -1, false, copies);
+      }
+      return true;
+    }
+  }
+  return false;
 }
 #endif

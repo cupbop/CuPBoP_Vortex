@@ -3309,6 +3309,71 @@ void lower_async_ptx(Module *M) {
 
 // ---------------------------------------------------------------------------------------------------------
 
+void fuse_mx_scale_copies(Module *M) {
+  auto *mma = M->getFunction("__cupbop_column_mma_mx");
+  auto *copy = M->getFunction("__cupbop_column_cp_warpx4");
+  const char *disable = std::getenv("CUPBOP_DISABLE_MX_SCALE_FUSION");
+  if (!mma || !copy || (disable && std::atoi(disable) != 0)) return;
+  auto constantIs = [](Value *v, unsigned n) {
+    auto *c = dyn_cast<ConstantInt>(v);
+    return c && c->getValue() == n;
+  };
+  // A single basic block preserves the copies' issuer and predicate. Cross
+  // only scalar computations, ordinary reads and the copies' own compiler
+  // clobbers. An observable shared write, fence, call or barrier ends the match.
+  auto precedingCopy = [&](Instruction *consumer) -> CallInst * {
+    for (auto *i = consumer->getPrevNonDebugInstruction(); i; i = i->getPrevNonDebugInstruction()) {
+      if (auto *call = dyn_cast<CallInst>(i))
+        return call->getCalledFunction() == copy && constantIs(call->getArgOperand(2), 0) ? call : nullptr;
+      if (auto *fence = dyn_cast<FenceInst>(i)) {
+        auto *prev = dyn_cast_or_null<CallInst>(i->getPrevNonDebugInstruction());
+        if (fence->getSyncScopeID() == SyncScope::SingleThread && prev && prev->getCalledFunction() == copy)
+          continue;
+        return nullptr;
+      }
+      if (auto *load = dyn_cast<LoadInst>(i)) {
+        if (load->isSimple()) continue;
+        return nullptr;
+      }
+      if (i->mayHaveSideEffects() || i->mayReadOrWriteMemory()) return nullptr;
+    }
+    return nullptr;
+  };
+  SmallVector<CallInst *> consumers;
+  for (auto *user : mma->users())
+    if (auto *call = dyn_cast<CallInst>(user); call && call->getCalledFunction() == mma)
+      consumers.push_back(call);
+  for (auto *call : consumers) {
+    auto *desc = dyn_cast<ConstantInt>(call->getArgOperand(3));
+    if (!desc || !constantIs(call->getArgOperand(8), 1) || !constantIs(call->getArgOperand(10), 0)) continue;
+    uint32_t bits = desc->getZExtValue(), n = ((bits >> 17) & 63) * 8;
+    if ((bits & 4) || ((bits >> 27) & 3) != 1 || !n || n > 16) continue;
+    // On column SimX the fused tile costs more cycles when it also has
+    // to convert the inputs. Use it for native homogeneous FP8.
+    unsigned aType = (bits >> 7) & 7, bType = (bits >> 10) & 7;
+    if (aType != bType || aType > 1) continue;
+    auto *second = precedingCopy(call);
+    auto *first = second ? precedingCopy(second) : nullptr;
+    if (!first || first->getArgOperand(3) != call->getArgOperand(7) ||
+        second->getArgOperand(3) != call->getArgOperand(7)) continue;
+    SmallVector<Value *> args{first->getArgOperand(0), first->getArgOperand(1),
+                              second->getArgOperand(0), second->getArgOperand(1)};
+    for (unsigned i = 0; i < 8; ++i) args.push_back(call->getArgOperand(i));
+    SmallVector<Type *> types;
+    for (auto *arg : args) types.push_back(arg->getType());
+    IRBuilder<> builder(call);
+    auto fused = M->getOrInsertFunction("__cupbop_column_mma_mx_scale_copies",
+                                        FunctionType::get(builder.getInt1Ty(), types, false));
+    auto *performed = builder.CreateCall(fused, args, "mx_placed");
+    // Leave the original calls and their constant descriptor visible at the
+    // kernel call sites so LTO can specialize the fallback exactly as before.
+    auto *fallback = SplitBlockAndInsertIfThen(builder.CreateNot(performed), call->getIterator(), false);
+    first->moveBefore(*fallback->getParent(), fallback->getIterator());
+    second->moveBefore(*fallback->getParent(), fallback->getIterator());
+    call->moveBefore(*fallback->getParent(), fallback->getIterator());
+  }
+}
+
 void finalize_mbarrier_ids(Module *M) {
 #ifdef VX_CFG_NUM_BARRIERS
   const unsigned num_barriers = VX_CFG_NUM_BARRIERS;

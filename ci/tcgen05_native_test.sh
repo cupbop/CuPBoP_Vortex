@@ -17,7 +17,7 @@ ln -s "$CuPBoP_PATH/examples/"{common.mk,async_common.h,tcgen05_test.h,lift.mk,l
 run_case() (
   local example=$1 expected=$2
   shift 2
-  local app="$work/examples/$example${replay_input:+-$replay_input}-$(basename "$work")"
+  local app="$work/examples/$example${replay_input:+-$replay_input}${case_suffix:+-$case_suffix}-$(basename "$work")"
   mkdir "$app"
   cp "$CuPBoP_PATH/examples/$example/Makefile" "$app/"
   if [[ -n ${replay_input:-} ]]; then
@@ -80,6 +80,29 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
 
   ln -s "$CuPBoP_PATH/examples/tcgen05_column_scaled" "$work/examples/"
   if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_MX_ENABLE "* && " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_FP8_ENABLE "* ]]; then
+    placement=tcgen05_mx_scale_placement
+    placement_ok='E4M3xE5M2 SFB=20 intervening_commit=0 mismatches=0/3072'
+    (unset CUPBOP_DISABLE_MX_SCALE_FUSION; expected_launches=5 run_case "$placement" "$placement_ok" '')
+    CUPBOP_DISABLE_MX_SCALE_FUSION=1 case_suffix=unfused expected_launches=5 run_case "$placement" "$placement_ok" ''
+    python3 - "$work/examples/$placement-$(basename "$work")" "$work/examples/$placement-unfused-$(basename "$work")" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+def metrics(app, fused_sites):
+    ir = (app / "kernel.ll").read_text()
+    assert ir.count("call i1 @__cupbop_column_mma_mx_scale_copies(") == fused_sites
+    assert ir.count("call void @__cupbop_column_mma_mx(") == 4  # original calls retained for fallback
+    return [json.loads(line)["val"] for line in (app / "perf-0.jsonl").read_text().splitlines()]
+
+enabled = metrics(Path(sys.argv[1]), 2)
+disabled = metrics(Path(sys.argv[2]), 0)
+for i in (0, 3):  # adjacent E4M3 and E5M2
+    for counter in ("core.instr_tcu", "core.instrs"):
+        assert enabled[i][counter] < disabled[i][counter], (i, counter, enabled[i][counter], disabled[i][counter])
+for i in (1, 2, 4):  # nonadjacent operands, an intervening commit, and mixed FP8
+    assert enabled[i]["core.instr_tcu"] == disabled[i]["core.instr_tcu"]
+PY
     if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_COLS=1024 "* ]]; then
       expected_launches=2 run_case tcgen05_full_mx_tmem_a 'case=3 mismatches=0/2048' ''
       for input in cuda129 raw; do
