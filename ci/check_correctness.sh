@@ -2,7 +2,7 @@
 # Correctness check of one CI matrix entry: the single source of truth used by the "Verify Correctness" step of
 # .github/workflows/ci.yml and by ci/run-v3-matrix.sbatch.
 #   usage: ci/check_correctness.sh <test> <schedule> <localmem>      (run from the repository root)
-# Prints "Correctness: PASS|FAIL|SKIP" (with the reason and the tail of the output on FAIL) and a final
+# Prints "Correctness: PASS|FAIL|XFAIL|SKIP" (with the reason and the tail of the output on FAIL) and a final
 # "RESULT=..." line, writes examples/<test>/ci_status_SCHE_<s>_LMEM_<l>.txt and exits 1 on FAIL.
 TEST_NAME=$1; SCHEDULE=$2; LMEM=$3
 EXAMPLE_DIR="${CI_EXAMPLE_DIR:-./examples/${TEST_NAME}}"   # CI_EXAMPLE_DIR: check a copy of the example elsewhere (coadapt trials)
@@ -74,9 +74,18 @@ case $TEST_NAME in
     RESULT="SKIP"; WHY="no correctness check defined for $TEST_NAME" ;;
 esac
 
+# A run ci/known_failures.txt lists: its failure is XFAIL (exit 0, shown with the written cause); if it passes, a warning to drop the entry.
+if KNOWN=$(./ci/known_failure.sh "$TEST_NAME" "$SCHEDULE" "$LMEM"); then
+  if [ "$RESULT" = "FAIL" ]; then
+    RESULT="XFAIL"; WHY="known failure, ci/known_failures.txt: $KNOWN${WHY:+; this run: $WHY}"
+    echo "::notice title=known failure $TEST_NAME s$SCHEDULE l$LMEM::$KNOWN"
+  elif [ "$RESULT" = "PASS" ]; then
+    echo "::warning title=known failure passes $TEST_NAME s$SCHEDULE l$LMEM::listed in ci/known_failures.txt but passes now: remove the entry"
+  fi
+fi
 echo "$RESULT" > "$STATUS_FILE"
 echo "Correctness: $RESULT${WHY:+ ($WHY)}"
-if [ "$RESULT" = "FAIL" ]; then
+if [ "$RESULT" = "FAIL" ] || [ "$RESULT" = "XFAIL" ]; then
   if [ -f "$CI_OUTPUT" ]; then echo "--- tail of $CI_OUTPUT:"; tail -20 "$CI_OUTPUT"; fi
   if [ -n "$G" ] && [ -f "$G" ] && [ -f "$R" ]; then echo "--- diff $G $R (first 20 lines):"; diff "$G" "$R" | head -20; fi
 fi
