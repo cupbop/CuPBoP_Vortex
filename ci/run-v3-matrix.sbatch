@@ -43,7 +43,8 @@ RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,ex
 run_one() { # test sched lmem
   local t=$1 s=$2 l=$3
   local log=$LOGS/${t}_s${s}_l${l}.log t0=$SECONDS   # separate line: a single `local` expands ${s} before assigning it
-  ( cd examples && make -C $t clean > /dev/null 2>&1; rm -f $t/ci_status_*.txt $t/ci_output.txt
+  # Perf_counter_* too: the program appends to it and make clean leaves it, so the cycles column would sum every earlier run
+  ( cd examples && make -C $t clean > /dev/null 2>&1; rm -f $t/ci_status_*.txt $t/ci_output.txt $t/Perf_counter_*.txt
     timeout 1800 make -C $t ci SCHEDULE=$s LOCALMEM=$l > $log 2>&1 ); local rc=$?
   local k=0 h=0 e=0; grep -q "Kernel compilation completed!" $log && k=1; grep -q "Host compilation completed!" $log && h=1; grep -q "Execution completed!" $log && e=1
   local r; r=$(./ci/check_correctness.sh $t $s $l 2>&1 | tee -a $log | sed -n 's/^RESULT=//p')
