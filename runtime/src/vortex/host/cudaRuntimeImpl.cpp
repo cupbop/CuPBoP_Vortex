@@ -1222,7 +1222,13 @@ static std::string cupbop_strip_prefix(const std::string &s) {
 // launched without its rewrite runs wrongly.
 // cta_*: CUPBOP_CTA_LOOP; what the launched grid becomes is decided with the block's local memory, cupbop_cta_loop_launch.
 // mbar_off, mbar_bytes: CUPBOP_TMA_DIRECT; the dynamic shared size loses the kernel's unused mbarrier words when they are its end.
-struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false, linear = false; };
+struct cupbop_cta_fix { uint32_t dims = 0, inner = 0; bool chunk = false, linear = false, grid_order = false; };
+// CUPBOP_GRID_ORDER (grid_order.cpp): the group size R of the next launch's grid walk, set by the front end right before
+// the launch (the Triton plugin's rule) and used once. CUPBOP_GRID_ORDER_R=<R> (measurement) sets it for every launch.
+// Applies only to a kernel the translator marked, on schedule 2, with no cluster and no CTA loop; R up to 255.
+static uint32_t g_cupbop_next_grid_order = 0;
+static uint32_t g_cupbop_last_grid_order = 0;   // what the last launch used (the perf record's "grid_order")
+extern "C" void cupbop_set_next_grid_order(uint32_t R) { g_cupbop_next_grid_order = R; }
 static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sharedMem, cupbop_cta_fix &cta) {
   static std::map<std::string, std::vector<std::pair<std::string, uint64_t>>> table;
   static uint64_t seen = 0;
@@ -1265,6 +1271,8 @@ static void cupbop_apply_launch_fix(const std::string &func_stripped, size_t &sh
       cta.chunk = v != 0;
     } else if (key == "cta_linear") {
       cta.linear = v != 0;
+    } else if (key == "grid_order") {   // grid_order.cpp: the kernel reads its block index through __cupbop_grid_order_xy
+      cta.grid_order = v != 0;
     } else {
       fprintf(stderr, "cudaLaunchKernel: %s: unknown launch rewrite `%s` in cupbop_launch_fix.txt\n", func_stripped.c_str(), key.c_str());
       std::abort();
@@ -1697,6 +1705,7 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
       ",\"kernel\":" + cupbop_json_str(kernel) + ",\"kernel_idx\":" + std::to_string(kernel_idx) +
       ",\"sched\":" + std::to_string(schedule) + ",\"ndim\":" + std::to_string(ndim) + ",\"grid\":" + d3(grid) +
       ",\"block\":" + d3(block) + ",\"cuda_grid\":" + d3(cg) + ",\"cuda_block\":" + d3(cb) + ",\"cluster\":" + d3(cd) +
+      ",\"grid_order\":" + std::to_string(g_cupbop_last_grid_order) +
       ",\"lmem\":" + std::to_string(lmem) + ",\"dyn_smem\":" + std::to_string(dyn_smem) +
       ",\"service_launches\":" + std::to_string(g_cupbop_service_launches - last_service) +
       ",\"cycles\":" + std::to_string(cyc_delta) +
@@ -2943,6 +2952,15 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       // Blackwell's opaque response packs the Y and Z coordinates into 16 bits each.
       if (DC->is_simx() && (schedule == 1 || schedule == 2) && grid[1] <= 65536 && grid[2] <= 65536)
         abuf_ptr->ctx.direct_launch_flags = CUPBOP_LAUNCH_SIMX_CLC;
+    }
+    {   // CUPBOP_GRID_ORDER: R in bits 8..15 of direct_launch_flags (the CTA loop's work_dim shares the word: never both)
+      uint32_t R = g_cupbop_next_grid_order;
+      g_cupbop_next_grid_order = 0;
+      if (const char *e = getenv("CUPBOP_GRID_ORDER_R")) R = (uint32_t)atoi(e);
+      if (R > 255) R = 255;
+      if (!cta_fix.grid_order || cta_fix.dims || members > 1 || schedule != 2) R = 0;
+      g_cupbop_last_grid_order = R;
+      if (R > 1) abuf_ptr->ctx.direct_launch_flags |= R << 8;
     }
     void *barriers = nullptr;
     if (split_barrier) {

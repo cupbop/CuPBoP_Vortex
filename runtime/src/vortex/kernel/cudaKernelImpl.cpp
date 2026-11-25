@@ -337,6 +337,17 @@ __attribute__((always_inline)) int __vx_is_dxa_warp(void) {
 extern "C" __attribute__((always_inline)) int __cupbop_num_threads(void) {
   return vx_num_threads();
 }
+// CUPBOP_GRID_ORDER (compilation/KernelTranslation/src/grid_order.cpp): the CUDA block index (axis 0 = x, 1 = y) of this
+// CTA when the launch walks the grid in groups of R rows of y, column first (Triton's GROUP_SIZE_M order; a last group
+// with fewer rows is walked the same way). bx, by, gx, gy: the launch's own block index and grid. R = bits 8..15 of the
+// context's direct_launch_flags (cudaRuntimeImpl.cpp); 0 or 1 = the launch's own order.
+extern "C" __attribute__((always_inline)) uint32_t __cupbop_grid_order_xy(uint32_t bx, uint32_t by, uint32_t gx, uint32_t gy, uint32_t axis) {
+  const uint32_t R = (cluster_context().direct_launch_flags >> 8) & 255u;
+  if (R <= 1 || gy <= 1) return axis ? by : bx;
+  const uint32_t lin = by * gx + bx, per = R * gx, grp = lin / per, first = grp * R, idx = lin - grp * per;
+  const uint32_t gs = (gy - first < R) ? gy - first : R;
+  return axis ? first + idx % gs : idx / gs;
+}
 extern "C" __attribute__((always_inline)) int __cupbop_cta_rank(void) {
   return (int)csr_read_nv(VX_CSR_CTA_RANK);
 }

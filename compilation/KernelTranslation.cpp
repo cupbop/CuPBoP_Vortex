@@ -17,6 +17,7 @@
 #include "smem_reserve.h"
 #include "simt_opt.h"
 #include "cta_loop.h"
+#include "grid_order.h"
 #include "llvm/IR/Module.h"
 #include <assert.h>
 #include <fstream>
@@ -155,6 +156,7 @@ int main(int argc, char **argv) {
   // rewrite reaches lower_async_ptx unchanged
   lower_tma_direct(program);
   lower_async_ptx(program);
+  lower_grid_order(program);   // CUPBOP_GRID_ORDER (default off): after the TMA passes, which need the block index as read
   // wide by-value parameters (CuLifter parameter structs) -> pointer to their consecutive launch slots
   pass_wide_kernel_args_by_slot(program);
   prepare_byval_args(program);  // by-value struct parameters -> their launch slots (CUPBOP_BYVAL_ARGS=0: off)
