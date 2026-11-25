@@ -103,6 +103,10 @@ for i in (0, 3):  # adjacent E4M3 and E5M2
 for i in (1, 2, 4):  # nonadjacent operands, an intervening commit, and mixed FP8
     assert enabled[i]["core.instr_tcu"] == disabled[i]["core.instr_tcu"]
 PY
+    ln -s "$CuPBoP_PATH/examples/$placement" "$work/examples/"
+    for input in cuda129 raw; do
+      expected_launches=5 replay_input=$input run_case "lifted_$placement" "$placement_ok" ''
+    done
     if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_COLS=1024 "* ]]; then
       expected_launches=2 run_case tcgen05_full_mx_tmem_a 'case=3 mismatches=0/2048' ''
       for input in cuda129 raw; do
