@@ -24,6 +24,40 @@
 
 using namespace llvm;
 
+// Preserve ordinary Vortex generic pointers. Only addresses assembled by
+// lifted SWINHI carry this non-canonical high word; their low byte fields
+// are the original NVIDIA rank and window-relative offset.
+void lower_lifted_shared_window(Module *M) {
+  constexpr uint32_t windowTag = 0xc0da5a5a;
+  for (StringRef op : {"hi", "lo", "resolve"}) {
+    auto *F = M->getFunction(("__culifter_shared_window_" + op).str());
+    if (!F || F->isDeclaration() || !F->hasLocalLinkage()) continue;
+    F->deleteBody();
+    F->setLinkage(GlobalValue::InternalLinkage);
+    F->removeFnAttr(Attribute::NoInline);
+    F->addFnAttr(Attribute::AlwaysInline);
+    IRBuilder<> B(BasicBlock::Create(M->getContext(), "entry", F));
+    if (op != "resolve") {
+      B.CreateRet(B.getInt32(op == "hi" ? windowTag : 0));
+      continue;
+    }
+    Value *address = F->getArg(0);
+    Value *hi = B.CreateLShr(address, 32);
+    auto *shared = BasicBlock::Create(M->getContext(), "shared", F);
+    auto *generic = BasicBlock::Create(M->getContext(), "generic", F);
+    B.CreateCondBr(B.CreateICmpEQ(hi, B.getInt64(windowTag)), shared, generic);
+    B.SetInsertPoint(generic);
+    B.CreateRet(address);
+    B.SetInsertPoint(shared);
+    Value *rank = B.CreateTrunc(B.CreateLShr(address, 24), B.getInt8Ty());
+    Value *offset = B.CreateSub(B.CreateAnd(address, B.getInt64(0xffffff)), F->getArg(2));
+    Value *local = B.CreateGEP(B.getInt8Ty(), F->getArg(1), offset);
+    auto map = M->getOrInsertFunction("__cupbop_cluster_map",
+        FunctionType::get(B.getPtrTy(), {B.getPtrTy(), B.getInt32Ty()}, false));
+    B.CreateRet(B.CreatePtrToInt(B.CreateCall(map, {local, B.CreateZExt(rank, B.getInt32Ty())}), B.getInt64Ty()));
+  }
+}
+
 // __syncthreads_and(p) / _or(p) / _count(p) == llvm.nvvm.barrier0.{and,or,popc}(i32 p) -> i32
 //
 //   barrier0                                   B1: every thread is past the previous reduction's read

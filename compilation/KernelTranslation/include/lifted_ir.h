@@ -6,6 +6,9 @@
 // Lowerings for constructs that CuLifter-lifted library kernels (cuBLAS / cuDNN / CUTLASS NVVM IR) contain and
 // CUDA-source kernels rarely do. See lifted_ir.cpp.
 
+// Resolve generic addresses constructed from Hopper shared-window registers.
+void lower_lifted_shared_window(llvm::Module *M);
+
 // llvm.nvvm.barrier0.and / .or / .popc (__syncthreads_and / _or / _count, SASS BAR.RED) -> plain CTA barriers around
 // a reduction in a shared-memory word, so that every schedule's barrier handling applies.
 void lower_barrier_reductions(llvm::Module *M);

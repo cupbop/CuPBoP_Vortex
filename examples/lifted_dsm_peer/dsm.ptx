@@ -1,0 +1,27 @@
+.version 8.0
+.target sm_90
+.address_size 64
+.visible .entry dsm(.param .u64 output) {
+.reg .b32 own,peer,cta,v,got,stored,addr,mapped,r;
+.reg .b64 base,dst;
+.shared .align 4 .b32 tile[2];
+mov.u32 own,%cluster_ctarank;
+mov.u32 cta,%ctaid.x;
+mov.u32 addr,tile;
+add.u32 v,cta,40;
+st.shared.u32 [addr],v;
+barrier.cluster.arrive.aligned;
+barrier.cluster.wait.aligned;
+xor.b32 peer,own,1;
+mapa.shared::cluster.u32 mapped,addr,peer;
+ld.shared::cluster.u32 got,[mapped];
+st.shared::cluster.u32 [mapped+4],v;
+barrier.cluster.arrive.aligned;
+barrier.cluster.wait.aligned;
+ld.shared.u32 stored,[addr+4];
+ld.param.u64 base,[output];
+mul.wide.u32 dst,cta,8;
+add.u64 dst,dst,base;
+st.global.v2.u32 [dst],{got,stored};
+ret;
+}

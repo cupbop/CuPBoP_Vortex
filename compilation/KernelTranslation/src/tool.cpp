@@ -2775,6 +2775,7 @@ void prepare_wgmma_scratch(llvm::Module *M) {
   if (geometry.schedule != 2 || geometry.nt != 32 || tensor_lowering_mode() == "sw" || !tensor_cfg_known() ||
       !vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
       !vortexConfigHasFlag("-DVX_CFG_EXT_A_ENABLE") ||
+      vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_COLUMN_ENABLE") ||
       !vortexConfigHasFlag("-DVX_CFG_TCU_WGMMA_ENABLE"))
     return;
 

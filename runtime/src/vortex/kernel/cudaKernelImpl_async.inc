@@ -141,7 +141,7 @@ static __attribute__((always_inline)) inline const cupbop_tmap *cupbop_tmap_of(c
 // CUPBOP_ASYNC_CHECKS=1: stop when the thread mask is not the full warp here.
 static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue_meta(uint32_t meta, void *smem, uint32_t rank,
                                                                            uint32_t c0, uint32_t c1, uint32_t c2,
-                                                                           uint32_t c3, uint32_t c4) {
+                                                                           uint32_t c3, uint32_t c4, uint32_t peers = 0) {
 #ifdef CUPBOP_ASYNC_CHECKS
   {
     const uint32_t m = (uint32_t)vx_active_threads(), full = (uint32_t)((1ull << vx_num_threads()) - 1u);
@@ -149,11 +149,11 @@ static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue_meta(uint
   }
 #endif
   const uint32_t a0 = (uint32_t)vx_wgather((size_t)(uintptr_t)smem, (size_t)meta, (size_t)c0, (size_t)c1);
-  if (rank <= 2) {
+  if (rank <= 2 && !peers) {
     register uint32_t rs1 __asm__("x31") = a0;
     __asm__ volatile(".insn r %0, 0, %1, x0, %2, x0\n\t" : : "i"(RISCV_CUSTOM0), "i"(0x3), "r"(rs1) : "memory");
   } else {
-    const uint32_t a1 = (uint32_t)__VX_WGATHER_IN("x30", 0, (size_t)c2, (size_t)c3, (size_t)c4, (size_t)0u);
+    const uint32_t a1 = (uint32_t)__VX_WGATHER_IN("x30", 0, (size_t)c2, (size_t)c3, (size_t)c4, (size_t)peers);
     register uint32_t rs1 __asm__("x31") = a0;
     register uint32_t rs2 __asm__("x30") = a1;
     __asm__ volatile(".insn r %0, 0, %1, x0, %2, %3\n\t" : : "i"(RISCV_CUSTOM0), "i"(0x3), "r"(rs1), "r"(rs2)

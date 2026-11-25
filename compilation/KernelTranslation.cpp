@@ -117,6 +117,7 @@ static void inlineCudaAsyncHeaders(Module &module) {
 int main(int argc, char **argv) {
   assert(argc == 3 && "incorrect number of arguments\n");
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
+  lower_lifted_shared_window(program);
   // stock Triton IR: PTX asm and newer NVVM intrinsics -> what every later pass reads (triton_ir.cpp), then lo-mma on schedule 2
   if (triton_cupbop_enabled()) {
     normalize_ptx_kernel_cc(program);

@@ -1,7 +1,25 @@
 // Full 512-column TCGEN05 allocations and dense signed INT8 MMA.
 #if defined(VX_CFG_EXT_TCU_ENABLE) && defined(VX_CFG_TCU_TMEM_ENABLE)
 #include <vx_tmem.h>
+#ifdef VX_CFG_TCU_TMEM_COLUMN_ENABLE
+// At NT=32 a block has 16 physical rows. Pair two 16-column panels
+// for the lower/upper halves of a CUDA warp's 32 logical rows.
+#if VX_CFG_NUM_THREADS == 32 && VX_CFG_NUM_TCU_BLOCKS == 4 && VX_CFG_ISSUE_WIDTH == 4
+#define CUPBOP_COLUMN_TILE
+constexpr unsigned cupbop_column_ratio = 2;
+#else
+constexpr unsigned cupbop_column_ratio = 1;
+#endif
+extern "C" void __cupbop_column_alloc(uint32_t *dst, uint32_t cols) {
+  if (cols * cupbop_column_ratio > VX_CFG_TCU_TMEM_COLS) cupbop_async_fail("TMEM allocation exceeds core capacity", cols, VX_CFG_TCU_TMEM_COLS);
+  if (vx_thread_id() == 0) *dst = vortex::tmem::alloc(cols * cupbop_column_ratio) / cupbop_column_ratio;
+}
+extern "C" void __cupbop_column_free(uint32_t col, uint32_t cols) {
+  if (vx_thread_id() == 0) vortex::tmem::dealloc(col * cupbop_column_ratio, cols * cupbop_column_ratio);
+}
+#else
 #define CUPBOP_NATIVE_TMEM
+#endif
 #endif
 
 // Backing store is indexed by the hardware CTA slot, which the KMU retains
@@ -40,6 +58,226 @@ static inline const int8_t *tcgen_chunk(const TcgenOperand &a, unsigned row, uns
   if (a.swizzle) return (const int8_t *)((a.start + offset + (row & 7) * 128 + half * 16) ^ ((row & 7) << 4));
   return (const int8_t *)(a.start + offset + (row & 7) * 16 + half * a.leading);
 }
+#ifdef CUPBOP_COLUMN_TILE
+namespace tmcol = vortex::tmem;
+namespace tensor = vortex::tensor;
+
+struct ColumnWords {
+  static constexpr unsigned NR = 8;
+  float data[NR];
+};
+
+static unsigned column_panel(unsigned col, unsigned half) {
+  return (col & ~15u) * 2 + half * 16;
+}
+
+// The two resident CTAs each own and release a physical run. CUDA sees
+// the same virtual address in both. CTA slots are local to a core.
+constexpr unsigned columnPairTag = 0x8000;
+struct ColumnPairRun { unsigned base, size; };
+static volatile ColumnPairRun pairRuns[VX_CFG_NUM_CORES * VX_CFG_NUM_CLUSTERS][VX_CFG_NUM_WARPS];
+static volatile ColumnPairRun &pairRun(unsigned side) {
+  unsigned rank = cluster_rank();
+  unsigned slot = csr_read_nv(VX_CSR_CTA_ID) - (rank & 1) + side;
+  return pairRuns[vx_core_id()][slot];
+}
+extern "C" void __cupbop_column_pair_alloc(unsigned *dst, unsigned cols) {
+  if (!vx_thread_id()) {
+    if (__cupbop_cluster_register(1,0) != 2 || cols * 4 > VX_CFG_TCU_TMEM_COLS)
+      cupbop_async_fail("paired runs exceed resident core capacity", cols, VX_CFG_TCU_TMEM_COLS);
+    auto &run = pairRun(cluster_rank() & 1);
+    if (run.size) cupbop_async_fail("paired column run already allocated", cols, run.size);
+    unsigned base = tmcol::alloc(cols * 2);
+    run.base = base / 2;
+    run.size = cols;
+    vx_fence();
+    *dst = columnPairTag;
+  }
+}
+extern "C" void __cupbop_column_pair_free(unsigned addr, unsigned cols) {
+  if (!vx_thread_id()) {
+    auto &run = pairRun(cluster_rank() & 1);
+    if (addr != columnPairTag || run.size != cols)
+      cupbop_async_fail("invalid paired run", addr, cols);
+    tmcol::dealloc(run.base * 2, cols * 2);
+    run.size = 0;
+  }
+}
+// A separate shared slab per issuing warp keeps one producer from
+// overwriting another's descriptors before its tc.commit has retired.
+template <typename Input, typename Output>
+static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
+                                     uint32_t use_d, uint8_t *scratch, unsigned columns, int side = -1) {
+  using ColumnGeometry = tensor::wgmma_config_t<32, Input, Output>;
+  unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
+  if (warp >= 4 || (col & 15) || col + columns > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
+    cupbop_async_fail("unsupported column MMA destination or issuer", col, warp);
+  auto a = tcgen_operand(desc_a);
+  auto b = tcgen_operand(desc_b);
+  TcgenOperand b_other = b;
+  if (side >= 0) {
+    a.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(a.start), side));
+    b_other.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(b.start), 1));
+    b.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(b.start), 0));
+  }
+  constexpr unsigned rows = 128, kbytes = 32;
+  // Only thread zero can issue a column job. The scratch operand is a
+  // CTA-shared symbol placed by mem_share2local in the launch allocation.
+  if (vx_thread_id() != 0) cupbop_async_fail("column MMA needs lane zero", col, warp);
+  scratch += warp * ((rows + 256) * kbytes);
+  uint8_t *a_stage = scratch;
+  uint8_t *b_stage = scratch + rows * kbytes;
+  for (unsigned row = 0; row < rows; ++row) {
+    const unsigned panel_row = (row % 32 / 16) * 64 + (row / 32) * 16 + row % 16;
+    for (unsigned half = 0; half < 2; ++half)
+      __builtin_memcpy(a_stage + panel_row * kbytes + half * 16, tcgen_chunk(a, row, half), 16);
+  }
+  for (unsigned n = 0; n < columns; ++n)
+    for (unsigned half = 0; half < 2; ++half)
+      __builtin_memcpy(b_stage + n * kbytes + half * 16, tcgen_chunk(side >= 0 && n >= columns/2 ? b_other : b,
+                        side >= 0 ? n % (columns/2) : n, half), 16);
+  vx_fence();
+  const unsigned a_off = tmcol::smem_offset(a_stage), b_off = tmcol::smem_offset(b_stage);
+  if (uint64_t(b_off) + columns * kbytes > (1u << tensor::smem_desc_offset_bits))
+    cupbop_async_fail("column MMA scratch exceeds descriptor range", a_off, b_off);
+  for (unsigned n = 0; n < columns; n += 16)
+    for (unsigned panel = 0; panel < 2; ++panel)
+      for (unsigned k = 0; k < kbytes; k += ColumnGeometry::fedpK * 4) {
+        auto desc = tmcol::make_idesc<Input>(16 / tmcol::frag_cols(), column_panel(col+n, panel),
+                                                   !use_d && !k);
+        tmcol::mma(desc, tmcol::smem_desc(a_off + panel * 64 * kbytes + k, kbytes),
+                        tmcol::smem_desc(b_off + n * kbytes + k, kbytes));
+      }
+  const unsigned barrier = ((vx_num_barriers() - 1 - warp) << 8) | csr_read_nv(VX_CSR_CTA_ID);
+  tmcol::commit(barrier, 2);
+  vx_barrier(barrier, 2);
+}
+
+template <typename Input, typename Output>
+static void column_pair_mma(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                         uint8_t *scratch, unsigned n) {
+  unsigned offset = addr - columnPairTag;
+  for (unsigned side = 0; side < 2; ++side) {
+    auto &run = pairRun(side);
+    if (offset > run.size || n > run.size - offset || (run.base + offset + n) * 2 > 1024)
+      cupbop_async_fail("paired destination outside addressable column run", addr, side);
+    column_mma<Input, Output>(run.base + offset, a, b, use_d, scratch, n, side);
+  }
+}
+template <typename Input, typename Output, bool Pair>
+static void column_issue(unsigned addr, uint64_t a, uint64_t b, unsigned use_d, uint8_t *scratch, unsigned n) {
+  if constexpr (Pair) column_pair_mma<Input, Output>(addr, a, b, use_d, scratch, n);
+  else column_mma<Input, Output>(addr, a, b, use_d, scratch, n);
+}
+
+template <bool Pair>
+static void column_mma_format(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                              uint8_t *scratch, unsigned n, unsigned format) {
+  // Low PTX instruction descriptor bits specify A, B and accumulator types.
+  switch (format) {
+    case 0x10: return column_issue<tensor::fp16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n);
+    case 0x490: return column_issue<tensor::bf16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n);
+    case 0x20: return column_issue<tensor::uint8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n);
+    case 0x4a0: return column_issue<tensor::int8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n);
+    default: cupbop_async_fail("invalid column MMA format", format, n);
+  }
+}
+
+extern "C" void __cupbop_column_pair_mma(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                         uint8_t *scratch, unsigned n, unsigned format) {
+  column_mma_format<true>(addr, a, b, use_d, scratch, n, format);
+}
+extern "C" void __cupbop_column_mma(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                    uint8_t *scratch, unsigned n, unsigned format) {
+  column_mma_format<false>(addr, a, b, use_d, scratch, n, format);
+}
+
+static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch) {
+  unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
+  if (warp >= 4 || vx_thread_id() || col % 4 || col + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
+    cupbop_async_fail("unsupported column copy destination or issuer", col, warp);
+  scratch += warp * (128 + 256) * 32;
+  constexpr uintptr_t bankRow = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+  scratch = reinterpret_cast<uint8_t *>((uintptr_t(scratch) + bankRow - 1) & ~(bankRow - 1));
+  for (unsigned group = 0; group < cols / 4; ++group) {
+    for (unsigned half = 0; half < 2; ++half) {
+      auto *stage = scratch + (2 * group + half) * 1024;
+      for (unsigned row = 0; row < 64; ++row) {
+        unsigned logical = (row / 16) * 32 + half * 16 + row % 16;
+        __builtin_memcpy(stage + row * 16, tcgen_chunk(src, logical, group), 16);
+      }
+      vx_fence();
+      unsigned dst = col + group * 4;
+      tmcol::cp(column_panel(dst, half) + dst % 16, stage, 4);
+    }
+  }
+  unsigned bar = ((vx_num_barriers() - 1 - warp) << 8) | csr_read_nv(VX_CSR_CTA_ID);
+  tmcol::commit(bar, 2);
+  vx_barrier(bar, 2);
+}
+
+extern "C" void __cupbop_column_cp(unsigned col, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
+  column_copy(col, tcgen_operand(descriptor), cols, scratch);
+}
+extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
+  unsigned offset = addr - columnPairTag;
+  for (unsigned side = 0; side < 2; ++side) {
+    auto &run = pairRun(side);
+    if (offset > run.size || cols > run.size - offset)
+      cupbop_async_fail("paired copy outside allocation", addr, cols);
+    auto src = tcgen_operand(descriptor);
+    src.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(src.start), side));
+    column_copy(run.base + offset, src, cols, scratch);
+  }
+}
+static unsigned column_transfer(unsigned addr, unsigned displacement, unsigned count) {
+  unsigned col = (addr & 0xffff) + displacement;
+  unsigned row = addr >> 16;
+  if (col & columnPairTag) {
+    unsigned side = cluster_rank() & 1;
+    auto &run = pairRun(side);
+    col -= columnPairTag;
+    if (col > run.size || count > run.size - col)
+      cupbop_async_fail("paired transfer outside run", addr, displacement);
+    col += run.base;
+    if (side && row >= 128) row -= 128;
+  }
+  unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
+  if (warp >= 4 || row != warp * 32 || col + count > VX_CFG_TCU_TMEM_COLS / 2)
+    cupbop_async_fail("column transfer outside warp datapath", addr, warp);
+  return col;
+}
+
+extern "C" void __cupbop_column_st4(unsigned addr, unsigned a, unsigned b, unsigned c, unsigned d) {
+  unsigned col = column_transfer(addr, 0, 4);
+  if (col % 4) cupbop_async_fail("unaligned column store", addr, col);
+  unsigned lane = vx_thread_id();
+  for (unsigned half = 0; half < 2; ++half) {
+    unsigned source = lane % 16 + half * 16;
+    unsigned x = vx_shfl_idx(a, source, 31, 0), y = vx_shfl_idx(b, source, 31, 0);
+    unsigned z = vx_shfl_idx(c, source, 31, 0), w = vx_shfl_idx(d, source, 31, 0);
+    register float f0 __asm__("f0") = __builtin_bit_cast(float, lane < 16 ? x : y);
+    register float f1 __asm__("f1") = __builtin_bit_cast(float, lane < 16 ? z : w);
+    unsigned dest = tmcol::make_taddr(tmcol::warp_lane(), column_panel(col, half) + col % 16);
+    __asm__ volatile(".insn r %0, 1, 5, x0, %1, x1" :: "i"(RISCV_CUSTOM0), "r"(dest), "f"(f0), "f"(f1) : "memory");
+  }
+}
+extern "C" void __cupbop_column_wait_st() { tmcol::wait_st(); }
+
+extern "C" uint32_t __cupbop_column_ld32(uint32_t address, uint32_t displacement) {
+  unsigned col = column_transfer(address, displacement, 1);
+  const unsigned lane = vx_thread_id();
+  uint32_t parts[2];
+  for (unsigned half = 0; half < 2; ++half) {
+    ColumnWords words;
+    tmcol::load(words, tmcol::make_taddr(tmcol::warp_lane(), column_panel(col, half)));
+    uint32_t bits;
+    __builtin_memcpy(&bits, &words.data[(col & 15) / 2], sizeof(bits));
+    parts[half] = vx_shfl_idx(bits, (lane % 16) + (col & 1) * 16, 31, 0);
+  }
+  return parts[lane / 16];
+}
+#endif
 #ifdef CUPBOP_NATIVE_TMEM
 static unsigned tcgen_pair_peer() {
   unsigned rank = cluster_rank();
@@ -222,6 +460,52 @@ extern "C" void __cupbop_tma_multicast(void *dst, const void *desc, void *bar, u
   }
   for (; mask; mask &= mask-1)
     __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(bar,__builtin_ctz(mask))),0,-int32_t(bytes));
+}
+
+// Each CTA's first producer warp owns a separate reserved barrier in each
+// receiver. Attach and arrive before issue so a fast completion cannot
+// roll the phase twice. Publish PTX byte completion after all writes land.
+extern "C" __attribute__((convergent)) void __cupbop_tma_multicast_warp(
+    unsigned issue, void *dst, const void *desc, void *mbar, unsigned rank,
+    int c0, int c1, int c2, int c3, int c4, unsigned mask) {
+#if defined(VX_CFG_EXT_DXA_ENABLE) && VX_CFG_NUM_THREADS == 32
+  if (vx_active_threads() == UINT32_MAX && vx_vote_ballot(issue) == 1 &&
+      csr_read_nv(VX_CSR_CTA_RANK) == 0 && vx_num_barriers() > __cupbop_cluster_register(1, 0)) {
+    unsigned peers = vx_shfl_idx(mask, 0, 31, 0);
+    unsigned slot = UINT32_MAX, bytes = 0;
+    bool valid = false;
+    if (vx_thread_id() == 0 && (peers & (peers - 1)) &&
+        !(peers >> __cupbop_cluster_register(1, 0))) {
+      const auto *map = cupbop_tmap_of(desc, rank);
+      slot = cupbop_tma_slot(map);
+      valid = cupbop_tma_dxa_ok(slot, dst, c0, c1, c2, c3, c4) &&
+              (!map->swizzle || !(cluster_context().cluster_stride & 127));
+      bytes = map->elem;
+      for (unsigned i = 0; i < rank; ++i) bytes *= map->box[i];
+    }
+    if (vx_vote_ballot(valid) == 1) {
+      const unsigned issuer = cluster_rank();
+      const unsigned base = ((vx_num_barriers() - 1 - issuer) << 8) | (csr_read_nv(VX_CSR_CTA_ID) - issuer);
+      void *first_page = reinterpret_cast<void *>(uintptr_t(dst) - issuer * cluster_context().cluster_stride);
+      unsigned phases = 0;
+      for (unsigned pending = peers; pending; pending &= pending - 1) {
+        unsigned peer = __builtin_ctz(pending);
+        vx_barrier_expect_tx(base + peer, 1);
+        phases |= unsigned(vx_barrier_arrive(base + peer, 1) & 1) << peer;
+      }
+      cupbop_tma_dxa_issue_meta((base << 4) | (slot & 15u), first_page, rank, c0, c1, c2, c3, c4, peers);
+      for (unsigned pending = peers; pending; pending &= pending - 1) {
+        unsigned peer = __builtin_ctz(pending);
+        vx_barrier_wait(base + peer, (phases >> peer) & 1);
+      }
+      if (vx_thread_id() == 0) for (; peers; peers &= peers - 1)
+        __cupbop_tcgen_arrive(static_cast<uint64_t *>(__cupbop_cluster_map(mbar, __builtin_ctz(peers))),
+                              0, -int32_t(bytes));
+      return;
+    }
+  }
+#endif
+  if (issue) __cupbop_tma_multicast(dst, desc, mbar, rank, c0, c1, c2, c3, c4, mask);
 }
 
 extern "C" void __cupbop_bulk_multicast(void *dst, const void *src, unsigned bytes, void *bar, unsigned mask) {

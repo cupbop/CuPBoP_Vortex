@@ -1711,7 +1711,7 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
 // service: a service launch (kernel_idx -1 / -2), which goes to cupbop_service_main when the module has it
 static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
                                const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes,
-                               bool service = false, dim3 cluster = dim3(1,1,1)) {
+                               bool service = false, dim3 cluster = dim3(1,1,1), uint32_t tmem_cols = 0) {
   vx_launch_info_t li = {};
   li.struct_size = sizeof(li);
   li.kernel      = service ? DC->service_kernel() : DC->kernel();
@@ -1723,6 +1723,9 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
   li.cluster_dim[0] = cluster.x;
   li.cluster_dim[1] = cluster.y;
   li.cluster_dim[2] = cluster.z;
+#ifdef VX_CFG_TCU_TMEM_COLUMN_ENABLE
+  li.tmem_cols = tmem_cols;
+#endif
   li.lmem_size   = lmem_bytes;
   vx_event_h ev = nullptr;
   RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
@@ -2422,6 +2425,21 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
   if (kernel_index < 0) return cudaErrorInvalidDeviceFunction;
   DBG_COUT("kernel lookup matched " << kernel_name_tmp << " at index " << kernel_index << std::endl);
   const std::string table_name = stripPrefix(kernel_name_tmp);
+  uint32_t tmem_cols = 0;
+  bool paired_columns = false;
+  {
+    std::ifstream columns("cupbop_column_kernels.txt");
+    for (std::string row; std::getline(columns, row);) {
+      paired_columns = row == kernel_name_tmp + " pair";
+      if (!paired_columns && row != kernel_name_tmp) continue;
+#ifdef VX_CFG_TCU_TMEM_COLUMN_ENABLE
+      tmem_cols = VX_CFG_TCU_TMEM_COLS / (paired_columns ? 2 : 1);
+#else
+      return cudaErrorInvalidConfiguration;
+#endif
+      break;
+    }
+  }
   cupbop_cta_fix cta_fix;
                       
   std::ifstream shapes("cupbop_cluster_dims.txt");
@@ -2448,6 +2466,8 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       gridDim.z % cluster.z) return cudaErrorInvalidConfiguration;
   const unsigned members = cluster.x * cluster.y * cluster.z;
   const char *local_memory = getenv("VORTEX_LOCALMEM_FLAG");
+  if (paired_columns && (members != 2 || uint64_t(blockDim.x) * blockDim.y * blockDim.z != 128)) return cudaErrorInvalidConfiguration;
+  if (tmem_cols && ((!paired_columns && members > 1) || cupbop_schedule_flag() != 2)) return cudaErrorInvalidConfiguration;
   if (members > 1 && local_memory && atoi(local_memory) != 1) return cudaErrorInvalidConfiguration;
   if ((members > 1 || split_barrier) && cupbop_schedule_flag() != 2) return cudaErrorInvalidConfiguration;
   DBG_PRINT("cudaLaunchKernel: gridDim=(%d, %d, %d), blockDim=(%d, %d, %d), sharedMem=%lu, num_args = %d\n",
@@ -2781,6 +2801,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
 
   // A tensor map's first word is its registered device address, including maps inside a by-value parameter.
   std::set<uint64_t> launch_tensor_maps;
+  std::vector<unsigned> tensor_slots;
   if (!dxa_tensor_maps.empty()) {
     int next_slot = 15;
     for (int i = 0; i < num_slots; ++i) {
@@ -2802,6 +2823,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
       dxa_program(DC->device(), d);
       DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
+      tensor_slots.push_back(d.slot);
       launch_tensor_maps.insert(r.self);
       --next_slot;
       DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
@@ -2935,6 +2957,10 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
           members * ((threads + lanes - 1) / lanes) > CUPBOP_EFF_NUM_WARPS())
         return cudaErrorInvalidConfiguration;
     }
+    if (members > 1) for (unsigned slot : tensor_slots) {
+      // The launch fixes the aligned distance between receiver CTA pages.
+      RT_CHECK(vx_dcr_write(DC->device(), 0x100 + slot * 24 + 21, uint32_t(stride)));
+    }
     if (cta_fix.dims && split_barrier) return cudaErrorInvalidConfiguration;
     if (!cta_fix.dims) {
       abuf_ptr->ctx.cluster_shape = cluster.x | (cluster.y << 8) | (cluster.z << 16) |
@@ -2975,6 +3001,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       if (!parsed) why = "not x,y,z";
       else if (pm == 1) why = "one CTA";
       else if (members > 1 || split_barrier || explicit_cluster) why = "the kernel has a cluster of its own";
+      else if (tmem_cols) why = "CTA reserves the core TMEM";
       else if (cta_fix.dims) why = "CTA loop";
       else if (schedule != 2) why = "not schedule 2";
       else if (px > 16 || py > 16 || pz > 16 || pm > 16) why = "more than 16 CTAs";
@@ -2985,7 +3012,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       fprintf(stderr, "cupbop: place %s: %s %s%s (grid %u,%u,%u, %lu warps and %lu bytes per CTA)\n", func_stripped.c_str(), pe,
               why ? "not applied: " : "applied", why ? why : "", grid[0], grid[1], grid[2], (unsigned long)cta_warps, (unsigned long)stride);
     }
-    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, place);
+    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, place, tmem_cols);
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
     // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
     // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
