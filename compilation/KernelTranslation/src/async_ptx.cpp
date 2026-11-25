@@ -2695,14 +2695,19 @@ static bool lowerSdkBuiltin(PassState &s, CallInst *call, ArrayRef<Stmt> stateme
   return true;
 }
 
-void lower_async_ptx(Module *M) {
-  if (std::getenv("VORTEX_CONFIGS") && vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_COLUMN_ENABLE")) {
-    for (StringRef opcode : {"utcatomsws", "utchmma", "utcimma", "utccp", "sttm"}) {
-      auto *unlifted = M->getFunction(("sass_unsupported_" + opcode).str());
-      if (unlifted && !unlifted->use_empty())
-        report_fatal_error(Twine("incomplete CuLifter column TMEM input: ") + unlifted->getName());
-    }
+void check_lifted_column_tmem(Module *M) {
+  if (!std::getenv("VORTEX_CONFIGS") || !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_COLUMN_ENABLE"))
+    return;
+  for (Function &F : *M) {
+    StringRef opcode = F.getName();
+    if (!opcode.consume_front("sass_unsupported_") || F.use_empty())
+      continue;
+    if (opcode.starts_with("utc") || opcode == "ldtm" || opcode == "sttm")
+      report_fatal_error(Twine("incomplete CuLifter column TMEM input: ") + F.getName());
   }
+}
+
+void lower_async_ptx(Module *M) {
   PassState S(M);
   const int sched = schedule();
   // 1. NVVM intrinsics (cluster registers first: CuLifter mbarrier addresses fold to constants after that)

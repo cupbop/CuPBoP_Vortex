@@ -61,10 +61,32 @@ grep -F 'call void @__cupbop_mma_m16n8k16_f16f32' kernel.ll
 test "$(grep -c 'call void @__cupbop_ldmatrix_m8n8_b16' kernel.ll)" -ge 3
 grep -E 'store i32 %[^,]+, ptr addrspace\(1\) %out' kernel.ll
 
+# A local symbol matching the name of a lifted SWIN helper can also occur in
+# ordinary LLVM input. Its result must still depend on the kernel argument.
+cat > window.ll <<'IR'
+target triple = "nvptx64-nvidia-cuda"
+@shared_mem = external addrspace(3) global [32 x i8]
+define internal i32 @__culifter_shared_window_hi(i32 %x) noinline {
+  ret i32 %x
+}
+define ptx_kernel void @window(ptr addrspace(1) %out, i32 %x) {
+  %word = call i32 @__culifter_shared_window_hi(i32 %x)
+  store i32 %word, ptr addrspace(1) %out
+  ret void
+}
+!nvvm.annotations = !{!0}
+!0 = !{ptr @window, !"kernel", i32 1}
+IR
+"$llvm_bin/llvm-as" window.ll -o input.bc
+"$translator" input.bc kernel.bc
+"$llvm_bin/llvm-dis" kernel.bc -o kernel.ll
+grep -E 'store i32 %[^,]+, ptr addrspace\(1\) %out' kernel.ll
+
 check_refused() {
-  local name=$1 expected=$2 instruction=$3
+  local name=$1 expected=$2 instruction=$3 helper=${4:-}
   cat > "$name.ll" <<IR
 target triple = "nvptx64-nvidia-cuda"
+$helper
 define ptx_kernel void @reject(ptr addrspace(1) %addr) {
   $instruction
   ret void
@@ -89,3 +111,11 @@ VORTEX_CONFIGS='-DVX_CFG_EXT_TCU_ENABLE' CUPBOP_MMA_LOWERING=tcu \
 check_refused compound_load 'unsupported compound PTX memory asm' '%v = call i32 asm sideeffect "ld.volatile.global.b32 $0, [$1]; red.release.gpu.global.add.u32 [$1], 1;", "=r,l,~{memory}"(ptr addrspace(1) %addr)'
 check_refused compound_convert 'unsupported compound PTX memory asm' '%v = call float asm sideeffect "cvt.f32.f16 $0, $1; st.release.gpu.global.u32 [$2], 1;", "=f,h,l,~{memory}"(i16 0,ptr addrspace(1) %addr)'
 check_refused reversed_fragments 'ldmatrix asm with unexpected operands' '%v = call {i32,i32} asm sideeffect "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {$1,$0}, [$2];", "=r,=r,r,~{memory}"(i32 0)'
+
+# CuLifter represents unhandled SASS as a weak no-op. Its LDTM output
+# registers have already become zeros by the time this IR reaches CuPBoP.
+for op in ldtm utcbar; do
+  VORTEX_CONFIGS='-DVX_CFG_TCU_TMEM_COLUMN_ENABLE' CUPBOP_LIFT_OPT=1 \
+    check_refused "column_$op" "incomplete CuLifter column TMEM input: sass_unsupported_$op" \
+      "call void @sass_unsupported_$op()" "define weak void @sass_unsupported_$op() { ret void }"
+done

@@ -10,7 +10,7 @@ This repository utilizes a distributed CI/CD pipeline that bridges GitHub Action
     * Phase 1: Build — `ci/run-crnch-cuda.sh` (Slurm job, 16 CPUs)
         * Checks out the repository
         * Builds the CuPBoP translators and host runtime against the Vortex LLVM 20 (`cmake` + `make`); the host runtime is compiled with the `VX_CFG_*` flags of the SimX configuration (`gen_config.py`)
-        * Makes sure the two SimX drivers exist: `$VORTEX_HOME/build64_cupbop` (main configuration) and `$VORTEX_HOME/build64_cupbop_tcu` (TCU + DXA, for `sgemm_tcu`, `sgemm_dxa`, `sgemm_tcu_dxa`). `cupbop_v3_ensure_simx` records the flags in `<build>/.cupbop_simx_configs` and only rebuilds when `VORTEX_CONFIGS` changed
+        * Makes sure the two SimX drivers exist: `$VORTEX_HOME/build64_cupbop` (main configuration) and `$VORTEX_HOME/build64_cupbop_tcu` (TCU + DXA, for `sgemm_tcu`, `sgemm_dxa`, `sgemm_tcu_dxa`). `cupbop_v3_ensure_simx` records the flags in `<build>/.cupbop_simx_configs` and checks Vortex build dependencies on every invocation, including when the flags match
     * Phase 2: Tests — `ci/run-crnch-cuda-test.sh`, one Slurm job per matrix entry
         * Matrix "name" lists all current tests, "scheduler" the CuPBoP schedulers (2 = one CUDA thread per hardware thread, 0 = FLAT/one block per hardware thread), "localmem" whether `__shared__` goes to the Vortex local memory
         * `make -C examples/<name> ci SCHEDULE=<s> LOCALMEM=<l>` translates the example, builds the kernel ELF in a Vortex regression cell (`$VORTEX_PATH/tests/regression/cupbop_<name>_s<s>_l<l>`, see `examples/v3_cell.mk`) and runs it on SimX

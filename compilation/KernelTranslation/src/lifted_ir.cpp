@@ -9,6 +9,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -24,6 +25,69 @@
 
 using namespace llvm;
 
+// New lifts mark the target-specific helper. For stored IR predating the
+// marker, recognize CuLifter's original NVPTX implementation and its callers.
+static bool isSharedWindowHelper(Function &F, StringRef op) {
+  using namespace PatternMatch;
+  if (!F.hasLocalLinkage() || F.isDeclaration() || F.isVarArg())
+    return false;
+  if (op == "resolve") {
+    if (F.arg_size() != 3 || !F.getReturnType()->isIntegerTy(64) ||
+        !F.getArg(0)->getType()->isIntegerTy(64) || !F.getArg(1)->getType()->isPointerTy() ||
+        !F.getArg(2)->getType()->isIntegerTy(64))
+      return false;
+  } else if (F.arg_size() != 1 || !F.getReturnType()->isIntegerTy(32) ||
+             !F.getArg(0)->getType()->isIntegerTy(32)) {
+    return false;
+  }
+  if (F.getMetadata("culifter.shared_window"))
+    return true;
+  if (F.size() != 1)
+    return false;
+  auto &block = F.getEntryBlock();
+  auto *ret = dyn_cast<ReturnInst>(block.getTerminator());
+  if (!ret || !ret->getReturnValue())
+    return false;
+  auto *shared = F.getParent()->getNamedGlobal("shared_mem");
+  if (!shared || shared->getAddressSpace() != 3)
+    return false;
+  for (User *use : F.users()) {
+    auto *call = dyn_cast<CallBase>(use);
+    if (!call || call->getCalledFunction() != &F)
+      return false;
+    if (op == "resolve") {
+      if (call->arg_size() != 3 || !call->getArgOperand(1)->getType()->isPointerTy() ||
+          call->getArgOperand(1)->stripPointerCasts() != shared)
+        return false;
+    } else {
+      Value *base = nullptr, *ptr = nullptr;
+      if (call->arg_size() != 1)
+        return false;
+      Value *word = call->getArgOperand(0);
+      bool known = op == "hi" ? match(word, m_Trunc(m_LShr(m_Value(base), m_SpecificInt(32))))
+                              : match(word, m_Trunc(m_And(m_Value(base), m_SpecificInt(0xffffff))));
+      if (!known)
+        return false;
+      // A dynamic shared section rebases the window by a constant byte offset.
+      Value *unbiased;
+      if (match(base, m_Sub(m_Value(unbiased), m_ConstantInt())))
+        base = unbiased;
+      if (!match(base, m_PtrToInt(m_Value(ptr))) || ptr->stripPointerCasts() != shared)
+        return false;
+    }
+  }
+  if (op != "resolve")
+    return block.size() == 1 && ret->getReturnValue() == F.getArg(0);
+  if (block.size() != 9)
+    return false;
+  auto address = m_Specific(F.getArg(0));
+  auto base = m_PtrToInt(m_Specific(F.getArg(1)));
+  auto bias = m_Sub(m_And(base, m_SpecificInt(0xffffff)), m_Specific(F.getArg(2)));
+  auto window = m_SpecificICmp(ICmpInst::ICMP_EQ, m_LShr(address, m_SpecificInt(32)),
+                                m_LShr(base, m_SpecificInt(32)));
+  return match(ret->getReturnValue(), m_Select(window, m_Add(address, bias), address));
+}
+
 // Preserve ordinary Vortex generic pointers. Only addresses assembled by
 // lifted SWINHI carry this non-canonical high word; their low byte fields
 // are the original NVIDIA rank and window-relative offset.
@@ -31,7 +95,7 @@ void lower_lifted_shared_window(Module *M) {
   constexpr uint32_t windowTag = 0xc0da5a5a;
   for (StringRef op : {"hi", "lo", "resolve"}) {
     auto *F = M->getFunction(("__culifter_shared_window_" + op).str());
-    if (!F || F->isDeclaration() || !F->hasLocalLinkage()) continue;
+    if (!F || !isSharedWindowHelper(*F, op)) continue;
     F->deleteBody();
     F->setLinkage(GlobalValue::InternalLinkage);
     F->removeFnAttr(Attribute::NoInline);

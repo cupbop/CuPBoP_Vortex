@@ -51,27 +51,30 @@ export CXX=g++
 umask 002
 
 # cupbop_v3_ensure_simx <build_dir> <VX_CFG flags>
-# Configure <build_dir> (once) and build its SimX driver with the given flags: hw (config headers), sw/kernel
-# (libvortex.a used by the kernel cells), sw/runtime/stub (libvortex.so), sim/simx and sw/runtime/simx with PERF=1
-# (the examples read the Perf_counter_* summary). The flags are recorded in <build_dir>/.cupbop_simx_configs and
-# nothing is rebuilt while they match, so changing VORTEX_CONFIGS above is enough to get a matching SimX on the next
-# build job. Build log: <build_dir>/cupbop_simx_build.log.
-cupbop_v3_ensure_simx() {
-  local bdir=$1 cfg=$2
-  local mark=$bdir/.cupbop_simx_configs log=$bdir/cupbop_simx_build.log jobs=${SLURM_CPUS_PER_TASK:-8}
-  if [ ! -f $bdir/config.mk ]; then
-    mkdir -p $bdir && ( cd $bdir && $VORTEX_HOME/configure --xlen=64 --tooldir=$TOOLDIR > /dev/null ) \
-      || { echo "cupbop_v3_ensure_simx: configure failed in $bdir"; return 1; }
-  fi
-  if [ ! -f $bdir/sw/runtime/libvortex-simx.so ] || [ "$(cat $mark 2>/dev/null)" != "$cfg" ]; then
-    echo "cupbop_v3_ensure_simx: building SimX in $bdir for: $cfg"
-    ( cd $bdir && make -C hw && make -C sw/kernel && make -C sw/runtime/stub && make -C sim/simx clean && make -C sw/runtime/simx clean && \
-      CONFIGS="$cfg" make -C sim/simx PERF=1 -j$jobs && CONFIGS="$cfg" make -C sw/runtime/simx PERF=1 ) > $log 2>&1 \
-      || { echo "cupbop_v3_ensure_simx: SimX build failed in $bdir (log: $log)"; grep -n "error" $log | head; return 1; }
-    echo "$cfg" > $mark
-  fi
-  echo "cupbop_v3_ensure_simx: $bdir ready ($(cat $mark))"
-}
+# Refresh the configured Makefiles and let make check source dependencies even
+# when the VX_CFG flags match. Multiple CI jobs can share this build directory.
+cupbop_v3_ensure_simx() (
+  local bdir=$1 cfg=$2 jobs=${SLURM_CPUS_PER_TASK:-8}
+  mkdir -p "$bdir" && cd "$bdir" || return 1
+  exec 9>.cupbop_simx_build.lock
+  flock -x 9 || return 1
+  local mark=.cupbop_simx_configs log=cupbop_simx_build.log
+  export CONFIGS="$cfg"
+  {
+    "$VORTEX_HOME/configure" --xlen=64 --tooldir="$TOOLDIR" &&
+    if [ ! -f "$mark" ] || [ "$(cat "$mark")" != "$cfg" ]; then
+      rm -f "$mark" && make -C sim/simx clean && make -C sw/runtime/simx clean
+    fi &&
+    make -C hw && make -B -C sw/kernel && make -C sw/runtime/stub &&
+    make -C sim/simx PERF=1 -j"$jobs" && make -C sw/runtime/simx PERF=1 -j"$jobs"
+  } > "$log" 2>&1 || {
+    echo "cupbop_v3_ensure_simx: build failed in $bdir (log: $bdir/$log)"
+    tail -n 10 "$log"
+    return 1
+  }
+  printf '%s\n' "$cfg" > "$mark" || return 1
+  echo "cupbop_v3_ensure_simx: $bdir ready ($cfg)"
+)
 
 # cupbop_v3_select_simx <test_name>
 # The tensor examples run on the TCU+DXA SimX build: switch VORTEX_PATH / VORTEX_CONFIGS for them.

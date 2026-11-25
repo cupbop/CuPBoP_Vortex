@@ -14,6 +14,9 @@ struct SparseWgmmaOperands {
 };
 SparseWgmmaOperands parse_sparse_wgmma(llvm::CallInst *, unsigned outputs);
 
+// Check CuLifter placeholders while calls to its weak no-op bodies are still visible.
+void check_lifted_column_tmem(llvm::Module *M);
+
 // Hopper / Ampere asynchronous PTX -> CuPBoP internal calls, software mode (async design, stages 1-2).
 // Runs first in the translator (before lower_named_barriers and lower_cp_async), on CUDA-source inline asm,
 // the NVVM mbarrier intrinsics and CuLifter's asm forms. The asm is parsed statement by statement (labels,
