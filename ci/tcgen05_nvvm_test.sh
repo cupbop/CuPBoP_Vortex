@@ -24,6 +24,12 @@ define ptx_kernel void @dense(i32 %d, i64 %a, i64 %b, i1 %acc) {
   call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 134481056, i1 true, i32 3, i32 1, i32 0)
   ret void
 }
+define ptx_kernel void @dynamic(i32 %d, i64 %a, i64 %b, i32 %desc) {
+  %dest = inttoptr i32 %d to ptr addrspace(6)
+  call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 %desc, i1 false, i32 0, i32 1, i32 0)
+  call void @llvm.nvvm.tcgen05.mma.shared.mxf8f6f4.block_scale(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 %desc, i1 false, ptr addrspace(6) %dest, ptr addrspace(6) %dest, i32 1, i32 0)
+  ret void
+}
 define ptx_kernel void @sparse(i32 %d, i32 %a, i64 %b, i32 %meta) {
   %dest = inttoptr i32 %d to ptr addrspace(6)
   %src = inttoptr i32 %a to ptr addrspace(6)
@@ -46,6 +52,7 @@ IR
 for name in mma pair_mma_ts_sp mma_mx; do
   grep -Eq "call void @__cupbop_column_${name}\(" kernel.ll
 done
+[[ $(grep -c 'call void @__cupbop_tcgen05_check_descriptor(i32 %desc,' kernel.ll) == 2 ]]
 if grep -Fq 'call void @llvm.nvvm.tcgen05.mma.' kernel.ll; then exit 1; fi
 
 if VORTEX_CONFIGS="${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/}" "$translator" source.bc missing.bc > missing.log 2>&1; then

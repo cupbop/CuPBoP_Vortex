@@ -1,0 +1,4 @@
+KERNEL_CU = ../tcgen05_column_scaled/tcgen05_column_scaled.cu
+override EXTRA_CLANG_FLAGS += -DCUPBOP_TEST_MIXED_MX -DCUPBOP_TEST_SCALED_TMEM_A
+EXTRA_NVCC_FLAGS = -arch=sm_100a -DCUPBOP_TEST_MIXED_MX -DCUPBOP_TEST_SCALED_TMEM_A
+include ../lift.mk

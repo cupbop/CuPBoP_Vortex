@@ -2,6 +2,7 @@
 // to CuPBoP internal calls in software mode. See async_ptx.h and 2026-10-28_ASYNC_DESIGN_KO.md (§4-§6).
 #include "async_ptx.h"
 #include "../../../runtime/include/cupbop_reduce.h"
+#include "../../../runtime/include/cupbop_tcgen05_desc.h"
 #include "async_copy.h"
 #include "tool.h"
 
@@ -722,13 +723,22 @@ struct AsmLowering {
       setReg(trim(s.ops[0]), B.CreatePtrToInt(paramAddress(it->second), S.I64), pred);
       return;
     }
+    if (o == "and.pred" || o == "not.pred" || o == "and.b32") {
+      bool unary = o == "not.pred";
+      Type *ty = o == "and.b32" ? S.I32 : S.I1;
+      nops(unary ? 2 : 3, unary ? 2 : 3);
+      Value *lhs = val(s.ops[1], ty);
+      setReg(s.ops[0], unary ? B.CreateNot(lhs) : B.CreateAnd(lhs, val(s.ops[2], ty)), pred);
+      return;
+    }
     if (sw("setp.")) {
-      nops(3, 3);
-      if (s.tok.size() < 3) fail("`" + s.text + "`");
+      const bool andPred = s.tok.size() == 4 && s.tok[2] == "and";
+      nops(andPred ? 4 : 3, andPred ? 4 : 3);
+      if (s.tok.size() != 3 && !andPred) fail("unsupported setp combination in async asm");
       if (s.ops[0].find('|') != std::string::npos) fail("setp with two destinations in async asm");
       const std::string &cmp = s.tok[1];
       Type *T = width();
-      bool sgn = s.tok[2][0] == 's';
+      bool sgn = s.tok.back()[0] == 's';
       Value *a = val(s.ops[1], T), *b = val(s.ops[2], T);
       CmpInst::Predicate P;
       if (cmp == "eq") P = CmpInst::ICMP_EQ;
@@ -739,6 +749,7 @@ struct AsmLowering {
       else if (cmp == "ge") P = sgn ? CmpInst::ICMP_SGE : CmpInst::ICMP_UGE;
       else fail("setp comparison `" + cmp + "` in async asm");
       Value *r = B.CreateICmp(P, a, b); // folds when both are constants
+      if (andPred) r = B.CreateAnd(r, val(s.ops[3], S.I1));
       setReg(trim(s.ops[0]), r, pred);
       return;
     }
@@ -937,6 +948,27 @@ struct AsmLowering {
     fail("unsupported statement in async asm: `" + s.text + "`");
   }
 
+  // Keep compile-time errors for constants. For runtime descriptors the check
+  // runs under the same PTX issue predicate as the operation itself.
+  void checkTcgenDescriptor(Value *desc, cupbop_tcgen05::Kind kind, bool pair, bool sparse,
+                            bool tmemA, unsigned vec) {
+    using namespace cupbop_tcgen05;
+    unsigned features = vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE") ? 0u : unsigned(Fp16);
+    for (const auto &feature : {std::make_pair(Tf32, "-DVX_CFG_TCU_TF32_ENABLE"),
+                                {Int8, "-DVX_CFG_TCU_INT8_ENABLE"}, {Mx, "-DVX_CFG_TCU_MX_ENABLE"},
+                                {Fp8, "-DVX_CFG_TCU_FP8_ENABLE"}, {Fp4, "-DVX_CFG_TCU_FP4_ENABLE"},
+                                {MxFp4, "-DVX_CFG_TCU_MXFP4_ENABLE"}, {NvFp4, "-DVX_CFG_TCU_NVFP4_ENABLE"}})
+      if (vortexConfigHasFlag(feature.second)) features |= feature.first;
+    if (auto *imm = dyn_cast<ConstantInt>(desc)) {
+      if (const char *error = descriptor_error(imm->getZExtValue(), kind, pair, sparse, tmemA, vec, features))
+        fail(error);
+    } else {
+      S.call(B, "__cupbop_tcgen05_check_descriptor", S.Void,
+             {desc, B.getInt32(unsigned(kind)), B.getInt32(pair), B.getInt32(sparse), B.getInt32(tmemA),
+              B.getInt32(vec), B.getInt32(features)});
+    }
+  }
+
   void lowerTcgen(const Stmt &s, Value *pred) {
     needWarps();
     const bool pair = s.has("cta_group::2");
@@ -1109,10 +1141,14 @@ struct AsmLowering {
     bool sparse = s.has("sp");
     std::string mma = sparse ? "tcgen05.mma.sp." : "tcgen05.mma.";
     mma += pair ? "cta_group::2.kind::" : "cta_group::1.kind::";
-    auto smallFloatType = [](unsigned code) { return code <= 1 || (code >= 3 && code <= 5); };
+    using cupbop_tcgen05::Kind;
     if (column && s.has("mma") && s.has("block_scale")) {
       bool wide = s.has("kind::mxf8f6f4");
       bool nv = s.has("kind::mxf4nvf4");
+      // The opcode itself requires the MX runtime on this target, even if
+      // its precision and vector selectors come from a register descriptor.
+      if (!vortexConfigHasFlag("-DVX_CFG_TCU_MX_ENABLE"))
+        fail("block-scaled MMA input type disabled in the Vortex target configuration");
       unsigned vec = (s.has("scale_vec::4X") || s.has("block16")) ? 4 : wide ? 1 : 2;
       std::string prefix = mma + (wide ? "mxf8f6f4" : nv ? "mxf4nvf4" : "mxf4") + ".block_scale";
       if (s.op != prefix + ".scale_vec::" + std::to_string(vec) + "X" &&
@@ -1123,34 +1159,10 @@ struct AsmLowering {
       if (s.ops.size() != idesc + 4 || s.ops[1].empty())
         fail("expected block-scaled MMA with two TMEM scale addresses");
       const bool tmemA = s.ops[1].front() == '[';
-      auto *desc = dyn_cast<ConstantInt>(val(s.ops[idesc], S.I32));
-      if (!desc) fail("expected constant block-scaled MMA instruction descriptor");
-      unsigned bits = desc->getZExtValue();
-      unsigned at = bits >> 7 & 7, bt = bits >> 10 & 7;
-      unsigned n = (bits >> 17 & 63) * 8;
-      unsigned sf = bits >> 23 & 3, aid = bits >> 29 & 3, bid = bits >> 4 & 3;
-      unsigned valid = (3u << 29) | (3u << 27) | (1u << 23) | (63u << 17) |
-                       (3u << 13) | (7u << 7) | (7u << 10) | (3u << 4) | 4u;
-      if (wide) valid |= 3u << 15;
-      if ((bits & ~valid) || bool(bits & 4) != sparse)
-        fail("unsupported layout, K dimension or sparsity in SM100 block-scaled MMA descriptor");
-      if (((bits >> 27) & 3) != (pair ? 2u : 1u) || !n || n > 256 || (pair && n % 16))
-        fail("unsupported M or N dimension for this block-scaled MMA CTA group");
-      if ((aid % vec) || (bid % vec)) fail("misaligned scale-factor byte selector");
-      if (wide ? vec != 1 || sf != 1 || !smallFloatType(at) || !smallFloatType(bt)
-               : at != 1 || bt != 1 || (vec == 4 && !nv) || (!sf && !(nv && vec == 4)))
-        fail("unsupported input format, scale format or vector length for this SM100 MMA kind");
-      if (tmemA && (bits & (1u << 15))) fail("TMEM-source MX MMA requires K-major A");
-      if (pair && wide && (bits & (1u << 16)) && n % 32)
-        fail("paired MN-major MXFP8 B requires N divisible by 32");
-      if (wide && ((at == 1 && (bt == 0 || bt == 3)) || (bt == 1 && (at == 0 || at == 3))))
-        fail("these mixed MX inputs cannot be represented in one native E5M2 or E4M3 job");
-      const char *typeFlag = wide ? "-DVX_CFG_TCU_FP8_ENABLE" :
-                             sf ? "-DVX_CFG_TCU_MXFP4_ENABLE" : "-DVX_CFG_TCU_NVFP4_ENABLE";
-      if (!vortexConfigHasFlag("-DVX_CFG_TCU_MX_ENABLE") || !vortexConfigHasFlag(typeFlag) ||
-          (!wide && !vortexConfigHasFlag("-DVX_CFG_TCU_FP4_ENABLE")))
-        fail("block-scaled MMA input type disabled in the Vortex target configuration");
+      Value *desc = val(s.ops[idesc], S.I32);
+      Kind kind = wide ? Kind::MXF8F6F4 : nv ? Kind::MXF4NVF4 : Kind::MXF4;
       underPred(pred, [&]() -> Value * {
+        checkTcgenDescriptor(desc, kind, pair, sparse, tmemA, vec);
         Value *a = tmemA ? B.CreateZExt(taddr(s.ops[1]), S.I64) : val(s.ops[1], S.I64);
         return S.call(B, "__cupbop_column_mma_mx", S.Void, {
             taddr(s.ops[0]), a, val(s.ops[2], S.I64), desc,
@@ -1162,7 +1174,7 @@ struct AsmLowering {
     bool half = s.op == mma + "f16";
     bool fp8 = s.op == mma + "f8f6f4";
     bool tf32 = s.op == mma + "tf32";
-    if (tf32 && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
+    if (tf32 && !pred && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
       fail("TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE");
     if ((column && (half || fp8 || tf32)) || (s.op == mma + "i8" && (column || !sparse))) {
       unsigned idesc = sparse ? 4 : 3;
@@ -1170,42 +1182,25 @@ struct AsmLowering {
         fail("malformed TCGEN MMA operands");
       const bool tmemA = s.ops[1].front() == '[';
       if (tmemA && !column) fail("TMEM-source MMA requires the column engine");
-      auto *desc = dyn_cast<ConstantInt>(val(s.ops[idesc], S.I32));
-      if (!desc) fail("expected constant TCGEN instruction descriptor");
-      unsigned bits = desc->getZExtValue();
-      unsigned columns = ((bits >> 17) & 63) * 8;
-      unsigned format = (bits & 0x1ffff) | (fp8 ? 1u << 17 : 0);
-      // PTX type fields, selectors, input negation and major-ness are
-      // independent. Reserved bits and optional unimplemented variants fail here.
-      unsigned allowed = tf32 ? (15u << 13) :
-          (fp8 ? 0x1f80 : 0x480) | (3u << 15) | ((half || fp8) ? 3u << 13 : 0);
-      if (sparse && (half || tf32)) allowed |= 1u;
-      unsigned required = (tf32 ? 0x910u : (half || fp8) ? 0x10u : 0x20u) | (sparse ? 4u : 0u);
-      // Group 2 integer MMA and MN-major 8-bit B need a whole 32-column
-      // tile. Each CTA contributes half the columns of B.
-      unsigned columnStep = pair && !half && !tf32 && (!fp8 || (bits & (1u << 16))) ? 32 : 16;
-      if (column && ((bits & ~((63u << 17) | allowed)) != ((pair ? 0x10000000u : 0x08000000u) | required) ||
-                     columns < columnStep || columns > 256 || columns % columnStep))
-        fail("unsupported column MMA instruction descriptor");
-      if (fp8 && (!smallFloatType(bits >> 7 & 7) || !smallFloatType(bits >> 10 & 7)))
-        fail("invalid FP8/FP6/FP4 MMA input type");
-      bool mixed = ((bits >> 7) & 1) != ((bits >> 10) & 1);
-      if (tmemA && (bits & (1u << 15)))
-        fail("TMEM-source MMA requires K-major A");
-      if (tmemA && (fp8 || tf32 || (mixed && (half || !(bits & (1u << 7))))))
-        needColumnOperands();
-      if (column && half && mixed && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
-        fail("mixed F16/BF16 inputs require TF32 for lossless widening");
-      if (column && !tf32 && !(half && mixed) && ((half || fp8) ? vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")
-                          : !vortexConfigHasFlag("-DVX_CFG_TCU_INT8_ENABLE")))
-        fail("column MMA input type disabled in the Vortex target configuration");
-      if (!column && bits != (pair ? 0x104004a0u : 0x084004a0u))
-        fail("unsupported i8 MMA instruction descriptor");
+      Value *desc = val(s.ops[idesc], S.I32);
+      auto *imm = dyn_cast<ConstantInt>(desc);
+      if (tmemA) {
+        // Converted A reads the words supplied by a preceding TMEM store or copy.
+        // An unknown descriptor can select a converted format at launch.
+        unsigned bits = imm ? unsigned(imm->getZExtValue()) : 0;
+        bool mixed = ((bits >> 7) & 1) != ((bits >> 10) & 1);
+        if (!imm || fp8 || tf32 || (mixed && (half || !(bits & (1u << 7))))) needColumnOperands();
+      }
+      Kind kind = !column ? Kind::LegacyI8 : half ? Kind::F16 : fp8 ? Kind::F8F6F4 : tf32 ? Kind::TF32 : Kind::I8;
       underPred(pred, [&]() -> Value * {
+        checkTcgenDescriptor(desc, kind, pair, sparse, tmemA, 0);
         if (column) {
+          Value *columns = B.CreateShl(B.CreateAnd(B.CreateLShr(desc, 17), 63), 3, "mma_n");
+          Value *format = B.CreateAnd(desc, 0x1ffff);
+          if (fp8) format = B.CreateOr(format, 1u << 17);
           Value *a = tmemA ? B.CreateZExt(taddr(s.ops[1]), S.I64) : val(s.ops[1], S.I64);
           SmallVector<Value *, 8> args = {taddr(s.ops[0]), a, val(s.ops[2], S.I64),
-              val(s.ops[idesc + 1], S.I32), columnScratch(), B.getInt32(columns), B.getInt32(format)};
+              val(s.ops[idesc + 1], S.I32), columnScratch(), columns, format};
           std::string helper = pair ? "__cupbop_column_pair_mma" : "__cupbop_column_mma";
           if (tmemA) helper += "_ts";
           if (sparse) {
@@ -3299,6 +3294,13 @@ void lower_async_ptx(Module *M) {
     std::remove("cupbop_async_kernels.txt");
   }
   // last: the steps above are keyed by Function, and cvta.param needed the original CuLifter parameter image
+  if (M->getFunction("__cupbop_column_meta_table") && !M->getFunction("__cupbop_column_uses_mx")) {
+    // Only translated modules that issue MX jobs borrow application columns.
+    auto *F = Function::Create(FunctionType::get(Type::getInt1Ty(S.ctx), false),
+                               GlobalValue::ExternalLinkage, "__cupbop_column_uses_mx", *M);
+    IRBuilder<> entry(BasicBlock::Create(S.ctx, "entry", F));
+    entry.CreateRet(entry.getInt1(M->getFunction("__cupbop_column_mma_mx") != nullptr));
+  }
   markTensorMapParameters(S);
   narrowWideKernelArgs(M, S.tensorMapArgs);
   fprintf(stderr, "[CuPBoP] async PTX lowered (software mode): %u asm, %u intrinsics, %u arrive(s) moved after their "

@@ -13,7 +13,7 @@ SRCS := $(CUPBOP_WORK)/dummy_host.cpp
 CUPBOP_RT_SRCS := $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp \
                   $(CuPBoP_PATH)/runtime/src/vortex/kernel/nv_libdevice_compat.cpp
 CUPBOP_RT_INCLUDES := $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) \
-                      $(CuPBoP_PATH)/runtime/include/cupbop_launch_context.h $(ROOT_DIR)/sw/VX_types.h \
+                      $(CuPBoP_PATH)/runtime/include/cupbop_launch_context.h $(CuPBoP_PATH)/runtime/include/cupbop_tcgen05_desc.h $(ROOT_DIR)/sw/VX_types.h \
                       $(wildcard $(VORTEX_HOME)/sw/kernel/include/vx_simx_clc.h)
 CUPBOP_LTO ?= 0
 ifeq ($(CUPBOP_LTO),1)

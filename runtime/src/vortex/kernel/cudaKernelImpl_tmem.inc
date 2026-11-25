@@ -1,3 +1,13 @@
+#include "../../../include/cupbop_tcgen05_desc.h"
+
+// A runtime descriptor must pass the same checks before it can affect D.
+extern "C" void __cupbop_tcgen05_check_descriptor(unsigned desc, unsigned kind, unsigned pair,
+                                                  unsigned sparse, unsigned tmem_a, unsigned vec,
+                                                  unsigned features) {
+  if (const char *error = cupbop_tcgen05::descriptor_error(
+          desc, static_cast<cupbop_tcgen05::Kind>(kind), pair, sparse, tmem_a, vec, features))
+    cupbop_async_fail(error, desc, kind);
+}
 // Exact floating-point decoders shared with the warp MMA runtime.
 static inline float __cupbop_f16_to_f32(uint32_t);
 static inline float __cupbop_e4m3_to_f32(uint32_t);
@@ -20,6 +30,10 @@ struct ColumnMetaCell {
 };
 struct ColumnMeta {
   uint32_t lock, allocated;
+#ifdef VX_CFG_TCU_MX_ENABLE
+  uint32_t access_lock, owner[VX_CFG_TCU_TMEM_COLS / 32];
+  uint8_t native_result[VX_CFG_TCU_TMEM_COLS / 2];
+#endif
   uint32_t generation[VX_CFG_TCU_TMEM_COLS / 2];
   ColumnMetaCell words[VX_CFG_TCU_TMEM_COLS / 2][128];
 };
@@ -31,10 +45,13 @@ extern "C" ColumnMeta *__cupbop_column_meta_storage() {
 }
 extern "C" ColumnMeta *__cupbop_column_meta_table() __attribute__((weak));
 
-static void column_meta_invalidate(unsigned col, unsigned count) {
+static void column_meta_invalidate(unsigned col, unsigned count, bool native_result = true) {
   if (!__cupbop_column_meta_table) return;
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
   for (unsigned i = col; i < col + count; ++i) {
+#ifdef VX_CFG_TCU_MX_ENABLE
+    meta.native_result[i] = native_result;
+#endif
     if (++meta.generation[i] == 0) {
       for (auto &word : meta.words[i]) word.generation = 0;
       meta.generation[i] = 1;
@@ -57,9 +74,54 @@ static uint32_t column_meta_word(unsigned col, unsigned row) {
   return cell.bits;
 }
 
+#ifdef VX_CFG_TCU_MX_ENABLE
+extern "C" bool __cupbop_column_uses_mx() __attribute__((weak));
+static bool column_may_borrow() {
+  // Older translated modules carry only the optional operand table.
+  return __cupbop_column_meta_table && (!__cupbop_column_uses_mx || __cupbop_column_uses_mx());
+}
+#endif
+
+// An MX instruction can borrow caller-owned columns to hold its scale image.
+// CUDA warps may issue unrelated native transfers while the borrower runs.
+// Serialize column accesses in modules that can issue MX jobs, including
+// the whole warp that reads or writes its own block's physical rows.
+struct ColumnAccess {
+#ifdef VX_CFG_TCU_MX_ENABLE
+  uint32_t *lock;
+  explicit ColumnAccess(bool participate = true) : lock(nullptr) {
+    if (participate && !vx_thread_id() && column_may_borrow()) {
+      lock = &__cupbop_column_meta_table()[vx_core_id()].access_lock;
+      while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE)) {}
+    }
+  }
+  ~ColumnAccess() {
+    if (lock) __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
+  }
+#else
+  explicit ColumnAccess(bool = true) {}
+#endif
+};
+
+static void column_publish_store() {
+#ifdef VX_CFG_TCU_MX_ENABLE
+  if (column_may_borrow()) {
+    // All lanes publish their global mirrors and posted TMEM stores before
+    // lane zero releases the access lock for a scalar issuer on another warp.
+    vx_fence();
+    vortex::tmem::wait_st();
+  }
+#endif
+}
+
 // Native alloc waits indefinitely when full. Under the per-core lock, keep
 // the same 32-column ownership bitmap for user runs and short-lived sparse
 // side columns. Never wait for another CTA's deallocation while locked.
+#ifdef VX_CFG_TCU_TMEM_EXT_SIDE_ENABLE
+constexpr unsigned column_side_limit = VX_CFG_TCU_TMEM_COLS;
+#else
+constexpr unsigned column_side_limit = VX_CFG_TCU_TMEM_COLS < 512 ? VX_CFG_TCU_TMEM_COLS : 512;
+#endif
 static int column_allocate(unsigned count, bool temporary = false) {
   if (!__cupbop_column_meta_table)
     return temporary ? -1 : int(vortex::tmem::alloc(count));
@@ -69,7 +131,7 @@ static int column_allocate(unsigned count, bool temporary = false) {
   if (!chunks || count > VX_CFG_TCU_TMEM_COLS || (count & (count - 1)))
     cupbop_async_fail("invalid column allocation size", count, 0);
   const uint32_t mask = chunks == 32 ? ~0u : (1u << chunks) - 1;
-  const unsigned limit = temporary && VX_CFG_TCU_TMEM_COLS > 512 ? 512 : VX_CFG_TCU_TMEM_COLS;
+  const unsigned limit = temporary ? column_side_limit : VX_CFG_TCU_TMEM_COLS;
   for (;;) {
     while (__atomic_exchange_n(&meta.lock, 1u, __ATOMIC_ACQUIRE)) {}
     for (unsigned i = 0; i + chunks <= limit / 32; i += chunks) {
@@ -83,27 +145,39 @@ static int column_allocate(unsigned count, bool temporary = false) {
         return -1;
       }
       __atomic_store_n(&meta.lock, 0u, __ATOMIC_RELEASE);
-      if (!temporary) column_meta_invalidate(base / 2, count / 2);
+      if (!temporary) {
+        ColumnAccess access;
+        column_meta_invalidate(base / 2, count / 2, false);
+#ifdef VX_CFG_TCU_MX_ENABLE
+        for (unsigned j = base / 32; j < (base + count) / 32; ++j)
+          meta.owner[j] = 1 + csr_read_nv(VX_CSR_CTA_ID);
+#endif
+      }
       return int(base);
     }
     __atomic_store_n(&meta.lock, 0u, __ATOMIC_RELEASE);
     if (temporary) return -1;
   }
 }
-static void column_deallocate(unsigned base, unsigned count) {
+static void column_deallocate(unsigned base, unsigned count, bool temporary = false) {
   if (!__cupbop_column_meta_table) {
     vortex::tmem::dealloc(base, count);
     return;
   }
+  ColumnAccess access(!temporary);
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
   while (__atomic_exchange_n(&meta.lock, 1u, __ATOMIC_ACQUIRE)) {}
   vortex::tmem::dealloc(base, count);
+#ifdef VX_CFG_TCU_MX_ENABLE
+  if (!temporary)
+    for (unsigned j = base / 32; j < (base + count) / 32; ++j) meta.owner[j] = 0;
+#endif
   const unsigned chunks = count / 32;
   meta.allocated &= ~((chunks == 32 ? ~0u : (1u << chunks) - 1) << (base / 32));
   __atomic_store_n(&meta.lock, 0u, __ATOMIC_RELEASE);
 }
 static int column_sparse_side() { return column_allocate(32, true); }
-static void column_sparse_release(unsigned base) { column_deallocate(base, 32); }
+static void column_sparse_release(unsigned base) { column_deallocate(base, 32, true); }
 #else
 static unsigned column_allocate(unsigned count) { return vortex::tmem::alloc(count); }
 static void column_deallocate(unsigned base, unsigned count) { vortex::tmem::dealloc(base, count); }
@@ -517,6 +591,7 @@ template <typename Input, typename Output>
 static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
                                      uint32_t use_d, uint8_t *scratch, unsigned columns, unsigned format, unsigned meta,
                        int side = -1, int a_col = -1) {
+  ColumnAccess access;
   using ColumnGeometry = tensor::wgmma_config_t<32, Input, Output>;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || (col & 15) || uint64_t(col) + columns > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
@@ -677,6 +752,7 @@ extern "C" void __cupbop_column_pair_mma_ts_sp(unsigned addr, uint64_t a, uint64
 #include "cudaKernelImpl_column_mx.inc"
 
 static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch, unsigned sourceRows = 128) {
+  ColumnAccess access;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || vx_thread_id() || col % 4 || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
     cupbop_async_fail("unsupported column copy destination or issuer", col, warp);
@@ -760,6 +836,7 @@ static inline void column_store_words(unsigned dest, unsigned first, unsigned se
 
 extern "C" void __cupbop_column_stsplit(unsigned addr, unsigned delta, unsigned count,
                                         unsigned a, unsigned b, unsigned c, unsigned d) {
+  ColumnAccess access;
   unsigned addresses[] = {addr, addr + delta};
   unsigned cols[2];
   for (unsigned h = 0; h < 2; ++h) {
@@ -780,6 +857,7 @@ extern "C" void __cupbop_column_stsplit(unsigned addr, unsigned delta, unsigned 
     unsigned dest = tmcol::make_taddr(tmcol::warp_lane(), column_panel(col, half) + col % 16);
     column_store_words(dest, first, second, count == 4);
   }
+  column_publish_store();
 }
 
 extern "C" void __cupbop_column_st32(unsigned addr, unsigned count, unsigned a, unsigned b, unsigned c, unsigned d) {
@@ -813,6 +891,7 @@ static inline unsigned column_st16_word(unsigned width, unsigned row, unsigned c
 
 extern "C" void __cupbop_column_st16(unsigned addr, unsigned width, unsigned count,
                                      unsigned a, unsigned b, unsigned c, unsigned d) {
+  ColumnAccess access;
   unsigned col = column_transfer(addr & ~(16u << 16), 0, count);
   if (col % 4) cupbop_async_fail("unaligned column store", addr, col);
   unsigned lane = vx_thread_id(), half = (addr >> 20) & 1;
@@ -826,6 +905,7 @@ extern "C" void __cupbop_column_st16(unsigned addr, unsigned width, unsigned cou
     column_store_words(tmcol::make_taddr(tmcol::warp_lane(), column_panel(dst, half) + dst % 16),
                        first, second, count != 2);
   }
+  column_publish_store();
 }
 extern "C" void __cupbop_column_wait_st() { tmcol::wait_st(); }
 
@@ -838,6 +918,7 @@ static inline unsigned column_load_word(unsigned col, unsigned half, unsigned ro
 }
 
 extern "C" uint32_t __cupbop_column_ld32(uint32_t address, uint32_t displacement) {
+  ColumnAccess access;
   unsigned col = column_transfer(address, displacement, 1);
   unsigned lane = vx_thread_id();
   unsigned lo = column_load_word(col, 0, lane % 16), hi = column_load_word(col, 1, lane % 16);
@@ -845,6 +926,7 @@ extern "C" uint32_t __cupbop_column_ld32(uint32_t address, uint32_t displacement
 }
 
 extern "C" uint32_t __cupbop_column_ldsplit(unsigned addr, unsigned delta) {
+  ColumnAccess access;
   unsigned second = addr + delta;
   unsigned c0 = column_transfer(addr & ~(16u << 16), 0, 1);
   unsigned c1 = column_transfer(second & ~(16u << 16), 0, 1);
@@ -855,6 +937,7 @@ extern "C" uint32_t __cupbop_column_ldsplit(unsigned addr, unsigned delta) {
 }
 
 static unsigned column_ld16(unsigned addr, unsigned width, unsigned reg, bool pack) {
+  ColumnAccess access;
   unsigned stride = pack ? 2 : 1;
   unsigned col = column_transfer(addr & ~(16u << 16), 0, width * stride);
   unsigned half = (addr >> 20) & 1, lane = vx_thread_id();
@@ -904,6 +987,7 @@ static void column_store_partial(unsigned col, unsigned half, unsigned value, un
 
 extern "C" void __cupbop_column_st_tile(unsigned addr, unsigned delta, unsigned width, unsigned unpack,
                                         unsigned a, unsigned b, unsigned c, unsigned d) {
+  ColumnAccess access;
   unsigned lane = vx_thread_id(), count = width * (unpack ? 2 : 1);
   unsigned halves = width == 1 ? 2 : 1;
   for (unsigned h = 0; h < halves; ++h) {
@@ -921,6 +1005,7 @@ extern "C" void __cupbop_column_st_tile(unsigned addr, unsigned delta, unsigned 
       }
     }
   }
+  column_publish_store();
 }
 #endif
 #ifdef CUPBOP_NATIVE_TMEM

@@ -1,5 +1,9 @@
 #include "../tcgen05_test.h"
 #include <vector>
+#ifdef CUPBOP_TEST_MN_TMEM_A
+#include "cupbop_tcgen05.cuh"
+constexpr unsigned aLeading = 139, aOrigin = 3;
+#endif
 
 #ifdef CUPBOP_TEST_COLUMN_PAIR
 #include <cooperative_groups.h>
@@ -23,7 +27,7 @@ constexpr unsigned bBytes = localN * 64;
 #endif
 constexpr unsigned wordsPerCTA = (aBytes + bBytes) / 4 + M * 2;
 
-__host__ __device__ unsigned value_bytes(unsigned op) { return (op & 0x21ff0) == 0x910 ? 4 : (op & 0x20010) == 0x10 ? 2 : 1; }
+__host__ __device__ constexpr unsigned value_bytes(unsigned op) { return (op & 0x21ff0) == 0x910 ? 4 : (op & 0x20010) == 0x10 ? 2 : 1; }
 __host__ __device__ unsigned b_subview(unsigned op) {
 #ifdef CUPBOP_TEST_TF32_SUBVIEW
   return value_bytes(op) == 4 && (op & (1u << 16)) ? 32 : 0;
@@ -71,6 +75,12 @@ __global__ void MMA_CLUSTER mma_case(const unsigned *input, unsigned *out) {
     asm volatile("tcgen05.alloc." CTA_GROUP ".sync.aligned.shared::cta.b32 [%0], %1;"
                  :: "r"(smem_u32(&slot)), "n"(2 * N) : "memory");
   __syncthreads();
+#ifdef CUPBOP_TEST_MN_TMEM_A
+  tcgen_after_sync();
+  constexpr unsigned elementBytes = value_bytes(F);
+  const char *matrix = reinterpret_cast<const char *>(elementBytes == 4 ? input : a);
+  cupbop::tcgen05::store_mn_major_a<8 * elementBytes>(slot + N + 8, matrix + aOrigin * elementBytes, aLeading);
+#endif
   unsigned meta = slot + N;
   // Each CTA addresses its own 128-row TMEM array.
   unsigned addr = slot + ((r & ~31u) << 16);
@@ -92,7 +102,9 @@ __global__ void MMA_CLUSTER mma_case(const unsigned *input, unsigned *out) {
 #ifdef CUPBOP_TEST_TMEM_A
     // All 128 rows store eight packed words. Leave the sparse metadata at N.
     const unsigned a_col = slot + N + 8;
+#ifndef CUPBOP_TEST_MN_TMEM_A
     asm volatile("tcgen05.cp." CTA_GROUP ".128x256b [%0], %1;" :: "r"(a_col), "l"(ad) : "memory");
+#endif
 #define A_OPERAND "[%1]"
 #define A_INPUT "r"(a_col)
 #else
@@ -190,6 +202,9 @@ static int check(unsigned *device, unsigned *result) {
           unsigned swizzled = column ^ ((k & 3) * 32);
           offset = ((row / 32) * extent + k) * 128 + swizzled;
         }
+#ifdef CUPBOP_TEST_MN_TMEM_A
+        if (!b) offset = (k * aLeading + row + aOrigin) * bytes;
+#endif
         unsigned bits;
         source_value(rank * rows + row,k,F,b,bits);
         memcpy(reinterpret_cast<char *>(tile) + b*aBytes + offset,&bits,bytes);
