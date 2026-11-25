@@ -27,27 +27,53 @@ run_test() (
     tail -n 50 build.log
     exit 1
   fi
-  for dxa in 0 1; do
-    if ! CUPBOP_TMA_DXA=$dxa CUPBOP_PERF_KERNEL_FILE="$PWD/perf-$dxa.jsonl" \
-        ./host.out > "run-$dxa.log" 2>&1; then
-      cat "run-$dxa.log"
+  cases=(off on)
+  if [[ $name == tma_multicast_native ]]; then
+    cases+=(partial full)
+  fi
+  for scenario in "${cases[@]}"; do
+    dxa=1
+    if [[ $scenario == off ]]; then
+      dxa=0
+    elif [[ $scenario == partial || $scenario == full ]]; then
+      # Leave two non-reserved slots for the raw descriptor and tensor map in
+      # the partial case. A full table must preserve the software copy.
+      awk -v scenario="$scenario" '{
+        for (slot = 0; slot < 16; ++slot) {
+          if (scenario == "partial" && (slot == 13 || slot == 14)) continue
+          print "desc", $2, "slot=" slot, "base=arg1 size=32 box=4 elem=4"
+        }
+      }' lookup.txt > dxa_descriptors.txt
+    fi
+    if ! CUPBOP_TMA_DXA=$dxa CUPBOP_PERF_KERNEL_FILE="$PWD/perf-$scenario.jsonl" \
+        ./host.out > "run-$scenario.log" 2>&1; then
+      cat "run-$scenario.log"
       exit 1
     fi
-    grep -Fx "$expected_result" "run-$dxa.log"
+    grep -Fx "$expected_result" "run-$scenario.log"
   done
-  python3 - "$launches" "$transfers" <<'PY'
+  python3 - "$launches" "$transfers" "${cases[@]}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-launches, per_launch = map(int, sys.argv[1:])
-for offload in (0, 1):
-    records = [json.loads(line) for line in Path(f"perf-{offload}.jsonl").read_text().splitlines()]
+launches = int(sys.argv[1])
+expected = list(map(int, sys.argv[2].split(",")))
+if len(expected) == 1:
+    expected *= launches
+assert len(expected) == launches
+for scenario in sys.argv[3:]:
+    records = [json.loads(line) for line in Path(f"perf-{scenario}.jsonl").read_text().splitlines()]
     transfers = [record["val"]["dxa.transfers"] for record in records]
-    assert transfers == [offload * per_launch] * launches, transfers
-    print(f"CUPBOP_TMA_DXA={offload}: DXA transfers per launch {transfers}")
+    assert transfers == (expected if scenario in ("on", "partial") else [0] * launches), transfers
+    print(f"{scenario}: DXA transfers per launch {transfers}")
 PY
 )
 
 run_test tma_dxa_layouts 'PASSED!' 5 2
 run_test tma_nvvm_3d 'PASSED!: 512/512' 1 1 tma_nvvm_3d.ll.in
+
+# The multicast issue packs its operands with the 32-lane warp ABI.
+if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_NUM_THREADS=32 "* ]]; then
+  run_test tma_multicast_native 'PASSED! multicast to four blocks' 5 2,16,2,16,0
+fi

@@ -2824,6 +2824,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       dxa_program(DC->device(), d);
       DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
       tensor_slots.push_back(d.slot);
+      dxa_slots.insert(d.slot);
       launch_tensor_maps.insert(r.self);
       --next_slot;
       DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
@@ -2969,6 +2970,36 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       // Blackwell's opaque response packs the Y and Z coordinates into 16 bits each.
       if (DC->is_simx() && (schedule == 1 || schedule == 2) && grid[1] <= 65536 && grid[2] <= 65536)
         abuf_ptr->ctx.direct_launch_flags = CUPBOP_LAUNCH_SIMX_CLC;
+    }
+    // A flat rank-1 descriptor takes the source word address as its DXA
+    // coordinate. Reserve an unused slot after tensor maps and explicit
+    // descriptors, and expose it only to this launch. Without a free slot,
+    // or on a VM target, the device uses the original peer copy.
+    const char *enable_raw_dxa = getenv("CUPBOP_TMA_DXA");
+    if (enable_raw_dxa && atoi(enable_raw_dxa) && members > 1 && !cta_fix.dims && schedule == 2 && lanes == 32) {
+      std::ifstream raw("cupbop_raw_multicast.txt");
+      for (std::string kernel; raw >> kernel;) {
+        if (kernel != kernel_name_tmp) continue;
+        uint64_t isa = 0, vm = 0;
+        RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
+        RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
+        if ((isa & VX_ISA_EXT_DXA) && !vm) {
+          uint32_t slot = 0;
+          while (slot < 16 && dxa_slots.count(slot)) ++slot;
+          if (slot < 16) {
+            DxaDescEntry d{};
+            d.slot = slot;
+            d.rank = 1;
+            d.elem_bytes = sizeof(uint32_t);
+            d.size[0] = 1u << 30;
+            d.box[0] = CUPBOP_RAW_DXA_TILE_BYTES / d.elem_bytes;
+            d.smem_stride = stride;
+            dxa_program(DC->device(), d);
+            abuf_ptr->ctx.direct_launch_flags |= (slot + 1) << CUPBOP_RAW_DXA_SLOT_SHIFT;
+          }
+        }
+        break;
+      }
     }
     void *barriers = nullptr;
     if (split_barrier) {

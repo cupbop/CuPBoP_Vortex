@@ -5,6 +5,7 @@
 #include "async_copy.h"
 #include "tool.h"
 
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -942,6 +943,14 @@ struct AsmLowering {
     const bool column = std::getenv("VORTEX_CONFIGS") &&
                         vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_COLUMN_ENABLE");
 
+    if (column && s.has("mma") && s.has("sp") &&
+        !S.M->getFunction("__cupbop_column_meta_table")) {
+      // The weak runtime reference resolves only in modules with sparse users.
+      auto *type = FunctionType::get(S.Ptr, false);
+      auto *F = Function::Create(type, GlobalValue::ExternalLinkage, "__cupbop_column_meta_table", *S.M);
+      IRBuilder<> entry(BasicBlock::Create(S.ctx, "entry", F));
+      entry.CreateRet(entry.CreateCall(S.M->getOrInsertFunction("__cupbop_column_meta_storage", type)));
+    }
     if (pair && (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
                  !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_ENABLE")))
       fail("TCGEN CTA pairs require -DVX_CFG_EXT_TCU_ENABLE and -DVX_CFG_TCU_TMEM_ENABLE");
@@ -972,19 +981,62 @@ struct AsmLowering {
       });
       return;
     }
-    if (column && StringRef(s.op).starts_with("tcgen05.st.sync.aligned.32x32b.x") &&
-        s.tok.size() == 7 && s.tok.back() == "b32") {
-      if (pred || s.ops.size() != 2 || s.ops[1].size() < 2 || s.ops[1].front() != '{' || s.ops[1].back() != '}')
-        fail("expected collective TCGEN store with register tuple");
-      auto src = splitTop(s.ops[1].substr(1, s.ops[1].size()-2), ',');
-      unsigned count;
-      if (StringRef(s.tok[5]).drop_front().getAsInteger(10, count) ||
-          count < 4 || count > 128 || (count & (count-1)) || src.size() != count)
-        fail("expected x4 through x128 TCGEN store with matching register tuple");
-      Value *base = taddr(s.ops[0]);
-      for (unsigned i = 0; i < count; i += 4)
-        S.call(B, "__cupbop_column_st4", S.Void, {B.CreateAdd(base, B.getInt32(i)), val(src[i], S.I32),
-               val(src[i+1], S.I32), val(src[i+2], S.I32), val(src[i+3], S.I32)});
+    if (column && s.tok.size() == 7 && s.tok[0] == "tcgen05" &&
+        (s.tok[1] == "ld" || s.tok[1] == "st") && s.tok[2] == "sync" &&
+        s.tok[3] == "aligned" && s.tok[6] == "b32") {
+      bool load = s.tok[1] == "ld";
+      bool split = s.tok[4] == "16x32bx2";
+      unsigned width = StringSwitch<unsigned>(s.tok[4]).Cases("32x32b", "16x32bx2", 1).Case("16x64b", 2)
+                       .Case("16x128b", 4).Case("16x256b", 8).Default(0);
+      StringRef num(s.tok[5]);
+      unsigned repeat = 0;
+      if (pred || s.ops.size() != (split ? 3u : 2u) || !width || !num.consume_front("x") ||
+          num.getAsInteger(10, repeat) || repeat == 0 || repeat > 128 || (repeat & (repeat - 1)))
+        fail("unsupported column TMEM transfer shape or repetition count");
+      unsigned regsPerTile = width == 1 ? 1 : width / 2;
+      unsigned count = regsPerTile * repeat;
+      Value *halfOffset = nullptr;
+      if (split) {
+        halfOffset = val(s.ops[load ? 2 : 1], S.I32);
+        if (!isa<ConstantInt>(halfOffset)) fail("TMEM half split offset must be an immediate");
+      }
+      StringRef tuple(load ? s.ops.front() : s.ops.back());
+      if (!tuple.consume_front("{") || !tuple.consume_back("}") || count > 128)
+        fail("expected a TMEM transfer register tuple of at most 128 words");
+      auto regs = splitTop(tuple.str(), ',');
+      if (regs.size() != count) fail("TMEM transfer register tuple width mismatch");
+      Value *base = taddr(s.ops[load ? 1 : 0]);
+      if (load) {
+        for (unsigned i = 0; i < count; ++i) {
+          Value *word;
+          if (split) {
+            word = S.call(B, "__cupbop_column_ldsplit", S.I32,
+                          {B.CreateAdd(base, B.getInt32(i)), halfOffset});
+          } else if (width == 1) {
+            word = S.call(B, "__cupbop_column_ld32", S.I32, {base, B.getInt32(i)});
+          } else {
+            Value *tile = B.CreateAdd(base, B.getInt32((i / regsPerTile) * width));
+            word = S.call(B, "__cupbop_column_ld16", S.I32,
+                          {tile, B.getInt32(width), B.getInt32(i % regsPerTile)});
+          }
+          setReg(regs[i], word, nullptr);
+        }
+      } else {
+        if (width == 1 && count == 1) fail("native store requires at least two columns");
+        unsigned batch = std::min(count, width == 1 || width == 8 ? 4u : 2u);
+        for (unsigned i = 0; i < count; i += batch) {
+          unsigned cols = width == 1 ? batch : 2 * batch;
+          SmallVector<Value *, 8> args{B.CreateAdd(base, B.getInt32(width == 1 ? i : 2 * i))};
+          if (split) args.push_back(halfOffset);
+          else if (width != 1) args.push_back(B.getInt32(width));
+          args.push_back(B.getInt32(cols));
+          for (unsigned r = 0; r < 4; ++r)
+            args.push_back(r < batch ? val(regs[i + r], S.I32) : B.getInt32(0));
+          const char *helper = split ? "__cupbop_column_stsplit" :
+                               width == 1 ? "__cupbop_column_st32" : "__cupbop_column_st16";
+          S.call(B, helper, S.Void, args);
+        }
+      }
       return;
     }
     if (column && s.op == "tcgen05.wait::st.sync.aligned") {
@@ -1025,30 +1077,49 @@ struct AsmLowering {
       B.CreateFence(AtomicOrdering::SequentiallyConsistent);
       return;
     }
-    if ((column && (s.op == "tcgen05.mma.cta_group::1.kind::f16" || s.op == "tcgen05.mma.cta_group::2.kind::f16")) || s.op == "tcgen05.mma.cta_group::1.kind::i8" || s.op == "tcgen05.mma.cta_group::2.kind::i8") {
-      if (s.ops.size() != 5) fail("expected dense SMEM/SMEM MMA");
-      auto *desc = dyn_cast<ConstantInt>(val(s.ops[3], S.I32));
+    bool sparse = s.has("sp");
+    std::string mma = sparse ? "tcgen05.mma.sp." : "tcgen05.mma.";
+    mma += pair ? "cta_group::2.kind::" : "cta_group::1.kind::";
+    bool half = s.op == mma + "f16";
+    bool fp8 = s.op == mma + "f8f6f4";
+    if ((column && (half || fp8)) || (s.op == mma + "i8" && (column || !sparse))) {
+      unsigned idesc = sparse ? 4 : 3;
+      if (s.ops.size() != idesc + 2 || s.ops[1].empty() || s.ops[1].front() == '[')
+        fail("expected shared/shared TCGEN MMA operands");
+      auto *desc = dyn_cast<ConstantInt>(val(s.ops[idesc], S.I32));
       if (!desc) fail("expected constant TCGEN instruction descriptor");
       unsigned bits = desc->getZExtValue();
       unsigned columns = ((bits >> 17) & 63) * 8;
-      bool half = s.has("kind::f16");
-      unsigned format = bits & 0x1fff;
-      bool wideExponent = half && format == 0x490; // BF16 A/B, FP32 D
-      bool unsignedInt = !half && format == 0x20; // U8 A/B, S32 D
-      unsigned expected = half ? (wideExponent ? 0x490 : 0x10) : (unsignedInt ? 0x20 : 0x4a0);
-      if (column && ((bits & ~(63u << 17)) != ((pair ? 0x10000000u : 0x08000000u) | expected) ||
-                     columns < 16 || columns > 256 || columns % 16))
-        fail("expected dense SS column MMA with M=128 (pair: 256), N=16..256 in steps of 16, and equal input types");
-      if (column && (half ? vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")
+      unsigned format = (bits & 0x1ffff) | (fp8 ? 1u << 17 : 0);
+      // PTX type fields, selectors, input negation and major-ness are
+      // independent. Reserved bits and optional unimplemented variants fail here.
+      unsigned allowed = 0x480 | (3u << 15) | ((half || fp8) ? 3u << 13 : 0) |
+                         (sparse && half ? 1u : 0);
+      unsigned required = ((half || fp8) ? 0x10u : 0x20u) | (sparse ? 4u : 0u);
+      // Group 2 integer MMA and MN-major 8-bit B need a whole 32-column
+      // tile. Each CTA contributes half the columns of B.
+      unsigned columnStep = pair && !half && (!fp8 || (bits & (1u << 16))) ? 32 : 16;
+      if (column && ((bits & ~((63u << 17) | allowed)) != ((pair ? 0x10000000u : 0x08000000u) | required) ||
+                     columns < columnStep || columns > 256 || columns % columnStep))
+        fail("unsupported column MMA instruction descriptor");
+      bool mixed = ((bits >> 7) & 1) != ((bits >> 10) & 1);
+      if (column && half && mixed && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
+        fail("mixed F16/BF16 inputs require TF32 for lossless widening");
+      if (column && ((half || fp8) ? vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")
                           : !vortexConfigHasFlag("-DVX_CFG_TCU_INT8_ENABLE")))
         fail("column MMA input type disabled in the Vortex target configuration");
       if (!column && bits != (pair ? 0x104004a0u : 0x084004a0u))
         fail("unsupported i8 MMA instruction descriptor");
       underPred(pred, [&]() -> Value * {
         if (column) {
-          return S.call(B, pair ? "__cupbop_column_pair_mma" : "__cupbop_column_mma", S.Void,
-                        {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64), val(s.ops[4], S.I32),
-                         columnScratch(), B.getInt32(columns), B.getInt32(format)});
+          SmallVector<Value *, 8> args = {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64),
+              val(s.ops[idesc + 1], S.I32), columnScratch(), B.getInt32(columns), B.getInt32(format)};
+          std::string helper = pair ? "__cupbop_column_pair_mma" : "__cupbop_column_mma";
+          if (sparse) {
+            helper += "_sp";
+            args.push_back(taddr(s.ops[3]));
+          }
+          return S.call(B, helper.c_str(), S.Void, args);
         }
         return S.call(B, pair ? "__cupbop_tmem_mma_s8_256x256x32" : "__cupbop_tmem_mma_s8_128x256x32", S.Void,
                       {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64), val(s.ops[4], S.I32)});
@@ -1062,7 +1133,7 @@ struct AsmLowering {
       if (dst.size() != (s.has("x2") ? 2u : 4u)) fail("TCGEN load tuple width mismatch");
       Value *base = taddr(s.ops[1]);
       for (size_t i = 0; i < dst.size(); ++i)
-        setReg(dst[i], S.call(B, column ? "__cupbop_column_ld32" : "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
+        setReg(dst[i], S.call(B, "__cupbop_tmem_ld32", S.I32, {base, B.getInt32(i)}), nullptr);
       return;
     }
     if (s.op == "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64" ||
@@ -1225,13 +1296,13 @@ struct AsmLowering {
       if (load) {
         if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: a tensor load must complete on an mbarrier");
         if (ops.size() != (s.has("multicast::cluster") ? 4 : 3)) fail("invalid tensor-load operand count");
-        if (pred && s.has("multicast::cluster") && S.multicastKernels.count(F)) {
+        if (s.has("multicast::cluster") && S.multicastKernels.count(F)) {
           // The elected lane supplies all operands. Keep the enclosing warp
           // converged so DXA can pack lane 0's values into x30 and x31.
           Value *desc = nullptr;
           auto c = coords(ops[1], desc);
           S.call(B, "__cupbop_tma_multicast_warp", S.Void,
-                              {B.CreateZExt(pred, S.I32), addr(ops[0], "shared destination"), desc,
+                              {pred ? B.CreateZExt(pred, S.I32) : B.getInt32(1), addr(ops[0], "shared destination"), desc,
                                addr(ops[2], "mbarrier"), B.getInt32(rank), c[0], c[1], c[2], c[3], c[4],
                                val(ops[3], S.I32)});
           return;
@@ -1294,6 +1365,13 @@ struct AsmLowering {
       if (!s.has("mbarrier::complete_tx::bytes")) fail("`" + s.op + "`: expected mbarrier::complete_tx::bytes");
       const bool multicast = s.has("multicast::cluster");
       if (ops.size() != (multicast ? 5 : 4)) fail("invalid bulk copy operand count");
+      if (g2s && multicast && S.multicastKernels.count(F)) {
+        S.call(B, "__cupbop_bulk_multicast_warp", S.Void,
+               {pred ? B.CreateZExt(pred, S.I32) : B.getInt32(1), addr(ops[0], "shared destination"),
+                addr(ops[1], "global source"), val(ops[2], S.I32), addr(ops[3], "completion barrier"),
+                val(ops[4], S.I32)});
+        return;
+      }
       underPred(pred, [&]() -> Value * {
         Value *dst = addr(ops[0], "shared destination");
         Value *src = addr(ops[1], "source");
@@ -1537,7 +1615,10 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.needWarps.insert(F);
     Value *bytes = C->getArgOperand(3);
     const bool multicast = C->arg_size() == 8 && !cast<ConstantInt>(C->getArgOperand(6))->isZero();
-    if (multicast)
+    if (multicast && S.multicastKernels.count(F))
+      S.call(B, "__cupbop_bulk_multicast_warp", S.Void,
+             {B.getInt32(1), P(0), P(2), bytes, P(1), B.CreateZExt(C->getArgOperand(4), S.I32)});
+    else if (multicast)
       S.call(B,"__cupbop_bulk_multicast",S.Void,{P(0),P(2),bytes,P(1),B.CreateZExt(C->getArgOperand(4),S.I32)});
     else {
       S.call(B,kBulk,S.Void,{P(0),P(2),bytes});
@@ -1562,7 +1643,10 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     if (load) {
       bool multicast = !cast<ConstantInt>(C->getArgOperand(rank+5))->isZero();
       if (multicast) args.push_back(B.CreateZExt(C->getArgOperand(rank+3),S.I32));
-      if (multicast)
+      if (multicast && S.multicastKernels.count(F)) {
+        args.insert(args.begin(), B.getInt32(1));
+        S.call(B, "__cupbop_tma_multicast_warp", S.Void, args);
+      } else if (multicast)
         S.call(B, "__cupbop_tma_multicast", S.Void, args);
       else if (S.tcgenFunctions.count(F))
         S.call(B, "__cupbop_tcgen_tma_load", S.Void, args);
@@ -2707,6 +2791,30 @@ void check_lifted_column_tmem(Module *M) {
   }
 }
 
+// A named NVVM copy is usually guarded by an LLVM branch. The operands can
+// be computed in the taken arm. Forward them with PHIs to the first point
+// after the arm so WGATHER sees all lanes. Only cross the conditional's
+// own empty bypass edge; moving across a wait in another arm can deadlock.
+static void reconvergeMulticast(CallInst *copy) {
+  BasicBlock *arm = copy->getParent();
+  auto *exit = dyn_cast<BranchInst>(arm->getTerminator());
+  BasicBlock *head = arm->getSinglePredecessor();
+  auto *guard = head ? dyn_cast<BranchInst>(head->getTerminator()) : nullptr;
+  if (!exit || exit->isConditional() || copy->getNextNonDebugInstruction() != exit ||
+      !guard || !guard->isConditional()) return;
+  BasicBlock *join = exit->getSuccessor(0);
+  if (join == head || join == arm || join->getUniquePredecessor() || pred_size(join) != 2 ||
+      (guard->getSuccessor(0) != join && guard->getSuccessor(1) != join)) return;
+  for (unsigned i = 0; i < copy->arg_size(); ++i) {
+    Value *v = copy->getArgOperand(i);
+    auto *arg = PHINode::Create(v->getType(), 2, "multicast.arg", &join->front());
+    arg->addIncoming(v, arm);
+    arg->addIncoming(Constant::getNullValue(v->getType()), head);
+    copy->setArgOperand(i, arg);
+  }
+  copy->moveBefore(&*join->getFirstInsertionPt());
+}
+
 void lower_async_ptx(Module *M) {
   PassState S(M);
   const int sched = schedule();
@@ -2734,14 +2842,22 @@ void lower_async_ptx(Module *M) {
         for (const auto &stmt : statements)
           if (!StringRef(stmt.op).starts_with("mbarrier.") &&
               !StringRef(stmt.op).starts_with("cp.async.bulk.tensor.") &&
-              !StringRef(stmt.op).starts_with("setp.") && !StringRef(stmt.op).starts_with("mov.") &&
+              !StringRef(stmt.op).starts_with("cp.async.bulk.shared::cluster.global.") &&
+              !StringRef(stmt.op).starts_with("setp.") && !StringRef(stmt.op).starts_with("selp.") &&
+              !StringRef(stmt.op).starts_with("mapa.shared::cluster.") && !StringRef(stmt.op).starts_with("mov.") &&
               !StringRef(stmt.op).starts_with("bra") && !stmt.op.empty() &&
               !StringRef(stmt.op).starts_with("fence.") && !StringRef(stmt.op).starts_with("barrier.cluster.") &&
-              stmt.op != "bar.sync" && stmt.op != "elect.sync") eligible = false;
+              stmt.op != "bar.sync" && stmt.op != "activemask.b32" && stmt.op != "elect.sync") eligible = false;
           else if (stmt.op == "bar.sync" && stmt.ops != std::vector<std::string>{"0"}) eligible = false;
       } else {
         const auto *callee = call->getCalledFunction();
         if (!callee || !(callee->getName().starts_with("llvm.nvvm.read.ptx.sreg.") ||
+                         callee->getName().starts_with("llvm.nvvm.cp.async.bulk.tensor.g2s.tile.") ||
+                         callee->getName() == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
+                         callee->getName() == "llvm.nvvm.activemask" || callee->getName() == "llvm.nvvm.elect.sync" ||
+                         callee->getName().starts_with("llvm.nvvm.vote.") || callee->getName().starts_with("llvm.nvvm.membar.") ||
+                         callee->getName().starts_with("llvm.nvvm.mbarrier.") ||
+                         callee->getName().starts_with("llvm.nvvm.barrier.cluster.") ||
                          callee->getName() == "_ZL24__cvta_generic_to_sharedPKv" ||
                          callee->getName() == "__nv_cvta_generic_to_shared_impl" ||
                          callee->getName() == "llvm.nvvm.barrier0" ||
@@ -2860,6 +2976,20 @@ void lower_async_ptx(Module *M) {
     L.st = st;
     L.run();
     S.n_asm++;
+  }
+  std::ofstream rawMulticast("cupbop_raw_multicast.txt", std::ios::trunc);
+  for (StringRef name : {"__cupbop_tma_multicast_warp", "__cupbop_bulk_multicast_warp"}) {
+    auto *helper = M->getFunction(name);
+    if (!helper) continue;
+    std::set<Function *> kernels;
+    for (User *user : helper->users())
+      if (auto *call = dyn_cast<CallInst>(user)) {
+        reconvergeMulticast(call);
+        kernels.insert(call->getFunction());
+      }
+    if (name == "__cupbop_bulk_multicast_warp")
+      for (Function *kernel : kernels)
+        rawMulticast << cupbop_kernel_lookup_name(kernel->getName().str()) << '\n';
   }
   // Record fixed geometry and the kernels whose threads participate in a split
   // barrier (including through a callee). Retired threads no longer owe an arrival.

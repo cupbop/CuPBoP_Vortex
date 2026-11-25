@@ -207,7 +207,7 @@ clean:
 	rm -rf .cupbop-cuda-headers
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
-	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_cluster_dims.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
+	rm -f kernel_wrapper.cpp ci_output.txt ci_status_*.txt cupbop_cluster_dims.txt cupbop_async_kernels.txt cupbop_cp_async_dxa.txt cupbop_raw_multicast.txt cupbop_kabi.txt cupbop_dyn_stack.txt cupbop_byval_args.txt cupbop_lmem_stack.txt cupbop_launch_fix.txt
 	rm -f $(EXTRA_OBJS)
 
 clean-perf:

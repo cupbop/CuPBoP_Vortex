@@ -119,3 +119,9 @@ for op in ldtm utcbar; do
     check_refused "column_$op" "incomplete CuLifter column TMEM input: sass_unsupported_$op" \
       "call void @sass_unsupported_$op()" "define weak void @sass_unsupported_$op() { ret void }"
 done
+
+# Paired integer MMA requires N to be a multiple of 32 (PTX tcgen05 shapes).
+# 0x100404a4 encodes M256 N16, sparse S8/S8 and S32 accumulation.
+VORTEX_CONFIGS='-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_TMEM_COLUMN_ENABLE -DVX_CFG_TCU_INT8_ENABLE' \
+  check_refused paired_sparse_i8_n16 'unsupported column MMA instruction descriptor' \
+    'call void asm sideeffect "{ .reg .pred p; setp.ne.u32 p, 0, 0; tcgen05.mma.sp.cta_group::2.kind::i8 [$0], $1, $2, [$3], $4, p; }", "r,l,l,r,r,~{memory}"(i32 0, i64 0, i64 0, i32 0, i32 268698788)'

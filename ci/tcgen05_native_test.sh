@@ -19,7 +19,10 @@ run_case() (
   shift 2
   local app="$work/examples/$example-$(basename "$work")"
   mkdir "$app"
-  cp "$CuPBoP_PATH/examples/$example/"{Makefile,"$example.cu"} "$app/"
+  cp "$CuPBoP_PATH/examples/$example/Makefile" "$app/"
+  if [[ -f "$CuPBoP_PATH/examples/$example/$example.cu" ]]; then
+    cp "$CuPBoP_PATH/examples/$example/$example.cu" "$app/"
+  fi
   cd "$app"
   make build SCHEDULE=2 LOCALMEM=1 > build.log 2>&1
   local index=0 args
@@ -44,3 +47,9 @@ export CUPBOP_MMA_LOWERING=auto VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOU
 run_case tcgen05_i8 'elements=131072 mismatches=0' 0 1
 run_case tcgen05_tma_mma 'elements=32768 mismatches=0' ''
 run_case tcgen05_i8_pair 'PASSED!: 131072/131072 INT32 results match' ''
+if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
+  # The column backend needs two physical columns per CUDA column. The
+  # M256 N32 example fits both CTA runs and the sparse metadata workspace.
+  ln -s "$CuPBoP_PATH/examples/tcgen05_column_mma" "$work/examples/"
+  run_case tcgen05_column_mma_pair 'format=4a4 mismatches=0/8192' ''
+fi
