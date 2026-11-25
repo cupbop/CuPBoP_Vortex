@@ -1,0 +1,40 @@
+.version 8.7
+.target sm_90a
+.address_size 64
+
+.visible .entry cluster_raw(.param .u64 data, .param .u64 output)
+.reqnctapercluster 2, 1, 1
+{
+    .shared .align 16 .b8 tile[128];
+    .shared .align 8 .b64 bar;
+    .reg .u64 src, out;
+    .reg .b32 r, b, lane, rank, block, offset, value;
+    .reg .pred leader, issuer, ready;
+
+    ld.param.u64 src, [data];
+    ld.param.u64 out, [output];
+    mov.u32 lane, %tid.x;
+    mov.u32 block, %ctaid.x;
+    mov.u32 rank, %cluster_ctarank;
+    mov.u32 r, tile;
+    mov.u32 b, bar;
+    shl.b32 offset, lane, 2;
+    add.u32 offset, r, offset;
+    st.shared.u32 [offset], 0;
+
+    setp.eq.u32 leader, lane, 0;
+    @leader mbarrier.init.shared::cta.b64 [b], 1;
+    @leader mbarrier.arrive.expect_tx.shared::cta.b64 _, [b], 128;
+    barrier.cluster.arrive.aligned;
+    barrier.cluster.wait.aligned;
+    setp.eq.and.u32 issuer, rank, 1, leader;
+    @issuer cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [r], [src], 128, [b], 3;
+wait:
+    mbarrier.try_wait.parity.shared::cta.b64 ready, [b], 0;
+    @!ready bra wait;
+    ld.shared.u32 value, [offset];
+    mad.lo.u32 lane, block, 32, lane;
+    mad.wide.u32 out, lane, 4, out;
+    st.global.u32 [out], value;
+    ret;
+}

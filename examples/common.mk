@@ -258,7 +258,15 @@ $(LIVE_CTA_SETTING): check-live-cta-setting
 	if [ "$$setting" != "$$(cat $@ 2>/dev/null)" ]; then printf '%s\n' "$$setting" > $@; fi
 endif
 
-kernel.bc kernel_wrapper.cpp kernel_meta.log: $(DEVICE_BC) $(KERNEL_TRANSLATOR) $(LIVE_CTA_SETTING)
+# Both the translator and the Vortex build emit multiple files in one run.
+# Running either recipe twice under make -j races on the same bitcode or cell.
+ifneq ($(filter grouped-target,$(.FEATURES)),)
+MULTI_OUTPUT_RULE := &:
+else
+MULTI_OUTPUT_RULE := :
+.NOTPARALLEL:
+endif
+kernel.bc kernel_wrapper.cpp kernel_meta.log $(MULTI_OUTPUT_RULE) $(DEVICE_BC) $(KERNEL_TRANSLATOR) $(LIVE_CTA_SETTING)
 	@echo "--- Translate kernel bitcode"
 	$(KERNEL_TRANSLATOR) $< kernel.bc
 	llvm-dis kernel.bc
@@ -283,7 +291,7 @@ host.o: host.bc
 # ─── Step 5: kernel.o ────────────────────────────────────────────────────────
 ifeq ($(VORTEX_VER),3)
 # Vortex 3.0: delegate the kernel ELF to Vortex's own regression makefile (see examples/v3_cell.mk).
-kernel.elf kernel.vxbin kernel.dump: kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) $(addprefix $(CuPBoP_PATH)/runtime/include/,cupbop_launch_context.h cupbop_reduce.h) $(VORTEX_PATH)/sw/VX_types.h $(wildcard $(VORTEX_HOME)/sw/kernel/include/vx_simx_clc.h)
+kernel.elf kernel.vxbin kernel.dump $(MULTI_OUTPUT_RULE) kernel.bc kernel_wrapper.cpp $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl.cpp $(wildcard $(CuPBoP_PATH)/runtime/src/vortex/kernel/cudaKernelImpl_*.inc) $(addprefix $(CuPBoP_PATH)/runtime/include/,cupbop_launch_context.h cupbop_reduce.h) $(VORTEX_PATH)/sw/VX_types.h $(wildcard $(VORTEX_HOME)/sw/kernel/include/vx_simx_clc.h)
 	@echo "--- Building kernel ELF with Vortex 3.0 tests/regression/common.mk in $(VX3_CELL)"
 	rm -rf $(VX3_CELL) && mkdir -p $(VX3_CELL)
 	printf 'int main(){return 0;}\n' > dummy_host.cpp
