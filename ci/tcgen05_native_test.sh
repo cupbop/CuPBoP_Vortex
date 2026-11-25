@@ -87,6 +87,9 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
       done
       if [[ " $VORTEX_CONFIGS " != *" -DVX_CFG_TCU_FP16_DISABLE "* ]]; then
         VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 run_case tcgen05_split_mx_tmem_a 'case=3 mismatches=0/2048' ''
+        for input in cuda129 raw; do
+          VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 replay_input=$input run_case lifted_tcgen05_split_mx_tmem_a 'case=3 mismatches=0/2048' ''
+        done
       fi
       if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_EXT_SIDE_ENABLE "* && " $VORTEX_CONFIGS " != *" -DVX_CFG_TCU_FP16_DISABLE "* ]]; then
         VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 run_case tcgen05_upper_mx_tmem_a 'case=3 mismatches=0/2048' ''
