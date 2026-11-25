@@ -26,7 +26,13 @@ __global__ void column_ops(unsigned *out, unsigned format) {
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   tcgen_after_sync();
   if (!row) {
+#ifdef CUPBOP_TEST_WARPX4_COPY
+    // The second vector of the eight-row core tile is 128 bytes ahead.
+    asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(slot), "l"(ad) : "memory");
+    asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(slot + 4), "l"(ad + 8) : "memory");
+#else
     asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" :: "r"(slot), "l"(ad) : "memory");
+#endif
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" :: "r"(smem_u32(&barrier)) : "memory");
   }
   __syncthreads();
@@ -87,7 +93,12 @@ int main() {
     column_ops<<<1,128>>>(dev, format);
     ASYNC_CHECK(cudaMemcpy(out.data(),dev,out.size()*sizeof(unsigned),cudaMemcpyDeviceToHost));
     for (unsigned r=0;r<128;++r) {
-      for (unsigned j=0;j<12;++j) errors += out[r*16+j] != (j<8 ? r*1000+j : r+j-8);
+#ifdef CUPBOP_TEST_WARPX4_COPY
+      const unsigned copyRow = r % 32;
+#else
+      const unsigned copyRow = r;
+#endif
+      for (unsigned j=0;j<12;++j) errors += out[r*16+j] != (j<8 ? copyRow*1000+j : r+j-8);
       for (unsigned j=0;j<64;++j) {
         float fp = float(16 * (1 + r%2) * (1 + j%2));
         unsigned expected;

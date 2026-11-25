@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+translator=$(realpath "$1")
+llvm_bin=$(realpath "$2")
+export LD_LIBRARY_PATH="$llvm_bin/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLAG=1 VORTEX_NUM_THREADS=32
+export VORTEX_CONFIGS="-DVX_CFG_EXT_TCU_ENABLE -DVX_CFG_TCU_TMEM_ENABLE -DVX_CFG_TCU_TMEM_COLUMN_ENABLE -DVX_CFG_TCU_FP8_ENABLE -DVX_CFG_TCU_INT8_ENABLE -DVX_CFG_TCU_MX_ENABLE -DVX_CFG_TCU_TF32_ENABLE"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+
+# LLVM 22 NVPTX CodeGen/tcgen05-mma.ll puts enable_input_d before sparse
+# metadata. Newer LLVM also accepts a collector B immediate after collector A.
+cat > source.ll <<'IR'
+target triple = "nvptx64-nvidia-cuda"
+declare void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6), i64, i64, i32, i1, i32, i32, i32)
+declare void @llvm.nvvm.tcgen05.mma.sp.tensor(ptr addrspace(6), ptr addrspace(6), i64, i32, i1, ptr addrspace(6), i32, i32, i32, i32)
+declare void @llvm.nvvm.tcgen05.mma.shared.mxf8f6f4.block_scale(ptr addrspace(6), i64, i64, i32, i1, ptr addrspace(6), ptr addrspace(6), i32, i32)
+define ptx_kernel void @dense(i32 %d, i64 %a, i64 %b, i1 %acc) {
+  %dest = inttoptr i32 %d to ptr addrspace(6)
+  call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 134482192, i1 %acc, i32 1, i32 1, i32 0)
+  call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 134479888, i1 true, i32 0, i32 1, i32 0)
+  call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 134484368, i1 true, i32 2, i32 1, i32 0)
+  call void @llvm.nvvm.tcgen05.mma.shared(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 134481056, i1 true, i32 3, i32 1, i32 0)
+  ret void
+}
+define ptx_kernel void @sparse(i32 %d, i32 %a, i64 %b, i32 %meta) {
+  %dest = inttoptr i32 %d to ptr addrspace(6)
+  %src = inttoptr i32 %a to ptr addrspace(6)
+  %metadata = inttoptr i32 %meta to ptr addrspace(6)
+  call void @llvm.nvvm.tcgen05.mma.sp.tensor(ptr addrspace(6) %dest, ptr addrspace(6) %src, i64 %b, i32 268962068, i1 false, ptr addrspace(6) %metadata, i32 1, i32 2, i32 0, i32 0)
+  ret void
+}
+define ptx_kernel void @scaled(i32 %d, i64 %a, i64 %b, i32 %sa, i32 %sb) {
+  %dest = inttoptr i32 %d to ptr addrspace(6)
+  %sfa = inttoptr i32 %sa to ptr addrspace(6)
+  %sfb = inttoptr i32 %sb to ptr addrspace(6)
+  call void @llvm.nvvm.tcgen05.mma.shared.mxf8f6f4.block_scale(ptr addrspace(6) %dest, i64 %a, i64 %b, i32 142868480, i1 true, ptr addrspace(6) %sfa, ptr addrspace(6) %sfb, i32 1, i32 0)
+  ret void
+}
+IR
+"$llvm_bin/llvm-as" source.ll -o source.bc
+"$translator" source.bc kernel.bc > translation.log 2>&1 || { cat translation.log; exit 1; }
+"$llvm_bin/opt" -passes=verify -disable-output kernel.bc
+"$llvm_bin/llvm-dis" kernel.bc -o kernel.ll
+for name in mma pair_mma_ts_sp mma_mx; do
+  grep -Eq "call void @__cupbop_column_${name}\(" kernel.ll
+done
+if grep -Fq 'call void @llvm.nvvm.tcgen05.mma.' kernel.ll; then exit 1; fi
+
+if VORTEX_CONFIGS="${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/}" "$translator" source.bc missing.bc > missing.log 2>&1; then
+  echo 'Named TF32 MMA unexpectedly translated without TF32 hardware' >&2
+  exit 1
+fi
+grep -Fq 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' missing.log
+sed 's/i32 1, i32 2, i32 0, i32 0)/i32 1, i32 2, i32 0, i32 3)/' source.ll > collector.ll
+"$llvm_bin/llvm-as" collector.ll -o collector.bc
+if "$translator" collector.bc bad.bc > collector.log 2>&1; then
+  echo 'Named MMA unexpectedly discarded a live collector' >&2
+  exit 1
+fi
+grep -Fq 'requires discard collector mode' collector.log
+echo 'Named TCGEN05 MMA shared, sparse tensor, block-scale and diagnostic checks passed'

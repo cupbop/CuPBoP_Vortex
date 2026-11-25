@@ -943,14 +943,16 @@ struct AsmLowering {
     const bool column = std::getenv("VORTEX_CONFIGS") &&
                         vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_COLUMN_ENABLE");
 
-    if (column && s.has("mma") && s.has("sp") &&
-        !S.M->getFunction("__cupbop_column_meta_table")) {
-      // The weak runtime reference resolves only in modules with sparse users.
+    auto needColumnOperands = [&]() {
+      if (S.M->getFunction("__cupbop_column_meta_table")) return;
+      // The issuer reads metadata, scales and converted TMEM inputs from
+      // the words supplied by an earlier column store or copy.
       auto *type = FunctionType::get(S.Ptr, false);
       auto *F = Function::Create(type, GlobalValue::ExternalLinkage, "__cupbop_column_meta_table", *S.M);
       IRBuilder<> entry(BasicBlock::Create(S.ctx, "entry", F));
       entry.CreateRet(entry.CreateCall(S.M->getOrInsertFunction("__cupbop_column_meta_storage", type)));
-    }
+    };
+    if (column && s.has("mma") && (s.has("sp") || s.has("block_scale"))) needColumnOperands();
     if (pair && (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
                  !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_ENABLE")))
       fail("TCGEN CTA pairs require -DVX_CFG_EXT_TCU_ENABLE and -DVX_CFG_TCU_TMEM_ENABLE");
@@ -970,21 +972,29 @@ struct AsmLowering {
       }
       return B.CreateAddrSpaceCast(scratch, S.Ptr);
     };
-    if (column && (s.op == "tcgen05.cp.cta_group::1.128x128b" ||
+    if (column && (s.op == "tcgen05.cp.cta_group::1.32x128b.warpx4" ||
+                   s.op == "tcgen05.cp.cta_group::2.32x128b.warpx4" ||
+                   s.op == "tcgen05.cp.cta_group::1.128x128b" ||
                    s.op == "tcgen05.cp.cta_group::1.128x256b" ||
                    s.op == "tcgen05.cp.cta_group::2.128x128b" ||
                    s.op == "tcgen05.cp.cta_group::2.128x256b")) {
       if (s.ops.size() != 2) fail("expected TCGEN copy destination and shared descriptor");
       underPred(pred, [&]() -> Value * {
+        if (s.has("warpx4"))
+          return S.call(B, "__cupbop_column_cp_warpx4", S.Void,
+                        {taddr(s.ops[0]), val(s.ops[1], S.I64), B.getInt32(pair), columnScratch()});
         return S.call(B, pair ? "__cupbop_column_pair_cp" : "__cupbop_column_cp", S.Void,
                       {taddr(s.ops[0]), val(s.ops[1], S.I64), B.getInt32(s.has("128x128b") ? 4 : 8), columnScratch()});
       });
       return;
     }
-    if (column && s.tok.size() == 7 && s.tok[0] == "tcgen05" &&
+    if (column && (s.tok.size() == 7 || s.tok.size() == 8) && s.tok[0] == "tcgen05" &&
         (s.tok[1] == "ld" || s.tok[1] == "st") && s.tok[2] == "sync" &&
-        s.tok[3] == "aligned" && s.tok[6] == "b32") {
+        s.tok[3] == "aligned" && s.tok.back() == "b32") {
       bool load = s.tok[1] == "ld";
+      bool packed = s.tok.size() == 8;
+      if (packed && s.tok[6] != (load ? "pack::16b" : "unpack::16b"))
+        fail("unsupported TMEM transfer modifier");
       bool split = s.tok[4] == "16x32bx2";
       unsigned width = StringSwitch<unsigned>(s.tok[4]).Cases("32x32b", "16x32bx2", 1).Case("16x64b", 2)
                        .Case("16x128b", 4).Case("16x256b", 8).Default(0);
@@ -1006,7 +1016,27 @@ struct AsmLowering {
       auto regs = splitTop(tuple.str(), ',');
       if (regs.size() != count) fail("TMEM transfer register tuple width mismatch");
       Value *base = taddr(s.ops[load ? 1 : 0]);
-      if (load) {
+      if (packed || (!load && width == 1 && count == 1)) {
+        // A 32-row tile is two 16-row accesses separated by bit 20.
+        // 16x32bx2 supplies both addresses explicitly. A packed word spans
+        // two adjacent columns within each access; the split delta is in columns.
+        Value *delta = split ? halfOffset : B.getInt32(16u << 16);
+        for (unsigned tile = 0; tile < repeat; ++tile) {
+          Value *address = B.CreateAdd(base, B.getInt32(tile * width * (packed ? 2 : 1)));
+          if (load) {
+            for (unsigned i = 0; i < regsPerTile; ++i) {
+              Value *v = S.call(B, "__cupbop_column_ldpack", S.I32,
+                                {address, delta, B.getInt32(width), B.getInt32(i)});
+              setReg(regs[tile * regsPerTile + i], v, nullptr);
+            }
+          } else {
+            SmallVector<Value *, 8> args{address, delta, B.getInt32(width), B.getInt32(packed)};
+            for (unsigned i = 0; i < 4; ++i)
+              args.push_back(i < regsPerTile ? val(regs[tile * regsPerTile + i], S.I32) : B.getInt32(0));
+            S.call(B, "__cupbop_column_st_tile", S.Void, args);
+          }
+        }
+      } else if (load) {
         for (unsigned i = 0; i < count; ++i) {
           Value *word;
           if (split) {
@@ -1022,7 +1052,6 @@ struct AsmLowering {
           setReg(regs[i], word, nullptr);
         }
       } else {
-        if (width == 1 && count == 1) fail("native store requires at least two columns");
         unsigned batch = std::min(count, width == 1 || width == 8 ? 4u : 2u);
         for (unsigned i = 0; i < count; i += batch) {
           unsigned cols = width == 1 ? batch : 2 * batch;
@@ -1080,12 +1109,67 @@ struct AsmLowering {
     bool sparse = s.has("sp");
     std::string mma = sparse ? "tcgen05.mma.sp." : "tcgen05.mma.";
     mma += pair ? "cta_group::2.kind::" : "cta_group::1.kind::";
+    auto smallFloatType = [](unsigned code) { return code <= 1 || (code >= 3 && code <= 5); };
+    if (column && s.has("mma") && s.has("block_scale")) {
+      bool wide = s.has("kind::mxf8f6f4");
+      bool nv = s.has("kind::mxf4nvf4");
+      unsigned vec = (s.has("scale_vec::4X") || s.has("block16")) ? 4 : wide ? 1 : 2;
+      std::string prefix = mma + (wide ? "mxf8f6f4" : nv ? "mxf4nvf4" : "mxf4") + ".block_scale";
+      if (s.op != prefix + ".scale_vec::" + std::to_string(vec) + "X" &&
+          s.op != prefix + (vec == 4 ? ".block16" : ".block32") &&
+          !(s.op == prefix && !nv))
+        fail("unknown block-scaled MMA kind or vector length");
+      const unsigned idesc = sparse ? 4 : 3;
+      if (s.ops.size() != idesc + 4 || s.ops[1].empty())
+        fail("expected block-scaled MMA with two TMEM scale addresses");
+      const bool tmemA = s.ops[1].front() == '[';
+      auto *desc = dyn_cast<ConstantInt>(val(s.ops[idesc], S.I32));
+      if (!desc) fail("expected constant block-scaled MMA instruction descriptor");
+      unsigned bits = desc->getZExtValue();
+      unsigned at = bits >> 7 & 7, bt = bits >> 10 & 7;
+      unsigned n = (bits >> 17 & 63) * 8;
+      unsigned sf = bits >> 23 & 3, aid = bits >> 29 & 3, bid = bits >> 4 & 3;
+      unsigned valid = (3u << 29) | (3u << 27) | (1u << 23) | (63u << 17) |
+                       (3u << 13) | (7u << 7) | (7u << 10) | (3u << 4) | 4u;
+      if (wide) valid |= 3u << 15;
+      if ((bits & ~valid) || bool(bits & 4) != sparse)
+        fail("unsupported layout, K dimension or sparsity in SM100 block-scaled MMA descriptor");
+      if (((bits >> 27) & 3) != (pair ? 2u : 1u) || !n || n > 256 || (pair && n % 16))
+        fail("unsupported M or N dimension for this block-scaled MMA CTA group");
+      if ((aid % vec) || (bid % vec)) fail("misaligned scale-factor byte selector");
+      if (wide ? vec != 1 || sf != 1 || !smallFloatType(at) || !smallFloatType(bt)
+               : at != 1 || bt != 1 || (vec == 4 && !nv) || (!sf && !(nv && vec == 4)))
+        fail("unsupported input format, scale format or vector length for this SM100 MMA kind");
+      if (tmemA && (bits & (1u << 15))) fail("TMEM-source MX MMA requires K-major A");
+      if (pair && wide && (bits & (1u << 16)) && n % 32)
+        fail("paired MN-major MXFP8 B requires N divisible by 32");
+      if (wide && ((at == 1 && (bt == 0 || bt == 3)) || (bt == 1 && (at == 0 || at == 3))))
+        fail("these mixed MX inputs cannot be represented in one native E5M2 or E4M3 job");
+      const char *typeFlag = wide ? "-DVX_CFG_TCU_FP8_ENABLE" :
+                             sf ? "-DVX_CFG_TCU_MXFP4_ENABLE" : "-DVX_CFG_TCU_NVFP4_ENABLE";
+      if (!vortexConfigHasFlag("-DVX_CFG_TCU_MX_ENABLE") || !vortexConfigHasFlag(typeFlag) ||
+          (!wide && !vortexConfigHasFlag("-DVX_CFG_TCU_FP4_ENABLE")))
+        fail("block-scaled MMA input type disabled in the Vortex target configuration");
+      underPred(pred, [&]() -> Value * {
+        Value *a = tmemA ? B.CreateZExt(taddr(s.ops[1]), S.I64) : val(s.ops[1], S.I64);
+        return S.call(B, "__cupbop_column_mma_mx", S.Void, {
+            taddr(s.ops[0]), a, val(s.ops[2], S.I64), desc,
+            taddr(s.ops[idesc+1]), taddr(s.ops[idesc+2]), val(s.ops[idesc+3], S.I32),
+            columnScratch(), B.getInt32(vec), sparse ? taddr(s.ops[3]) : B.getInt32(0), B.getInt32(tmemA)});
+      });
+      return;
+    }
     bool half = s.op == mma + "f16";
     bool fp8 = s.op == mma + "f8f6f4";
-    if ((column && (half || fp8)) || (s.op == mma + "i8" && (column || !sparse))) {
+    bool tf32 = s.op == mma + "tf32";
+    if (tf32 && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
+      fail("TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE");
+    if ((column && (half || fp8 || tf32)) || (s.op == mma + "i8" && (column || !sparse))) {
       unsigned idesc = sparse ? 4 : 3;
-      if (s.ops.size() != idesc + 2 || s.ops[1].empty() || s.ops[1].front() == '[')
-        fail("expected shared/shared TCGEN MMA operands");
+      if (s.ops.size() != idesc + 2 || s.ops[1].empty())
+        fail("malformed TCGEN MMA operands");
+      const bool tmemA = s.ops[1].front() == '[';
+      if (tmemA && !column) fail("TMEM-source MMA requires the column engine");
       auto *desc = dyn_cast<ConstantInt>(val(s.ops[idesc], S.I32));
       if (!desc) fail("expected constant TCGEN instruction descriptor");
       unsigned bits = desc->getZExtValue();
@@ -1093,28 +1177,37 @@ struct AsmLowering {
       unsigned format = (bits & 0x1ffff) | (fp8 ? 1u << 17 : 0);
       // PTX type fields, selectors, input negation and major-ness are
       // independent. Reserved bits and optional unimplemented variants fail here.
-      unsigned allowed = 0x480 | (3u << 15) | ((half || fp8) ? 3u << 13 : 0) |
-                         (sparse && half ? 1u : 0);
-      unsigned required = ((half || fp8) ? 0x10u : 0x20u) | (sparse ? 4u : 0u);
+      unsigned allowed = tf32 ? (15u << 13) :
+          (fp8 ? 0x1f80 : 0x480) | (3u << 15) | ((half || fp8) ? 3u << 13 : 0);
+      if (sparse && (half || tf32)) allowed |= 1u;
+      unsigned required = (tf32 ? 0x910u : (half || fp8) ? 0x10u : 0x20u) | (sparse ? 4u : 0u);
       // Group 2 integer MMA and MN-major 8-bit B need a whole 32-column
       // tile. Each CTA contributes half the columns of B.
-      unsigned columnStep = pair && !half && (!fp8 || (bits & (1u << 16))) ? 32 : 16;
+      unsigned columnStep = pair && !half && !tf32 && (!fp8 || (bits & (1u << 16))) ? 32 : 16;
       if (column && ((bits & ~((63u << 17) | allowed)) != ((pair ? 0x10000000u : 0x08000000u) | required) ||
                      columns < columnStep || columns > 256 || columns % columnStep))
         fail("unsupported column MMA instruction descriptor");
+      if (fp8 && (!smallFloatType(bits >> 7 & 7) || !smallFloatType(bits >> 10 & 7)))
+        fail("invalid FP8/FP6/FP4 MMA input type");
       bool mixed = ((bits >> 7) & 1) != ((bits >> 10) & 1);
+      if (tmemA && (bits & (1u << 15)))
+        fail("TMEM-source MMA requires K-major A");
+      if (tmemA && (fp8 || tf32 || (mixed && (half || !(bits & (1u << 7))))))
+        needColumnOperands();
       if (column && half && mixed && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
         fail("mixed F16/BF16 inputs require TF32 for lossless widening");
-      if (column && ((half || fp8) ? vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")
+      if (column && !tf32 && !(half && mixed) && ((half || fp8) ? vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE")
                           : !vortexConfigHasFlag("-DVX_CFG_TCU_INT8_ENABLE")))
         fail("column MMA input type disabled in the Vortex target configuration");
       if (!column && bits != (pair ? 0x104004a0u : 0x084004a0u))
         fail("unsupported i8 MMA instruction descriptor");
       underPred(pred, [&]() -> Value * {
         if (column) {
-          SmallVector<Value *, 8> args = {taddr(s.ops[0]), val(s.ops[1], S.I64), val(s.ops[2], S.I64),
+          Value *a = tmemA ? B.CreateZExt(taddr(s.ops[1]), S.I64) : val(s.ops[1], S.I64);
+          SmallVector<Value *, 8> args = {taddr(s.ops[0]), a, val(s.ops[2], S.I64),
               val(s.ops[idesc + 1], S.I32), columnScratch(), B.getInt32(columns), B.getInt32(format)};
           std::string helper = pair ? "__cupbop_column_pair_mma" : "__cupbop_column_mma";
+          if (tmemA) helper += "_ts";
           if (sparse) {
             helper += "_sp";
             args.push_back(taddr(s.ops[3]));
@@ -1494,6 +1587,70 @@ static bool hasLocalTmaArrive(const CallInst &C, const DataLayout &DL) {
   return false;
 }
 
+// LLVM's NVPTX TableGen ABI puts enable_input_d before sparse metadata.
+// Keep one descriptor validator and runtime dispatch for named and inline-PTX
+// callers. The installed LLVM can read these declarations without an enum ID.
+static void lowerNamedTcgenMma(PassState &S, CallInst *C, StringRef suffix) {
+  const bool sparse = suffix.consume_front("sp.");
+  const bool tensor = suffix.consume_front("tensor");
+  if (!tensor && !suffix.consume_front("shared"))
+    fail_at(C, "unsupported named TCGEN05 MMA operand space");
+  const bool scaled = !suffix.empty();
+  StringRef kind;
+  if (scaled) {
+    kind = StringSwitch<StringRef>(suffix)
+        .Cases(".mxf8f6f4.block_scale", ".mxf8f6f4.block_scale.block32", "mxf8f6f4.block_scale")
+        .Cases(".mxf4.block_scale", ".mxf4.block_scale.block32", "mxf4.block_scale")
+        .Case(".mxf4nvf4.block_scale.block32", "mxf4nvf4.block_scale.scale_vec::2X")
+        .Case(".mxf4nvf4.block_scale.block16", "mxf4nvf4.block_scale.scale_vec::4X")
+        .Default("");
+    if (kind.empty()) fail_at(C, "unsupported named TCGEN05 MMA variant " + suffix.str());
+  }
+  unsigned flagIndex = 5 + sparse + (scaled ? 2 : 0);
+  unsigned groupIndex = flagIndex + !scaled;
+  // LLVM 22 has collector A. Newer versions append collector B (discard by default).
+  if (!C->getType()->isVoidTy() || C->getFunctionType()->isVarArg() ||
+      (C->arg_size() != groupIndex + 2 && C->arg_size() != groupIndex + 3))
+    fail_at(C, "invalid named TCGEN05 MMA signature");
+  auto argType = [&](unsigned i) { return C->getArgOperand(i)->getType(); };
+  Type *tmem = PointerType::get(S.ctx, 6);
+  if (argType(0) != tmem || argType(1) != (tensor ? tmem : S.I64) ||
+      argType(2) != S.I64 || argType(3) != S.I32 || !argType(4)->isIntegerTy(1))
+    fail_at(C, "invalid named TCGEN05 MMA operand type");
+  for (unsigned i = 5; i < flagIndex; ++i)
+    if (argType(i) != tmem) fail_at(C, "expected a tensor address in NVVM address space 6");
+  auto flag = [&](unsigned i) -> uint64_t {
+    auto *imm = dyn_cast<ConstantInt>(C->getArgOperand(i));
+    if (argType(i) != S.I32 || !imm) fail_at(C, "named TCGEN05 MMA flags must be constant i32");
+    return imm->getZExtValue();
+  };
+  if (!scaled) {
+    static const char *const kinds[] = {"f16", "tf32", "f8f6f4", "i8"};
+    uint64_t id = flag(flagIndex);
+    if (id >= 4) fail_at(C, "unsupported named TCGEN05 MMA kind");
+    kind = kinds[id];
+  }
+  uint64_t group = flag(groupIndex);
+  if (group != 1 && group != 2) fail_at(C, "named TCGEN05 MMA requires CTA group 1 or 2");
+  for (unsigned i = groupIndex + 1; i < C->arg_size(); ++i)
+    if (flag(i) != 0) fail_at(C, "named TCGEN05 MMA requires discard collector mode");
+
+  Stmt mma;
+  mma.op = std::string(sparse ? "tcgen05.mma.sp." : "tcgen05.mma.") +
+           "cta_group::" + std::to_string(group) + ".kind::" + kind.str();
+  mma.text = mma.op;
+  mma.tok = splitDots(mma.op);
+  mma.ops = {"[$0]", tensor ? "[$1]" : "$1", "$2"};
+  if (sparse) mma.ops.push_back("[$5]");
+  mma.ops.push_back("$3");
+  if (scaled) {
+    mma.ops.push_back(sparse ? "[$6]" : "[$5]");
+    mma.ops.push_back(sparse ? "[$7]" : "[$6]");
+  }
+  mma.ops.push_back("$4");
+  AsmLowering(S, C).lowerTcgen(mma, nullptr);
+}
+
 bool lowerIntrinsic(PassState &S, CallInst *C) {
   Function *Fn = C->getCalledFunction();
   if (!Fn) return false;
@@ -1511,6 +1668,11 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
+  StringRef mmaName = n;
+  if (mmaName.consume_front("llvm.nvvm.tcgen05.mma.")) {
+    lowerNamedTcgenMma(S, C, mmaName);
+    return done(nullptr);
+  }
   if (n.starts_with("llvm.nvvm.mapa")) {
     Value *mapped = S.call(B,"__cupbop_cluster_map",S.Ptr,{P(0),C->getArgOperand(1)});
     return done(B.CreatePointerCast(mapped,C->getType()));
@@ -2900,7 +3062,7 @@ void lower_async_ptx(Module *M) {
               structuredTma.insert(&F);
               if (!isOrdinaryTmaLoad(*C) || !hasLocalTmaArrive(*C, M->getDataLayout())) S.tcgenFunctions.insert(&F);
             }
-            if (name.starts_with("llvm.nvvm.mapa") ||
+            if (name.starts_with("llvm.nvvm.tcgen05.mma.") || name.starts_with("llvm.nvvm.mapa") ||
                 name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
                 name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
           } else if (!callee->isDeclaration()) {

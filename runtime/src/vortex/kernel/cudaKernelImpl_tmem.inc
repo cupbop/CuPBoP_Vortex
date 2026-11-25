@@ -23,8 +23,8 @@ struct ColumnMeta {
   uint32_t generation[VX_CFG_TCU_TMEM_COLS / 2];
   ColumnMetaCell words[VX_CFG_TCU_TMEM_COLS / 2][128];
 };
-// Only a translated sparse module references this storage function. Section
-// GC removes its per-core buffer from dense-only binaries, including non-LTO.
+// Only modules that read back copy/store operands reference this storage.
+// Section GC removes its per-core buffer from other binaries, including non-LTO.
 extern "C" ColumnMeta *__cupbop_column_meta_storage() {
   static ColumnMeta storage[VX_CFG_NUM_CORES * VX_CFG_NUM_CLUSTERS];
   return storage;
@@ -49,11 +49,11 @@ static void column_meta_store(unsigned col, unsigned row, uint32_t bits) {
 }
 static uint32_t column_meta_word(unsigned col, unsigned row) {
   if (row >= 128 || col >= VX_CFG_TCU_TMEM_COLS / 2)
-    cupbop_async_fail("sparse metadata outside TMEM", col, row);
+    cupbop_async_fail("column operand outside TMEM", col, row);
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
   auto cell = meta.words[col][row];
   if (!cell.generation || cell.generation != meta.generation[col])
-    cupbop_async_fail("sparse metadata requires a TMEM copy or store", col, row);
+    cupbop_async_fail("column operand requires a TMEM copy or store", col, row);
   return cell.bits;
 }
 
@@ -135,25 +135,35 @@ static inline TcgenStore &tcgen_store() { return tcgen_slots[vx_core_id()][csr_r
 
 struct TcgenOperand {
   uintptr_t start;
-  uint32_t leading, stride, swizzle;
+  uint32_t leading, stride, swizzle, cuda_offset;
 };
 
-static inline TcgenOperand tcgen_operand(uint64_t desc) {
+static inline TcgenOperand tcgen_operand(uint64_t desc, bool tf32_mn = false) {
   const unsigned mode = desc >> 61;
-  // Relative K-major, base-offset zero; version 1. The archived DGEMM
-  // uses 128B swizzling (mode 2). Reject absolute-stride and other layouts.
-  if (((desc >> 46) & 0x7fff) != 1 || (mode != 0 && mode != 2))
+  // Relative leading stride, base offset zero, version 1. MN-major TF32
+  // requires SW128 with 32B atomicity (mode 1).
+  if (((desc >> 46) & 0x7fff) != 1 || (tf32_mn ? mode != 1 : mode != 0 && mode != 2))
     cupbop_async_fail("unsupported TCGEN SMEM descriptor", uint32_t(desc >> 32), uint32_t(desc));
   const uintptr_t lmem = csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
   const uintptr_t start = lmem + ((((desc & 0x3fff) << 4) - lmem) & 0x3ffff);
-  return {start, uint32_t((desc >> 16) & 0x3fff) * 16, uint32_t((desc >> 32) & 0x3fff) * 16, mode};
+  return {start, uint32_t((desc >> 16) & 0x3fff) * 16, uint32_t((desc >> 32) & 0x3fff) * 16, mode, uint32_t(start - lmem)};
+}
+
+// Swizzle CUDA addresses within their original CTA. A peer mapping may
+// relocate the whole slab to a different alignment. Retain the descriptor's
+// low offset bits for a submatrix that begins within a swizzle atom.
+static inline uintptr_t tcgen_swizzled_address(const TcgenOperand &a, uintptr_t offset, unsigned mask) {
+  return (a.start - a.cuda_offset) + ((a.cuda_offset + offset) ^ mask);
 }
 
 static inline const int8_t *tcgen_chunk(const TcgenOperand &a, unsigned row, unsigned half) {
   // PTX canonical K-major layout, in 16-byte core vectors. In swizzle
   // mode 2 XOR row bits [2:0] into byte-address bits [6:4].
   uintptr_t offset = (row >> 3) * a.stride;
-  if (a.swizzle) return (const int8_t *)((a.start + offset + (row & 7) * 128 + half * 16) ^ ((row & 7) << 4));
+  if (a.swizzle) {
+    offset += (row & 7) * 128 + half * 16;
+    return reinterpret_cast<const int8_t *>(tcgen_swizzled_address(a, offset, (row & 7) << 4));
+  }
   return (const int8_t *)(a.start + offset + (row & 7) * 16 + half * a.leading);
 }
 #ifdef CUPBOP_COLUMN_TILE
@@ -211,10 +221,16 @@ static T column_element(const TcgenOperand &src, unsigned row, unsigned k, bool 
     address = reinterpret_cast<const uint8_t *>(tcgen_chunk(src, row, k / vec)) + k % vec * sizeof(T);
   } else {
     uintptr_t p;
-    if (src.swizzle) {
-      p = src.start + row / (8 * vec) * src.leading + k / 8 * src.stride +
+    if (src.swizzle == 1) {
+      // Swizzle within the CUDA atom before adding the mapped CTA base.
+      // Two Vortex CTA scratch slabs need not have the same low address bits.
+      uintptr_t offset = row / (8 * vec) * src.leading + k / 4 * src.stride +
+          (k % 4) * 128 + (row % (8 * vec)) * sizeof(T);
+      p = tcgen_swizzled_address(src, offset, (k % 4) << 5);
+    } else if (src.swizzle) {
+      uintptr_t offset = row / (8 * vec) * src.leading + k / 8 * src.stride +
           (k % 8) * 128 + (row % (8 * vec)) * sizeof(T);
-      p ^= (k % 8) << 4;
+      p = tcgen_swizzled_address(src, offset, (k % 8) << 4);
     } else {
       p = src.start + row / vec * src.stride + k / 8 * src.leading +
           (k % 8) * 16 + (row % vec) * sizeof(T);
@@ -226,10 +242,69 @@ static T column_element(const TcgenOperand &src, unsigned row, unsigned k, bool 
   return value;
 }
 
+// SM100 K32 f8f6f4 packs a run of 16 FP4 or FP6 values into a
+// padded 16-byte core vector. MN-major transposes the packed dimension.
+static unsigned column_small_float(const TcgenOperand &src, unsigned row, unsigned k,
+                                   unsigned type, bool transpose) {
+  if (type <= 1) return column_element<uint8_t>(src, row, k, transpose);
+  unsigned width = type == 5 ? 4 : 6;
+  unsigned pos = transpose ? row : k;
+  unsigned bit = (pos % 16) * width;
+  unsigned byte = (pos & ~15u) + bit / 8;
+  auto read = [&](unsigned i) {
+    return transpose ? column_element<uint8_t>(src, i, k, true)
+                     : column_element<uint8_t>(src, row, i, false);
+  };
+  unsigned bits = read(byte);
+  if (bit % 8 + width > 8) bits |= unsigned(read(byte + 1)) << 8;
+  return (bits >> (bit % 8)) & ((1u << width) - 1);
+}
+
+// Every finite E2M1, E2M3 and E3M2 number (including subnormals) is
+// exactly representable in E4M3. Low-precision formats have no NaN/Inf.
+static unsigned column_low_to_e4m3(unsigned bits, unsigned type) {
+  unsigned mbits = type == 5 ? 1 : type == 3 ? 3 : 2;
+  unsigned ebits = type == 4 ? 3 : 2;
+  unsigned sign = (bits >> (mbits + ebits)) << 7;
+  unsigned e = (bits >> mbits) & ((1u << ebits) - 1);
+  unsigned m = bits & ((1u << mbits) - 1);
+  int bias = (1 << (ebits - 1)) - 1;
+  if (!e) {
+    if (!m) return sign;
+    unsigned shift = mbits - (31 - __builtin_clz(m));
+    m = (m << shift) & ((1u << mbits) - 1);
+    return sign | ((8 - bias - shift) << 3) | (m << (3 - mbits));
+  }
+  return sign | ((e + 7 - bias) << 3) | (m << (3 - mbits));
+}
+
+// With dense K32 each FP6/FP4 element occupies one byte in CUDA
+// TMEM. E2M1 uses bits 5:2; both FP6 encodings use bits 5:0.
+static unsigned column_tmem_small_float(unsigned col, unsigned row, unsigned k, unsigned type) {
+  unsigned byte = column_meta_word(col + k / 4, row) >> ((k % 4) * 8) & 255;
+  return type == 5 ? (byte >> 2) & 15 : type >= 3 ? byte & 63 : byte;
+}
+
+static unsigned column_small_to_half(unsigned raw, unsigned type) {
+  if (type == 1) return raw << 8;
+  if (type > 1) raw = column_low_to_e4m3(raw, type);
+  return __cupbop_f32_to_f16_rne(__cupbop_e4m3_to_f32(raw));
+}
+
 // Four adjacent K positions have two stored values. CUDA interleaves the
 // F16 row and K-block indices in the two halfwords of the selected column.
+static bool column_tf32(unsigned format) { return (format & 0x21ff0u) == 0x910; }
+
 static unsigned column_sparse_indices(unsigned meta, unsigned row, unsigned k, unsigned format) {
   unsigned word, shift;
+  if (column_tf32(format)) {
+    // TF32 stores a nibble (4 or 14) per pair. Re-express two successive
+    // pairs as the two selected indices of one four-element native group.
+    word = column_meta_word(meta + (format & 1), (row & ~8u) | (k & 8));
+    shift = (row & 8) * 2 + (k & 4) * 2;
+    unsigned pairs = (word >> shift) & 255;
+    return unsigned((pairs & 15) == 14) | ((2u + unsigned((pairs >> 4) == 14)) << 2);
+  }
   if ((format & 0x20010) == 0x10) {
     word = column_meta_word(meta + (format & 1), (row & ~8u) | ((k & 16) >> 1));
     shift = ((row & 8) << 1) + (k & 12);
@@ -254,11 +329,19 @@ static typename Input::dtype column_value(const TcgenOperand &src, unsigned row,
     return static_cast<typename Input::dtype>(val);
   } else {
     if (format & (1u << 17)) {
-      unsigned byte = column_element<uint8_t>(src, row, k, transpose);
-      if (format & (1u << (13 + is_b))) byte ^= 0x80;
+      unsigned type = (format >> (is_b ? 10 : 7)) & 7;
+      unsigned byte = column_small_float(src, row, k, type, transpose);
+      unsigned half = column_small_to_half(byte, type);
       // Both FP8 encodings widen exactly to binary16. E5M2 already uses
       // binary16's exponent and bias, with two stored fraction bits.
-      return alt ? byte << 8 : __cupbop_f32_to_f16_rne(__cupbop_e4m3_to_f32(byte));
+      return half ^ ((format & (1u << (13 + is_b))) ? 0x8000 : 0);
+    }
+    if constexpr (Input::id == tensor::tf32::id) {
+      if (column_tf32(format)) {
+        uint32_t word = column_element<uint32_t>(src, row, k, transpose);
+        if (format & (1u << (13 + is_b))) word ^= 1u << 31;
+        return word >> 13; // Vortex stores sign, exponent and fraction in bits 18:0.
+      }
     }
     unsigned val = column_element<uint16_t>(src, row, k, transpose);
     if (format & (1u << (13 + is_b))) val ^= 0x8000;
@@ -277,21 +360,28 @@ static void column_wait(unsigned warp) {
   vx_barrier(barrier, 2);
 }
 
+template <typename Input>
+static bool column_convert_tmem_a(unsigned format) {
+  return Input::id == tensor::tf32::id || (format & (1u << 17)) ||
+         (Input::id == tensor::int8::id && !(format & (1u << 7)));
+}
+
 template <typename Input, typename Output>
 static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenOperand &b,
                                const TcgenOperand &peer_b, bool pair, unsigned use_d,
                                uint8_t *scratch, unsigned columns, unsigned format,
-                               unsigned meta, int workspace, unsigned warp) {
+                               unsigned meta, int workspace, bool native_sp, unsigned warp, int a_col) {
   using Geometry = tensor::wgmma_config_t<32, Input, Output>;
   using T = typename Input::dtype;
   constexpr unsigned ratio = 4 / sizeof(T);
   constexpr unsigned packedK = Geometry::fedpK * ratio;
   const bool sparse = format & 4;
   const bool mixed_int = Input::bits == 8 && ((format >> 7 ^ format >> 10) & 1);
-  const unsigned cudaK = ((format & 0x20010) == 0x10 ? 16 : 32) * (sparse ? 2 : 1);
-  // TF32 promotion changes a word's sparsity granularity from 2:4 to 1:2.
-  // Its full-range 2:4 data uses the expanded path.
-  const bool native_sp = sparse && workspace >= 0;
+  const bool tf32 = column_tf32(format);
+  const unsigned cudaK = (tf32 ? 8 : (format & 0x20010) == 0x10 ? 16 : 32) * (sparse ? 2 : 1);
+  const bool convert_a = column_convert_tmem_a<Input>(format);
+  const bool direct_a = a_col >= 0 && !convert_a && (!sparse || native_sp);
+  const bool staged_tmem_a = a_col >= 0 && convert_a && workspace >= 0;
   const unsigned stepK = native_sp ? 2 * packedK : packedK;
   const unsigned bstride = stepK * sizeof(T);
   auto *a_stage = reinterpret_cast<T *>(scratch);
@@ -321,10 +411,10 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
         }
       }
       vx_fence();
-      tmcol::cp(workspace + warp * 8, masks, 8);
+      tmcol::cp(workspace, masks, 8);
     }
     for (unsigned part = 0; part < (mixed_int ? 3u : 1u); ++part) {
-      for (unsigned row = 0; row < 128; ++row) {
+      for (unsigned row = 0; !direct_a && row < 128; ++row) {
         unsigned pr = (row % 32 / 16) * 64 + (row / 32) * 16 + row % 16;
         for (unsigned x = 0; x < packedK; ++x) {
           unsigned k = native_sp ? start / 2 + x : start + x;
@@ -337,8 +427,47 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
             }
             k = k / 4 * 2 + unsigned(p == (indices >> 2));
           }
-          a_stage[pr * packedK + x] = column_value<Input>(a, row, k, format, false, part);
+          if (a_col >= 0 && (format & (1u << 17))) {
+            unsigned type = (format >> 7) & 7;
+            a_stage[pr * packedK + x] = column_small_to_half(column_tmem_small_float(a_col, row, k, type), type);
+          } else if (a_col >= 0) {
+            // A sparse-to-dense fallback can unpack values supplied by the
+            // original TMEM copy/store alongside its CUDA metadata.
+            unsigned per_word = Input::id == tensor::tf32::id && !tf32 ? 2 : ratio;
+            uint32_t word = column_meta_word(unsigned(a_col) + k / per_word, row);
+            uint32_t value = word >> ((k % per_word) * (32 / per_word));
+            if constexpr (Input::id == tensor::tf32::id) {
+              if (!tf32) {
+                uint32_t half = value & 0xffff;
+                value = (format & (1u << 7)) ? half << 16 :
+                    __builtin_bit_cast(uint32_t, __cupbop_f16_to_f32(half));
+              }
+              value >>= 13;
+            } else if constexpr (Input::id == tensor::int8::id) {
+              if (!(format & (1u << 7))) value = part ? ((value & 128) >> 1) : (value & 127);
+            }
+            a_stage[pr * packedK + x] = T(value);
+          } else {
+            a_stage[pr * packedK + x] = column_value<Input>(a, row, k, format, false, part);
+          }
         }
+      }
+      if (staged_tmem_a) {
+        // Stage the converted TF32 or FP16 words in TMEM before issuing a
+        // native TMEM-source job. The two panels are contiguous here.
+        if (native_sp) column_wait(warp);
+        auto *packed = reinterpret_cast<uint32_t *>((uintptr_t(b_stage) + bankRow - 1) & ~(bankRow - 1));
+        const unsigned width = tmcol::frag_cols();
+        for (unsigned pr = 0; pr < 128; ++pr)
+          for (unsigned x = 0; x < Geometry::fedpK; ++x) {
+            unsigned group = (pr / 64 * Geometry::fedpK + x) / width;
+            uint32_t word;
+            __builtin_memcpy(&word, a_stage + pr * packedK + x * ratio, sizeof(word));
+            packed[(group * 64 + pr % 64) * width + x % width] = word;
+          }
+        vx_fence();
+        tmcol::cp(workspace + 8, packed, 2 * Geometry::fedpK);
+        column_wait(warp);
       }
       for (unsigned base = 0; base < columns; base += 64) {
         unsigned count = columns - base < 64 ? columns - base : 64;
@@ -360,11 +489,20 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
         vx_fence();
         for (unsigned n = 0; n < count; n += 16) {
           for (unsigned panel = 0; panel < 2; ++panel) {
-            unsigned side_col = native_sp ? workspace + warp * 8 + panel * 4 : 0;
+            unsigned side_col = native_sp ? workspace + panel * 4 : 0;
             auto idesc = tmcol::make_idesc<Input>(16 / tmcol::frag_cols(),
                 column_panel(col + base + n, panel), !use_d && !start && !part, native_sp, side_col);
-            tmcol::mma(idesc, tmcol::smem_desc(a_off + panel * 64 * packedK * sizeof(T), packedK * sizeof(T)),
-                       tmcol::smem_desc(b_off + n * bstride, bstride));
+            auto b_desc = tmcol::smem_desc(b_off + n * bstride, bstride);
+            if (staged_tmem_a) {
+              tmcol::mma(idesc, tmcol::tmem_col{unsigned(workspace) + 8 + panel * Geometry::fedpK}, b_desc);
+            } else if (direct_a) {
+              unsigned word = unsigned(a_col) + start / (native_sp ? 2 : 1) / ratio;
+              unsigned physical = column_panel(word, panel) + word % 16;
+              tmcol::mma(idesc, tmcol::tmem_col{physical}, b_desc);
+            } else {
+              tmcol::mma(idesc, tmcol::smem_desc(a_off + panel * 64 * packedK * sizeof(T),
+                                                 packedK * sizeof(T)), b_desc);
+            }
           }
         }
         column_wait(warp);
@@ -377,18 +515,29 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
 // overwriting another's descriptors before its tc.commit has retired.
 template <typename Input, typename Output>
 static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
-                                     uint32_t use_d, uint8_t *scratch, unsigned columns, unsigned format, unsigned meta, int side = -1) {
+                                     uint32_t use_d, uint8_t *scratch, unsigned columns, unsigned format, unsigned meta,
+                       int side = -1, int a_col = -1) {
   using ColumnGeometry = tensor::wgmma_config_t<32, Input, Output>;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || (col & 15) || uint64_t(col) + columns > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
     cupbop_async_fail("unsupported column MMA destination or issuer", col, warp);
   if ((format & 4) && meta >= VX_CFG_TCU_TMEM_COLS / 2)
     cupbop_async_fail("sparse metadata base outside TMEM", meta, 0);
-  auto a = tcgen_operand(desc_a);
-  auto b = tcgen_operand(desc_b);
+  // A contains 32 bytes per CUDA data-path lane, including a compressed
+  // 2:4 operand. A Vortex FEDP read must stay within one 16-column panel.
+  if (a_col >= 0) {
+    if (unsigned(a_col) % ColumnGeometry::fedpK || uint64_t(a_col) + 8 > VX_CFG_TCU_TMEM_COLS / 2 ||
+        (unsigned(a_col) < col + columns && col < unsigned(a_col) + 8))
+      cupbop_async_fail("invalid TMEM-source MMA address", a_col, col);
+    // Negating either multiplicand changes the same product sign. Stage B
+    // with the effective sign so A can stay in its original TMEM columns.
+    if (format & (1u << 13)) format ^= (1u << 13) | (1u << 14);
+  }
+  auto a = a_col >= 0 ? TcgenOperand{} : tcgen_operand(desc_a, column_tf32(format) && (format & (1u << 15)));
+  auto b = tcgen_operand(desc_b, column_tf32(format) && (format & (1u << 16)));
   TcgenOperand b_other = b;
   if (side >= 0) {
-    a.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(a.start), side));
+    if (a_col < 0) a.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(a.start), side));
     b_other.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(b.start), 1));
     b.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(b.start), 0));
   }
@@ -397,14 +546,17 @@ static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
   // CTA-shared symbol placed by mem_share2local in the launch allocation.
   if (vx_thread_id() != 0) cupbop_async_fail("column MMA needs lane zero", col, warp);
   scratch += warp * ((rows + 256) * kbytes);
-  if ((format & ~0x4b0u) || (((format >> 7) ^ (format >> 10)) & 1)) {
-    int workspace = -1;
+  if (a_col >= 0 || (format & ~0x4b0u) || (((format >> 7) ^ (format >> 10)) & 1)) {
+    bool native_sp = false;
 #ifdef VX_CFG_TCU_SPARSE_ENABLE
-    if ((format & 4) && Input::bits != 32 && ColumnGeometry::sp_k_words == ColumnGeometry::fedpK)
-      workspace = column_sparse_side();
+    // Mixed F16/BF16 promoted to TF32 retains 2:4 halves, while native
+    // TF32 accepts one of each pair. Explicit TF32 already has that layout.
+    native_sp = (format & 4) && (Input::bits != 32 || column_tf32(format)) &&
+                ColumnGeometry::sp_k_words == ColumnGeometry::fedpK;
 #endif
+    int workspace = native_sp || (a_col >= 0 && column_convert_tmem_a<Input>(format)) ? column_sparse_side() : -1;
     column_adapted_mma<Input, Output>(col, a, b, b_other, side >= 0, use_d, scratch, columns,
-                                      format, meta, workspace, warp);
+                                      format, meta, workspace, native_sp && workspace >= 0, warp, a_col);
     if (workspace >= 0) column_sparse_release(workspace);
     column_meta_invalidate(col, columns);
     return;
@@ -440,7 +592,7 @@ static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
 
 template <typename Input, typename Output, bool Pair>
 static void column_issue(unsigned addr, uint64_t a, uint64_t b, unsigned use_d, uint8_t *scratch,
-                         unsigned n, unsigned format, unsigned meta) {
+                         unsigned n, unsigned format, unsigned meta, bool tmem_a) {
   if constexpr (Pair) {
     unsigned offset = addr - columnPairTag;
     for (unsigned side = 0; side < 2; ++side) {
@@ -455,27 +607,32 @@ static void column_issue(unsigned addr, uint64_t a, uint64_t b, unsigned use_d, 
         if (meta_offset > run.size || metadata_cols > run.size - meta_offset)
           cupbop_async_fail("paired metadata outside column run", meta, side);
       }
-      column_mma<Input, Output>(run.base + offset, a, b, use_d, scratch, n, format, run.base + meta_offset, side);
+      unsigned a_offset = unsigned(a) - columnPairTag;
+      if (tmem_a && (a_offset > run.size || 8 > run.size - a_offset))
+        cupbop_async_fail("paired TMEM-source MMA outside its run", unsigned(a), side);
+      column_mma<Input, Output>(run.base + offset, a, b, use_d, scratch, n, format,
+                                run.base + meta_offset, side, tmem_a ? int(run.base + a_offset) : -1);
     }
   } else {
-    column_mma<Input, Output>(addr, a, b, use_d, scratch, n, format, meta);
+    if (tmem_a && a > VX_CFG_TCU_TMEM_COLS / 2) cupbop_async_fail("invalid TMEM-source MMA base", a, 0);
+    column_mma<Input, Output>(addr, a, b, use_d, scratch, n, format, meta, -1, tmem_a ? int(a) : -1);
   }
 }
 
 template <bool Pair>
 static void column_mma_format(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
-                              uint8_t *scratch, unsigned n, unsigned format, unsigned meta) {
+                              uint8_t *scratch, unsigned n, unsigned format, unsigned meta, bool tmem_a = false) {
   // Independent 3-bit A/B type fields and 2-bit accumulator field.
   if (format & (1u << 17))
-    return column_issue<tensor::fp16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
+    return column_issue<tensor::fp16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
   switch (format & 0x1ff0u) {
-    case 0x10: return column_issue<tensor::fp16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
-    case 0x490: return column_issue<tensor::bf16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
-    case 0x90: case 0x410:
-      return column_issue<tensor::tf32, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
-    case 0x20: return column_issue<tensor::uint8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
+    case 0x10: return column_issue<tensor::fp16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
+    case 0x490: return column_issue<tensor::bf16, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
+    case 0x910: case 0x90: case 0x410:
+      return column_issue<tensor::tf32, tensor::fp32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
+    case 0x20: return column_issue<tensor::uint8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
     case 0xa0: case 0x420: case 0x4a0:
-      return column_issue<tensor::int8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n, format, meta);
+      return column_issue<tensor::int8, tensor::int32, Pair>(addr, a, b, use_d, scratch, n, format, meta, tmem_a);
     default: cupbop_async_fail("invalid column MMA format", format, n);
   }
 }
@@ -497,8 +654,29 @@ extern "C" void __cupbop_column_mma_sp(unsigned addr, uint64_t a, uint64_t b, un
                                     uint8_t *scratch, unsigned n, unsigned format, unsigned meta) {
   column_mma_format<false>(addr, a, b, use_d, scratch, n, format, meta);
 }
+// The CUDA assembly operand selects TMEM or a shared descriptor. Separate
+// entry points preserve the ABI of previously translated shared-source IR.
+extern "C" void __cupbop_column_mma_ts(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                       uint8_t *scratch, unsigned n, unsigned format) {
+  column_mma_format<false>(addr, a, b, use_d, scratch, n, format, 0, true);
+}
+extern "C" void __cupbop_column_pair_mma_ts(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                            uint8_t *scratch, unsigned n, unsigned format) {
+  column_mma_format<true>(addr, a, b, use_d, scratch, n, format, 0, true);
+}
+extern "C" void __cupbop_column_mma_ts_sp(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                          uint8_t *scratch, unsigned n, unsigned format, unsigned meta) {
+  column_mma_format<false>(addr, a, b, use_d, scratch, n, format, meta, true);
+}
+extern "C" void __cupbop_column_pair_mma_ts_sp(unsigned addr, uint64_t a, uint64_t b, unsigned use_d,
+                                               uint8_t *scratch, unsigned n, unsigned format, unsigned meta) {
+  column_mma_format<true>(addr, a, b, use_d, scratch, n, format, meta, true);
+}
 
-static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch) {
+
+#include "cudaKernelImpl_column_mx.inc"
+
+static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch, unsigned sourceRows = 128) {
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || vx_thread_id() || col % 4 || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
     cupbop_async_fail("unsupported column copy destination or issuer", col, warp);
@@ -510,7 +688,7 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
       auto *stage = scratch + (2 * group + half) * 1024;
       for (unsigned row = 0; row < 64; ++row) {
         unsigned logical = (row / 16) * 32 + half * 16 + row % 16;
-        __builtin_memcpy(stage + row * 16, tcgen_chunk(src, logical, group), 16);
+        __builtin_memcpy(stage + row * 16, tcgen_chunk(src, logical % sourceRows, group), 16);
         if (__cupbop_column_meta_table) {
           for (unsigned j = 0; j < 4; ++j) {
             uint32_t word;
@@ -532,7 +710,7 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
 extern "C" void __cupbop_column_cp(unsigned col, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
   column_copy(col, tcgen_operand(descriptor), cols, scratch);
 }
-extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
+static void column_pair_copy(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch, unsigned sourceRows) {
   unsigned offset = addr - columnPairTag;
   for (unsigned side = 0; side < 2; ++side) {
     auto &run = pairRun(side);
@@ -540,8 +718,15 @@ extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsi
       cupbop_async_fail("paired copy outside allocation", addr, cols);
     auto src = tcgen_operand(descriptor);
     src.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(src.start), side));
-    column_copy(run.base + offset, src, cols, scratch);
+    column_copy(run.base + offset, src, cols, scratch, sourceRows);
   }
+}
+extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
+  column_pair_copy(addr, descriptor, cols, scratch, 128);
+}
+extern "C" void __cupbop_column_cp_warpx4(unsigned addr, uint64_t descriptor, unsigned pair, uint8_t *scratch) {
+  if (pair) column_pair_copy(addr, descriptor, 4, scratch, 32);
+  else column_copy(addr, tcgen_operand(descriptor), 4, scratch, 32);
 }
 static unsigned column_transfer(unsigned addr, unsigned displacement, unsigned count) {
   unsigned col = (addr & 0xffff) + displacement;
@@ -669,8 +854,9 @@ extern "C" uint32_t __cupbop_column_ldsplit(unsigned addr, unsigned delta) {
   return lane < 16 ? lo : hi;
 }
 
-extern "C" uint32_t __cupbop_column_ld16(unsigned addr, unsigned width, unsigned reg) {
-  unsigned col = column_transfer(addr & ~(16u << 16), 0, width);
+static unsigned column_ld16(unsigned addr, unsigned width, unsigned reg, bool pack) {
+  unsigned stride = pack ? 2 : 1;
+  unsigned col = column_transfer(addr & ~(16u << 16), 0, width * stride);
   unsigned half = (addr >> 20) & 1, lane = vx_thread_id();
   unsigned row = lane / 4 + 8 * (width == 2 ? lane % 2 : (width == 4 ? reg : reg / 2));
   unsigned group = width == 2 ? (lane / 2) % 2 : lane % 4;
@@ -678,10 +864,63 @@ extern "C" uint32_t __cupbop_column_ld16(unsigned addr, unsigned width, unsigned
   unsigned result = 0;
   for (unsigned i = 0; i < groups; ++i) {
     unsigned offset = width == 8 ? 2 * i + reg % 2 : i;
-    unsigned bits = column_load_word(col + offset, half, row);
+    unsigned at = col + offset * stride;
+    unsigned bits = column_load_word(at, half, row);
+    if (pack) bits = (bits & 0xffff) | (column_load_word(at + 1, half, row) << 16);
     if (i == group) result = bits;
   }
   return result;
+}
+extern "C" uint32_t __cupbop_column_ld16(unsigned addr, unsigned width, unsigned reg) {
+  return column_ld16(addr, width, reg, false);
+}
+extern "C" uint32_t __cupbop_column_ldpack(unsigned addr, unsigned delta, unsigned width, unsigned reg) {
+  if (width != 1) return column_ld16(addr, width, reg, true);
+  unsigned lo = __cupbop_column_ldsplit(addr, delta);
+  unsigned hi = __cupbop_column_ldsplit(addr + 1, delta);
+  return (lo & 0xffff) | (hi << 16);
+}
+
+// The native address is four-column aligned. The CTA warp owns these
+// 16 physical rows; another warp's transfers land in a different TCU block
+// or a separate CTA allocation. Read and update only this four-column group.
+// CP and MMA writes to these rows cover whole aligned groups.
+static void column_store_partial(unsigned col, unsigned half, unsigned value, unsigned mask) {
+  unsigned dest = tmcol::make_taddr(tmcol::warp_lane(), column_panel(col, half) + (col & 12));
+  tmcol::wait_st();
+  register float f0 __asm__("f0"), f1 __asm__("f1");
+  __asm__ volatile(".insn r %2, 0, 5, x0, %3, x1" : "=f"(f0), "=f"(f1)
+                   : "i"(RISCV_CUSTOM0), "r"(dest) : "memory");
+  unsigned first = __builtin_bit_cast(unsigned, f0), second = __builtin_bit_cast(unsigned, f1);
+  unsigned lane = vx_thread_id(), j = col & 3;
+  unsigned &word = j < 2 ? first : second;
+  if (lane / 16 == (j & 1)) {
+    word = (word & ~mask) | (value & mask);
+    unsigned row = 32 * csr_read_nv(VX_CSR_CTA_RANK) + 16 * half + lane % 16;
+    column_meta_store(col, row, word);
+  }
+  column_store_words(dest, first, second, j >= 2);
+}
+
+extern "C" void __cupbop_column_st_tile(unsigned addr, unsigned delta, unsigned width, unsigned unpack,
+                                        unsigned a, unsigned b, unsigned c, unsigned d) {
+  unsigned lane = vx_thread_id(), count = width * (unpack ? 2 : 1);
+  unsigned halves = width == 1 ? 2 : 1;
+  for (unsigned h = 0; h < halves; ++h) {
+    unsigned address = addr + h * delta;
+    unsigned base = column_transfer(address & ~(16u << 16), 0, count);
+    unsigned half = (address >> 20) & 1;
+    for (unsigned j = 0; j < width; ++j) {
+      unsigned value = width == 1 ? vx_shfl_idx(a, h * 16 + lane % 16, 31, 0)
+                                  : column_st16_word(width, lane % 16, j, a, b, c, d);
+      if (unpack) {
+        column_store_partial(base + 2 * j, half, value, 0xffff);
+        column_store_partial(base + 2 * j + 1, half, value >> 16, 0xffff);
+      } else {
+        column_store_partial(base + j, half, value, ~0u);
+      }
+    }
+  }
 }
 #endif
 #ifdef CUPBOP_NATIVE_TMEM

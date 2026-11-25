@@ -1,0 +1,4 @@
+KERNEL_CU = ../tcgen05_column_mma/tcgen05_column_mma.cu
+override EXTRA_CLANG_FLAGS += -DCUPBOP_TEST_TMEM_A -DCUPBOP_TEST_COLUMN_PAIR
+EXTRA_NVCC_FLAGS = -arch=sm_100a -DCUPBOP_TEST_TMEM_A -DCUPBOP_TEST_COLUMN_PAIR
+include ../common.mk

@@ -50,6 +50,10 @@ if ! bash ci/tma_nvvm_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/b
   cat "$OUT/tma_nvvm.log"
   exit 1
 fi
+if ! bash ci/tcgen05_nvvm_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/tcgen05_nvvm.log" 2>&1; then
+  cat "$OUT/tcgen05_nvvm.log"
+  exit 1
+fi
 if ! bash ci/dxa_layout_metadata_test.sh build/compilation/kernelTranslator "$LLVM_PREFIX/bin" > "$OUT/dxa_layout_metadata.log" 2>&1; then
   cat "$OUT/dxa_layout_metadata.log"
   exit 1
