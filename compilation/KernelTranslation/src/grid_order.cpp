@@ -89,7 +89,7 @@ bool rewrite(Module *M, Function &K, std::string &why, std::string &done) {
 
   LLVMContext &C = M->getContext();
   Type *I32 = Type::getInt32Ty(C);
-  FunctionCallee helper = M->getOrInsertFunction("__cupbop_grid_order_xy", FunctionType::get(I32, {I32, I32, I32, I32, I32}, false));
+  FunctionCallee helper = M->getOrInsertFunction("__cupbop_grid_order_xy", FunctionType::get(I32, {I32, I32, I32}, false));
   // after the entry block's allocas: one remap per kernel entry, shared by every read
   BasicBlock &E = K.getEntryBlock();
   IRBuilder<> B(&*E.getFirstInsertionPt());
@@ -97,10 +97,9 @@ bool rewrite(Module *M, Function &K, std::string &why, std::string &done) {
   auto sreg = [&](Intrinsic::ID id, const char *name) { return B.CreateCall(Intrinsic::getDeclaration(M, id), {}, name); };
   Value *bx = sreg(Intrinsic::nvvm_read_ptx_sreg_ctaid_x, "go.bx");
   Value *by = sreg(Intrinsic::nvvm_read_ptx_sreg_ctaid_y, "go.by");
-  Value *gx = sreg(Intrinsic::nvvm_read_ptx_sreg_nctaid_x, "go.gx");
-  Value *gy = sreg(Intrinsic::nvvm_read_ptx_sreg_nctaid_y, "go.gy");
-  Value *nx = B.CreateCall(helper, {bx, by, gx, gy, B.getInt32(0)}, "go.x");
-  Value *ny = B.CreateCall(helper, {bx, by, gx, gy, B.getInt32(1)}, "go.y");
+  // the grid comes from the launch context inside the helper, on the R > 1 path only
+  Value *nx = B.CreateCall(helper, {bx, by, B.getInt32(0)}, "go.x");
+  Value *ny = B.CreateCall(helper, {bx, by, B.getInt32(1)}, "go.y");
   for (CallInst *R : reads) {
     R->replaceAllUsesWith(ctaid_axis(*R) == 0 ? nx : ny);
     R->eraseFromParent();
