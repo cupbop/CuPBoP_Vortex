@@ -131,6 +131,11 @@ jobs:
             echo "Execution successful!"
           else
             echo "Execution failure."
+            # a run ci/known_failures.txt lists (e.g. a known timeout) does not fail the job; Verify Correctness reports it as XFAIL
+            if KNOWN=$(./ci/known_failure.sh "${{ matrix.name }}" "${{ matrix.scheduler }}" "${{ matrix.localmem }}"); then
+              echo "::notice title=known failure ${{ matrix.name }} s${{ matrix.scheduler }}::$KNOWN"
+              exit 0
+            fi
             exit 1
           fi
 

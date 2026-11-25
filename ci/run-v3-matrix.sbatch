@@ -39,7 +39,7 @@ cupbop_v3_ensure_simx $VORTEX_PATH "$VORTEX_CONFIGS" || exit 1
 cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU" || exit 1
 echo "simx ready $(date +%H:%M:%S)"
 # --- matrix ---
-RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,exec_ok,result,seconds" > $RES
+RES=$LOGS/results.csv; echo "test,schedule,localmem,make_rc,kernel_ok,host_ok,exec_ok,result,seconds,cycles" > $RES
 run_one() { # test sched lmem
   local t=$1 s=$2 l=$3
   local log=$LOGS/${t}_s${s}_l${l}.log t0=$SECONDS   # separate line: a single `local` expands ${s} before assigning it
@@ -47,8 +47,12 @@ run_one() { # test sched lmem
     timeout 1800 make -C $t ci SCHEDULE=$s LOCALMEM=$l > $log 2>&1 ); local rc=$?
   local k=0 h=0 e=0; grep -q "Kernel compilation completed!" $log && k=1; grep -q "Host compilation completed!" $log && h=1; grep -q "Execution completed!" $log && e=1
   local r; r=$(./ci/check_correctness.sh $t $s $l 2>&1 | tee -a $log | sed -n 's/^RESULT=//p')
-  [ $rc -ne 0 ] && r=FAIL   # a failed build can never be a PASS (stale result files from an earlier run must not count)
-  echo "$t,$s,$l,$rc,$k,$h,$e,$r,$((SECONDS-t0))" >> $RES
+  # a failed build or run can never be a PASS (stale result files from an earlier run must not count); a listed one is XFAIL
+  [ $rc -ne 0 ] && { ./ci/known_failure.sh $t $s $l > /dev/null && r=XFAIL || r=FAIL; }
+  # the run's cycles (sum over its launches, the Perf_counter file of this configuration), kept for ci/compare_matrix.py
+  local pf; [ $s = 0 ] && pf=$(ls examples/$t/Perf_counter_*SCHE_0*.txt 2>/dev/null | head -1) || pf=$(ls examples/$t/Perf_counter_*SCHE_${s}_LOCAL_MEM_${l}*.txt 2>/dev/null | head -1)
+  local cy=""; [ -n "$pf" ] && [ $rc -eq 0 ] && { cp $pf $LOGS/${t}_s${s}_l${l}.perf; cy=$(sed -n 's/^PERF: instrs=[0-9]*, cycles=\([0-9]*\),.*/\1/p' $pf | awk '{c += $1} END {if (NR) print c}'); }
+  echo "$t,$s,$l,$rc,$k,$h,$e,$r,$((SECONDS-t0)),$cy" >> $RES
   printf "%-20s sched=%s lmem=%s make=%-3s k/h/e=%s%s%s  %s  %ss\n" $t $s $l $rc $k $h $e $r $((SECONDS-t0))
 }
 export -f run_one; export LOGS RES
@@ -68,7 +72,9 @@ echo; echo "=== summary"; python3 - "$RES" <<'PY'
 import csv,sys,collections
 rows=list(csv.DictReader(open(sys.argv[1])))
 c=collections.Counter(r['result'] for r in rows); print("total",len(rows),dict(c))
-bad=[r for r in rows if r['result']!='PASS']
+bad=[r for r in rows if r['result'] not in ('PASS','XFAIL')]
+for r in rows:
+    if r['result']=='XFAIL': print(f"  known failure {r['test']} s{r['schedule']} l{r['localmem']} (ci/known_failures.txt)")
 for r in bad: print(f"  {r['test']:20s} s{r['schedule']} l{r['localmem']}: result={r['result']} make_rc={r['make_rc']} kernel={r['kernel_ok']} host={r['host_ok']} exec={r['exec_ok']}")
 PY
 INNER
