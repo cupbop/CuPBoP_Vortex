@@ -790,10 +790,14 @@ CUPBOP_MMA884_F32(col, col, 0, 0)
 // lower column), with .trans {M_j[2t][g], M_j[2t+1][g]}. stmatrix is the inverse (lane l holds d_j, the rows' lanes
 // give the addresses). The address operand is a 32-bit shared-window value: CuLifter's ptrtoint of @shared_mem + off
 // (32 or 64 bits, truncated here) or __cupbop_cvta_to_shared's offset; both decode to the local-memory pointer
-// lmem + ((a - lmem) mod 2^18), as the wgmma descriptors do (local memory < 256 KB). Software: index shuffles over the
-// hardware warp (1:1 / core mapping with 32 hardware lanes), all 32 lanes active as .sync requires.
+// base + ((a - base) mod 2^18). When the core has more than one 256 KiB
+// window, the executing CTA's allocation anchors its CUDA shared addresses.
 static inline char *__cupbop_smem_ptr(uint32_t a) {
+#if VX_CFG_LMEM_LOG_SIZE > 18
+  const uintptr_t lmem = csr_read_nv(VX_CSR_CTA_LMEM_ADDR);
+#else
   const uintptr_t lmem = (uintptr_t)csr_read(VX_CSR_LOCAL_MEM_BASE);
+#endif
   return (char *)(lmem + ((a - (uint32_t)lmem) & 0x3FFFFu));
 }
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16(uint32_t a, int num, int trans, uint32_t *d) {
