@@ -107,4 +107,3 @@ A dry run of the exact workflow scripts from a fresh clone (`GITHUB_WORKSPACE=<c
 * A kernel that aborts on the first atomic, hangs in `atomicCAS` or gets wrong counts across cores means the SimX was built without the A / Zacas / L2 flags — check `<build>/.cupbop_simx_configs`
 ## Future Improvements
 * Parallelize running tests by adding more runners
-* Fix the four remaining SCHE_0 failures listed above

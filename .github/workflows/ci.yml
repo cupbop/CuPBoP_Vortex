@@ -140,9 +140,10 @@ jobs:
             sbatch --wait -o "$CI_LOG_DIR/CuPBoP-build-%j.out" ./ci/run-crnch-cuda.sh
           fi
           status=0
-          job_id=$(sbatch --parsable --wait -o "$CI_LOG_DIR/CuPBoP-cuda-test-%j.out" ./ci/run-crnch-cuda-test.sh) || status=$?
+          job_id=$(sbatch --parsable --wait --export=ALL,CI_LOG_DIR="$CI_LOG_DIR" -o "$CI_LOG_DIR/CuPBoP-cuda-test-%j.out" ./ci/run-crnch-cuda-test.sh) || status=$?
           echo "Showing last 100 lines of log:"
           LOG_FILE="$CI_LOG_DIR/CuPBoP-cuda-test-${job_id%%;*}.out"
+          echo "$LOG_FILE"
           tail -n 100 "$LOG_FILE"
           if [ "$status" -ne 0 ]; then exit "$status"; fi
 
