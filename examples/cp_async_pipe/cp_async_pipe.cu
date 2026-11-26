@@ -2,8 +2,8 @@
 // mainloop: prefetch STAGES-1 tiles, then per tile issue the tile STAGES-1 ahead, commit, wait_prior(STAGES-1),
 // __syncthreads, consume (each thread reads ANOTHER thread's copy), __syncthreads. The last tile of the last
 // block runs past n: those 16-byte copies zero-fill (src-size 0 via the zfill argument).
-// CuPBoP lowers the cp.async family to synchronous copies (lower_cp_async); nvcc -arch=sm_80 compiles the
-// same kernel to LDGSTS / LDGDEPBAR / DEPBAR, the input of the lifted-IR test.
+// Groups in this ring span loop iterations, so CuPBoP uses its LSU fallback here.
+// nvcc -arch=sm_80 produces LDGSTS / LDGDEPBAR / DEPBAR for the lifted-IR test.
 //   usage: ./host.out [-n elements] [-t tiles_per_block]
 #include <cstdio>
 #include <cstdlib>

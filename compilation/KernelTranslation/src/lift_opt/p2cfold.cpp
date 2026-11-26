@@ -67,6 +67,15 @@ static bool asmHas(const CallInst *C, const char *s) {
   return IA && IA->getAsmString().find(s) != std::string::npos;
 }
 static bool isCp(const CallInst *C) { return asmHas(C, "cp.async.cg.shared.global") || asmHas(C, "cp.async.ca.shared.global"); }
+
+// Folded and aliased tiles can be reused before the original copy-group wait.
+// Keep the property on the individual calls across inlining and IR serialization.
+static void markSynchronousCopies(Function &F) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *C = dyn_cast<CallInst>(&I); C && isCp(C))
+        C->setMetadata("cupbop.cp_async.synchronous", MDNode::get(F.getContext(), {}));
+}
 static bool isLdsm(const CallInst *C) { return asmHas(C, "ldmatrix.sync"); }
 static bool isIntr(const CallInst *C, StringRef n) { Function *F = C->getCalledFunction(); return F && F->getName() == n; }
 static bool isBar(const Instruction *I) { auto *C = dyn_cast<CallInst>(I); return C && isIntr(C, "llvm.nvvm.barrier0"); }
@@ -1105,6 +1114,7 @@ static bool foldFunction(Function &F, GlobalVariable *GV, int Sn) {
   NG->setAlignment(GV->getAlign()); NG->takeName(GV);
   GV->replaceAllUsesWith(NG); GV->eraseFromParent();
   for (User *U : NG->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) if (G->getSourceElementType()->isArrayTy()) { G->setSourceElementType(NT); }
+  markSynchronousCopies(F);
   return true;
 }
 
@@ -1284,6 +1294,7 @@ static bool aliasFunction(Function &F, GlobalVariable *GV) {
   NG->setAlignment(GV->getAlign()); NG->takeName(GV);
   GV->replaceAllUsesWith(NG); GV->eraseFromParent();
   for (User *U : NG->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) if (G->getSourceElementType()->isArrayTy()) G->setSourceElementType(NT);
+  markSynchronousCopies(F);
   return true;
 }
 

@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
   drop_cta_membar_at_barriers(program);
 
   // cp.async family (before init_block: replace_asm_call would drop the PTX asm).
-  // Default: synchronous copies (lower_cp_async), correct whatever the commit/wait groups say.
+  // The normal pass preserves CUDA completion groups for eligible DXA tiles and uses LSU copies elsewhere.
   // CUPBOP_CP_ASYNC_DXA=1: the old automatic cp.async -> DXA conversion first (an SGEMM-only prototype that
   // produces wrong code for other kernels: fixed coordinates, square tensors, per-thread smem destinations).
   if (const char *e = std::getenv("CUPBOP_CP_ASYNC_DXA"); e && std::atoi(e) != 0) {

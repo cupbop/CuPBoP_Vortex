@@ -13,6 +13,7 @@
 #define VX_CFG_NUM_BARRIERS 8
 #endif
 #include "cupbop_async.h"
+#include "cupbop_launch_context.h"
 
 // Stops the simulation (SimX: "invalid CSR read addr=0xc00" -- `unimp` is csrrw x0, cycle, x0). Deliberately
 // not __builtin_trap(): the compiler would mark this function noreturn and put `unreachable` after every call,
@@ -165,37 +166,93 @@ static __attribute__((always_inline)) inline void cupbop_tma_dxa_issue(uint32_t 
                                                                       uint32_t c2, uint32_t c3, uint32_t c4) {
   cupbop_tma_dxa_issue_meta((bar << 4) | slot, smem, rank, c0, c1, c2, c3, c4);
 }
-#if defined(VX_CFG_EXT_DXA_ENABLE) && VX_CFG_NUM_THREADS == 8
-extern "C" __attribute__((always_inline, convergent)) void __cupbop_cp_async_dxa16(
+#if defined(VX_CFG_EXT_DXA_ENABLE) && (VX_CFG_NUM_THREADS == 8 || VX_CFG_NUM_THREADS == 32)
+static __attribute__((always_inline)) inline uint32_t cupbop_issue_cp_async_box(
+    void *dst, const void *src, uint32_t read_source, uint32_t descriptor, uint32_t barrier_number,
+    uintptr_t local_base, uintptr_t local_bytes) {
+  constexpr unsigned lanes = VX_CFG_NUM_THREADS;
+  constexpr unsigned copy_bytes = lanes * 16;
+  if (vx_active_threads() != uint32_t((1ull << lanes) - 1))
+    return 0;
+
+  const uintptr_t source = reinterpret_cast<uintptr_t>(src);
+  const uintptr_t destination = reinterpret_cast<uintptr_t>(dst);
+  const uintptr_t source_base = vx_shfl_idx(source, 0, lanes - 1, 0);
+  const uintptr_t destination_base = vx_shfl_idx(destination, 0, lanes - 1, 0);
+  const unsigned lane_offset = vx_thread_id() * 16;
+  const bool contiguous = (read_source != 0) & (source == source_base + lane_offset) &
+                          (destination == destination_base + lane_offset);
+  if (!vx_vote_all(contiguous) || ((source_base | destination_base) & 15) ||
+      source_base > UINT32_MAX - (copy_bytes - 1) || local_bytes < copy_bytes ||
+      destination_base - local_base > local_bytes - copy_bytes)
+    return 0;
+
+  const uint32_t barrier = (barrier_number << 8) + csr_read_nv(VX_CSR_CTA_ID);
+  vx_fence();
+  vx_barrier_expect_tx(barrier, 1);
+  cupbop_tma_dxa_issue(descriptor, barrier, reinterpret_cast<void *>(destination_base),
+                       1, source_base / sizeof(uint32_t), 0, 0, 0, 0);
+  return barrier;
+}
+
+static __attribute__((always_inline)) inline void cupbop_cp_async_lsu16(
     void *dst, const void *src, uint32_t read_source) {
-  const unsigned cta_warps = csr_read_nv(VX_CSR_CTA_SIZE);
-  const unsigned barriers = vx_num_barriers();
-  if (vx_active_threads() == 0xff && cta_warps < barriers) {
-    const uintptr_t source = reinterpret_cast<uintptr_t>(src);
-    const uintptr_t destination = reinterpret_cast<uintptr_t>(dst);
-    const uintptr_t source_base = vx_shfl_idx(source, 0, 7, 0);
-    const uintptr_t destination_base = vx_shfl_idx(destination, 0, 7, 0);
-    constexpr unsigned copy_bytes = CUPBOP_CP_ASYNC_DXA_WORDS * sizeof(uint32_t);
-    const unsigned lane_offset = vx_thread_id() * 16;
-    const bool contiguous = (read_source != 0) & (source == source_base + lane_offset) &
-                            (destination == destination_base + lane_offset);
-    if (((source_base | destination_base) % 16 == 0) && source_base <= UINT32_MAX - (copy_bytes - 1) &&
-        vx_vote_all(contiguous)) {
-      const unsigned barrier_number = barriers - cta_warps + csr_read_nv(VX_CSR_CTA_RANK);
-      const unsigned barrier = (barrier_number << 8) + csr_read_nv(VX_CSR_CTA_ID);
-      vx_fence();
-      vx_barrier_expect_tx(barrier, 1);
-      cupbop_tma_dxa_issue(CUPBOP_CP_ASYNC_DXA_SLOT, barrier, reinterpret_cast<void *>(destination_base),
-                           1, source_base / sizeof(uint32_t), 0, 0, 0, 0);
-      vx_barrier(barrier, 1);
-      return;
-    }
-  }
   const auto *input = static_cast<const volatile uint32_t *>(src);
   auto *output = static_cast<volatile uint32_t *>(dst);
   for (int word = 0; word < 4; ++word)
     output[word] = read_source ? input[word] : 0;
 }
+
+extern "C" __attribute__((always_inline, convergent)) uint32_t __cupbop_cp_async_issue16(
+    void *dst, const void *src, uint32_t read_source, uint32_t slot) {
+  const auto &ctx = *reinterpret_cast<const cupbop_launch_context<uintptr_t> *>(csr_read_nv(VX_CSR_MSCRATCH));
+  const unsigned descriptor = (ctx.direct_launch_flags >> CUPBOP_CP_ASYNC_SLOT_SHIFT) & CUPBOP_CP_ASYNC_SLOT_MASK;
+  const unsigned barriers = vx_num_barriers();
+  const unsigned cta_warps = csr_read_nv(VX_CSR_CTA_SIZE);
+  const unsigned rank = csr_read_nv(VX_CSR_CTA_RANK);
+  // Each simultaneously live copy has a compiler-assigned slot. Reserve a
+  // different hardware barrier for every (slot, physical warp), leaving 0
+  // for CTA synchronization. A replayed CUDA warp can issue 32/lanes boxes
+  // per slot before its first wait, for each logical warp assigned to it.
+  constexpr unsigned warps_per_rank = VX_CFG_MAX_BAR_EVENTS / (32 / VX_CFG_NUM_THREADS);
+  const unsigned threads = ctx.local_size[0] * ctx.local_size[1] * ctx.local_size[2];
+  const unsigned index = slot * cta_warps + rank;
+  if (descriptor && slot < barriers && index + 1 < barriers && threads <= cta_warps * warps_per_rank * 32) {
+    const uint32_t token = cupbop_issue_cp_async_box(dst, src, read_source, descriptor - 1, barriers - 1 - index,
+                                                    csr_read_nv(VX_CSR_CTA_LMEM_ADDR), ctx.cluster_stride);
+    if (token)
+      return token;
+  }
+  cupbop_cp_async_lsu16(dst, src, read_source);
+  return 0;
+}
+
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_cp_async_wait(uint32_t token) {
+  // A private single-warp BAR.SYNC consumes any still-outstanding events.
+  // This also works if DXA completed (and advanced the phase) before the wait.
+  if (token)
+    vx_barrier(token, 1);
+}
+
+#if VX_CFG_NUM_THREADS == 8
+// Already-translated NT8 bitcode used fixed descriptor 7 and expected each
+// call to finish its own copy. Its launch flags can contain CTA-loop geometry.
+extern "C" __attribute__((always_inline, convergent)) void __cupbop_cp_async_dxa16(
+    void *dst, const void *src, uint32_t read_source) {
+  const unsigned cta_warps = csr_read_nv(VX_CSR_CTA_SIZE);
+  const unsigned barriers = vx_num_barriers();
+  if (cta_warps < barriers) {
+    const unsigned barrier_number = barriers - cta_warps + csr_read_nv(VX_CSR_CTA_RANK);
+    const uint32_t token = cupbop_issue_cp_async_box(dst, src, read_source, CUPBOP_CP_ASYNC_DXA_SLOT,
+                                                    barrier_number, 0, UINTPTR_MAX);
+    if (token) {
+      __cupbop_cp_async_wait(token);
+      return;
+    }
+  }
+  cupbop_cp_async_lsu16(dst, src, read_source);
+}
+#endif
 #endif
 static __attribute__((always_inline)) inline void cupbop_copy_elem(void *d, const void *s, uint32_t e) {
   switch (e) {

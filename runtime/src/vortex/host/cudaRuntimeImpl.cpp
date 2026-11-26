@@ -145,6 +145,23 @@ struct DxaDescEntry {
 };
 std::vector<DxaDescEntry> dxa_descriptors;
 
+// The original NT8 binary used slot 7 for every kernel and wrote only "8".
+// New binaries name the entry points that can use a launch-assigned descriptor.
+static uint32_t cp_async_lanes_for_kernel(const std::string &kernel, bool &fixed_slot) {
+  std::ifstream input("cupbop_cp_async_dxa.txt");
+  uint32_t width = 0;
+  if (!(input >> width) || (width != 8 && width != 32)) return 0;
+  std::string entry;
+  if (!(input >> entry)) {
+    fixed_slot = width == 8;
+    return fixed_slot ? width : 0;
+  }
+  do {
+    if (entry == kernel) return width;
+  } while (input >> entry);
+  return 0;
+}
+
 // returns an error message, or "" when the descriptor can be programmed
 static std::string dxa_desc_check(const DxaDescEntry &d) {
   if (d.slot >= 16) return "slot must be 0..15";
@@ -2988,28 +3005,24 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     // ── DXA descriptor programming (before kernel launch) ──────────────────
     // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
     // for this kernel (resolved against this launch's arguments).
-    const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
+    bool fixed_cp_slot = false;
+    const uint32_t cp_width = cp_async_lanes_for_kernel(kernel_name_tmp, fixed_cp_slot);
+    bool cp_dxa_available = false;
     std::set<uint32_t> dxa_slots;
-    if (coalesced_cp_async) {
+    if (cp_width) {
       uint64_t isa = 0, threads = 0, vm = 0;
       RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
       RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &threads));
       RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
-      if (threads != 8 || !(isa & VX_ISA_EXT_DXA) || vm) {
+      cp_dxa_available = threads == cp_width && (isa & VX_ISA_EXT_DXA) && !vm;
+      if (fixed_cp_slot && !cp_dxa_available) {
         fprintf(stderr, "cudaLaunchKernel: coalesced cp.async requires an 8-lane DXA device with flat global memory\n");
         std::abort();
       }
-      DxaDescEntry descriptor{};
-      descriptor.slot = CUPBOP_CP_ASYNC_DXA_SLOT;
-      descriptor.rank = 1;
-      descriptor.elem_bytes = sizeof(uint32_t);
-      descriptor.size[0] = 1u << 30;
-      descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
-      dxa_program(DC->device(), descriptor);
-      dxa_slots.insert(descriptor.slot);
+      if (fixed_cp_slot) dxa_slots.insert(CUPBOP_CP_ASYNC_DXA_SLOT);
     }
     for (auto &desc : dxa_descriptors) {
-      if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      if (fixed_cp_slot && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
         fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", desc.slot);
         std::abort();
       }
@@ -3044,7 +3057,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
         d.stride[0] = d.size[0] * adesc.elem_bytes;
         d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
       }
-      if (coalesced_cp_async && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+      if (fixed_cp_slot && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
         fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", d.slot);
         std::abort();
       }
@@ -3115,10 +3128,27 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
             d.box[0] = CUPBOP_RAW_DXA_TILE_BYTES / d.elem_bytes;
             d.smem_stride = stride;
             dxa_program(DC->device(), d);
+            dxa_slots.insert(slot);
             abuf_ptr->ctx.direct_launch_flags |= (slot + 1) << CUPBOP_RAW_DXA_SLOT_SHIFT;
           }
         }
         break;
+      }
+    }
+    if (cp_dxa_available && (fixed_cp_slot || !cta_fix.dims)) {
+      uint32_t slot = fixed_cp_slot ? CUPBOP_CP_ASYNC_DXA_SLOT : 0;
+      if (!fixed_cp_slot)
+        while (slot < 16 && dxa_slots.count(slot)) ++slot;
+      if (slot < 16) {
+        DxaDescEntry d{};
+        d.slot = slot;
+        d.rank = 1;
+        d.elem_bytes = sizeof(uint32_t);
+        d.size[0] = 1u << 30; // word indices in a flat 4 GiB window
+        d.box[0] = cp_width * (16 / sizeof(uint32_t));
+        dxa_program(DC->device(), d);
+        if (!fixed_cp_slot)
+          abuf_ptr->ctx.direct_launch_flags |= (slot + 1) << CUPBOP_CP_ASYNC_SLOT_SHIFT;
       }
     }
     // 1) restore cudaMemcpyToSymbol / __device__ variables (single-thread service launch)

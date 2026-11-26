@@ -265,6 +265,7 @@ ifneq ($(TARGET_SETTING),)
 .PHONY: check-translation-target
 $(TARGET_SETTING): check-translation-target
 	@setting='$(if $(filter simx:1,$(VORTEX_DRIVER):$(strip $(CUPBOP_SIMX_LIVE_CTA_BARRIER))),1,0)'" $$VORTEX_CONFIGS $${CUPBOP_MMA_LOWERING:-auto}"; \
+	setting="$$setting cp_async=$${CUPBOP_CP_ASYNC_COALESCED_DXA:-auto} sgemm_dxa=$${CUPBOP_CP_ASYNC_DXA:-0} sched=$(SCHEDULE) lmem=$(LOCALMEM) nt=$(VORTEX_NUM_THREADS) lanes=$${CUPBOP_VIRT_LANES:-auto}"; \
 	if [ "$$setting" != "$$(cat $@ 2>/dev/null)" ]; then printf '%s\n' "$$setting" > $@; fi
 endif
 

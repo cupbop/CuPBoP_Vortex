@@ -3,7 +3,10 @@
 #include "../../../runtime/include/cupbop_dxa_layout.h"
 #include "tool.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
@@ -15,10 +18,13 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/SSAUpdater.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -190,9 +196,10 @@ static Value *zfillReadAddress(IRBuilder<> &B, Module *M, Value *dst) {
   return G;
 }
 
-// Emit the synchronous copy of one cp.async in front of S.call.
-void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> &DTs, unsigned &n_traced,
-              unsigned &n_inttoptr, bool coalescedDxa, unsigned &nDxa) {
+// Emit the transfer at its PTX issue point. A coalesced issue returns a
+// warp-uniform completion token, including zero for its dynamic LSU fallback.
+Value *emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> &DTs,
+                unsigned &n_traced, unsigned &n_inttoptr, int slot) {
   LLVMContext &ctx = S.call->getContext();
   IRBuilder<> B(S.call);
   Type *I8 = Type::getInt8Ty(ctx), *I32 = Type::getInt32Ty(ctx), *I64 = Type::getInt64Ty(ctx);
@@ -255,43 +262,47 @@ void emitCopy(CopySite &S, std::map<Function *, std::unique_ptr<DominatorTree>> 
     }
   }
 
-  if (coalescedDxa && S.cp == 16 && (is_const ? const_size == 16 : !partial_possible)) {
+  if (slot >= 0 && S.cp == 16 && (is_const ? const_size == 16 : !partial_possible)) {
     auto *module = S.call->getModule();
     auto *ptr = PointerType::getUnqual(ctx);
-    auto helper = module->getOrInsertFunction("__cupbop_cp_async_dxa16",
-        FunctionType::get(Type::getVoidTy(ctx), {ptr, ptr, I32}, false));
+    auto helper = module->getOrInsertFunction("__cupbop_cp_async_issue16",
+        FunctionType::get(I32, {ptr, ptr, I32, I32}, false));
     cast<Function>(helper.getCallee())->addFnAttr(Attribute::Convergent);
     Value *readSource = is_const ? ConstantInt::get(I32, 1) : B.CreateZExt(full, I32);
-    B.CreateCall(helper, {toGeneric(B, dst), src, readSource})->addFnAttr(Attribute::Convergent);
-    ++nDxa;
-    return;
+    auto *token = B.CreateCall(helper, {toGeneric(B, dst), src, readSource, B.getInt32(slot)}, "cpa_token");
+    token->addFnAttr(Attribute::Convergent);
+    return token;
   }
   if (is_const) {
     if (const_size == 0) {
       B.CreateAlignedStore(zero, dst, al);
     } else {
-      Value *v = B.CreateAlignedLoad(T, src, al, "cpa_val");
-      if (const_size < S.cp) // the remainder is zero-filled (the read stays inside the aligned cp-byte block)
-        v = B.CreateAnd(v, ConstantInt::get(T, APInt::getLowBitsSet(S.cp * 8, const_size * 8)), "cpa_zfill");
-      B.CreateAlignedStore(v, dst, al);
+      Type *readType = IntegerType::get(ctx, const_size * 8);
+      Value *v = B.CreateAlignedLoad(readType, src, al, "cpa_val");
+      B.CreateAlignedStore(B.CreateZExtOrTrunc(v, T), dst, al);
     }
-    return;
+    return nullptr;
   }
-  // runtime: never read src when nothing is to be read (its address may be out of bounds) -- read something else
-  // and discard the value
-  Value *rd = B.CreateSelect(nz, toGeneric(B, src), zfillReadAddress(B, S.call->getModule(), dst), "cpa_rdaddr");
-  Value *v = B.CreateAlignedLoad(T, rd, al, "cpa_val");
+  Value *dummy = zfillReadAddress(B, S.call->getModule(), dst);
   Value *outv;
   if (partial_possible) {
-    Value *ss = B.CreateZExtOrTrunc(S.src_size, T);
-    Value *sh = B.CreateMul(B.CreateSub(ConstantInt::get(T, S.cp), ss), ConstantInt::get(T, 8), "cpa_sh");
-    Value *mask = B.CreateLShr(ConstantInt::getAllOnesValue(T), sh, "cpa_mask"); // poison when nz is false: unselected
-    Value *part = B.CreateAnd(v, mask);
-    outv = B.CreateSelect(full, v, B.CreateSelect(nz, part, zero), "cpa_zfill");
+    // The last valid source byte can also be the end of the allocation. Select
+    // a safe address before each load, then assemble the little-endian result.
+    Value *ss = B.CreateZExtOrTrunc(S.src_size, I32);
+    outv = zero;
+    for (unsigned i = 0; i < S.cp; ++i) {
+      Value *valid = B.CreateICmpUGT(ss, B.getInt32(i));
+      Value *address = B.CreateGEP(I8, src, B.getInt32(i));
+      Value *byte = B.CreateLoad(I8, B.CreateSelect(valid, address, dummy));
+      Value *piece = B.CreateZExt(B.CreateSelect(valid, byte, B.getInt8(0)), T);
+      outv = B.CreateOr(outv, B.CreateShl(piece, i * 8));
+    }
   } else {
-    outv = B.CreateSelect(full, v, zero, "cpa_zfill");
+    Value *address = B.CreateSelect(nz, src, dummy, "cpa_rdaddr");
+    outv = B.CreateSelect(full, B.CreateAlignedLoad(T, address, al), zero, "cpa_zfill");
   }
   B.CreateAlignedStore(outv, dst, al);
+  return nullptr;
 }
 
 // `[$k]`, `[$k+imm]`, `[$k-imm]` -> operand k and the byte offset
@@ -301,16 +312,18 @@ bool parseMemOperand(const std::string &tok, CallInst *C, Value *&v, int64_t &of
   t = trim(t.substr(1, t.size() - 2));
   if (t.empty() || t[0] != '$') return false;
   char *end = nullptr;
-  unsigned k = std::strtoul(t.c_str() + 1, &end, 10);
+  unsigned long k = std::strtoul(t.c_str() + 1, &end, 10);
   if (end == t.c_str() + 1 || k >= C->arg_size()) return false;
   std::string rest = trim(std::string(end));
   off = 0;
   if (!rest.empty()) {
     if (rest[0] != '+' && rest[0] != '-') return false;
-    char *e2 = nullptr;
-    long long o = std::strtoll(trim(rest.substr(1)).c_str(), &e2, 0);
-    if (*e2) return false;
-    off = rest[0] == '+' ? o : -o;
+    std::string magnitude = trim(rest.substr(1));
+    if (magnitude.empty() || magnitude[0] == '+' || magnitude[0] == '-') return false;
+    const std::string offset = rest[0] + magnitude;
+    errno = 0;
+    off = std::strtoll(offset.c_str(), &end, 0);
+    if (*end || errno == ERANGE) return false;
   }
   v = C->getArgOperand(k);
   return true;
@@ -336,6 +349,107 @@ bool mentionsAsync(const std::string &s) {
          s.find("cp.reduce.async") != std::string::npos;
 }
 
+// -O0 CUDA headers can leave these pure CUDA address conversions out of line.
+bool isCudaSharedAddressConversion(StringRef name) {
+  return name == "_ZL24__cvta_generic_to_sharedPKv" || name == "__nv_cvta_generic_to_shared_impl";
+}
+
+// The hardware barrier numbers used for these leases must remain private.
+// CTA sync uses barrier zero, which the runtime never lends to a copy.
+bool usesOtherBarriers(Function *kernel) {
+  SmallVector<Function *, 8> work{kernel};
+  SmallPtrSet<Function *, 16> seen;
+  while (!work.empty()) {
+    Function *F = work.pop_back_val();
+    if (!seen.insert(F).second) continue;
+    for (BasicBlock &BB : *F) {
+      for (Instruction &I : BB) {
+        auto *C = dyn_cast<CallBase>(&I);
+        if (!C) continue;
+        if (C->isInlineAsm()) {
+          StringRef body = cast<InlineAsm>(C->getCalledOperand())->getAsmString();
+          if (body.contains(".insn") || body.contains("vx_barrier") ||
+              body.contains("wgmma.") || body.contains("tcgen05.")) return true;
+          continue;
+        }
+        auto *callee = C->getCalledFunction();
+        if (!callee) return true;
+        auto name = callee->getName();
+        if (name.starts_with("__cupbop_bar_") || name.starts_with("__cupbop_mbar_") ||
+            name.starts_with("__cupbop_tma_") || name.starts_with("__cupbop_tcgen") ||
+            name.starts_with("__cupbop_tmem_") || name.contains("wgmma") ||
+            name.starts_with("__cupbop_bulk_") || name.contains("__vx_dxa_") ||
+            name.contains("__vx_barrier_") || name.starts_with("__cupbop_dxa_")) return true;
+        if (callee->isDeclaration()) {
+          // An opaque device function on a different warp can reserve these
+          // same hardware barriers, even outside the issuing lane's path.
+          if (!callee->isIntrinsic() && !isCudaSharedAddressConversion(name) &&
+              !(C->doesNotAccessMemory() && C->hasFnAttr(Attribute::NoSync))) return true;
+        } else {
+          work.push_back(callee);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+enum class GroupOp { Copy, Commit, Wait, WaitAll, UnknownWait };
+struct GroupEvent {
+  GroupOp op;
+  unsigned keep = 0;
+};
+using GroupEvents = DenseMap<CallInst *, GroupEvent>;
+
+// From a particular copy, follow the path that every issuing lane must take.
+// Other lanes can enter at a merge and will receive a zero token. A split,
+// backedge or opaque call can change which lanes wait or commit on this path.
+CallInst *completionWait(CallInst *issue, const GroupEvents &events,
+                         SmallVectorImpl<CallInst *> &liveEvents) {
+  unsigned committed = 0;
+  SmallPtrSet<BasicBlock *, 8> visited;
+  BasicBlock *BB = issue->getParent();
+  Instruction *first = issue->getNextNode();
+  liveEvents.push_back(issue);
+  while (visited.insert(BB).second) {
+    for (auto it = first->getIterator(); it != BB->end(); ++it) {
+      auto *C = dyn_cast<CallInst>(&*it);
+      if (!C) continue;
+      auto e = events.find(C);
+      if (e != events.end()) {
+        liveEvents.push_back(C);
+        if (e->second.op == GroupOp::UnknownWait) return nullptr;
+        if (e->second.op == GroupOp::Commit) ++committed; // even an empty committed group counts
+        if (e->second.op == GroupOp::WaitAll ||
+            (e->second.op == GroupOp::Wait && committed > e->second.keep)) return C;
+        continue;
+      }
+      if (isCudaSharedAddressConversion(calleeName(C)) ||
+          isa<IntrinsicInst>(C) || C->doesNotAccessMemory() ||
+          (C->isInlineAsm() && asmString(C).empty())) continue;
+      return nullptr;
+    }
+    BB = BB->getSingleSuccessor();
+    if (!BB) return nullptr;
+    first = &BB->front();
+  }
+  return nullptr;
+}
+
+// A wait in a join block can be executed by lanes that skipped the issue
+// entirely. Zero also kills the token on a later path around a loop that
+// executes the wait without issuing another transfer.
+Value *tokenAtWait(Value *token, CallInst *issue, CallInst *wait) {
+  if (issue->getParent() == wait->getParent()) return token;
+  Value *zero = ConstantInt::get(token->getType(), 0);
+  SSAUpdater ssa;
+  ssa.Initialize(token->getType(), "cpa_pending");
+  ssa.AddAvailableValue(&issue->getFunction()->getEntryBlock(), zero);
+  ssa.AddAvailableValue(issue->getParent(), token);
+  ssa.AddAvailableValue(wait->getParent(), zero);
+  return ssa.GetValueInMiddleOfBlock(wait->getParent());
+}
+
 } // namespace
 
 void lower_cp_async(Module *M) {
@@ -344,24 +458,24 @@ void lower_cp_async(Module *M) {
   const char *configs = std::getenv("VORTEX_CONFIGS");
   const char *localMemory = std::getenv("VORTEX_LOCALMEM_FLAG");
   const VirtGeom geometry = getVirtGeom();
-  bool coalescedDxa = requested && std::atoi(requested) && geometry.schedule == 1 &&
-      geometry.nt == 8 && geometry.lanes == 8 && (!localMemory || std::atoi(localMemory) == 1) && configs &&
-      vortexConfigHasFlag("-DVX_CFG_EXT_DXA_ENABLE") &&
-      !vortexConfigHasFlag("-DVX_CFG_VM_ENABLE") &&
-      !M->getNamedMetadata("vx.dxa.desc") && !cupbop_dxa_sidecar_written;
-  if (coalescedDxa) {
-    for (const Function &function : *M) {
-      StringRef name = function.getName();
-      if (!function.use_empty() && (name.starts_with("__cupbop_bar_") || name.starts_with("__cupbop_mbar_") ||
-          name.starts_with("__cupbop_tma_") || name.contains("__vx_dxa_") || name.contains("__vx_barrier_"))) {
-        coalescedDxa = false;
-        break;
-      }
-    }
-  }
+  const bool coalescedDxa = (!requested || std::atoi(requested)) &&
+      (geometry.schedule == 1 || geometry.schedule == 2) &&
+      (geometry.nt == 8 || geometry.nt == 32) && geometry.lanes == geometry.nt &&
+      (!localMemory || std::atoi(localMemory) == 1) && configs &&
+      vortexConfigHasFlag("-DVX_CFG_EXT_DXA_ENABLE") && !vortexConfigHasFlag("-DVX_CFG_VM_ENABLE") &&
+      !cupbop_dxa_sidecar_written;
   std::map<Function *, std::unique_ptr<DominatorTree>> DTs;
   std::vector<CopySite> copies;
   std::vector<CallInst *> commits, waits;
+  GroupEvents events;
+  auto addWait = [&](CallInst *C, bool all, Value *depth) {
+    const auto *n = dyn_cast_or_null<ConstantInt>(depth);
+    if (!all && !depth) fail_at(C, "cp.async.wait_group requires a depth operand");
+    waits.push_back(C);
+    if (all) events[C] = {GroupOp::WaitAll};
+    else if (n) events[C] = {GroupOp::Wait, unsigned(n->getLimitedValue(std::numeric_limits<unsigned>::max()))};
+    else events[C] = {GroupOp::UnknownWait}; // a template immediate still opaque at -O0: keep the LSU path
+  };
   for (auto &F : *M)
     for (auto &BB : F)
       for (auto &I : BB) {
@@ -378,7 +492,12 @@ void lower_cp_async(Module *M) {
           if (n.rfind("llvm.nvvm.mbarrier", 0) == 0)
             fail_at(C, "mbarrier intrinsics (" + n + ") are not supported yet (mbarrier lowering is being designed)");
           if (n == "llvm.nvvm.cp.async.commit.group") { commits.push_back(C); continue; }
-          if (n == "llvm.nvvm.cp.async.wait.group" || n == "llvm.nvvm.cp.async.wait.all") { waits.push_back(C); continue; }
+          if (n == "llvm.nvvm.cp.async.wait.group" || n == "llvm.nvvm.cp.async.wait.all") {
+            const bool all = n == "llvm.nvvm.cp.async.wait.all";
+            if (C->arg_size() != (all ? 0u : 1u)) fail_at(C, "malformed " + n);
+            addWait(C, all, all ? nullptr : C->getArgOperand(0));
+            continue;
+          }
           if (n.rfind("llvm.nvvm.cp.async.ca.shared.global.", 0) == 0 ||
               n.rfind("llvm.nvvm.cp.async.cg.shared.global.", 0) == 0) {
             // llvm.nvvm.cp.async.{ca,cg}.shared.global.{4,8,16}[.s](ptr addrspace(3) dst, ptr addrspace(1) src[, i32 src_size])
@@ -426,7 +545,9 @@ void lower_cp_async(Module *M) {
           continue;
         }
         if (op == "cp.async.wait_all" || op == "cp.async.wait_group") {
-          waits.push_back(C); // any N: with synchronous copies every group is already complete
+          const bool all = op == "cp.async.wait_all";
+          if (all && !rest.empty()) fail_at(C, "unexpected operands on cp.async.wait_all");
+          addWait(C, all, all ? nullptr : parseScalarOperand(rest, C));
           continue;
         }
         bool ca = op.rfind("cp.async.ca.shared", 0) == 0, cg = op.rfind("cp.async.cg.shared", 0) == 0;
@@ -461,10 +582,51 @@ void lower_cp_async(Module *M) {
 
   if (copies.empty() && commits.empty() && waits.empty()) return;
   unsigned n_traced = 0, n_i2p = 0, nDxa = 0;
+  for (auto &S : copies) events[S.call] = {GroupOp::Copy};
+  for (auto *C : commits) events[C] = {GroupOp::Commit};
+  DenseMap<Function *, bool> eligible;
+  struct Plan {
+    CallInst *wait = nullptr;
+    SmallVector<CallInst *, 8> live;
+  };
+  DenseMap<CallInst *, Plan> plans;
   for (auto &S : copies) {
-    emitCopy(S, DTs, n_traced, n_i2p, coalescedDxa, nDxa);
-    S.call->eraseFromParent();
+    auto *F = S.call->getFunction();
+    if (!coalescedDxa || S.cp != 16 || S.call->getMetadata("cupbop.cp_async.synchronous")) continue;
+    if (!eligible.count(F)) eligible[F] = isKernelFunction(M, F) && !usesOtherBarriers(F);
+    if (eligible[F]) {
+      auto &plan = plans[S.call];
+      plan.wait = completionWait(S.call, events, plan.live);
+    }
   }
+  std::set<std::string> kernels;
+  DenseMap<CallInst *, SmallVector<unsigned, 4>> occupied;
+  for (auto &S : copies) {
+    const Plan &plan = plans[S.call];
+    int slot = -1;
+    if (plan.wait) {
+      std::set<unsigned> busy;
+      for (CallInst *C : plan.live) {
+        auto it = occupied.find(C);
+        if (it != occupied.end()) busy.insert(it->second.begin(), it->second.end());
+      }
+      slot = 0;
+      while (busy.count(slot)) ++slot;
+    }
+    if (Value *token = emitCopy(S, DTs, n_traced, n_i2p, slot)) {
+      for (CallInst *C : plan.live) occupied[C].push_back(slot);
+      auto *F = S.call->getFunction();
+      auto *value = tokenAtWait(token, S.call, plan.wait);
+      IRBuilder<> B(plan.wait);
+      auto helper = M->getOrInsertFunction("__cupbop_cp_async_wait",
+          FunctionType::get(B.getVoidTy(), {B.getInt32Ty()}, false));
+      cast<Function>(helper.getCallee())->addFnAttr(Attribute::Convergent);
+      B.CreateCall(helper, {value})->addFnAttr(Attribute::Convergent);
+      kernels.insert(cupbop_kernel_lookup_name(F->getName().str()));
+      ++nDxa;
+    }
+  }
+  for (auto &S : copies) S.call->eraseFromParent();
   for (auto *C : commits) C->eraseFromParent();
   for (auto *C : waits) {
     // keep the compiler ordering the "memory" clobber gave (no instruction: a single-thread fence)
@@ -477,7 +639,8 @@ void lower_cp_async(Module *M) {
           nDxa ? "" : " to synchronous copies", copies.size(), n_traced, n_i2p, commits.size(), waits.size());
   if (nDxa) {
     std::ofstream marker("cupbop_cp_async_dxa.txt");
-    marker << "8\n";
+    marker << geometry.nt << '\n';
+    for (const auto &kernel : kernels) marker << kernel << '\n';
     marker.close();
     if (!marker) {
       fprintf(stderr, "error: could not write cupbop_cp_async_dxa.txt\n");

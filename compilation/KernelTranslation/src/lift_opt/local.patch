@@ -605,3 +605,25 @@
            else return false;
          }
          MPM.addPass(std::move(P)); return true;
+--- a/tools/p2cfold.cpp
++++ b/tools/p2cfold.cpp
+@@ -69,2 +69,11 @@
+ static bool isCp(const CallInst *C) { return asmHas(C, "cp.async.cg.shared.global") || asmHas(C, "cp.async.ca.shared.global"); }
++
++// Folded and aliased tiles can be reused before the original copy-group wait.
++// Keep the property on the individual calls across inlining and IR serialization.
++static void markSynchronousCopies(Function &F) {
++  for (BasicBlock &BB : F)
++    for (Instruction &I : BB)
++      if (auto *C = dyn_cast<CallInst>(&I); C && isCp(C))
++        C->setMetadata("cupbop.cp_async.synchronous", MDNode::get(F.getContext(), {}));
++}
+ static bool isLdsm(const CallInst *C) { return asmHas(C, "ldmatrix.sync"); }
+@@ -1107,2 +1116,3 @@
+   for (User *U : NG->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) if (G->getSourceElementType()->isArrayTy()) { G->setSourceElementType(NT); }
++  markSynchronousCopies(F);
+   return true;
+@@ -1286,2 +1296,3 @@
+   for (User *U : NG->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) if (G->getSourceElementType()->isArrayTy()) G->setSourceElementType(NT);
++  markSynchronousCopies(F);
+   return true;

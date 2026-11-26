@@ -122,3 +122,32 @@ done
 run_lift_opt ring P2C_STAGES=1
 grep -F 'ring S=3 -> 1' "$work/ring.log"
 grep -qF '@shared_mem = external addrspace(3) global [512 x i8]' "$work/ring.out.ll"
+
+# Leave explicit CUDA waits in the input. The folded tile may be read before
+# those original waits. The sibling kernel keeps its independent DXA issue.
+sed -e '/call void asm sideeffect "cp.async./a\  call void @llvm.nvvm.cp.async.wait.all()' \
+    -e 's/!nvvm.annotations = !{!0}/!nvvm.annotations = !{!0, !2}/' \
+    "$work/ring.ll" > "$work/pair.ll"
+cat >> "$work/pair.ll" <<'IR'
+declare void @llvm.nvvm.cp.async.wait.all()
+define void @sibling(ptr addrspace(3) %dst, ptr addrspace(1) %src) {
+EntryBB_sibling:
+  %param_local = alloca [8 x i8]
+  call void asm sideeffect "cp.async.cg.shared.global [$0], [$1], 16;", "l,l,~{memory}"(ptr addrspace(3) %dst, ptr addrspace(1) %src)
+  call void @llvm.nvvm.cp.async.wait.all()
+  ret void
+}
+!2 = !{ptr @sibling, !"kernel", i32 1}
+IR
+run_lift_opt pair P2C_STAGES=1
+grep -F 'ring S=3 -> 1' "$work/pair.log"
+grep -q '!cupbop.cp_async.synchronous' "$work/pair.out.ll"
+(
+  cd "$work"
+  # Feed the serialized result back in without running the fold a second time.
+  env CUPBOP_LIFT_OPT=0 VORTEX_SCHEDULE_FLAG=2 VORTEX_NUM_THREADS=32 CUPBOP_VIRT_LANES=32 \
+    VORTEX_LOCALMEM_FLAG=1 VORTEX_CONFIGS=-DVX_CFG_EXT_DXA_ENABLE CUPBOP_CP_ASYNC_COALESCED_DXA=1 \
+    "$translator" pair.out.ll translated.bc > translation.log 2>&1 || { cat translation.log; exit 1; }
+  "${llvm_bin:+$llvm_bin/}opt" -passes=verify -disable-output translated.bc
+  diff -u <(printf '32\nsibling\n') cupbop_cp_async_dxa.txt
+)

@@ -3,14 +3,11 @@
 
 #include "llvm/IR/Module.h"
 
-// cp.async family (Ampere async global->shared copies; CUDA __pipeline_memcpy_async, inline PTX,
-// llvm.nvvm.cp.async.* and CuLifter's LDGSTS lift) complete at the issue point. The default uses a global
-// load and a shared store with src-size zero-fill. The optional NT8 path coalesces contiguous full copies
-// through DXA and waits for completion. In both paths commit_group / wait_group / wait_all
-// become no-ops (a compiler-only fence for the waits). This also handles CuLifter IR that preserves the
-// LDGDEPBAR/DEPBAR group boundaries and pending depth of a hardware copy scoreboard. Refused with a translation error
-// instead of being dropped: cp.async.mbarrier.arrive*, cp.async.bulk*, mbarrier* and any other cp.async
-// form the parser does not understand. Runs before init_block (replace_asm_call would drop the asm).
+// Lower Ampere global->shared copies from CUDA, NVVM or CuLifter. On an eligible
+// DXA target a contiguous 16-byte copy can issue a warp tile and defer completion
+// to its CUDA wait. Empty groups and the pending depth of wait_group count when
+// finding that wait. Other copies use the LSU with the CUDA source-size zero fill.
+// Run before init_block, which consumes or erases inline asm.
 void lower_cp_async(llvm::Module *M);
 
 // DXA waits: a call __vx_barrier_arrive_and_wait(id, n) whose barrier id comes from __vx_dxa_barrier_id()

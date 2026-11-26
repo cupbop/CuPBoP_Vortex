@@ -1,6 +1,6 @@
 // cp_async_test.cu — tiled SGEMM staged with cp.async (inline PTX wrappers, avoids cuda_pipeline.h host issues).
 //
-// Default: kernelTranslator lowers cp.async / commit_group / wait_group to synchronous copies (lower_cp_async).
+// This kernel copies 4 bytes per lane, which selects the LSU in lower_cp_async.
 // CUPBOP_CP_ASYNC_DXA=1 selects the old automatic cp.async -> DXA conversion (an SGEMM-only prototype written
 // for this kernel; it writes dxa_descriptors.txt, which the host runtime reads at launch).
 

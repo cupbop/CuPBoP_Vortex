@@ -198,6 +198,7 @@ std::string cta_loop_refusal(const FunctionList &fs, Function *K) {
         if (!C) continue;
         Function *G = C->getCalledFunction();
         const std::string n = G ? G->getName().str() : "";
+        if (n == "__cupbop_cp_async_issue16") return "per-launch cp.async DXA descriptor";
         // cooperative groups at grid level (block-level ones became barriers)
         if ((n.find("grid") != std::string::npos && n.find("sync") != std::string::npos) || n.find("grid_group") != std::string::npos || n.find("this_grid") != std::string::npos ||
             n.find("cudaCG") != std::string::npos)

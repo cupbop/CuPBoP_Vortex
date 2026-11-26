@@ -120,6 +120,14 @@ if ! env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" \
   exit 1
 fi
 echo "tma_dxa_layouts: PASS"
+if [[ $VORTEX_NUM_THREADS == 8 || $VORTEX_NUM_THREADS == 32 ]]; then
+  if ! env VORTEX_PATH="$VORTEX_PATH_TCU" VORTEX_CONFIGS="$VORTEX_CONFIGS_TCU" \
+      bash ci/cp_async_groups_test.sh > "$OUT/cp_async_groups.log" 2>&1; then
+    cat "$OUT/cp_async_groups.log"
+    exit 1
+  fi
+  echo "cp_async_groups: PASS"
+fi
 for sch in 2 1; do
   tag=s${sch}_async_tma2d_dxa
   ( cd examples/async_tma2d && make clean > /dev/null 2>&1; rm -f ci_output.txt
