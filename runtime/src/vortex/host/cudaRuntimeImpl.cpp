@@ -23,8 +23,13 @@
 #include <limits>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
+
+// One queue, one loaded module and one set of device-side descriptor registers.
+// Serialize a whole launch, including descriptor setup, argument upload and retirement.
+static std::recursive_mutex device_operations;
 
 // DepthFlexGPU rt_num_warps knob: VX_RT_NUM_WARPS=<k> caps the warps the Vortex CTA dispatcher uses
 // per core (a runtime DCR, see vortex sw/runtime/common/queue.cpp). The launch checks below must use
@@ -161,6 +166,7 @@ static void dxa_fill_dense_strides(DxaDescEntry &d) {
 }
 
 static int dxa_queue(DxaDescEntry d, const char *api) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   std::string err = dxa_desc_check(d);
   if (!err.empty()) {
     fprintf(stderr, "%s: invalid DXA descriptor for slot %u: %s\n", api, d.slot, err.c_str());
@@ -508,6 +514,7 @@ static_assert(sizeof(cupbop_tmap) == 128, "cupbop_tmap must match the CUtensorMa
 static std::map<uint64_t, cupbop_tmap> dxa_tensor_maps;
 
 static const char *upload_tensor_map(void *tensor_map, cupbop_tmap &record) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   void *device_record = nullptr;
   if (cudaMalloc(&device_record, sizeof(record)) != cudaSuccess || !device_record)
     return "cudaMalloc of the device record failed";
@@ -588,6 +595,7 @@ extern "C" int cuTensorMapEncodeTiled(void *tensorMap, int tensorDataType, uint3
 }
 
 extern "C" int cudaDxaSetTensorMapLayout(void *tensor_map, uint32_t layout, uint32_t tc_n, uint32_t block_k) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   const auto bad = [](const char *why) {
     fprintf(stderr, "cudaDxaSetTensorMapLayout (CuPBoP): %s\n", why);
     return 1;
@@ -826,8 +834,6 @@ class DeviceContext {
 private:
   DeviceContext()
     : device_(nullptr)
-    , staging_buf_(std::vector<uint8_t>())
-    , staging_size_(0)
     , krnl_buffer_(nullptr)
     , args_buffer_(nullptr)
     , module_(nullptr)
@@ -854,12 +860,38 @@ private:
       if (kernel_) vx_kernel_release(kernel_);
       if (module_) vx_module_release(module_);
       if (queue_)  vx_queue_release(queue_);
+      if (grid_workspace_) vx_buffer_release(grid_workspace_);
       vx_dev_close(device_);
     }
   }
 
 public:
   bool is_simx() const { return simx_; }
+  bool device_lost() const { return device_lost_; }
+  cudaError_t launch_result(vx_result_t result) {
+    if (result == VX_SUCCESS) return cudaSuccess;
+    if (result == VX_ERR_TIMEOUT || result == VX_ERR_DEVICE_LOST) device_lost_ = true;
+    if (result == VX_ERR_OUT_OF_DEVICE_MEMORY || result == VX_ERR_OUT_OF_HOST_MEMORY)
+      return cudaErrorMemoryAllocation;
+    return cudaErrorLaunchFailure;
+  }
+  cudaError_t prepare_grid_workspace(uint64_t *address) {
+    // CUDA driver ABI: byte size and the zeroed phase counter. The queue has
+    // retired every previous launch before this buffer can be initialized again.
+    const uint32_t words[] = {2 * sizeof(uint32_t), 0};
+    if (!grid_workspace_) {
+      vx_result_t result = vx_buffer_create(device_, sizeof(words), VX_MEM_READ_WRITE, &grid_workspace_);
+      if (result != VX_SUCCESS) return launch_result(result);
+    }
+    vx_result_t result = vx_buffer_address(grid_workspace_, address);
+    if (result != VX_SUCCESS) return launch_result(result);
+    vx_event_h event = nullptr;
+    result = vx_enqueue_write(queue_, grid_workspace_, 0, words, sizeof(words), 0, nullptr, &event);
+    if (result != VX_SUCCESS) return launch_result(result);
+    result = vx_event_wait_value(event, 1, VX_TIMEOUT_INFINITE);
+    vx_event_release(event);
+    return launch_result(result);
+  }
 
   void cleanup_args() {
     if (args_buffer_ != nullptr) {
@@ -899,8 +931,6 @@ public:
 private:
 
   vx_device_h device_;
-  std::vector<uint8_t> staging_buf_;
-  size_t staging_size_;
 
   // Buffers
   vx_buffer_h krnl_buffer_;
@@ -911,6 +941,8 @@ private:
   vx_kernel_h service_kernel_;
   vx_queue_h  queue_;
   bool simx_;
+  vx_buffer_h grid_workspace_ = nullptr;
+  bool device_lost_ = false;
 
   // Pointer manager
   struct MemoryInfo {
@@ -951,9 +983,7 @@ public:
   }
   
   std::vector<uint8_t> staging_alloc(size_t size) {
-    staging_buf_.resize(size);
-    staging_size_ = size;
-    return staging_buf_;
+    return std::vector<uint8_t>(size);
   }
 
   void dev_mem_alloc(int size, int flag, uint64_t* mem_addr) {
@@ -1712,7 +1742,7 @@ static void cupbop_perf_post(DeviceContext *DC, const std::string &kernel, int k
   last_service = g_cupbop_service_launches;
 }
 // service: a service launch (kernel_idx -1 / -2), which goes to cupbop_service_main when the module has it
-static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
+static cudaError_t cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size, uint32_t ndim,
                                const uint32_t grid[3], const uint32_t block[3], uint32_t lmem_bytes,
                                bool service = false, dim3 cluster = dim3(1,1,1), uint32_t tmem_cols = 0) {
   vx_launch_info_t li = {};
@@ -1731,9 +1761,11 @@ static void cupbop_launch_blob(DeviceContext *DC, const void *blob, size_t size,
 #endif
   li.lmem_size   = lmem_bytes;
   vx_event_h ev = nullptr;
-  RT_CHECK((int)vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev));
-  RT_CHECK((int)vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE));
+  vx_result_t result = vx_enqueue_launch(DC->queue(), &li, 0, nullptr, &ev);
+  if (result != VX_SUCCESS) return DC->launch_result(result);
+  result = vx_event_wait_value(ev, 1, VX_TIMEOUT_INFINITE);
   vx_event_release(ev);
+  return DC->launch_result(result);
 }
 // CUPBOP_CTA_LOOP (compilation/KernelTranslation/src/cta_loop.cpp): a kernel translated with the block loop reads context words
 // no device code reads otherwise: printf_buffer (its low word: this launch loops) and, for the chunk form,
@@ -1810,7 +1842,7 @@ static void cupbop_service_launch(DeviceContext *DC, int kind, const std::vector
   ka->num_args = 0;
   memcpy(ka->args, list.data(), list.size() * sizeof(uint64_t));
   uint32_t one[3] = {1, 1, 1};
-  cupbop_launch_blob(DC, blob.data(), blob.size(), 1, one, one, 0, true);
+  RT_CHECK(cupbop_launch_blob(DC, blob.data(), blob.size(), 1, one, one, 0, true));
 }
 // Read device memory that lives inside the module image (BSS / __device__ vars):
 // the service kernel copies each range into a host-visible staging buffer.
@@ -1848,6 +1880,7 @@ extern "C" int cupbopVortexContext(void **device, void **queue) {
 }
 
 extern "C" int cupbopVortexLaunch(const void *launch_info, const char *name) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   auto DC = DeviceContext::instance();
   const vx_launch_info_t *li = static_cast<const vx_launch_info_t *>(launch_info);
   if (!li || !li->kernel) return 1;
@@ -1879,7 +1912,9 @@ cudaError_t cudaDeviceReset(void) {
   return cudaSuccess;
 }
 
-cudaError_t cudaDeviceSynchronize(void) { 
+cudaError_t cudaDeviceSynchronize(void) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
+  if (DeviceContext::instance()->device_lost()) return cudaErrorLaunchFailure;
   cuSynchronizeBarrier(); 
   return cudaSuccess;
 }
@@ -1895,6 +1930,7 @@ cudaError_t cudaFreeHost(void *devPtr) {
 }
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   auto DC = DeviceContext::instance();
   uint64_t mem_addr;  
   // RT_CHECK(vx_mem_alloc(DC->device(), size, VX_MEM_TYPE_GLOBAL, &mem_addr));
@@ -1907,6 +1943,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 }
 
 cudaError_t cudaFree(void *devPtr) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   auto DC = DeviceContext::instance(); 
   uint64_t mem_addr = (uint64_t)devPtr;  
   dxa_tensor_maps.erase(mem_addr);
@@ -1917,7 +1954,8 @@ cudaError_t cudaFree(void *devPtr) {
   return cudaSuccess;
 }
 
-cudaError_t cudaMemset(void *devPtr, int value, size_t count) {  
+cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   void* tmp_ptr;
   tmp_ptr = (void *) malloc(count);
   memset(tmp_ptr, value, count);
@@ -1960,6 +1998,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 // }
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind kind) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   int vx_err; 
   if (kind == cudaMemcpyHostToHost) {
     memcpy(dst, src, count);
@@ -2008,6 +2047,7 @@ cudaError_t cudaMemcpyFromSymbol(void *dst,
                                  size_t count, 
                                  size_t offset, 
                                  cudaMemcpyKind kind) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
 
 // 2026 Feb 26, Currently not working!!!
     if (kind != cudaMemcpyDeviceToHost) {
@@ -2068,6 +2108,7 @@ cudaError_t cudaMemcpyToSymbol_host(void *dst,
                                     size_t offset, 
                                     cudaMemcpyKind kind,
                                     void *symbol) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
                                       
   assert(offset == 0 && "DO not support offset !=0\n");
 
@@ -2199,6 +2240,7 @@ static int stream_counter = 1;
 
 */
 cudaError_t cudaStreamCreate(cudaStream_t *pStream) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   cstreamData *s = (cstreamData *)calloc(1, sizeof(cstreamData));
   if (s == NULL)
     return cudaErrorMemoryAllocation;
@@ -2227,6 +2269,9 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream) {
 }
 
 cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
+  if (DeviceContext::instance()->device_lost()) return cudaErrorLaunchFailure;
+  if (!stream) return cudaDeviceSynchronize();
   cstreamData *e = ((cstreamData *)(stream));
   MUTEX_LOCK(e->stream_lock);
 
@@ -2331,7 +2376,7 @@ cudaError_t cudaGetLastError(void) {
   return lastError; 
 }
 
-static callParams callParamTemp;
+static thread_local callParams callParamTemp;
 
 /*
   Internal Cuda Library Functions
@@ -2396,7 +2441,10 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blockDim, void **args,
                                         size_t sharedMem, cudaStream_t stream, int num_args,
                                         dim3 cluster, bool explicit_cluster, bool cooperative = false) {
+  std::lock_guard<std::recursive_mutex> guard(device_operations);
   if (!func || !*func) return cudaErrorInvalidDeviceFunction;
+  if (DeviceContext::instance()->device_lost()) return cudaErrorLaunchFailure;
+  if (num_args < 0 || (num_args && !args)) return cudaErrorInvalidValue;
   const bool launch_by_path = strchr(func, '/') != nullptr;
   DBG_COUT("RUNTIME FUNCTION" << std::endl);
   DBG_COUT("kernel_name: " << func << std::endl);
@@ -2748,121 +2796,17 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
 
   DBG_PRINT("uploaded args\n");
 
-  // ── DXA descriptor programming (before kernel launch) ──────────────────
-  // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
-  // for this kernel (resolved against this launch's arguments).
-  const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
-  std::set<uint32_t> dxa_slots;
-  if (coalesced_cp_async) {
-    uint64_t isa = 0, threads = 0, vm = 0;
-    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
-    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &threads));
-    RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
-    if (threads != 8 || !(isa & VX_ISA_EXT_DXA) || vm) {
-      fprintf(stderr, "cudaLaunchKernel: coalesced cp.async requires an 8-lane DXA device with flat global memory\n");
-      std::abort();
-    }
-    DxaDescEntry descriptor{};
-    descriptor.slot = CUPBOP_CP_ASYNC_DXA_SLOT;
-    descriptor.rank = 1;
-    descriptor.elem_bytes = sizeof(uint32_t);
-    descriptor.size[0] = 1u << 30;
-    descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
-    dxa_program(DC->device(), descriptor);
-    dxa_slots.insert(descriptor.slot);
-  }
-  for (auto &desc : dxa_descriptors) {
-    if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
-      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", desc.slot);
-      std::abort();
-    }
-    DBG_PRINT("[DXA] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
-              desc.slot, desc.base_addr, desc.rank, desc.size[0], desc.size[1], desc.size[2], desc.stride[0],
-              desc.stride[1], desc.box[0], desc.box[1], desc.box[2], desc.elem_bytes, desc.layout, desc.fill);
-    dxa_program(DC->device(), desc);
-    dxa_slots.insert(desc.slot);
-  }
-  dxa_descriptors.clear();
-
-  load_dxa_auto_descriptors();
-  for (auto &adesc : dxa_auto_descriptors) {
-    // Match kernel name
-    if (kernel_name_tmp.find(adesc.kernel_name) == std::string::npos &&
-        adesc.kernel_name.find(kernel_name_tmp) == std::string::npos)
-      continue;
-    DxaDescEntry d{};
-    if (adesc.v2) {
-      std::string err;
-      if (!dxa_v2_resolve(adesc, args, nargs, d, err)) {
-        fprintf(stderr, "dxa_descriptors.txt: %s\n  in: %s\n", err.c_str(), adesc.line.c_str());
-        exit(1);
-      }
-    } else {
-      if (adesc.ptr_arg_idx < 0 || adesc.ptr_arg_idx >= nargs) continue;
-      d.slot = adesc.slot; d.rank = 2; d.elem_bytes = adesc.elem_bytes;
-      memcpy(&d.base_addr, args[adesc.ptr_arg_idx], sizeof(uint64_t));
-      if (adesc.dim0_arg_idx >= 0 && adesc.dim0_arg_idx < nargs)
-        memcpy(&d.size[0], args[adesc.dim0_arg_idx], sizeof(uint32_t));
-      if (adesc.dim1_arg_idx >= 0 && adesc.dim1_arg_idx < nargs)
-        memcpy(&d.size[1], args[adesc.dim1_arg_idx], sizeof(uint32_t));
-      d.stride[0] = d.size[0] * adesc.elem_bytes;
-      d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
-    }
-    if (coalesced_cp_async && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
-      fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", d.slot);
-      std::abort();
-    }
-    DBG_PRINT("[DXA-auto] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
-              d.slot, d.base_addr, d.rank, d.size[0], d.size[1], d.size[2], d.stride[0], d.stride[1],
-              d.box[0], d.box[1], d.box[2], d.elem_bytes, d.layout, d.fill);
-    dxa_program(DC->device(), d);
-    dxa_slots.insert(d.slot);
-  }
-
-
-  // A tensor map's first word is its registered device address, including maps inside a by-value parameter.
   std::set<uint64_t> launch_tensor_maps;
-  std::vector<unsigned> tensor_slots;
-  if (!dxa_tensor_maps.empty()) {
-    int next_slot = 15;
-    for (int i = 0; i < num_slots; ++i) {
-      auto map = dxa_tensor_maps.find(abuf_ptr->args[i]);
-      if (map == dxa_tensor_maps.end() || launch_tensor_maps.count(map->first)) continue;
-      while (next_slot >= 8 && dxa_slots.count(next_slot)) --next_slot;
-      if (next_slot < 8) {
-        fprintf(stderr, "cudaLaunchKernel: no free TMA descriptor slots; remaining tensor maps use software copies\n");
-        break;
-      }
-      const auto &r = map->second;
-      DxaDescEntry d{};
-      d.slot = next_slot; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem; d.swizzle = r.swizzle;
-      d.layout = r.layout; d.tc_n = r.geometry & 0xffffu; d.block_k = r.geometry >> 16;
-      for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
-      for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
-      d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
-      std::string err = dxa_desc_check(d);
-      if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
-      dxa_program(DC->device(), d);
-      DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
-      tensor_slots.push_back(d.slot);
-      dxa_slots.insert(d.slot);
-      launch_tensor_maps.insert(r.self);
-      --next_slot;
-      DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
-    }
-  }
-
+  auto clear_tensor_slots = [&] {
+    uint32_t invalid = UINT32_MAX;
+    if (!DC->device_lost())
+      for (uint64_t address : launch_tensor_maps)
+        DC->copy_to_dev(address + offsetof(cupbop_tmap, dxa_slot), &invalid, sizeof(invalid));
+  };
   // ── CUPBOP_LAUNCH2: hardware CTA dispatch via vx_enqueue_launch ─────────────
   {
     const int schedule = cupbop_schedule_flag();
     const int kernel_idx = abuf_ptr->kernel_idx;
-    // 1) restore cudaMemcpyToSymbol / __device__ variables (single-thread service launch)
-    if (!memcpy_symbol.empty()) {
-      abuf_ptr->kernel_idx = -1;
-      uint32_t one[3] = {1, 1, 1};
-      cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0, true);
-      abuf_ptr->kernel_idx = kernel_idx;
-    }
     // 2) the kernel itself
     uint32_t grid[3], block[3], ndim, lmem = 0;
     if (schedule == 2) {
@@ -2870,7 +2814,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       const uint64_t block_threads = (uint64_t)blockDim.x * blockDim.y * blockDim.z;
       const uint64_t core_threads = (uint64_t)CUPBOP_EFF_NUM_WARPS() * CUPBOP_EFF_NUM_THREADS();   // VX_RT_NUM_WARPS/SIMD_WIDTH-aware
       if (block_threads > core_threads) {
-        if (explicit_cluster) return cudaErrorInvalidConfiguration;
+        if (explicit_cluster || cooperative) return cudaErrorInvalidConfiguration;
         printf("Error: block_size %lu exceeds threads_per_core %lu (NUM_WARPS*NUM_THREADS); a CUDA block must fit one core in the 1:1 schedule\n",
                (unsigned long)block_threads, (unsigned long)core_threads);
         std::abort();
@@ -2878,7 +2822,9 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       grid[0] = gridDim.x; grid[1] = gridDim.y; grid[2] = gridDim.z;
       block[0] = blockDim.x; block[1] = blockDim.y; block[2] = blockDim.z;
       ndim = 3;
-      lmem = cupbop_lmem_touched(table_name, cupbop_static_lmem_bytes(table_name) + (uint32_t)sharedMem, blockDim);
+      const uint32_t static_bytes = cupbop_static_lmem_bytes(table_name);
+      if (cooperative && sharedMem > UINT32_MAX - static_bytes) return cudaErrorInvalidConfiguration;
+      lmem = cupbop_lmem_touched(table_name, static_bytes + (uint32_t)sharedMem, blockDim);
     } else if (schedule == 1) {
       // core mapping (virt): CTA == CUDA block, but only P physical warps
       // (CUPBOP_VIRT_WARPS, default = all block warps). The kernel loops over
@@ -2984,10 +2930,6 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
           members * ((threads + lanes - 1) / lanes) > CUPBOP_EFF_NUM_WARPS())
         return cudaErrorInvalidConfiguration;
     }
-    if (members > 1) for (unsigned slot : tensor_slots) {
-      // The launch fixes the aligned distance between receiver CTA pages.
-      RT_CHECK(vx_dcr_write(DC->device(), 0x100 + slot * 24 + 21, uint32_t(stride)));
-    }
     if (cta_fix.dims && split_barrier) return cudaErrorInvalidConfiguration;
     if (!cta_fix.dims) {
       abuf_ptr->ctx.cluster_shape = cluster.x | (cluster.y << 8) | (cluster.z << 16) |
@@ -2996,6 +2938,158 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       // Blackwell's opaque response packs the Y and Z coordinates into 16 bits each.
       if (DC->is_simx() && (schedule == 1 || schedule == 2) && grid[1] <= 65536 && grid[2] <= 65536)
         abuf_ptr->ctx.direct_launch_flags = CUPBOP_LAUNCH_SIMX_CLC;
+    }
+    void *barriers = nullptr;
+    if (cooperative) {
+      uint64_t cores = 0, warps = 0, capacity = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_NUM_CORES, &cores) ||
+          vx_dev_caps(DC->device(), VX_CAPS_NUM_WARPS, &warps) ||
+          vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity)) return cudaErrorInvalidConfiguration;
+      static const unsigned core_cap = cupbop_env_u32("VX_RT_NUM_CORES", 0);
+      if (core_cap) cores = std::min<uint64_t>(cores, core_cap);
+      if (cupbop_rt_num_warps()) warps = std::min<uint64_t>(warps, cupbop_rt_num_warps());
+      const uint64_t warps_per_cta = (threads + lanes - 1) / lanes;
+      uint64_t per_core = warps / warps_per_cta;
+      if (stride) per_core = std::min(per_core, capacity / stride);
+      // Column-TMEM residency also depends on the target's physical budget.
+      // Reserve an entire core per such CTA, which is safe for every admitted allocation.
+      if (tmem_cols) per_core = std::min<uint64_t>(1, per_core);
+      const uint64_t xy = uint64_t(gridDim.x) * gridDim.y;
+      if (xy > 0x7fffffffu / gridDim.z || xy * gridDim.z > cores * per_core)
+        return cudaErrorCooperativeLaunchTooLarge;
+      const uint32_t blocks = uint32_t(xy * gridDim.z);
+      abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_COOPERATIVE;
+      if (blocks > 1 && blocks <= cores && capacity && capacity <= UINT32_MAX) {
+        // KMU must admit exactly one CTA per participating core. Otherwise
+        // the global barrier's count in cores differs from the CUDA CTA count.
+        lmem = uint32_t(capacity);
+        abuf_ptr->ctx.cluster_stride = lmem;
+        abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_GRID_GBAR;
+      }
+      DBG_PRINT("cooperative grid %u CTA(s): %s\n", blocks, blocks == 1 ? "CTA barrier" :
+                (abuf_ptr->ctx.direct_launch_flags & CUPBOP_LAUNCH_GRID_GBAR) ? "native global barrier" : "CTA phase counter");
+    }
+    if (cooperative) {
+      cudaError_t ready = DC->prepare_grid_workspace(&abuf_ptr->ctx.cluster_barriers);
+      if (ready != cudaSuccess) return ready;
+    }
+    if (split_barrier) {
+      const size_t groups = size_t(gridDim.x / cluster.x) * (gridDim.y / cluster.y);
+      const size_t nz = gridDim.z / cluster.z;
+      const size_t bytes = (8 + 4 * threads * members + 7) & ~size_t(7);
+      if (!nz || groups > SIZE_MAX / nz / bytes) return cudaErrorInvalidConfiguration;
+      const size_t storage = groups * nz * bytes;
+      cudaError_t error = cudaMalloc(&barriers, storage);
+      if (error != cudaSuccess) return error;
+      error = cudaMemset(barriers, 0, storage);
+      if (error != cudaSuccess) { cudaFree(barriers); return error; }
+      abuf_ptr->ctx.cluster_barriers = uintptr_t(barriers);
+    }
+    // ── DXA descriptor programming (before kernel launch) ──────────────────
+    // Host API calls (cudaDxaProgramDesc*) queued since the previous launch, then the sidecar's entries
+    // for this kernel (resolved against this launch's arguments).
+    const bool coalesced_cp_async = std::ifstream("cupbop_cp_async_dxa.txt").good();
+    std::set<uint32_t> dxa_slots;
+    if (coalesced_cp_async) {
+      uint64_t isa = 0, threads = 0, vm = 0;
+      RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_ISA_FLAGS, &isa));
+      RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_NUM_THREADS, &threads));
+      RT_CHECK(vx_dev_caps(DC->device(), VX_CAPS_VM_SUPPORT, &vm));
+      if (threads != 8 || !(isa & VX_ISA_EXT_DXA) || vm) {
+        fprintf(stderr, "cudaLaunchKernel: coalesced cp.async requires an 8-lane DXA device with flat global memory\n");
+        std::abort();
+      }
+      DxaDescEntry descriptor{};
+      descriptor.slot = CUPBOP_CP_ASYNC_DXA_SLOT;
+      descriptor.rank = 1;
+      descriptor.elem_bytes = sizeof(uint32_t);
+      descriptor.size[0] = 1u << 30;
+      descriptor.box[0] = CUPBOP_CP_ASYNC_DXA_WORDS;
+      dxa_program(DC->device(), descriptor);
+      dxa_slots.insert(descriptor.slot);
+    }
+    for (auto &desc : dxa_descriptors) {
+      if (coalesced_cp_async && desc.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+        fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", desc.slot);
+        std::abort();
+      }
+      DBG_PRINT("[DXA] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
+                desc.slot, desc.base_addr, desc.rank, desc.size[0], desc.size[1], desc.size[2], desc.stride[0],
+                desc.stride[1], desc.box[0], desc.box[1], desc.box[2], desc.elem_bytes, desc.layout, desc.fill);
+      dxa_program(DC->device(), desc);
+      dxa_slots.insert(desc.slot);
+    }
+
+    load_dxa_auto_descriptors();
+    for (auto &adesc : dxa_auto_descriptors) {
+      // Match kernel name
+      if (kernel_name_tmp.find(adesc.kernel_name) == std::string::npos &&
+          adesc.kernel_name.find(kernel_name_tmp) == std::string::npos)
+        continue;
+      DxaDescEntry d{};
+      if (adesc.v2) {
+        std::string err;
+        if (!dxa_v2_resolve(adesc, args, nargs, d, err)) {
+          fprintf(stderr, "dxa_descriptors.txt: %s\n  in: %s\n", err.c_str(), adesc.line.c_str());
+          exit(1);
+        }
+      } else {
+        if (adesc.ptr_arg_idx < 0 || adesc.ptr_arg_idx >= nargs) continue;
+        d.slot = adesc.slot; d.rank = 2; d.elem_bytes = adesc.elem_bytes;
+        memcpy(&d.base_addr, args[adesc.ptr_arg_idx], sizeof(uint64_t));
+        if (adesc.dim0_arg_idx >= 0 && adesc.dim0_arg_idx < nargs)
+          memcpy(&d.size[0], args[adesc.dim0_arg_idx], sizeof(uint32_t));
+        if (adesc.dim1_arg_idx >= 0 && adesc.dim1_arg_idx < nargs)
+          memcpy(&d.size[1], args[adesc.dim1_arg_idx], sizeof(uint32_t));
+        d.stride[0] = d.size[0] * adesc.elem_bytes;
+        d.box[0] = adesc.tile0; d.box[1] = adesc.tile1;
+      }
+      if (coalesced_cp_async && d.slot == CUPBOP_CP_ASYNC_DXA_SLOT) {
+        fprintf(stderr, "cudaLaunchKernel: DXA slot %u is reserved for coalesced cp.async\n", d.slot);
+        std::abort();
+      }
+      DBG_PRINT("[DXA-auto] slot=%u base=0x%lx rank=%u size=(%u,%u,%u) stride=(%u,%u) box=(%u,%u,%u) elem=%u layout=%u fill=0x%x\n",
+                d.slot, d.base_addr, d.rank, d.size[0], d.size[1], d.size[2], d.stride[0], d.stride[1],
+                d.box[0], d.box[1], d.box[2], d.elem_bytes, d.layout, d.fill);
+      dxa_program(DC->device(), d);
+      dxa_slots.insert(d.slot);
+    }
+
+
+    // A tensor map's first word is its registered device address, including maps inside a by-value parameter.
+    std::vector<unsigned> tensor_slots;
+    if (!dxa_tensor_maps.empty()) {
+      int next_slot = 15;
+      for (int i = 0; i < num_slots; ++i) {
+        auto map = dxa_tensor_maps.find(abuf_ptr->args[i]);
+        if (map == dxa_tensor_maps.end() || launch_tensor_maps.count(map->first)) continue;
+        while (next_slot >= 8 && dxa_slots.count(next_slot)) --next_slot;
+        if (next_slot < 8) {
+          fprintf(stderr, "cudaLaunchKernel: no free TMA descriptor slots; remaining tensor maps use software copies\n");
+          break;
+        }
+        const auto &r = map->second;
+        DxaDescEntry d{};
+        d.slot = next_slot; d.base_addr = r.gaddr; d.rank = r.rank; d.elem_bytes = r.elem; d.swizzle = r.swizzle;
+        d.layout = r.layout; d.tc_n = r.geometry & 0xffffu; d.block_k = r.geometry >> 16;
+        for (uint32_t k = 0; k < r.rank; ++k) { d.size[k] = r.dim[k]; d.box[k] = r.box[k]; }
+        for (uint32_t k = 0; k + 1 < r.rank; ++k) d.stride[k] = (uint32_t)r.stride[k];
+        d.fill = r.oob_nan ? (r.elem == 2 ? 0x7FFF7FFFu : 0x7FFFFFFFu) : 0u;
+        std::string err = dxa_desc_check(d);
+        if (!err.empty()) { fprintf(stderr, "cudaLaunchKernel: tensor map not DXA-representable (%s)\n", err.c_str()); continue; }
+        dxa_program(DC->device(), d);
+        DC->copy_to_dev(r.self + offsetof(cupbop_tmap, dxa_slot), &d.slot, sizeof(d.slot));
+        tensor_slots.push_back(d.slot);
+        dxa_slots.insert(d.slot);
+        launch_tensor_maps.insert(r.self);
+        --next_slot;
+        DBG_PRINT("[TMA] arg %d: tensor map %lx -> DXA slot %u\n", i, (unsigned long)r.self, d.slot);
+      }
+    }
+
+    if (members > 1) for (unsigned slot : tensor_slots) {
+      // The launch fixes the aligned distance between receiver CTA pages.
+      RT_CHECK(vx_dcr_write(DC->device(), 0x100 + slot * 24 + 21, uint32_t(stride)));
     }
     // A flat rank-1 descriptor takes the source word address as its DXA
     // coordinate. Reserve an unused slot after tensor maps and explicit
@@ -3027,47 +3121,17 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
         break;
       }
     }
-    void *barriers = nullptr;
-    if (cooperative) {
-      uint64_t cores = 0, warps = 0, capacity = 0;
-      if (vx_dev_caps(DC->device(), VX_CAPS_NUM_CORES, &cores) ||
-          vx_dev_caps(DC->device(), VX_CAPS_NUM_WARPS, &warps) ||
-          vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity)) return cudaErrorInvalidConfiguration;
-      const unsigned core_cap = cupbop_env_u32("VX_RT_NUM_CORES", 0);
-      if (core_cap) cores = std::min<uint64_t>(cores, core_cap);
-      if (cupbop_rt_num_warps()) warps = std::min<uint64_t>(warps, cupbop_rt_num_warps());
-      const uint64_t warps_per_cta = (threads + lanes - 1) / lanes;
-      uint64_t per_core = warps / warps_per_cta;
-      if (stride) per_core = std::min(per_core, capacity / stride);
-      // Column-TMEM residency also depends on the target's physical budget.
-      // Reserve an entire core per such CTA, which is safe for every admitted allocation.
-      if (tmem_cols) per_core = std::min<uint64_t>(1, per_core);
-      const uint64_t xy = uint64_t(gridDim.x) * gridDim.y;
-      if (xy > 0x7fffffffu / gridDim.z || xy * gridDim.z > cores * per_core)
-        return cudaErrorCooperativeLaunchTooLarge;
-      const uint32_t blocks = uint32_t(xy * gridDim.z);
-      abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_COOPERATIVE;
-      if (blocks > 1 && blocks <= cores && capacity && capacity <= UINT32_MAX) {
-        // KMU must admit exactly one CTA per participating core. Otherwise
-        // the global barrier's count in cores differs from the CUDA CTA count.
-        lmem = uint32_t(capacity);
-        abuf_ptr->ctx.cluster_stride = lmem;
-        abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_GRID_GBAR;
+    // 1) restore cudaMemcpyToSymbol / __device__ variables (single-thread service launch)
+    if (!memcpy_symbol.empty()) {
+      abuf_ptr->kernel_idx = -1;
+      uint32_t one[3] = {1, 1, 1};
+      cudaError_t restored = cupbop_launch_blob(DC, abuf_ptr, abuf_total, 1, one, one, 0, true);
+      if (restored != cudaSuccess) {
+        clear_tensor_slots();
+        if (barriers) cudaFree(barriers);
+        return restored;
       }
-      DBG_PRINT("cooperative grid %u CTA(s): %s\n", blocks, blocks == 1 ? "CTA barrier" :
-                (abuf_ptr->ctx.direct_launch_flags & CUPBOP_LAUNCH_GRID_GBAR) ? "native global barrier" : "CTA phase counter");
-    }
-    if (split_barrier || cooperative) {
-      const size_t groups = size_t(gridDim.x / cluster.x) * (gridDim.y / cluster.y);
-      const size_t nz = gridDim.z / cluster.z;
-      const size_t bytes = (8 + 4 * threads * members + 7) & ~size_t(7);
-      if (!nz || groups > SIZE_MAX / nz / bytes) return cudaErrorInvalidConfiguration;
-      const size_t storage = cooperative ? 2 * sizeof(uint32_t) : groups * nz * bytes;
-      cudaError_t error = cudaMalloc(&barriers, storage);
-      if (error != cudaSuccess) return error;
-      error = cudaMemset(barriers, 0, storage);
-      if (error != cudaSuccess) { cudaFree(barriers); return error; }
-      abuf_ptr->ctx.cluster_barriers = uintptr_t(barriers);
+      abuf_ptr->kernel_idx = kernel_idx;
     }
     cupbop_perf_pre(DC);   // CUPBOP_PERF_KERNEL_FILE (JSON): the counters right before the kernel
     // CUPBOP_PLACE=x,y,z (measurement, default off; experiments/cluster README 1k): hand the dispatcher a cluster shape for
@@ -3098,7 +3162,14 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       fprintf(stderr, "cupbop: place %s: %s %s%s (grid %u,%u,%u, %lu warps and %lu bytes per CTA)\n", func_stripped.c_str(), pe,
               why ? "not applied: " : "applied", why ? why : "", grid[0], grid[1], grid[2], (unsigned long)cta_warps, (unsigned long)stride);
     }
-    cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, place, tmem_cols);
+    cudaError_t result = cupbop_launch_blob(DC, abuf_ptr, abuf_total, ndim, grid, block, lmem, false, place, tmem_cols);
+    if (result != cudaSuccess) {
+      clear_tensor_slots();
+      if (barriers) cudaFree(barriers);
+      return result;
+    }
+    // A rejected enqueue leaves explicit descriptors available for the next launch.
+    dxa_descriptors.clear();
     // CUPBOP_PERF_KERNEL_FILE=<file> (measurement): the device counters right after the kernel, one JSON line per launch
     // (cupbop_perf_post above; CUPBOP_PERF_KERNEL_FORMAT=text: vx_dump_perf's text, the stklmem record). The
     // Perf_counter_* dump at the end of this function comes after the __device__ read-back service launch below, and
@@ -3109,9 +3180,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
   }
 
   // Descriptor DCRs are reused at the next launch, including launches that access a map indirectly.
-  uint32_t invalid_slot = UINT32_MAX;
-  for (uint64_t address : launch_tensor_maps)
-    DC->copy_to_dev(address + offsetof(cupbop_tmap, dxa_slot), &invalid_slot, sizeof(invalid_slot));
+  clear_tensor_slots();
 
   // Read back __device__ variables from device memory after kernel execution.
   // These are registered as memcpy_symbol entries so they get restored

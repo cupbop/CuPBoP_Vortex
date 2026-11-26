@@ -30,9 +30,15 @@ for variant in "${variants[@]}"; do
     fi
     make build SCHEDULE=2 LOCALMEM=1 > build.log 2>&1
     CUPBOP_DEBUG=1 make ci-run SCHEDULE=2 LOCALMEM=1 > run.log 2>&1
+    grep -F 'PASSED! concurrent cooperative launches' run.log
     grep -F 'PASSED! cooperative launch, grid validity and 1056 cross-CTA values' run.log
     if [[ $variant == source ]]; then
       grep -q '__cupbop_grid_sync' kernel.ll
+      "${CXX:-c++}" -shared -fPIC -I"$VORTEX_HOME/sw/runtime/include" "$CuPBoP_PATH/ci/cooperative_grid_faults.cpp" -ldl -o faults.so
+      for fault in alloc init enqueue lost; do
+        CUPBOP_TEST_GRID_FAULT=$fault LD_PRELOAD="$PWD/faults.so${LD_PRELOAD:+:$LD_PRELOAD}" ./host.out > "fault-$fault.log" 2>&1
+        grep -F "PASSED! cooperative workspace failure: $fault" "fault-$fault.log"
+      done
     fi
   )
 done
