@@ -134,6 +134,18 @@ with tempfile.TemporaryDirectory() as work:
     checked += translate("mma.bc", "")
     checked += translate("mma.bc", f"{base} {tf32} -UVX_CFG_TCU_TF32_ENABLE")
     checked += translate("mma.bc", f"{base} -UVX_CFG_TCU_TF32_ENABLE {tf32}", cases["mma"][1])
+    # The hardware generator accepts true/false and ordered _DISABLE overrides.
+    # Raw -D values in the SimX stamp may also carry a C integer suffix.
+    disable = "-DVX_CFG_TCU_TF32_DISABLE"
+    for suffix, enabled in [(f"{tf32}=true", True), (f"{tf32}=false", False),
+                            (f"{tf32}=1U", True), (f"{tf32}=0x0UL", False),
+                            (f"{tf32} {disable}", False), (f"{disable} {tf32}", True),
+                            (f"{tf32} {disable}=true", False), (f"{tf32} {disable}=false", True),
+                            (f"{tf32} -DVX_CFG_EXT_TCU_DISABLE", False)]:
+        flags = f"{base} {suffix}"
+        checked += translate("mma.bc", flags, cases["mma"][1] if enabled else None)
+        query = subprocess.run([translator, "--supports-tf32-mma"], env=dict(os.environ, VORTEX_CONFIGS=flags))
+        assert query.returncode == (0 if enabled else 1), (flags, query.returncode)
     checked += translate("mma.bc", f"{base} -DOTHER{tf32}")
     checked += translate("mma.bc", base, VORTEX_SCHEDULE_FLAG="1", VORTEX_NUM_THREADS="16")
     convert = module("@llvm.nvvm.f2tf32.rna(float %c)", "i32", "declare i32 @llvm.nvvm.f2tf32.rna(float)")

@@ -94,17 +94,18 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
   fi
   run_case tcgen05_column_mma_pair 'format=4a4 mismatches=0/8192' ''
 
-  # Exercise the actual translator entry point with the TF32 hardware flag removed.
+  # Test an explicit TF32-off override even when the selected target enables it.
   negative="$work/examples/tf32-disabled"
   mkdir "$negative"
   cp "$CuPBoP_PATH/examples/tcgen05_tf32/Makefile" "$negative/"
-  tf32_disabled=" ${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/} "
+  tf32_disabled="$VORTEX_CONFIGS -UVX_CFG_TCU_TF32_ENABLE -DVX_CFG_TCU_TF32_DISABLE"
   if make -C "$negative" kernel.bc VORTEX_CONFIGS="$tf32_disabled" SCHEDULE=2 LOCALMEM=1 > "$negative/build.log" 2>&1; then
     echo "TF32 translation unexpectedly succeeded with TF32 disabled" >&2
     exit 1
   fi
   grep -F 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' "$negative/build.log"
-  if [[ " ${VORTEX_CONFIGS} " == *" -DVX_CFG_TCU_TF32_ENABLE "* ]]; then
+  source "$CuPBoP_PATH/ci/tf32_target.sh"
+  if cupbop_target_has_tf32; then
     expected_launches=3 run_case tcgen05_tf32 'format=18910 mismatches=0/2048' ''
     expected_launches=3 run_case tcgen05_tf32_pair 'format=18910 mismatches=0/8192' ''
     expected_launches=6 run_case tcgen05_tf32_tmem_a 'format=410 mismatches=0/2048' ''

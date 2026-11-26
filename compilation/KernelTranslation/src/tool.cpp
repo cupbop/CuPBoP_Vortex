@@ -2287,20 +2287,32 @@ static bool classify_mma_form(const std::string &geom, const std::string &ta, co
 // VORTEX_CONFIGS (exported by examples/common.mk callers: ci/rg-ci-setup-v3.sh, the coadapt harness) holds the
 // -DVX_CFG_* flags of the SimX build the kernel is compiled for. Unset: unknown build (the link then decides).
 static bool tensor_cfg_known() { return std::getenv("VORTEX_CONFIGS") != nullptr; }
+// Vortex's configuration generator accepts boolean words. Raw compiler defines
+// can also encode the same setting with a C integer literal (e.g. 0x1UL).
+static bool configDefineEnabled(StringRef value) {
+  if (value.equals_insensitive("true")) return true;
+  size_t end = value.find_last_not_of("uUlL");
+  if (end == StringRef::npos) return false;
+  StringRef digits = value.take_front(end + 1);
+  if (digits.starts_with("+") || digits.starts_with("-")) digits = digits.drop_front();
+  uint64_t number;
+  return !digits.getAsInteger(0, number) && number != 0;
+}
+
 bool vortexConfigHasFlag(const char *flag) {
   const char *e = std::getenv("VORTEX_CONFIGS");
   if (!e) return true;
   std::istringstream flags(e);
   const std::string define(flag), undef = "-U" + define.substr(2);
+  const std::string disable = StringRef(define).ends_with("_ENABLE")
+      ? StringRef(define).drop_back(7).str() + "_DISABLE" : "";
   bool enabled = false;
   for (std::string token; flags >> token;) {
-    if (token == undef) enabled = false;
-    else if (token == define) enabled = true;
-    else if (StringRef(token).starts_with(define + "=")) {
-      StringRef value = StringRef(token).drop_front(define.size() + 1);
-      uint64_t number;
-      enabled = !value.getAsInteger(0, number) && number != 0;
-    }
+    const auto [name, value] = StringRef(token).split('=');
+    if (name == undef) enabled = false;
+    else if (name == define) enabled = name.size() == token.size() || configDefineEnabled(value);
+    else if (name == disable && (name.size() == token.size() || configDefineEnabled(value)))
+      enabled = false;
   }
   return enabled;
 }

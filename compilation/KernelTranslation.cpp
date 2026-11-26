@@ -116,7 +116,6 @@ static void inlineCudaAsyncHeaders(Module &module) {
 }
 
 int main(int argc, char **argv) {
-  assert(argc == 3 && "incorrect number of arguments\n");
   // Direct invocations can select a configured SimX build without exporting its flags.
   const char *driver = std::getenv("VORTEX_DRIVER");
   const char *build = std::getenv("VORTEX_PATH");
@@ -124,6 +123,12 @@ int main(int argc, char **argv) {
     std::ifstream stamp(std::string(build) + "/.cupbop_simx_configs");
     std::string flags;
     if (std::getline(stamp, flags)) setenv("VORTEX_CONFIGS", flags.c_str(), 0);
+  }
+  if (argc == 2 && StringRef(argv[1]) == "--supports-tf32-mma")
+    return vortexSupportsTf32Mma() ? 0 : 1;
+  if (argc != 3) {
+    errs() << "usage: kernelTranslator <input.bc> <output.bc> | --supports-tf32-mma\n";
+    return 2;
   }
   llvm::Module *program = LoadModuleFromFilr(argv[1]);
   check_lifted_column_tmem(program);
