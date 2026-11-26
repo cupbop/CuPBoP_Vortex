@@ -1,0 +1,26 @@
+.version 8.7
+.target sm_100a
+.address_size 64
+.visible .entry serial(.param .u64 out, .param .u32 count) .reqntid 32 {
+ .shared .align 4 .b32 slot;
+ .reg .b32 h, s, lane, x;
+ .reg .u64 d,t;
+ mov.u32 s, slot;
+ bar.sync 1,32;
+ mov.u32 lane,%tid.x;
+ ld.param.u64 d,[out];
+ ld.param.u32 x,[count];
+ tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [s],x;
+ bar.sync 1,32;
+ ld.volatile.shared.u32 h,[s];
+ { .reg .b32 expected, addr;
+  mad.lo.u32 addr,lane,4,0;
+  cvt.u64.u32 t,addr;
+  add.u64 d,d,t;
+  add.u32 expected,h,x;
+  st.global.u32 [d],expected;
+ }
+ tcgen05.dealloc.cta_group::1.sync.aligned.b32 h,x;
+ tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+ ret;
+}

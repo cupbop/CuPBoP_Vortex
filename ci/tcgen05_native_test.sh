@@ -54,6 +54,15 @@ run_case tcgen05_i8 'elements=131072 mismatches=0' 0 1
 run_case tcgen05_tma_mma 'elements=32768 mismatches=0' ''
 run_case tcgen05_i8_pair 'PASSED!: 131072/131072 INT32 results match' ''
 if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
+  if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_COLS=1024 "* ]]; then
+    expected_launches=5 replay_input=raw run_case lifted_tcgen05_alloc_size 'TMEM runtime allocation size passed 160/160' ''
+    app="$work/examples/lifted_tcgen05_alloc_size-raw-$(basename "$work")"
+    if (ulimit -c 0; cd "$app"; VORTEX_DRIVER=simx ./host.out invalid) > "$app/invalid.log" 2>&1; then
+      echo 'A runtime request for 48 TMEM columns unexpectedly succeeded' >&2
+      exit 1
+    fi
+    grep -Ei 'invalid CSR (read|write) addr=0xc00' "$app/invalid.log"
+  fi
   minimum_tcu=0 run_case shared_lmem_alignment 'shared alignment mismatches=0/8' ''
   expected_launches=2 run_case tcgen05_copy_formats 'TMEM compressed copy: 0 mismatches in 6144 words' ''
   run_case tcgen05_pack 'TMEM single column and pack: 0 mismatches in 7296 values' ''
