@@ -75,5 +75,5 @@ run_test tma_nvvm_3d 'PASSED!: 512/512' 1 1 tma_nvvm_3d.ll.in
 
 # The multicast issue packs its operands with the 32-lane warp ABI.
 if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_NUM_THREADS=32 "* ]]; then
-  run_test tma_multicast_native 'PASSED! multicast to four blocks' 5 2,16,2,16,0
+  run_test tma_multicast_native 'PASSED! multicast to four blocks' 8 2,16,2,16,16,2,16,2
 fi

@@ -1200,15 +1200,27 @@ static __attribute__((always_inline, convergent)) inline bool cupbop_multicast_d
     unsigned issue, void *dst, const void *src, void *mbar, unsigned rank,
     int c0, int c1, int c2, int c3, int c4, unsigned mask, unsigned raw_bytes) {
   const unsigned members = __cupbop_cluster_register(1, 0);
-  if (vx_active_threads() != UINT32_MAX || vx_vote_ballot(issue) != 1 ||
-      csr_read_nv(VX_CSR_CTA_RANK) != 0 || vx_num_barriers() <= members) return false;
-  const unsigned peers = vx_shfl_idx(mask, 0, 31, 0);
-  if (!(peers & (peers - 1)) || (peers >> members)) return false;
+  if (vx_active_threads() != UINT32_MAX || csr_read_nv(VX_CSR_CTA_RANK) != 0 ||
+      vx_num_barriers() <= members) return false;
+  const unsigned issuers = vx_vote_ballot(issue);
+  if (!issuers || (issuers & (issuers - 1))) return false;
+  const unsigned lane = __builtin_ctz(issuers);
+  // WGATHER takes its inputs from hardware lane zero. PTX lets any one lane
+  // issue the copy, and operands outside that lane may be undefined.
+  const unsigned peers = vx_shfl_idx(mask, lane, 31, 0);
+  if (!peers || (peers >> members)) return false;
+  dst = reinterpret_cast<void *>(vx_shfl_idx(uintptr_t(dst), lane, 31, 0));
+  src = reinterpret_cast<const void *>(vx_shfl_idx(uintptr_t(src), lane, 31, 0));
+  mbar = reinterpret_cast<void *>(vx_shfl_idx(uintptr_t(mbar), lane, 31, 0));
+  rank = vx_shfl_idx(rank, lane, 31, 0);
+  raw_bytes = vx_shfl_idx(raw_bytes, lane, 31, 0);
+  c0 = vx_shfl_idx(c0, lane, 31, 0);
+  c1 = vx_shfl_idx(c1, lane, 31, 0);
+  c2 = vx_shfl_idx(c2, lane, 31, 0);
+  c3 = vx_shfl_idx(c3, lane, 31, 0);
+  c4 = vx_shfl_idx(c4, lane, 31, 0);
   unsigned slot = UINT32_MAX, bytes = 0, chunks = 1;
   bool valid = false;
-  // Only the issuing lane's arguments have defined values after an LLVM
-  // guard. Rank zero denotes an unstructured global-to-cluster byte copy.
-  rank = vx_shfl_idx(rank, 0, 31, 0);
   if (vx_thread_id() == 0) {
     if (!rank) {
       const unsigned encoded = (cluster_context().direct_launch_flags >> CUPBOP_RAW_DXA_SLOT_SHIFT)
@@ -1233,9 +1245,11 @@ static __attribute__((always_inline, convergent)) inline bool cupbop_multicast_d
   chunks = vx_shfl_idx(chunks, 0, 31, 0);
   const unsigned issuer = cluster_rank();
   const unsigned base = ((vx_num_barriers() - 1 - issuer) << 8) | (csr_read_nv(VX_CSR_CTA_ID) - issuer);
-  // The DXA adds recipient_rank * stride. A PTX destination may already
-  // be mapped into a peer's page; canonicalize it to rank zero first.
-  uintptr_t first_page = uintptr_t(__cupbop_cluster_map(dst, 0));
+  // Hardware applies rank strides only for two or more mask bits. For a
+  // single recipient, encode its actual page and its own completion barrier.
+  const unsigned page_rank = (peers & (peers - 1)) ? 0 : __builtin_ctz(peers);
+  const unsigned issue_bar = base + page_rank;
+  uintptr_t first_page = uintptr_t(__cupbop_cluster_map(dst, page_rank));
   for (unsigned chunk = 0; chunk < chunks; ++chunk) {
     unsigned phases = 0;
     for (unsigned pending = peers; pending; pending &= pending - 1) {
@@ -1244,7 +1258,7 @@ static __attribute__((always_inline, convergent)) inline bool cupbop_multicast_d
       phases |= unsigned(vx_barrier_arrive(base + peer, 1) & 1) << peer;
     }
     unsigned offset = chunk * CUPBOP_RAW_DXA_TILE_BYTES;
-    cupbop_tma_dxa_issue_meta((base << 4) | (slot & 15u), reinterpret_cast<void *>(first_page + offset),
+    cupbop_tma_dxa_issue_meta((issue_bar << 4) | (slot & 15u), reinterpret_cast<void *>(first_page + offset),
                               rank ? rank : 1, unsigned(c0) + offset / sizeof(uint32_t), c1, c2, c3, c4, peers);
     for (unsigned pending = peers; pending; pending &= pending - 1) {
       unsigned peer = __builtin_ctz(pending);
