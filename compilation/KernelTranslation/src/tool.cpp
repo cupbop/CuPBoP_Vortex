@@ -52,6 +52,7 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 
 using namespace llvm;
 
@@ -2255,6 +2256,7 @@ static bool classify_mma_form(const std::string &geom, const std::string &ta, co
     return false;
   };
   if (tensor_is_f16ish(ta) || ta == "tf32") {
+    if (ta == "tf32" && !vortexSupportsTf32Mma()) { err = Tf32MmaTargetError; return false; }
     if (tb != ta) { err = "mixed A/B types " + ta + "/" + tb; return false; }
     if (acc != "f32") { err = ta + " with " + acc + " accumulator (only f32 accumulators are lowered)"; return false; }
     if (sat) { err = ".satfinite with " + ta; return false; }
@@ -2288,12 +2290,24 @@ static bool tensor_cfg_known() { return std::getenv("VORTEX_CONFIGS") != nullptr
 bool vortexConfigHasFlag(const char *flag) {
   const char *e = std::getenv("VORTEX_CONFIGS");
   if (!e) return true;
-  std::string s(e), f(flag);
-  for (size_t p = s.find(f); p != std::string::npos; p = s.find(f, p + 1)) {
-    size_t q = p + f.size();
-    if (q == s.size() || s[q] == ' ' || s[q] == '=' || s[q] == '\t') return true;
+  std::istringstream flags(e);
+  const std::string define(flag), undef = "-U" + define.substr(2);
+  bool enabled = false;
+  for (std::string token; flags >> token;) {
+    if (token == undef) enabled = false;
+    else if (token == define) enabled = true;
+    else if (StringRef(token).starts_with(define + "=")) {
+      StringRef value = StringRef(token).drop_front(define.size() + 1);
+      uint64_t number;
+      enabled = !value.getAsInteger(0, number) && number != 0;
+    }
   }
-  return false;
+  return enabled;
+}
+
+bool vortexSupportsTf32Mma() {
+  return tensor_cfg_known() && vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") &&
+         vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE");
 }
 // Vortex config flag that gates element type t on the TCU (RTL: VX_tcu_pkg / tfr_mul_join; SimX implements
 // every dense type once VX_CFG_EXT_TCU_ENABLE is on, but a build for a type the RTL leaves out is not real).
@@ -2462,6 +2476,7 @@ static void lower_inline_mma_sp(CallInst *call, Module *M, StringRef assembly) {
            opcode == "m16n8k64.row.col.s32.u8.u8.s32.satfinite") dtype = "u8";
   else fail("supported shapes are m16n8k32 f16/bf16, m16n8k16 tf32, and m16n8k64 s8/s8 or u8/u8");
 
+  if (StringRef(dtype) == "tf32" && !vortexSupportsTf32Mma()) fail(Tf32MmaTargetError);
   const auto geometry = getVirtGeom();
   if (geometry.schedule != 2 || geometry.nt != 32)
     fail("sparse MMA requires a 32-lane Vortex schedule-2 build");
@@ -3319,6 +3334,7 @@ void replace_asm_call(llvm::Module *M) {
                 wtag = wa + "f32"; ntrail = 4;
               } else if (wa == "tf32") {
                 if (wb != wa || wd != "f32" || wK != (sparse ? 16 : 8) || wsat) werr = "tf32 wgmma needs m64nNk8 .f32.tf32.tf32";
+                if (!vortexSupportsTf32Mma()) werr = Tf32MmaTargetError;
                 wtag = "tf32f32"; ntrail = 2;
               } else if (tensor_is_fp8(wa)) {
                 if (!tensor_is_fp8(wb) || (wd != "f32" && !(sparse && wd == "f16")) || wK != (sparse ? 64 : 32) || wsat) werr = "fp8 wgmma needs m64nNk32 .f32.<e4m3|e5m2>.<e4m3|e5m2>";
@@ -3333,7 +3349,7 @@ void replace_asm_call(llvm::Module *M) {
               const bool packed = sparse && wd == "f16";
               unsigned nacc = ok ? (unsigned)N / (packed ? 4 : 2) : 0;
               SparseWgmmaOperands sparseOps;
-              if (sparse) sparseOps = parse_sparse_wgmma(Call, nacc);
+              if (sparse && ok) sparseOps = parse_sparse_wgmma(Call, nacc);
               const bool hasTiedAccumulator = sparse ? sparseOps.tied : Call->arg_size() != 2;
               unsigned firstAcc = hasTiedAccumulator && Call->arg_size() >= nacc ? Call->arg_size() - nacc : 2;
               // operands before the accumulators: desc_a, desc_b and, when scale-d is a register ("r" operand,
@@ -5657,6 +5673,7 @@ void replace_nvvm_wmma_intrinsics(llvm::Module *M) {
     else if (sig.size() == 1) t = sig[0];
     else refuse(Name, "unrecognized signature");
     if (geomOf(t).empty() || geomOf(t) != geom) refuse(Name, "type " + t + " with shape " + geom);
+    if (t == "tf32" && !vortexSupportsTf32Mma()) refuse(Name, Tf32MmaTargetError);
     if (sat && !tensor_is_int8(t)) refuse(Name, ".satfinite with " + t);
     const int nAB = t == "f16" ? 8 : (tensor_is_int8(t) ? 2 : 4);
     auto *RT = dyn_cast<StructType>(CI->getType());

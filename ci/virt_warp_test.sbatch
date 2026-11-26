@@ -64,7 +64,10 @@ mma16() { # example
     env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make ci SCHEDULE=1 > $OUT/mma16_$t.log 2>&1; cp -f ci_output.txt $OUT/mma16_$t.out 2>/dev/null )
   echo "== mma16_$t: $(grep -c PASSED $OUT/mma16_$t.out 2>/dev/null) PASSED, $(grep -c 'FAIL\|mismatch' $OUT/mma16_$t.out 2>/dev/null) FAIL/mismatch lines"
 }
-for t in tcu_dt_mma_tf32 tcu_dt_mma_int8 tcu_dt_mma_fp8 mma884_test; do mma16 $t; done
+( cd examples/tcu_dt_mma_tf32 && make clean > /dev/null 2>&1 &&
+  ! env VORTEX_PATH=$NT16B VORTEX_CONFIGS="$CFG16" VORTEX_NUM_THREADS=16 make kernel.bc SCHEDULE=1 > "$OUT/mma16_tf32.log" 2>&1 &&
+  grep -F 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' "$OUT/mma16_tf32.log" ) || exit 1
+for t in tcu_dt_mma_int8 tcu_dt_mma_fp8 mma884_test; do mma16 $t; done
 python3 - $OUT <<'PY'
 import sys,os
 d=sys.argv[1]

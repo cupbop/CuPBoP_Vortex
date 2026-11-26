@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+tf32_test=$(realpath "$(dirname "$0")/tf32_target_test.py")
 translator=$(realpath "$1")
 llvm_bin=$(realpath "$2")
 export LD_LIBRARY_PATH="$llvm_bin/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -128,4 +129,5 @@ IR
   fi
   grep -Eq 'ashift requires column TMEM A|invalid or repeated TCGEN MMA collector mode' invalid.log
 done
+python3 "$tf32_test" "$translator" "$llvm_bin"
 echo 'Named TCGEN05 MMA shared, sparse tensor, block-scale, collectors, ashift and diagnostics passed'

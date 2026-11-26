@@ -96,3 +96,4 @@ ci/logs_runner/
 examples/_lit_*
 
 .cupbop-cuda-headers/
+.cupbop-translation-target

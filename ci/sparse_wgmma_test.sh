@@ -13,6 +13,7 @@ mkdir -p "$work/examples"
 ln -s "$CuPBoP_PATH/build" "$work/build"
 ln -s "$CuPBoP_PATH/examples/"{common.mk,v3_cell.mk,async_common.h} "$work/examples/"
 
+source "$CuPBoP_PATH/ci/tf32_target.sh"
 config=" ${VORTEX_CONFIGS:-} "
 has_flag() {
   [[ $config =~ [[:space:]]-D$1(=[^[:space:]]+)?[[:space:]] ]]
@@ -35,7 +36,9 @@ run_dtypes() (
   export VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLAG=1
   export CUPBOP_PERF_KERNEL_FILE="$app/kernels.jsonl"
   export LD_LIBRARY_PATH="$work/build/runtime/threadPool:$VORTEX_PATH/sw/runtime:$work/build/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  local flags="${EXTRA_CLANG_FLAGS:-} -DCUPBOP_SPARSE_DTYPE_MASK=63"
+  local mask=62
+  if cupbop_target_has_tf32; then mask=63; fi
+  local flags="${EXTRA_CLANG_FLAGS:-} -DCUPBOP_SPARSE_DTYPE_MASK=$mask"
   if ! make build SCHEDULE=2 LOCALMEM=1 EXTRA_CLANG_FLAGS="$flags" > build.log 2>&1; then
     tail -40 build.log
     exit 1
@@ -45,16 +48,16 @@ run_dtypes() (
   grep -Fxq 'PASSED!' ci_output.txt
 
   local tf32=0 fp8=0 int8=0
-  if ((native)) && has_flag VX_CFG_TCU_TF32_ENABLE; then tf32=1; fi
+  if ((native)) && cupbop_target_has_tf32; then tf32=1; fi
   if ((native)) && has_flag VX_CFG_TCU_FP8_ENABLE; then fp8=1; fi
   if ((native)) && has_flag VX_CFG_TCU_INT8_ENABLE; then int8=1; fi
-  python3 - "$tf32" "$fp8" "$int8" "$expected" <<'PY'
+  python3 - "$tf32" "$fp8" "$int8" "$expected" "$mask" <<'PY'
 import json
 from pathlib import Path
 import re
 import sys
 
-tf32, fp8, int8, fp16 = map(int, sys.argv[1:])
+tf32, fp8, int8, fp16, mask = map(int, sys.argv[1:])
 specs = [
     ("TF32×TF32", 4, 1024, tf32),
     ("E4M3×E4M3", 2, 1024, fp8),
@@ -69,6 +72,8 @@ specs = [
     ("FP16×FP16→FP16", 1, 512, fp16),
     ("E4M3×E5M2→FP16", 1, 512, fp16),
 ]
+if not (mask & 1):
+    specs = specs[1:]
 cases = [(label, str(values), use_tcu) for label, count, values, use_tcu in specs for _ in range(count)]
 actual = re.findall(r"^(.+?) (?:SS|RS|packed SS)(?: selector=[01])?: (512|1024) values, 0 mismatches$",
                     Path("ci_output.txt").read_text(encoding="utf-8"), re.M)

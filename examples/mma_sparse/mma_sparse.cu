@@ -8,7 +8,11 @@ constexpr unsigned Threads = 64;
 constexpr unsigned Blocks = 2;
 constexpr unsigned Rows = 16;
 constexpr unsigned Cols = 8;
+#ifdef CUPBOP_TEST_NO_TF32
+constexpr unsigned Flavors = 8;
+#else
 constexpr unsigned Flavors = 10;
+#endif
 constexpr unsigned Results = Blocks * (Threads / 32) * Rows * Cols;
 
 __host__ __device__ unsigned sparse_positions(unsigned tile, unsigned row, unsigned group) {
@@ -152,8 +156,10 @@ __global__ void sparse_mma(unsigned *output) {
   check_tile<3, 0>(dst + 5 * Results, tile, lane);
   check_tile<2, 0, true>(dst + 6 * Results, tile, lane);
   check_tile<3, 0, true>(dst + 7 * Results, tile, lane);
-  check_tile<4, 0>(dst + 8 * Results, tile, lane);
-  check_tile<4, 1>(dst + 9 * Results, tile, lane);
+  if constexpr (Flavors == 10) {
+    check_tile<4, 0>(dst + 8 * Results, tile, lane);
+    check_tile<4, 1>(dst + 9 * Results, tile, lane);
+  }
 }
 
 } // namespace

@@ -31,6 +31,10 @@ struct VirtGeom { int schedule; int nt; int lanes; int subpasses; int lg_lanes; 
 VirtGeom getVirtGeom();
 // Tests a complete -D flag in VORTEX_CONFIGS. With no configuration the link decides.
 bool vortexConfigHasFlag(const char *flag);
+// TF32 is opt-in even when the lowering mode permits software emulation.
+inline constexpr char Tf32MmaTargetError[] =
+    "TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE and -DVX_CFG_EXT_TCU_ENABLE on the target";
+bool vortexSupportsTf32Mma();
 void VerifyModule(llvm::Module *);
 void phi2alloc(llvm::Module *M);
 void remove_cuda_built_in(llvm::Module *M);

@@ -97,15 +97,21 @@ VX_VXFLAGS = -Xclang -target-feature -Xclang +vortex \
 # VORTEX_DRIVER (default simx). VORTEX_CONFIGS must equal the CONFIGS the SimX driver was built with.
 VORTEX_VER ?= 2
 ifeq ($(VORTEX_VER),3)
+  export VORTEX_DRIVER ?= simx
+  ifeq ($(VORTEX_DRIVER),simx)
+    ifneq ($(wildcard $(VORTEX_PATH)/.cupbop_simx_configs),)
+      VORTEX_CONFIGS ?= $(shell cat "$(VORTEX_PATH)/.cupbop_simx_configs")
+    endif
+  endif
   VORTEX_CONFIGS ?= -DVX_CFG_NUM_CORES=$(VORTEX_NUM_CORES) -DVX_CFG_NUM_WARPS=$(VORTEX_NUM_WARPS) -DVX_CFG_NUM_THREADS=$(VORTEX_NUM_THREADS)
+  export VORTEX_CONFIGS
   # keyed by the example directory, not the kernel file: several examples share main.cu
   VX3_CELL   = $(VORTEX_PATH)/tests/regression/cupbop_$(notdir $(CURDIR))_s$(SCHEDULE)_l$(LOCALMEM)
   VX3_RT_DIR = $(VORTEX_PATH)/sw/runtime
-  export VORTEX_DRIVER ?= simx
   # Older SimX builds and other drivers use the fixed-count CTA barrier.
   export CUPBOP_SIMX_LIVE_CTA_BARRIER ?= $(strip $(if $(filter simx,$(VORTEX_DRIVER)),\
     $(shell grep -q '^\#define VX_BAR_LIVE_CTA ' "$(VORTEX_PATH)/sw/VX_types.h" 2>/dev/null && echo 1)))
-  LIVE_CTA_SETTING := .cupbop-live-cta-barrier
+  TARGET_SETTING := .cupbop-translation-target
 endif
 
 # ─── Derived ──────────────────────────────────────────────────────────────────
@@ -203,7 +209,7 @@ rebuild-ir:
 
 clean:
 	rm -f *.out *.o *.dump *.log *.ll *.bc *.elf *.vxbin *.bin
-	rm -f .cupbop-live-cta-barrier
+	rm -f .cupbop-translation-target .cupbop-live-cta-barrier
 	rm -rf .cupbop-cuda-headers
 	rm -f *.cui *.cubin *.fatbin *.s
 	rm -f lookup.txt lookup_global_symbols.txt
@@ -251,10 +257,10 @@ $(HOST_BC): $(DEVICE_BC)
 # ─── Step 2: kernelTranslator -> kernel.bc + kernel_wrapper.cpp ──────────────
 endif
 
-ifneq ($(LIVE_CTA_SETTING),)
-.PHONY: check-live-cta-setting
-$(LIVE_CTA_SETTING): check-live-cta-setting
-	@setting='$(if $(filter simx:1,$(VORTEX_DRIVER):$(strip $(CUPBOP_SIMX_LIVE_CTA_BARRIER))),1,0)'; \
+ifneq ($(TARGET_SETTING),)
+.PHONY: check-translation-target
+$(TARGET_SETTING): check-translation-target
+	@setting='$(if $(filter simx:1,$(VORTEX_DRIVER):$(strip $(CUPBOP_SIMX_LIVE_CTA_BARRIER))),1,0)'" $$VORTEX_CONFIGS $${CUPBOP_MMA_LOWERING:-auto}"; \
 	if [ "$$setting" != "$$(cat $@ 2>/dev/null)" ]; then printf '%s\n' "$$setting" > $@; fi
 endif
 
@@ -266,7 +272,7 @@ else
 MULTI_OUTPUT_RULE := :
 .NOTPARALLEL:
 endif
-kernel.bc kernel_wrapper.cpp kernel_meta.log $(MULTI_OUTPUT_RULE) $(DEVICE_BC) $(KERNEL_TRANSLATOR) $(LIVE_CTA_SETTING)
+kernel.bc kernel_wrapper.cpp kernel_meta.log $(MULTI_OUTPUT_RULE) $(DEVICE_BC) $(KERNEL_TRANSLATOR) $(TARGET_SETTING)
 	@echo "--- Translate kernel bitcode"
 	$(KERNEL_TRANSLATOR) $< kernel.bc
 	llvm-dis kernel.bc

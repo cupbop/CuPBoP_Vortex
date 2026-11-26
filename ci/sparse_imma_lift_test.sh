@@ -45,6 +45,11 @@ MK
 
   export CUPBOP_MMA_LOWERING=auto VORTEX_CP_POLL_TIMEOUT_S=${VORTEX_CP_POLL_TIMEOUT_S:-180}
   export CUPBOP_PERF_KERNEL_FILE="$PWD/perf.jsonl"
+  if [[ $variant == tf32 ]] && ! cupbop_target_has_tf32; then
+    if make kernel.bc SCHEDULE=2 LOCALMEM=1 > target.log 2>&1; then return 1; fi
+    grep -F 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' target.log
+    return
+  fi
   if ! make ci SCHEDULE=2 LOCALMEM=1 EXTRA_CLANG_FLAGS="${EXTRA_CLANG_FLAGS:-} -std=c++17 $flags" > run.log 2>&1; then
     tail -40 run.log
     exit 1
@@ -92,12 +97,13 @@ assert wmma == metadata == expected_opcodes, (wmma, metadata)
 rows = [json.loads(line) for line in Path('perf.jsonl').read_text().splitlines()]
 assert [row['kernel'] for row in rows] == [name for name, _, _ in cases], rows
 for row, (name, dtype, _) in zip(rows, cases):
-    retired = row['val']['core.instr_tcu']
+    retired = row['val'].get('core.instr_tcu', 0)
     assert (retired > 0) == (dtype in native), (name, retired)
     print(f'{name}: {wmma[dtype]} WMMA_SP, {metadata[dtype]} TCU_LD, {retired} dynamic TCU instructions')
 PY
 )
 
+source "$CuPBoP_PATH/ci/tf32_target.sh"
 run_replay imma sm90_synth/imma_sp16864 replay.cu '' --kernel-name kern_imma_sp16864
 run_replay half warp_sparse_fp16_bf16 replay_float.cu ''
 run_replay tf32 warp_sparse_tf32 replay_float.cu -DCUPBOP_REPLAY_TF32

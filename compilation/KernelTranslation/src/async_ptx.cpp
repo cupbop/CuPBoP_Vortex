@@ -1015,8 +1015,8 @@ struct AsmLowering {
                             bool tmemA, unsigned vec) {
     using namespace cupbop_tcgen05;
     unsigned features = vortexConfigHasFlag("-DVX_CFG_TCU_FP16_DISABLE") ? 0u : unsigned(Fp16);
-    for (const auto &feature : {std::make_pair(Tf32, "-DVX_CFG_TCU_TF32_ENABLE"),
-                                {Int8, "-DVX_CFG_TCU_INT8_ENABLE"}, {Mx, "-DVX_CFG_TCU_MX_ENABLE"},
+    if (vortexSupportsTf32Mma()) features |= Tf32;
+    for (const auto &feature : {std::make_pair(Int8, "-DVX_CFG_TCU_INT8_ENABLE"), {Mx, "-DVX_CFG_TCU_MX_ENABLE"},
                                 {Fp8, "-DVX_CFG_TCU_FP8_ENABLE"}, {Fp4, "-DVX_CFG_TCU_FP4_ENABLE"},
                                 {MxFp4, "-DVX_CFG_TCU_MXFP4_ENABLE"}, {NvFp4, "-DVX_CFG_TCU_NVFP4_ENABLE"}})
       if (vortexConfigHasFlag(feature.second)) features |= feature.first;
@@ -1290,7 +1290,7 @@ struct AsmLowering {
     bool half = mmaOp == mma + "f16";
     bool fp8 = mmaOp == mma + "f8f6f4";
     bool tf32 = mmaOp == mma + "tf32";
-    if (tf32 && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE")) {
+    if (tf32 && !vortexSupportsTf32Mma()) {
       // UTCHMMA has one SASS opcode for both half and TF32. CuLifter
       // dispatches from its runtime descriptor when the type is unknown.
       // Reject explicit TF32 at translation; trap only the TF32 arm of
@@ -1298,7 +1298,7 @@ struct AsmLowering {
       bool dispatch = pred && isCuLifterFunction(F) && llvm::any_of(st, [](const Stmt &other) {
         return other.has("mma") && other.has("kind::f16");
       });
-      if (!dispatch) fail("TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE");
+      if (!dispatch) fail(Tf32MmaTargetError);
       underPred(pred, [&]() -> Value * {
         return B.CreateCall(Intrinsic::getOrInsertDeclaration(S.M, Intrinsic::trap));
       });
