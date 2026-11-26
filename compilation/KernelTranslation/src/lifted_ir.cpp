@@ -205,6 +205,7 @@ void lower_barrier_reductions(Module *M) {
 void lower_ldmatrix_asm(Module *M) {
   static const std::regex ld(R"(^\s*ldmatrix\.sync\.aligned\.(?:x([124])\.m8n8|m8n8\.x([124]))(\.trans)?\.shared(?:::cta)?\.b16\s*\{([^}]*)\}\s*,\s*\[\s*\$(\d+)\s*\]\s*;?\s*$)");
   static const std::regex st(R"(^\s*stmatrix\.sync\.aligned\.(?:x([124])\.m8n8|m8n8\.x([124]))(\.trans)?\.shared(?:::cta)?\.b16\s*\[\s*\$(\d+)\s*\]\s*,\s*\{([^}]*)\}\s*;?\s*$)");
+  static const std::regex named(R"(^llvm\.nvvm\.(ldmatrix|stmatrix)\.sync\.aligned\.m8n8\.x([124])(\.trans)?\.b16\.p([03])$)");
   LLVMContext &C = M->getContext();
   Type *I32 = Type::getInt32Ty(C), *PtrT = PointerType::get(C, 0), *VoidT = Type::getVoidTy(C);
   auto helper = [&](const char *name) { // declared only when used: modules without these asm stay unchanged
@@ -218,28 +219,43 @@ void lower_ldmatrix_asm(Module *M) {
       for (auto &I : BB)
         if (auto *CI = dyn_cast<CallInst>(&I))
           if (CI->isInlineAsm()) {
-            const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
+            const std::string &a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
             if (a.find("ldmatrix") != std::string::npos || a.find("stmatrix") != std::string::npos) calls.push_back(CI);
+          } else if (auto *callee = CI->getCalledFunction()) {
+            StringRef name = callee->getName();
+            if (name.starts_with("llvm.nvvm.ldmatrix.") || name.starts_with("llvm.nvvm.stmatrix.")) calls.push_back(CI);
           }
   unsigned nld = 0, nst = 0;
   for (CallInst *CI : calls) {
-    const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
     std::smatch m;
-    const bool isLd = std::regex_match(a, m, ld);
-    if (!isLd && !std::regex_match(a, m, st)) continue; // unsupported forms are diagnosed by replace_asm_call
-    const int num = std::stoi(m[1].matched ? m[1].str() : m[2].str());
-    const bool trans = m[3].matched;
-    // operand numbering: outputs first, then inputs (the CuLifter forms list the registers in order)
-    const int addrOp = std::stoi(isLd ? m[5].str() : m[4].str());
-    const std::string regList = (isLd ? m[4] : m[5]).str();
-    SmallVector<StringRef, 4> regs;
-    StringRef(regList).split(regs, ',');
-    bool registerOrder = regs.size() == static_cast<unsigned>(num);
-    for (unsigned i = 0; registerOrder && i < regs.size(); ++i)
-      registerOrder = regs[i].trim() == "$" + std::to_string(i + (isLd ? 0 : 1));
-    if (CI->arg_size() != (unsigned)(isLd ? 1 : 1 + num) || addrOp != (isLd ? num : 0) || !registerOrder) {
-      fprintf(stderr, "error: %s asm with unexpected operands: %s\n", isLd ? "ldmatrix" : "stmatrix", a.c_str());
-      exit(1);
+    bool isLd, trans;
+    unsigned num;
+    if (CI->isInlineAsm()) {
+      const std::string a = cast<InlineAsm>(CI->getCalledOperand())->getAsmString();
+      isLd = std::regex_match(a, m, ld);
+      if (!isLd && !std::regex_match(a, m, st)) continue; // replace_asm_call diagnoses unsupported forms
+      num = std::stoi(m[1].matched ? m[1].str() : m[2].str());
+      trans = m[3].matched;
+      const unsigned addrOp = std::stoi(isLd ? m[5].str() : m[4].str());
+      const std::string regList = (isLd ? m[4] : m[5]).str();
+      SmallVector<StringRef, 4> regs;
+      StringRef(regList).split(regs, ',');
+      bool registerOrder = regs.size() == num;
+      for (unsigned i = 0; registerOrder && i < regs.size(); ++i)
+        registerOrder = regs[i].trim() == "$" + std::to_string(i + (isLd ? 0 : 1));
+      if (addrOp != (isLd ? num : 0) || !registerOrder || CI->arg_size() != (isLd ? 1 : 1 + num)) {
+        fprintf(stderr, "error: %s asm with unexpected operands: %s\n", isLd ? "ldmatrix" : "stmatrix", a.c_str());
+        exit(1);
+      }
+    } else {
+      const std::string name = CI->getCalledFunction()->getName().str();
+      if (!std::regex_match(name, m, named)) report_fatal_error(Twine("unsupported NVVM matrix intrinsic: ") + name);
+      isLd = m[1] == "ldmatrix";
+      num = std::stoi(m[2]);
+      trans = m[3].matched;
+      if (CI->arg_size() != (isLd ? 1 : 1 + num) || !CI->getArgOperand(0)->getType()->isPointerTy() ||
+          CI->getArgOperand(0)->getType()->getPointerAddressSpace() != unsigned(std::stoi(m[4])))
+        report_fatal_error(Twine("unexpected NVVM matrix operands: ") + name);
     }
     const auto isFragment = [I32](Type *T) { return CastInst::isBitCastable(T, I32); };
     if (isLd) {

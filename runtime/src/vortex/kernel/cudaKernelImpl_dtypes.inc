@@ -800,8 +800,37 @@ static inline char *__cupbop_smem_ptr(uint32_t a) {
 #endif
   return (char *)(lmem + ((a - (uint32_t)lmem) & 0x3FFFFu));
 }
+#if defined(VX_CFG_EXT_LDST_MATRIX_ENABLE) && VX_CFG_NUM_THREADS == 32
+// At 32 lanes the A_SP fragment shape addresses two independent rows and
+// two words 16 bytes apart in each row.  CUDA x4 numbers a 16x16 tile as
+// top-left, bottom-left, top-right, bottom-right; row pitches may differ.
+static inline bool __cupbop_matrix_x4_rows(uint32_t a, int lane, uintptr_t (&rows)[2]) {
+  const int g = lane >> 2;
+  uintptr_t addr[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    addr[j] = (uintptr_t)__cupbop_smem_ptr(__cupbop_shfl32(a, 8 * j + g));
+  rows[0] = addr[0] + 4 * (lane & 3);
+  rows[1] = addr[1] + 4 * (lane & 3);
+  return vx_vote_all(addr[2] == addr[0] + 16 && addr[3] == addr[1] + 16);
+}
+
+#endif
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n8_b16(uint32_t a, int num, int trans, uint32_t *d) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+#if defined(VX_CFG_EXT_LDST_MATRIX_ENABLE) && VX_CFG_NUM_THREADS == 32
+  uintptr_t rows[2];
+  if (num == 4 && __cupbop_matrix_x4_rows(a, lane, rows)) {
+    float fragment[4];
+    vx_ldm<0, 4, 2, 0, VX_LDM_A_SP>(fragment, rows);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t word = __cupbop_f32_bits(fragment[(j & 1) * 2 + j / 2]);
+      d[j] = trans ? __cupbop_movmatrix_m8n8_trans_b16(word) : word;
+    }
+    return;
+  }
+#endif
   for (int j = 0; j < num; ++j) {
     if (!trans) {
       const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
@@ -815,6 +844,19 @@ extern "C" __attribute__((always_inline, convergent)) void __cupbop_ldmatrix_m8n
 }
 extern "C" __attribute__((always_inline, convergent)) void __cupbop_stmatrix_m8n8_b16(uint32_t a, int num, int trans, const uint32_t *v) {
   const int lane = vx_thread_id(), g = lane >> 2, t = lane & 3;
+#if defined(VX_CFG_EXT_LDST_MATRIX_ENABLE) && VX_CFG_NUM_THREADS == 32
+  uintptr_t rows[2];
+  if (num == 4 && __cupbop_matrix_x4_rows(a, lane, rows)) {
+    float fragment[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t word = trans ? __cupbop_movmatrix_m8n8_trans_b16(v[j]) : v[j];
+      fragment[(j & 1) * 2 + j / 2] = __cupbop_bits_f32(word);
+    }
+    vx_stm<0, 4, 2, 0, VX_LDM_A_SP>(fragment, rows);
+    return;
+  }
+#endif
   for (int j = 0; j < num; ++j) {
     if (!trans) {
       const uint32_t row = __cupbop_shfl32(a, 8 * j + g);
