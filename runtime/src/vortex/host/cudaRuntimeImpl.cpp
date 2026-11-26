@@ -2244,6 +2244,13 @@ cudaError_t cudaGetDeviceCount(int *count) {
   return cudaSuccess;
 }
 
+static bool cupbop_supports_cooperative_launch() {
+  // Original CUDA cubins update the workspace atomically even for one CTA.
+  uint64_t isa = 0;
+  return cupbop_schedule_flag() == 2 &&
+         vx_dev_caps(DeviceContext::instance()->device(), VX_CAPS_ISA_FLAGS, &isa) == 0 && (isa & VX_ISA_STD_A);
+}
+
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
 static bool cupbop_supports_cluster_launch() {
   const char *lmem = getenv("VORTEX_LOCALMEM_FLAG");
@@ -2255,6 +2262,10 @@ static bool cupbop_supports_cluster_launch() {
 cudaError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
   if (!value) return cudaErrorInvalidValue;
   if (device != 0) return cudaErrorInvalidDevice;
+  if (attr == cudaDevAttrCooperativeLaunch) {
+    *value = cupbop_supports_cooperative_launch();
+    return cudaSuccess;
+  }
   if (attr != cudaDevAttrClusterLaunch) return cudaErrorNotSupported;
   *value = cupbop_supports_cluster_launch();
   return cudaSuccess;
@@ -2293,6 +2304,9 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *deviceProp, int device) {
     deviceProp->textureAlignment = 0;
     deviceProp->deviceOverlap = false;
     deviceProp->multiProcessorCount = 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
+    deviceProp->cooperativeLaunch = cupbop_supports_cooperative_launch();
+#endif
   }
   return cudaSuccess;
 }
@@ -2381,7 +2395,7 @@ extern __host__ __device__ unsigned CUDARTAPI __cudaPushCallConfiguration(
 
 static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blockDim, void **args,
                                         size_t sharedMem, cudaStream_t stream, int num_args,
-                                        dim3 cluster, bool explicit_cluster) {
+                                        dim3 cluster, bool explicit_cluster, bool cooperative = false) {
   if (!func || !*func) return cudaErrorInvalidDeviceFunction;
   const bool launch_by_path = strchr(func, '/') != nullptr;
   DBG_COUT("RUNTIME FUNCTION" << std::endl);
@@ -2462,13 +2476,16 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     break;
   }
   if (!gridDim.x || !gridDim.y || !gridDim.z || !blockDim.x || !blockDim.y || !blockDim.z ||
-      ((explicit_cluster || split_barrier) && uint64_t(blockDim.x) * blockDim.y > 1024 / blockDim.z) || sharedMem > UINT32_MAX)
+      ((explicit_cluster || split_barrier || cooperative) && uint64_t(blockDim.x) * blockDim.y > 1024 / blockDim.z) || sharedMem > UINT32_MAX)
     return cudaErrorInvalidConfiguration;
   if (!cluster.x || !cluster.y || !cluster.z || cluster.x > 16 || cluster.y > 16 || cluster.z > 16 ||
       cluster.x * cluster.y * cluster.z > 16 || gridDim.x % cluster.x || gridDim.y % cluster.y ||
       gridDim.z % cluster.z) return cudaErrorInvalidConfiguration;
   const unsigned members = cluster.x * cluster.y * cluster.z;
   const char *local_memory = getenv("VORTEX_LOCALMEM_FLAG");
+  if (cooperative && !cupbop_supports_cooperative_launch()) return cudaErrorNotSupported;
+  if (cooperative && (members != 1 || split_barrier))
+    return cudaErrorInvalidConfiguration;
   if (paired_columns && (members != 2 || uint64_t(blockDim.x) * blockDim.y * blockDim.z != 128)) return cudaErrorInvalidConfiguration;
   if (tmem_cols && ((!paired_columns && members > 1) || cupbop_schedule_flag() != 2)) return cudaErrorInvalidConfiguration;
   if (members > 1 && local_memory && atoi(local_memory) != 1) return cudaErrorInvalidConfiguration;
@@ -2497,6 +2514,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     }
   }
   cupbop_apply_launch_fix(table_name, sharedMem, cta_fix);
+  if (cooperative && cta_fix.dims) return cudaErrorInvalidConfiguration;
 
 
   // Allocate context pool and set __ctx_pool pointer. The pool also holds the core mapping's context scratch
@@ -2951,7 +2969,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     if (schedule == 1 || schedule == 2) {
       uint64_t lmem_cap = 0;
       if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
-        if (explicit_cluster) return cudaErrorInvalidConfiguration;
+        if (explicit_cluster || cooperative) return cudaErrorInvalidConfiguration;
         printf("Error: kernel needs %u bytes of local memory per block, device has %lu\n", lmem, (unsigned long)lmem_cap);
         std::abort();
       }
@@ -3010,12 +3028,41 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
       }
     }
     void *barriers = nullptr;
-    if (split_barrier) {
+    if (cooperative) {
+      uint64_t cores = 0, warps = 0, capacity = 0;
+      if (vx_dev_caps(DC->device(), VX_CAPS_NUM_CORES, &cores) ||
+          vx_dev_caps(DC->device(), VX_CAPS_NUM_WARPS, &warps) ||
+          vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &capacity)) return cudaErrorInvalidConfiguration;
+      const unsigned core_cap = cupbop_env_u32("VX_RT_NUM_CORES", 0);
+      if (core_cap) cores = std::min<uint64_t>(cores, core_cap);
+      if (cupbop_rt_num_warps()) warps = std::min<uint64_t>(warps, cupbop_rt_num_warps());
+      const uint64_t warps_per_cta = (threads + lanes - 1) / lanes;
+      uint64_t per_core = warps / warps_per_cta;
+      if (stride) per_core = std::min(per_core, capacity / stride);
+      // Column-TMEM residency also depends on the target's physical budget.
+      // Reserve an entire core per such CTA, which is safe for every admitted allocation.
+      if (tmem_cols) per_core = std::min<uint64_t>(1, per_core);
+      const uint64_t xy = uint64_t(gridDim.x) * gridDim.y;
+      if (xy > 0x7fffffffu / gridDim.z || xy * gridDim.z > cores * per_core)
+        return cudaErrorCooperativeLaunchTooLarge;
+      const uint32_t blocks = uint32_t(xy * gridDim.z);
+      abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_COOPERATIVE;
+      if (blocks > 1 && blocks <= cores && capacity && capacity <= UINT32_MAX) {
+        // KMU must admit exactly one CTA per participating core. Otherwise
+        // the global barrier's count in cores differs from the CUDA CTA count.
+        lmem = uint32_t(capacity);
+        abuf_ptr->ctx.cluster_stride = lmem;
+        abuf_ptr->ctx.direct_launch_flags |= CUPBOP_LAUNCH_GRID_GBAR;
+      }
+      DBG_PRINT("cooperative grid %u CTA(s): %s\n", blocks, blocks == 1 ? "CTA barrier" :
+                (abuf_ptr->ctx.direct_launch_flags & CUPBOP_LAUNCH_GRID_GBAR) ? "native global barrier" : "CTA phase counter");
+    }
+    if (split_barrier || cooperative) {
       const size_t groups = size_t(gridDim.x / cluster.x) * (gridDim.y / cluster.y);
       const size_t nz = gridDim.z / cluster.z;
       const size_t bytes = (8 + 4 * threads * members + 7) & ~size_t(7);
       if (!nz || groups > SIZE_MAX / nz / bytes) return cudaErrorInvalidConfiguration;
-      const size_t storage = groups * nz * bytes;
+      const size_t storage = cooperative ? 2 * sizeof(uint32_t) : groups * nz * bytes;
       cudaError_t error = cudaMalloc(&barriers, storage);
       if (error != cudaSuccess) return error;
       error = cudaMemset(barriers, 0, storage);
@@ -3030,7 +3077,7 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     // the shape divides the launched grid and fits one core's warps and local memory. Otherwise the launch goes as it is.
     // One line on stderr either way.
     dim3 place = cluster;
-    if (const char *pe = getenv("CUPBOP_PLACE")) {
+    if (const char *pe = cooperative ? nullptr : getenv("CUPBOP_PLACE")) {
       unsigned px = 1, py = 1, pz = 1;
       const bool parsed = sscanf(pe, "%u,%u,%u", &px, &py, &pz) == 3 && px && py && pz;
       const uint64_t pm = (uint64_t)px * py * pz;
@@ -3193,6 +3240,11 @@ cudaError_t cudaLaunchKernel_vortex(const char *func, dim3 grid, dim3 block, voi
   return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, dim3(1,1,1), false);
 }
 
+cudaError_t cupbopLaunchCooperativeKernel(const char *func, dim3 grid, dim3 block, void **args,
+                                          size_t shared, cudaStream_t stream, int nargs) {
+  return cupbop_launch_kernel(func, grid, block, args, shared, stream, nargs, dim3(1,1,1), false, true);
+}
+
 // Used by cubin replay with the geometry captured by the CUDA driver.
 cudaError_t cupbopLaunchClusterKernel(const char *func, dim3 grid, dim3 block, void **args,
                                       size_t shared, cudaStream_t stream, int nargs, dim3 cluster) {
@@ -3202,7 +3254,7 @@ cudaError_t cupbopLaunchClusterKernel(const char *func, dim3 grid, dim3 block, v
 cudaError_t cupbopLaunchKernelEx(const cudaLaunchConfig_t *config, const char *func, void **args, int nargs) {
   if (!config || (nargs && !args) || (config->numAttrs && !config->attrs)) return cudaErrorInvalidValue;
   dim3 cluster(1,1,1);
-  bool has_cluster = false;
+  bool has_cluster = false, cooperative = false;
   for (unsigned i = 0; i < config->numAttrs; ++i) {
     const auto &a = config->attrs[i];
     if (a.id == cudaLaunchAttributeIgnore) continue;
@@ -3213,13 +3265,17 @@ cudaError_t cupbopLaunchKernelEx(const cudaLaunchConfig_t *config, const char *f
           policy != cudaClusterSchedulingPolicyLoadBalancing) return cudaErrorInvalidValue;
       continue;
     }
+    if (a.id == cudaLaunchAttributeCooperative) {
+      cooperative = a.val.cooperative != 0;
+      continue;
+    }
     if (a.id != cudaLaunchAttributeClusterDimension) return cudaErrorNotSupported;
     if (has_cluster) return cudaErrorInvalidValue;
     cluster = dim3(a.val.clusterDim.x, a.val.clusterDim.y, a.val.clusterDim.z);
     has_cluster = true;
   }
   return cupbop_launch_kernel(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes,
-                              config->stream, nargs, cluster, has_cluster);
+                              config->stream, nargs, cluster, has_cluster, cooperative);
 }
 #endif
 

@@ -43,6 +43,7 @@ enum cudaError {
   cudaErrorFileNotFound = 301,
   cudaErrorInvalidDevice = 101,
   cudaErrorLaunchFailure = 719,
+  cudaErrorCooperativeLaunchTooLarge = 720,
   cudaErrorUnknown = 999
 };
 typedef enum cudaError cudaError_t;

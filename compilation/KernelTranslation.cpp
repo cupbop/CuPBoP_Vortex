@@ -3,6 +3,7 @@
 #include "handle_sync.h"
 #include "init.h"
 #include "async_copy.h"
+#include "cg_sync.h"
 #include "async_direct.h"
 #include "async_ptx.h"
 #include "insert_sync.h"
@@ -127,6 +128,7 @@ int main(int argc, char **argv) {
   }
   // CUPBOP_LIFT_OPT: the lift optimisation sees the module as it was read; launch rewrites go to cupbop_launch_fix.txt
   program = run_lift_opt(program);
+  lower_grid_workspace_registers(program);
   launch_fix_collect(program);
 
   std::ofstream fout;

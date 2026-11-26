@@ -35,6 +35,20 @@ def prepare(cuda, destination):
             for name in sorted({header, header.resolve()}):
                 roots.append({"type": "file", "name": str(name),
                               "use-external-name": False, "external-contents": str(content.resolve())})
+    # Bind the SDK's inlined synchronization to the Vortex launch context.
+    groups = cuda.absolute() / "include/cooperative_groups.h"
+    if groups.is_file():
+        text = groups.read_text()
+        workspace = "grid_group gg(details::get_grid_workspace());"
+        sync = "details::grid::sync(&_data.grid.gridWs->barrier);"
+        if workspace in text and sync in text:
+            text = ('extern "C" __device__ void __cupbop_grid_sync();\n' +
+                    text.replace(sync, "__cupbop_grid_sync();"))
+            content = destination.with_name("cooperative_groups.h")
+            content.write_text(text)
+            for name in sorted({groups, groups.resolve()}):
+                roots.append({"type": "file", "name": str(name), "use-external-name": False,
+                              "external-contents": str(content.resolve())})
     destination.write_text(json.dumps({"version": 0, "roots": roots}))
 
 

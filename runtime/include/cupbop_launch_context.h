@@ -6,6 +6,8 @@ constexpr uint32_t CUPBOP_LAUNCH_SIMX_CLC = 1u;
 constexpr uint32_t CUPBOP_RAW_DXA_SLOT_SHIFT = 1;
 constexpr uint32_t CUPBOP_RAW_DXA_SLOT_MASK = 31;
 constexpr uint32_t CUPBOP_RAW_DXA_TILE_BYTES = 16;
+constexpr uint32_t CUPBOP_LAUNCH_COOPERATIVE = 1u << 6;
+constexpr uint32_t CUPBOP_LAUNCH_GRID_GBAR = 1u << 7;
 
 // Preserve the offsets of the legacy printf fields for existing device binaries.
 // CTA-loop launches reuse these words for loop geometry and cannot use cluster barriers.

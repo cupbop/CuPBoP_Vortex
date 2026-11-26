@@ -14,6 +14,43 @@ static inline unsigned cluster_block(unsigned axis) {
     return csr_read_nv(VX_CSR_CTA_BLOCK_ID_Y);
   return csr_read_nv(VX_CSR_CTA_BLOCK_ID_Z);
 }
+// The cooperative workspace is launch-private. An ordinary CUDA grid has an
+// invalid grid_group handle, including when CTA-loop geometry overlays flags.
+extern "C" void *__cupbop_grid_workspace() {
+  const auto &ctx = cluster_context();
+  return ctx.cluster_barriers > 1 && (ctx.direct_launch_flags & CUPBOP_LAUNCH_COOPERATIVE)
+           ? reinterpret_cast<void *>(ctx.cluster_barriers) : nullptr;
+}
+
+extern "C" __attribute__((convergent, noduplicate, noinline)) void __cupbop_grid_sync() {
+  const auto &ctx = cluster_context();
+  const unsigned blocks = ctx.num_groups[0] * ctx.num_groups[1] * ctx.num_groups[2];
+  const unsigned cta = csr_read_nv(VX_CSR_CTA_ID);
+  const unsigned warps = csr_read_nv(VX_CSR_CTA_SIZE);
+  vx_fence();
+  if (blocks == 1) {
+    vx_barrier(cta, warps);
+  } else if (ctx.direct_launch_flags & CUPBOP_LAUNCH_GRID_GBAR) {
+    // Exactly one resident CTA on each participating core. Every warp
+    // arrives; the local barrier unit forwards one count per core.
+    vx_barrier(cta, warps);
+    vx_barrier(0x80000000u, blocks);
+  } else {
+    // A CUDA grid can contain several CTAs per core. Count CTA leaders in
+    // global memory, using the CUDA high-bit phase protocol so the next
+    // generation can start while other CTAs are leaving this one.
+    vx_barrier(cta, warps);
+    if (csr_read_nv(VX_CSR_CTA_RANK) == 0 && vx_thread_id() == 0) {
+      const bool first = !(cluster_block(0) | cluster_block(1) | cluster_block(2));
+      auto *arrived = reinterpret_cast<uint32_t *>(ctx.cluster_barriers) + 1;
+      const uint32_t old = __atomic_fetch_add(arrived, first ? 0x80000001u - blocks : 1u, __ATOMIC_ACQ_REL);
+      while (((__atomic_load_n(arrived, __ATOMIC_ACQUIRE) ^ old) & 0x80000000u) == 0) {}
+    }
+    vx_barrier(cta, warps);
+  }
+  vx_fence();
+}
+
 static inline unsigned cluster_rank() {
   unsigned x = cluster_dim(0), y = cluster_dim(1);
   return cluster_block(0) % x + x * (cluster_block(1) % y + y * (cluster_block(2) % cluster_dim(2)));

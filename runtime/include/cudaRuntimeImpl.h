@@ -51,6 +51,8 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
 cudaError_t cudaLaunchKernel_vortex(const char *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem,
                              cudaStream_t stream, const int num_args);
+cudaError_t cupbopLaunchCooperativeKernel(const char *func, dim3 grid, dim3 block, void **args,
+                                          size_t shared, cudaStream_t stream, int nargs);
 cudaError_t cupbopLaunchClusterKernel(const char *func, dim3 grid, dim3 block, void **args,
                                       size_t shared, cudaStream_t stream, int nargs, dim3 cluster);
 cudaError_t cudaMalloc(void **devPtr, size_t size);

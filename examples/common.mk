@@ -225,7 +225,7 @@ ifeq ($(VORTEX_VER),3)
 # cudaConfigureCall launch API; -target-sdk-version keeps __cudaPushCallConfiguration.
 # DEVICE_BC_SRC: the examples/lift.mk examples have their device bitcode from a lifted IR file and use this one at most for the source kernels of the program.
 CUDA_OVERLAY := .cupbop-cuda-headers/overlay.json
-$(CUDA_OVERLAY): $(CuPBoP_PATH)/compilation/cuda_header_overlay.py $(wildcard $(CUDA_PATH)/include/cuda/std/barrier $(CUDA_PATH)/include/cuda.h)
+$(CUDA_OVERLAY): $(CuPBoP_PATH)/compilation/cuda_header_overlay.py $(wildcard $(CUDA_PATH)/include/cuda/std/barrier $(CUDA_PATH)/include/cuda.h $(CUDA_PATH)/include/cooperative_groups.h)
 	python3 $< "$(CUDA_PATH)" "$@"
 $(DEVICE_BC_SRC): $(KERNEL_CU) $(CuPBoP_PATH)/runtime/include/cupbop_cluster_dims.h $(CUDA_OVERLAY)
 	@echo "--- Generate device bitcode (clang --cuda-device-only)"

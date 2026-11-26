@@ -1,4 +1,6 @@
 #include "cg_sync.h"
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/IR/IRBuilder.h>
 
 bool isCGThreadBlockSync(const std::string &FuncNameStr) {
     // cg::
@@ -51,4 +53,30 @@ bool has_cg_group_sync(llvm::Module *M) {
       }
     }
   return false;
+}
+
+void lower_grid_workspace_registers(llvm::Module *module) {
+  // CUDA's cooperative_groups driver ABI exposes the workspace pointer in
+  // envreg1 (high word) and envreg2 (low word) on SM80/SM90.
+  llvm::SmallVector<llvm::CallInst *> reads;
+  for (llvm::Function &function : *module)
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &inst : block)
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst); call && call->isInlineAsm() &&
+            call->arg_empty() && call->getType()->isIntegerTy(32)) {
+          auto *assembly = llvm::cast<llvm::InlineAsm>(call->getCalledOperand());
+          llvm::StringRef body = assembly->getAsmString();
+          if (body == "mov.u32 $0, %envreg1;" || body == "mov.u32 $0, %envreg2;")
+            reads.push_back(call);
+        }
+  for (auto *read : reads) {
+    const auto *assembly = llvm::cast<llvm::InlineAsm>(read->getCalledOperand());
+    llvm::IRBuilder<> b(read);
+    auto workspace = module->getOrInsertFunction("__cupbop_grid_workspace", b.getPtrTy());
+    llvm::Value *address = b.CreatePtrToInt(b.CreateCall(workspace), b.getInt64Ty());
+    if (llvm::StringRef(assembly->getAsmString()).ends_with("%envreg1;"))
+      address = b.CreateLShr(address, 32);
+    read->replaceAllUsesWith(b.CreateTrunc(address, b.getInt32Ty()));
+    read->eraseFromParent();
+  }
 }

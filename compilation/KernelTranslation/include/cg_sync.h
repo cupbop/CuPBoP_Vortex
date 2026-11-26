@@ -15,4 +15,6 @@ bool isWarpSync(const std::string &FuncNameStr);
 
 bool has_cg_group_sync(llvm::Module *M);
 
+void lower_grid_workspace_registers(llvm::Module *module);
+
 #endif // __CG_SYNC_H__
