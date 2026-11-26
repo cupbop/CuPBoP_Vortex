@@ -60,6 +60,21 @@ if VORTEX_CONFIGS="${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/}" "$translator" s
   exit 1
 fi
 grep -Fq 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' missing.log
+# Explicit dynamically predicated TF32 must also fail with the target disabled.
+cat > pred-tf32.ll <<'IR'
+target triple = "nvptx64-nvidia-cuda"
+define ptx_kernel void @pred_tf32(i32 %dest, i64 %a, i64 %b, i32 %desc, i32 %issue) {
+  call void asm sideeffect "{ .reg .pred p; setp.ne.u32 p, $4, 0; @p tcgen05.mma.cta_group::1.kind::tf32 [$0], $1, $2, $3, p; }", "r,l,l,r,r,~{memory}"(i32 %dest, i64 %a, i64 %b, i32 %desc, i32 %issue)
+  ret void
+}
+IR
+"$llvm_bin/llvm-as" pred-tf32.ll -o pred-tf32.bc
+"$translator" pred-tf32.bc kernel.bc > pred-on.log 2>&1
+if VORTEX_CONFIGS="${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/}" "$translator" pred-tf32.bc bad.bc > pred-off.log 2>&1; then
+  echo 'Predicated TF32 unexpectedly accepted without TF32 hardware' >&2
+  exit 1
+fi
+grep -Fq 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' pred-off.log
 sed 's/i32 1, i32 2, i32 0, i32 0)/i32 1, i32 2, i32 0, i32 3)/' source.ll > collector.ll
 "$llvm_bin/llvm-as" collector.ll -o collector.bc
 if "$translator" collector.bc bad.bc > collector.log 2>&1; then

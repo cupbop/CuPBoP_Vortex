@@ -1004,19 +1004,30 @@ struct AsmLowering {
       }
       return B.CreateAddrSpaceCast(scratch, S.Ptr);
     };
-    if (column && (s.op == "tcgen05.cp.cta_group::1.32x128b.warpx4" ||
-                   s.op == "tcgen05.cp.cta_group::2.32x128b.warpx4" ||
-                   s.op == "tcgen05.cp.cta_group::1.128x128b" ||
-                   s.op == "tcgen05.cp.cta_group::1.128x256b" ||
-                   s.op == "tcgen05.cp.cta_group::2.128x128b" ||
-                   s.op == "tcgen05.cp.cta_group::2.128x256b")) {
+    if (column && s.tok.size() >= 4 && s.tok[0] == "tcgen05" && s.tok[1] == "cp" &&
+        (s.tok[2] == "cta_group::1" || s.tok[2] == "cta_group::2")) {
       if (s.ops.size() != 2) fail("expected TCGEN copy destination and shared descriptor");
+      unsigned end = s.tok.size(), bits = 0;
+      if (end >= 6 && s.tok[end - 2] == "b8x16") {
+        bits = StringSwitch<unsigned>(s.tok[end - 1]).Case("b6x16_p32", 6).Case("b4x16_p64", 4).Default(0);
+        if (!bits) fail("unsupported TCGEN copy source format");
+        end -= 2;
+      }
+      unsigned rowMask = 127, cols = 4;
+      if (end == 4 && s.tok[3] == "128x256b") cols = 8;
+      else if (end == 5 && s.tok[3] == "32x128b" && s.tok[4] == "warpx4") rowMask = 31;
+      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::01_23") rowMask = 63;
+      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::02_13") rowMask = 95;
+      else if (end != 4 || s.tok[3] != "128x128b") fail("unsupported TCGEN column copy shape");
       underPred(pred, [&]() -> Value * {
-        if (s.has("warpx4"))
-          return S.call(B, "__cupbop_column_cp_warpx4", S.Void,
-                        {taddr(s.ops[0]), val(s.ops[1], S.I64), B.getInt32(pair), columnScratch()});
+        Value *col = taddr(s.ops[0]), *desc = val(s.ops[1], S.I64);
+        if (bits || (rowMask != 127 && rowMask != 31))
+          return S.call(B, "__cupbop_column_cp_layout", S.Void,
+                        {col, desc, B.getInt32(pair), B.getInt32(cols), B.getInt32(rowMask), B.getInt32(bits), columnScratch()});
+        if (rowMask == 31)
+          return S.call(B, "__cupbop_column_cp_warpx4", S.Void, {col, desc, B.getInt32(pair), columnScratch()});
         return S.call(B, pair ? "__cupbop_column_pair_cp" : "__cupbop_column_cp", S.Void,
-                      {taddr(s.ops[0]), val(s.ops[1], S.I64), B.getInt32(s.has("128x128b") ? 4 : 8), columnScratch()});
+                      {col, desc, B.getInt32(cols), columnScratch()});
       });
       return;
     }
@@ -1110,15 +1121,16 @@ struct AsmLowering {
         s.op == "tcgen05.dealloc.cta_group::1.sync.aligned.b32" ||
         s.op == "tcgen05.dealloc.cta_group::2.sync.aligned.b32") {
       if (pred || s.ops.size() != 2) fail("unsupported predicated or malformed TCGEN allocation");
-      auto *cols = dyn_cast<ConstantInt>(val(s.ops[1], S.I32));
+      Value *count = val(s.ops[1], S.I32);
+      auto *cols = dyn_cast<ConstantInt>(count);
       if (column) {
         if (schedule() != 2) fail("column TMEM allocations require direct CTA dispatch");
-        if (!cols || cols->getLimitedValue() < 32 || cols->getLimitedValue() > 512 ||
-            !cols->getValue().isPowerOf2()) fail("expected 32 to 512 power-of-two TMEM columns");
+        if (cols && (cols->getLimitedValue() < 32 || cols->getLimitedValue() > 512 ||
+                     !cols->getValue().isPowerOf2())) fail("expected 32 to 512 power-of-two TMEM columns");
         bool alloc = s.tok[1] == "alloc";
         if (alloc) S.call(B, pair ? "__cupbop_column_pair_alloc" : "__cupbop_column_alloc", S.Void,
-                          {addr(s.ops[0], "TMEM allocation result"), cols});
-        else S.call(B, pair ? "__cupbop_column_pair_free" : "__cupbop_column_free", S.Void, {val(s.ops[0], S.I32), cols});
+                          {addr(s.ops[0], "TMEM allocation result"), count});
+        else S.call(B, pair ? "__cupbop_column_pair_free" : "__cupbop_column_free", S.Void, {val(s.ops[0], S.I32), count});
         return;
       }
       if (!cols || cols->getZExtValue() != 512) fail("only full 512-column TMEM allocations are supported");
@@ -1174,8 +1186,20 @@ struct AsmLowering {
     bool half = s.op == mma + "f16";
     bool fp8 = s.op == mma + "f8f6f4";
     bool tf32 = s.op == mma + "tf32";
-    if (tf32 && !pred && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE"))
-      fail("TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE");
+    if (tf32 && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE")) {
+      // UTCHMMA has one SASS opcode for both half and TF32. CuLifter
+      // dispatches from its runtime descriptor when the type is unknown.
+      // Reject explicit TF32 at translation; trap only the TF32 arm of
+      // the lifted dispatch so a selected half opcode can still execute.
+      bool dispatch = pred && isCuLifterFunction(F) && llvm::any_of(st, [](const Stmt &other) {
+        return other.has("mma") && other.has("kind::f16");
+      });
+      if (!dispatch) fail("TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE");
+      underPred(pred, [&]() -> Value * {
+        return B.CreateCall(Intrinsic::getOrInsertDeclaration(S.M, Intrinsic::trap));
+      });
+      return;
+    }
     if ((column && (half || fp8 || tf32)) || (s.op == mma + "i8" && (column || !sparse))) {
       unsigned idesc = sparse ? 4 : 3;
       if (s.ops.size() != idesc + 2 || s.ops[1].empty())

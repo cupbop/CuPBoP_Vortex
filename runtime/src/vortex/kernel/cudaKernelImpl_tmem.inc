@@ -182,11 +182,19 @@ static void column_sparse_release(unsigned base) { column_deallocate(base, 32, t
 static unsigned column_allocate(unsigned count) { return vortex::tmem::alloc(count); }
 static void column_deallocate(unsigned base, unsigned count) { vortex::tmem::dealloc(base, count); }
 #endif
+static void column_check_size(unsigned cols) {
+  if (cols < 32 || cols > 512 || (cols & (cols - 1)))
+    cupbop_async_fail("expected 32 to 512 power-of-two TMEM columns", cols, 0);
+}
 extern "C" void __cupbop_column_alloc(uint32_t *dst, uint32_t cols) {
+  column_check_size(cols);
   if (cols * cupbop_column_ratio > VX_CFG_TCU_TMEM_COLS) cupbop_async_fail("TMEM allocation exceeds core capacity", cols, VX_CFG_TCU_TMEM_COLS);
   if (vx_thread_id() == 0) *dst = column_allocate(cols * cupbop_column_ratio) / cupbop_column_ratio;
 }
 extern "C" void __cupbop_column_free(uint32_t col, uint32_t cols) {
+  column_check_size(cols);
+  if (col % cols || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / cupbop_column_ratio)
+    cupbop_async_fail("invalid TMEM deallocation range", col, cols);
   if (vx_thread_id() == 0) column_deallocate(col * cupbop_column_ratio, cols * cupbop_column_ratio);
 }
 #else
@@ -264,6 +272,7 @@ static volatile ColumnPairRun &pairRun(unsigned side) {
   return pairRuns[vx_core_id()][slot];
 }
 extern "C" void __cupbop_column_pair_alloc(unsigned *dst, unsigned cols) {
+  column_check_size(cols);
   if (!vx_thread_id()) {
     if (__cupbop_cluster_register(1,0) != 2 || cols * 4 > VX_CFG_TCU_TMEM_COLS)
       cupbop_async_fail("paired runs exceed resident core capacity", cols, VX_CFG_TCU_TMEM_COLS);
@@ -277,6 +286,7 @@ extern "C" void __cupbop_column_pair_alloc(unsigned *dst, unsigned cols) {
   }
 }
 extern "C" void __cupbop_column_pair_free(unsigned addr, unsigned cols) {
+  column_check_size(cols);
   if (!vx_thread_id()) {
     auto &run = pairRun(cluster_rank() & 1);
     if (addr != columnPairTag || run.size != cols)
@@ -751,7 +761,8 @@ extern "C" void __cupbop_column_pair_mma_ts_sp(unsigned addr, uint64_t a, uint64
 
 #include "cudaKernelImpl_column_mx.inc"
 
-static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch, unsigned sourceRows = 128) {
+static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *scratch,
+                        unsigned rowMask = 127, unsigned bits = 0) {
   ColumnAccess access;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || vx_thread_id() || col % 4 || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
@@ -764,7 +775,23 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
       auto *stage = scratch + (2 * group + half) * 1024;
       for (unsigned row = 0; row < 64; ++row) {
         unsigned logical = (row / 16) * 32 + half * 16 + row % 16;
-        __builtin_memcpy(stage + row * 16, tcgen_chunk(src, logical % sourceRows, group), 16);
+        // warpx2::02_13 broadcasts the first 32 rows to warps 0/1 and the next 32 to 2/3.
+        unsigned sourceRow = rowMask == 95 ? (logical & 31) + ((logical & 64) >> 1) : logical & rowMask;
+        const auto *packed = reinterpret_cast<const uint8_t *>(tcgen_chunk(src, sourceRow, group));
+        uint8_t *out = stage + row * 16;
+        if (bits == 4) {
+          for (unsigned j = 0; j < 8; ++j) {
+            out[2 * j] = (packed[j] & 15) << 2;
+            out[2 * j + 1] = (packed[j] >> 4) << 2;
+          }
+        } else if (bits == 6) {
+          for (unsigned j = 0; j < 4; ++j) {
+            unsigned v = packed[3*j] | (packed[3*j+1] << 8) | (packed[3*j+2] << 16);
+            for (unsigned k = 0; k < 4; ++k) out[4*j+k] = (v >> (6*k)) & 63;
+          }
+        } else {
+          __builtin_memcpy(out, packed, 16);
+        }
         if (__cupbop_column_meta_table) {
           for (unsigned j = 0; j < 4; ++j) {
             uint32_t word;
@@ -786,7 +813,8 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
 extern "C" void __cupbop_column_cp(unsigned col, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
   column_copy(col, tcgen_operand(descriptor), cols, scratch);
 }
-static void column_pair_copy(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch, unsigned sourceRows) {
+static void column_pair_copy(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch,
+                             unsigned rowMask, unsigned bits = 0) {
   unsigned offset = addr - columnPairTag;
   for (unsigned side = 0; side < 2; ++side) {
     auto &run = pairRun(side);
@@ -794,15 +822,20 @@ static void column_pair_copy(unsigned addr, uint64_t descriptor, unsigned cols, 
       cupbop_async_fail("paired copy outside allocation", addr, cols);
     auto src = tcgen_operand(descriptor);
     src.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(src.start), side));
-    column_copy(run.base + offset, src, cols, scratch, sourceRows);
+    column_copy(run.base + offset, src, cols, scratch, rowMask, bits);
   }
 }
 extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
-  column_pair_copy(addr, descriptor, cols, scratch, 128);
+  column_pair_copy(addr, descriptor, cols, scratch, 127);
 }
 extern "C" void __cupbop_column_cp_warpx4(unsigned addr, uint64_t descriptor, unsigned pair, uint8_t *scratch) {
-  if (pair) column_pair_copy(addr, descriptor, 4, scratch, 32);
-  else column_copy(addr, tcgen_operand(descriptor), 4, scratch, 32);
+  if (pair) column_pair_copy(addr, descriptor, 4, scratch, 31);
+  else column_copy(addr, tcgen_operand(descriptor), 4, scratch, 31);
+}
+extern "C" void __cupbop_column_cp_layout(unsigned addr, uint64_t descriptor, unsigned pair, unsigned cols,
+                                         unsigned rowMask, unsigned bits, uint8_t *scratch) {
+  if (pair) column_pair_copy(addr, descriptor, cols, scratch, rowMask, bits);
+  else column_copy(addr, tcgen_operand(descriptor), cols, scratch, rowMask, bits);
 }
 static unsigned column_transfer(unsigned addr, unsigned displacement, unsigned count) {
   unsigned col = (addr & 0xffff) + displacement;

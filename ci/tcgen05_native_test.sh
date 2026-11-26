@@ -54,6 +54,7 @@ run_case tcgen05_i8 'elements=131072 mismatches=0' 0 1
 run_case tcgen05_tma_mma 'elements=32768 mismatches=0' ''
 run_case tcgen05_i8_pair 'PASSED!: 131072/131072 INT32 results match' ''
 if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
+  expected_launches=2 run_case tcgen05_copy_formats 'TMEM compressed copy: 0 mismatches in 6144 words' ''
   run_case tcgen05_pack 'TMEM single column and pack: 0 mismatches in 7296 values' ''
   # The column backend needs two physical columns per CUDA column. The
   # M256 N32 example fits both CTA runs and the sparse metadata workspace.
