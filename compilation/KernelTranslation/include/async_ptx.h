@@ -26,8 +26,8 @@ void check_lifted_column_tmem(llvm::Module *M);
 //   cp.async.mbarrier.arrive[.noinc]    -> nothing (net zero with synchronous cp.async) / a thread arrival
 //   cp.async.bulk.tensor.Nd (load, store), cp.async.bulk (g2s, s2s, s2g)
 //                                       -> __cupbop_tma_load / __cupbop_tma_store / __cupbop_bulk_copy
-//   commit_group / wait_group[.read], prefetch, fence.proxy.*, fence.mbarrier_init, setmaxnreg,
-//     griddepcontrol, barrier.cluster.arrive  -> nothing;  barrier.cluster.wait -> llvm.nvvm.barrier0
+//   proxy, mbarrier-init and grid dependency ordering -> target memory fences
+//   data/tensormap prefetch -> llvm.prefetch; register budgets use Vortex static registers
 //   elect.sync, activemask, mov/setp/selp, %cluster_ctarank (0), %cluster_nctarank (1), mapa (identity, a
 //     rank other than 0 traps), cvta.param (the CuLifter param image)
 // An arrive that is followed, in the same thread and before any wait, by bulk / TMA copies completing on an

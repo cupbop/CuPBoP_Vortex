@@ -62,6 +62,34 @@ bool tensorMapScope(StringRef scope) {
   return scope == "cta" || scope == "cluster" || scope == "gpu" || scope == "sys";
 }
 
+// Vortex orders all memory spaces with a RISC-V fence. The broader scope
+// also orders aliases and the shared window used by the async engines.
+std::optional<AtomicOrdering> proxyFenceOrder(StringRef op) {
+  return StringSwitch<std::optional<AtomicOrdering>>(op)
+      .Cases("fence.proxy.alias", "membar.proxy.alias", "fence.proxy.async",
+             "fence.proxy.async.global", AtomicOrdering::SequentiallyConsistent)
+      .Cases("fence.proxy.async.shared::cta", "fence.proxy.async.shared::cluster",
+             AtomicOrdering::SequentiallyConsistent)
+      .Cases("fence.acquire.sync_restrict::shared::cluster.cluster",
+             "fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster",
+             "fence.proxy.alias.acquire.sys", AtomicOrdering::Acquire)
+      .Cases("fence.release.sync_restrict::shared::cta.cluster", "fence.mbarrier_init.release.cluster",
+             "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster",
+             "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster",
+             "fence.proxy.alias.release.sys", AtomicOrdering::Release)
+      .Default(std::nullopt);
+}
+
+void prefetch(IRBuilder<> &B, Value *ptr, unsigned locality) {
+  B.CreateIntrinsic(Intrinsic::prefetch, {ptr->getType()},
+                    {ptr, B.getInt32(0), B.getInt32(locality), B.getInt32(1)});
+}
+
+bool validRegisterBudget(const ConstantInt *budget) {
+  return budget && budget->getValue().uge(24) && budget->getValue().ule(256) &&
+         budget->getZExtValue() % 8 == 0;
+}
+
 std::string str(const Value *V) {
   std::string s;
   raw_string_ostream os(s);
@@ -254,7 +282,7 @@ bool ownedOp(const Stmt &s) {
   auto sw = [&](const char *p) { return o.rfind(p, 0) == 0; };
   if (sw("clusterlaunchcontrol.") || sw("tcgen05.") || sw("mbarrier.") || sw("cp.async.bulk") ||
       sw("cp.reduce.async.bulk") || sw("cp.async.mbarrier.arrive") || sw("elect.sync") || sw("fence.mbarrier_init") ||
-      sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.tensormap") ||
+      sw("ld.shared::cluster.") || sw("st.shared::cluster.") || sw("st.async.") || sw("getctarank") || sw("isspacep.shared::cluster") || sw("mapa") || sw("barrier.cluster.") || sw("setmaxnreg.") || sw("griddepcontrol.") || sw("prefetch.") || sw("prefetchu.") || sw("membar.proxy.") ||
       sw("cvta.param") || sw("multimem.") || sw("tensormap.") || sw("fence.proxy."))
     return true;
   if (isCtaAtomic(s) || o == "fence.sc.cta")
@@ -270,7 +298,8 @@ bool ownedOp(const Stmt &s) {
 bool mentionsAsyncText(const std::string &s) {
   for (const char *k :
        {"clusterlaunchcontrol.", "tcgen05.", "mbarrier", "cp.async.bulk", "cp.reduce.async.bulk", "elect.sync", "mapa",
-        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param", "fence.proxy.", "fence.mbarrier_init"})
+        "barrier.cluster", "%cluster_", "setmaxnreg", "griddepcontrol", "tensormap", "cvta.param", "fence.proxy.", "fence.mbarrier_init",
+        "membar.proxy.", "sync_restrict::", "prefetch.", "prefetchu."})
     if (s.find(k) != std::string::npos) return true;
   return false;
 }
@@ -342,6 +371,8 @@ Value *toPointer(IRBuilder<> &B, PassState &S, Value *V, Instruction *at, const 
     if (P->getType()->getPointerAddressSpace() != 0) P = B.CreateAddrSpaceCast(P, S.Ptr, "async_gen");
     return P;
   }
+  if (V->getType()->isIntegerTy(32) && StringRef(what) == "prefetch")
+    return B.CreateIntToPtr(V, S.Ptr, "prefetch_addr"); // a non-faulting address hint
   if (V->getType()->isIntegerTy(64)) return B.CreateIntToPtr(V, S.Ptr, "async_i2p"); // flat memory
   if (V->getType()->isIntegerTy(32) && (StringRef(what).contains("shared") || StringRef(what).contains("barrier")))
     return S.call(B,"__cupbop_cluster_shared_ptr",S.Ptr,{V});
@@ -882,21 +913,51 @@ struct AsmLowering {
       return;
     }
     // --- fences and hints
-    if (sw("fence.proxy.") || sw("fence.mbarrier_init")) {
-      const bool init = o == "fence.mbarrier_init.release.cluster";
-      if (!s.ops.empty() || !(init || o == "fence.proxy.async" || o == "fence.proxy.async.global" ||
-                             o == "fence.proxy.async.shared::cta" || o == "fence.proxy.async.shared::cluster"))
-        fail("unsupported proxy or mbarrier initialization fence: " + s.text);
+    if (auto order = proxyFenceOrder(o)) {
+      nops(0, 0);
+      underPred(pred, [&]() -> Value * { return B.CreateFence(*order); });
+      return;
+    }
+    if (sw("fence.proxy.") || sw("membar.proxy.") || sw("fence.mbarrier_init") ||
+        o.find("sync_restrict") != std::string::npos)
+      fail("unsupported proxy or restricted fence: " + s.text);
+    if (sw("setmaxnreg.")) {
+      nops(1, 1);
+      if ((o != "setmaxnreg.inc.sync.aligned.u32" && o != "setmaxnreg.dec.sync.aligned.u32") ||
+          !validRegisterBudget(dyn_cast<ConstantInt>(val(s.ops[0], S.I32))))
+        fail("setmaxnreg requires inc/dec.sync.aligned.u32 and an immediate multiple of 8 in [24,256]");
+      // The Vortex register file has a fixed allocation per warp.
+      return;
+    }
+    if (sw("griddepcontrol.")) {
+      nops(0, 0);
+      if (o != "griddepcontrol.wait" && o != "griddepcontrol.launch_dependents")
+        fail("unsupported grid dependency control: " + s.text);
+      // CuPBoP waits for the kernel completion event at each host launch.
+      // Device fences preserve publication/consumption at the original site.
       underPred(pred, [&]() -> Value * {
-        // Order the issuing thread's accesses before DXA/TCU can consume the data.
-        return B.CreateFence(init ? AtomicOrdering::Release : AtomicOrdering::SequentiallyConsistent);
+        return B.CreateFence(o == "griddepcontrol.wait" ? AtomicOrdering::Acquire : AtomicOrdering::Release);
       });
       return;
     }
-    if (sw("setmaxnreg.") || sw("griddepcontrol.") ||
-        sw("prefetch.tensormap") || sw("cp.async.bulk.prefetch") || sw("cp.async.bulk.commit_group") ||
-        sw("cp.async.bulk.wait_group")) {
-      return; // synchronous software copies: nothing to order beyond the compiler fence
+    if (sw("prefetch.") || sw("prefetchu.")) {
+      nops(1, 1);
+      underPred(pred, [&]() -> Value * {
+        prefetch(B, addr(s.ops[0], "prefetch"), s.has("L2") || o.find("L2::") != std::string::npos ? 2 : 3);
+        return nullptr;
+      });
+      return;
+    }
+    if (sw("cp.async.bulk.prefetch.L2.global")) {
+      nops(2, 3);
+      underPred(pred, [&]() -> Value * {
+        prefetch(B, addr(s.ops[0], "prefetch"), 2); // hint the first line of this byte range
+        return nullptr;
+      });
+      return;
+    }
+    if (sw("cp.async.bulk.prefetch") || sw("cp.async.bulk.commit_group") || sw("cp.async.bulk.wait_group")) {
+      return; // the software bulk operations complete before the issuer continues
     }
     if (sw("fence.") && o.find(".cluster") != std::string::npos) {
       underPred(pred, [&]() -> Value * {
@@ -1780,10 +1841,32 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     }
     return done(B.CreateFence(acquire ? AtomicOrdering::Acquire : AtomicOrdering::Release));
   }
+  if (n.starts_with("llvm.nvvm.fence.proxy.") || n.starts_with("llvm.nvvm.fence.mbarrier.") ||
+      n.starts_with("llvm.nvvm.fence.mbarrier_init.")) {
+    std::string op = n.drop_front(sizeof("llvm.nvvm.") - 1).str();
+    replaceAll(op, "shared.cta", "shared::cta");
+    replaceAll(op, "shared.cluster", "shared::cluster");
+    replaceAll(op, "mbarrier.init", "mbarrier_init");
+    auto order = proxyFenceOrder(op);
+    if (!order || !C->arg_empty()) fail_at(C, "unsupported named proxy fence: " + n.str());
+    return done(B.CreateFence(*order));
+  }
+  if (n == "llvm.nvvm.griddepcontrol.wait" || n == "llvm.nvvm.griddepcontrol.launch.dependents") {
+    return done(B.CreateFence(n.ends_with(".wait") ? AtomicOrdering::Acquire : AtomicOrdering::Release));
+  }
+  if (n.starts_with("llvm.nvvm.setmaxnreg.")) {
+    if ((n != "llvm.nvvm.setmaxnreg.inc.sync.aligned.u32" && n != "llvm.nvvm.setmaxnreg.dec.sync.aligned.u32") ||
+        C->arg_size() != 1 || !validRegisterBudget(dyn_cast<ConstantInt>(C->getArgOperand(0))))
+      fail_at(C, "setmaxnreg requires inc/dec.sync.aligned.u32 and an immediate multiple of 8 in [24,256]");
+    return done(nullptr);
+  }
+  if (n.starts_with("llvm.nvvm.prefetch.tensormap") || n.starts_with("llvm.nvvm.cp.async.bulk.prefetch.L2")) {
+    if (C->arg_empty()) fail_at(C, "prefetch requires an address");
+    prefetch(B, P(0), 2);
+    return done(nullptr);
+  }
   if (n == "llvm.nvvm.cp.async.bulk.commit.group" || n.starts_with("llvm.nvvm.cp.async.bulk.wait.group") ||
-      n.starts_with("llvm.nvvm.cp.async.bulk.prefetch") || n.starts_with("llvm.nvvm.cp.async.bulk.tensor.prefetch") ||
-      n.starts_with("llvm.nvvm.fence.proxy") || n.starts_with("llvm.nvvm.setmaxnreg") ||
-      n.starts_with("llvm.nvvm.griddepcontrol") || n.starts_with("llvm.nvvm.prefetch.tensormap")) {
+      n.starts_with("llvm.nvvm.cp.async.bulk.tensor.prefetch")) {
     B.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
     return done(nullptr);
   }
