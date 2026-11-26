@@ -10,6 +10,8 @@
 # Transformations (where each one acts): CUPBOP_DIV_RESTORE hotspot strsm; CUPBOP_SQRT_RESTORE nn (needs MUFU: rsqrt is lowered earlier without it); CUPBOP_ADDR_CARRY hotspot nn backprop addr (addr is written by hand; raw: lo-pair takes
 # them first; addr: negative index, 2^32); CUPBOP_PARAM_SPAN conv3 transpose (height and width differ, conv3 is square: a swapped pair shows only in transpose); CUPBOP_TRIP_HOIST conv3; CUPBOP_TRIP_VERSION saxpy nn; lo-pair every pre; p2c-fold hgemm g32 fprop; lo-mma hgemm g32 fprop; CUPBOP_PARAM_DYN fprop
 # --- SIMT kernels, host programs of the source examples
+dsm_peer        lifted_dsm_peer   s2 main raw PASS - -
+dsm_atomic      lifted_dsm_atomic s2 main raw PASS - -
 ampere_groups   lift_ampere_cp_async s2 main raw PASS - 3~commit_group,1~wait_group
 sx_raw_s2       lift_saxpy    s2   main raw PASS a -                                              %RAW
 sx_raw_s1p1     lift_saxpy    s1p1 main raw PASS a -                                              %RAW

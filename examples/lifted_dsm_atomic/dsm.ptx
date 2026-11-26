@@ -1,0 +1,37 @@
+.version 8.0
+.target sm_90
+.address_size 64
+.visible .entry dsm(.param .u64 output) {
+.reg .b32 own,peer,cta,v,got,stored,addr,mapped,r;
+.reg .b64 base,dst,gen,addr64;
+.reg .b32 old,now,inc;
+.shared .align 8 .b32 tile[4];
+mov.u32 own,%cluster_ctarank;
+mov.u32 cta,%ctaid.x;
+mov.u32 addr,tile;
+add.u32 v,cta,40;
+st.shared.u32 [addr],v;
+mov.u32 inc,0;
+st.shared.u32 [addr+4],inc;
+barrier.cluster.arrive.aligned;
+barrier.cluster.wait.aligned;
+xor.b32 peer,own,1;
+mapa.shared::cluster.u32 mapped,addr,peer;
+cvt.u64.u32 gen,mapped;
+cvta.shared::cluster.u64 gen,gen;
+add.u64 gen,gen,4;
+st.volatile.shared.b64 [tile+8],gen;
+ld.volatile.shared.b64 addr64,[tile+8];
+atom.add.u32 old,[addr64],v;
+red.add.u32 [addr64],1;
+ld.shared::cluster.u32 got,[mapped];
+add.u32 got,got,old;
+barrier.cluster.arrive.aligned;
+barrier.cluster.wait.aligned;
+ld.shared.u32 stored,[addr+4];
+ld.param.u64 base,[output];
+mul.wide.u32 dst,cta,8;
+add.u64 dst,dst,base;
+st.global.v2.u32 [dst],{got,stored};
+ret;
+}

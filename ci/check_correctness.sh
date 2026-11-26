@@ -68,7 +68,7 @@ case $TEST_NAME in
     check_golden "${EXAMPLE_DIR}/golden_output.txt" "$CI_OUTPUT"; check_bits ;;
   lift_hotspot)
     check_golden "${EXAMPLE_DIR}/golden_output_hotspot.txt" "${EXAMPLE_DIR}/output.out"; check_bits ;;
-  lift_*)
+  lifted_dsm_peer|lifted_dsm_atomic|lift_*)
     check_marker "PASSED"; check_bits ;;
   *)
     RESULT="SKIP"; WHY="no correctness check defined for $TEST_NAME" ;;
