@@ -77,6 +77,7 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
   fi
   for input in cuda129 raw; do
     replay_input=$input run_case lifted_tcgen05_ashift '0/5120 mismatches' ''
+    replay_input=$input run_case lifted_tcgen05_ashift_pair '0/18432 mismatches' ''
   done
   if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_READBACK_ENABLE "* ]]; then
     run_case tcgen05_mma_metadata 'format=4a4 mismatches=0/2048' ''
