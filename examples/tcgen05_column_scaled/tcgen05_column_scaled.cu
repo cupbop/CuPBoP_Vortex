@@ -244,6 +244,9 @@ template <Case C> __global__ void column_scaled(const unsigned *input, unsigned 
 
 static unsigned width(unsigned t) { return t <= 1 ? 8 : t == 5 ? 4 : 6; }
 template <Case C> static unsigned raw(unsigned row, unsigned k, unsigned type, bool b) {
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+  if (C == SP_E5_E4 && b && k == 0 && row % 2 == 0) return 0x7f;
+#endif
   unsigned v = row * (b ? 5 : 7) + k * (b ? 3 : 5) + k / 3 + row / 5 + int(b);
   if (C >= E5_E4) {
     // Exercise odd significands, both range limits and signed subnormals.
@@ -399,7 +402,9 @@ int main() {
   unsigned *in, *out;
   ASYNC_CHECK(cudaMalloc(&in, words * 4));
   ASYNC_CHECK(cudaMalloc(&out, M * resultStride * 4));
-#ifdef CUPBOP_TEST_FULL_MX
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+  int failed = check<SP_E5_E4>(in, out);
+#elif defined(CUPBOP_TEST_FULL_MX)
   int failed = check<MX_F6>(in, out) | check<MX_BF8>(in, out);
 #elif defined(CUPBOP_TEST_MIXED_MX)
   int failed = check<E5_E4>(in, out) | check<E4_E5>(in, out) | check<E5_E2>(in, out) |

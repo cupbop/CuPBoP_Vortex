@@ -1286,7 +1286,10 @@ static uint32_t cupbop_static_lmem_bytes(const std::string &func_stripped) {
     std::ifstream f("kernel_lmem.log");
     std::string name; uint32_t bytes;
     while (f >> name >> bytes) {
-      std::string k = cupbop_strip_prefix(name);
+      constexpr char align_prefix[] = "__cupbop_lmem_align.";
+      bool alignment = name.compare(0, sizeof(align_prefix) - 1, align_prefix) == 0;
+      std::string k = alignment ? align_prefix + cupbop_strip_prefix(name.substr(sizeof(align_prefix) - 1))
+                                : cupbop_strip_prefix(name);
       if (table[k] < bytes) table[k] = bytes;
     }
   }
@@ -1387,7 +1390,7 @@ static const CupbopLmemStackInfo &cupbop_lmem_stack_info() {
   return info;
 }
 static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::string &name, const uint32_t block[3],
-                              uint64_t cuda_block_threads, uint32_t &lmem) {
+                              uint64_t cuda_block_threads, uint32_t &lmem, uint64_t slot_alignment) {
   const CupbopLmemStackInfo &info = cupbop_lmem_stack_info();
   if (!info.loaded) return;
   int mode = info.mode;
@@ -1423,7 +1426,7 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   const uint64_t need = (chain + dyn + margin + 16 + 15) & ~15ull;
   char buf[512];
   if (mode == 2 && chain == 0 && dyn == 0) { log("hardware stack (auto: the kernel uses no stack)"); return; }
-  const uint64_t A = ((uint64_t)lmem + 63) & ~63ull;
+  const uint64_t A = (uint64_t(lmem) + slot_alignment - 1) & ~(slot_alignment - 1);
   if (A > cap) return;
   const uint64_t slots0 = A ? std::min<uint64_t>(NWhw, cap / A) : NWhw;
   const uint64_t R0 = std::min<uint64_t>(slots0, effNW / cta_warps);
@@ -1474,13 +1477,13 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
   }
   uint64_t R = 0, st = 0;
   for (uint64_t r = R0; try_cta && r >= (occ ? 1 : R0) && r >= 1; --r) {
-    const uint64_t smax = (cap / r) & ~63ull;
+    const uint64_t smax = (cap / r) & ~(slot_alignment - 1);
     if (smax <= A) continue;
     const uint64_t most = down((smax - A) / n), least = up(need);
     if (most >= least) { R = r; st = fill ? most : least; break; }
   }
   if (!R) {
-    const uint64_t smax = (cap / R0) & ~63ull;
+    const uint64_t smax = (cap / R0) & ~(slot_alignment - 1);
     const uint64_t corefree = cap > (A ? slots0 * A : 0) ? down((cap - (A ? slots0 * A : 0)) / (effNW * T)) : 0;
     snprintf(buf, sizeof buf, "hardware stack: %lu bytes per thread (chain %lu + dyn %lu + margin %lu + 16) x %lu threads "
              "do not fit next to %lu bytes of shared memory at %lu CTAs per core (%lu bytes per thread there, %lu core-wide)%s",
@@ -1490,7 +1493,7 @@ static void cupbop_stack_lmem(DeviceContext *DC, kernel_arg_t *ka, const std::st
     log(buf);
     return;
   }
-  const uint64_t top = A + n * st, slot = (top + 63) & ~63ull;
+  const uint64_t top = A + n * st, slot = (top + slot_alignment - 1) & ~(slot_alignment - 1);
   ka->ctx.global_offset[0] = (uint32_t)top;
   ka->ctx.global_offset[1] = (uint32_t)st;
   ka->ctx.global_offset[2] = (uint32_t)T;
@@ -2933,7 +2936,18 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
     }
     if (cta_fix.dims && (schedule == 1 || schedule == 2))   // CUPBOP_CTA_LOOP
       cupbop_cta_loop_launch(abuf_ptr, cta_fix.dims, cta_fix.inner, cta_fix.chunk, cta_fix.linear, grid, block, lmem);
-    cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem);   // CUPBOP_STACK_IN_LMEM
+    // Preserve explicit CUDA shared alignment for every resident CTA. The
+    // KMU rounds only to a memory block, including when CUDA adds dynamic bytes.
+#ifdef VX_CFG_MEM_BLOCK_SIZE
+    constexpr uint32_t block_alignment = VX_CFG_MEM_BLOCK_SIZE;
+#else
+    constexpr uint32_t block_alignment = 64;
+#endif
+    uint32_t alignment = std::max(block_alignment, cupbop_static_lmem_bytes("__cupbop_lmem_align." + table_name));
+    uint64_t aligned_lmem = (uint64_t(lmem) + alignment - 1) & ~uint64_t(alignment - 1);
+    if (aligned_lmem > UINT32_MAX) return cudaErrorInvalidConfiguration;
+    if (alignment > block_alignment) lmem = uint32_t(aligned_lmem);
+    cupbop_stack_lmem(DC, abuf_ptr, func_stripped, block, (uint64_t)blockDim.x * blockDim.y * blockDim.z, lmem, alignment);   // CUPBOP_STACK_IN_LMEM
     if (schedule == 1 || schedule == 2) {
       uint64_t lmem_cap = 0;
       if (vx_dev_caps(DC->device(), VX_CAPS_LOCAL_MEM_SIZE, &lmem_cap) == 0 && lmem > lmem_cap) {
@@ -2942,12 +2956,6 @@ static cudaError_t cupbop_launch_kernel(const char *func, dim3 gridDim, dim3 blo
         std::abort();
       }
     }
-    // Match the KMU slot pitch (CtaDispatcher::step).
-#ifdef VX_CFG_MEM_BLOCK_SIZE
-    constexpr uint64_t alignment = VX_CFG_MEM_BLOCK_SIZE;
-#else
-    constexpr uint64_t alignment = 64;
-#endif
     const uint64_t stride = (uint64_t(lmem) + alignment - 1) & ~(alignment - 1);
     const uint64_t threads = uint64_t(blockDim.x) * blockDim.y * blockDim.z;
     const uint32_t lanes = CUPBOP_EFF_NUM_THREADS();

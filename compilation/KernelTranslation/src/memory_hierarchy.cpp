@@ -535,12 +535,12 @@ static void breakConstantExprUses(llvm::Value *V, llvm::Function *F) {
 template <class Items>
 static uint32_t smem_reserve_drop_bytes(llvm::Function &F, const Items &layout,
                                         const llvm::SmallVectorImpl<llvm::GlobalVariable *> &usedDynamic,
-                                        uint32_t staticAligned) {
+                                        uint32_t staticAligned, Align alignment) {
   if (!smem_reserve_drop_enabled()) return 0;
   std::vector<std::pair<llvm::GlobalVariable *, uint32_t>> st;
   for (auto &it : layout) st.push_back({it.GV, it.off});
   std::vector<llvm::GlobalVariable *> dy(usedDynamic.begin(), usedDynamic.end());
-  const uint32_t drop = smem_reserve_drop_for(F, st, dy, staticAligned);
+  const uint32_t drop = alignDown(smem_reserve_drop_for(F, st, dy, staticAligned), alignment.value());
   smem_shrink_log(F, st, dy, drop);   // CUPBOP_SMEM_SHRINK (no-op when off)
   return drop;
 }
@@ -652,6 +652,39 @@ void mem_share2local(llvm::Module *M) {
     }
     if (usedStatic.empty() && usedDynamic.empty()) continue;
 
+    // CUDA shared globals often require stronger alignment than their element
+    // type (e.g. a byte array used through a tensor shared-memory descriptor).
+    auto alignment = [&](GlobalVariable *gv) {
+      return std::max(DL.getABITypeAlign(gv->getValueType()), gv->getAlign().valueOrOne());
+    };
+    struct Item { GlobalVariable *GV; uint32_t off; };
+    SmallVector<Item, 8> layout;
+    Align groupAlign(1), dynAlign(1);
+    uint32_t staticBytes = 0;
+    for (auto *gv : usedStatic) {
+      groupAlign = std::max(groupAlign, alignment(gv));
+      staticBytes = alignTo(staticBytes, alignment(gv));
+      layout.push_back({gv, staticBytes});
+      staticBytes += DL.getTypeAllocSize(gv->getValueType());
+    }
+    for (auto *gv : usedDynamic) dynAlign = std::max(dynAlign, alignment(gv));
+    groupAlign = std::max(groupAlign, dynAlign);
+    const uint32_t staticAligned = alignTo(staticBytes, dynAlign);
+    const uint32_t drop = smem_reserve_drop_bytes(F, layout, usedDynamic, staticAligned, groupAlign);
+    const uint32_t reserved = staticAligned - drop;
+    // Preserve the two-field log format used by older wrappers. The launch
+    // rounds the final CTA slot pitch (including dynamic memory and stacks)
+    // to this alignment, so a DSM byte offset is identical in every member.
+    kernel_lmem_log() << F.getName().str() << " " << reserved << "\n";
+    kernel_lmem_log() << "__cupbop_lmem_align." << F.getName().str() << " " << groupAlign.value() << "\n";
+    kernel_lmem_log().flush();
+    auto allocateGroup = [&](IRBuilder<> &B) -> Value * {
+      Value *size = ConstantInt::get(I32, reserved);
+      if (!usedDynamic.empty() && DynSizeGV)
+        size = B.CreateAdd(size, B.CreateLoad(I32, DynSizeGV), "total_stride");
+      return B.CreateCall(vxAlloc, {size}, "__local_group_i8");
+    };
+
     // --- 0) In the entry block, find the "first vx_barrier" call
     BasicBlock *EntryBB = &F.getEntryBlock();
     CallInst *FirstBarrier = nullptr;
@@ -674,49 +707,7 @@ void mem_share2local(llvm::Module *M) {
       while (EntryIP != EntryBB->end() && isa<AllocaInst>(&*EntryIP)) ++EntryIP;
       IRBuilder<> B(&*EntryIP);
 
-      // static layout
-      struct Item { GlobalVariable* GV; uint32_t off; };
-      SmallVector<Item, 8> layout;
-      uint32_t staticBytes = 0;
-      for (auto *GV : usedStatic) {
-        Type *Ty = GV->getValueType();
-        uint64_t a = DL.getABITypeAlign(Ty).value();
-        staticBytes = alignTo(staticBytes, a);
-        layout.push_back({GV, staticBytes});
-        staticBytes += DL.getTypeAllocSize(Ty);
-      }
-
-      // required alignment for dynamic region
-      uint64_t dynAlign = 1;
-      for (auto *GV : usedDynamic) {
-        auto *AT = cast<ArrayType>(GV->getValueType());
-        dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
-      }
-      uint32_t staticAligned = alignTo(staticBytes, dynAlign);
-      // CUPBOP_SMEM_RESERVE_DROP (smem_reserve.cpp): the proven-untouched prefix of the area (0 when off)
-      const uint32_t drop = smem_reserve_drop_bytes(F, layout, usedDynamic, staticAligned);
-
-      // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
-      // lmem size so generate_wrapper.cpp can emit a kernel_lmem_sizes[] table
-      // and main() can set __vx_lmem_per_cta_bytes before vx_spawn_threads
-      // (which clamps groups_per_core to avoid lmem wraparound).
-      {
-        // Open with default mode (truncate) on first call within this run,
-        // then subsequent writes append via the same stream. Across
-        // re-invocations of the compiler, the static is reinitialized and the
-        // file is truncated fresh.
-        kernel_lmem_log() << F.getName().str() << " " << staticAligned - drop << "\n";
-        kernel_lmem_log().flush();
-      }
-
-      Value *dynBytes = ConstantInt::get(I32, 0);
-      if (!usedDynamic.empty() && DynSizeGV)
-        dynBytes = B.CreateLoad(I32, DynSizeGV, "dyn_bytes");
-
-      Value *stride = B.CreateAdd(ConstantInt::get(I32, staticAligned - drop), dynBytes, "total_stride");
-
-      // base_group = vx_local_alloc(stride)  // ★ internally already applies gid*stride
-      Value *bgrp = B.CreateCall(vxAlloc, {stride}, "__local_group_i8");
+      Value *bgrp = allocateGroup(B);
 
       // replace statics
       DenseMap<GlobalVariable*, Value*> repl;
@@ -794,41 +785,7 @@ void mem_share2local(llvm::Module *M) {
     }
 
     // --- 2) AllocBB: compute static/dynamic sizes → single allocation → store to global
-    struct Item { GlobalVariable* GV; uint32_t off; };
-    SmallVector<Item, 8> layout;
-    uint32_t staticBytes = 0;
-    for (auto *GV : usedStatic) {
-      Type *Ty = GV->getValueType();
-      uint64_t a = DL.getABITypeAlign(Ty).value();
-      staticBytes = alignTo(staticBytes, a);
-      layout.push_back({GV, staticBytes});
-      staticBytes += DL.getTypeAllocSize(Ty);
-    }
-
-    uint64_t dynAlign = 1;
-    for (auto *GV : usedDynamic) {
-      auto *AT = cast<ArrayType>(GV->getValueType());
-      dynAlign = std::max<uint64_t>(dynAlign, DL.getABITypeAlign(AT->getElementType()).value());
-    }
-    uint32_t staticAligned = alignTo(staticBytes, dynAlign);
-    // CUPBOP_SMEM_RESERVE_DROP (smem_reserve.cpp): the proven-untouched prefix of the area (0 when off)
-    const uint32_t drop = smem_reserve_drop_bytes(F, layout, usedDynamic, staticAligned);
-
-    // FIX (huffman SCHE_2 LMEM=1 wrap bug, May 13 2026): log per-kernel static
-    // lmem size. See no-barrier branch above for context.
-    {
-      kernel_lmem_log() << F.getName().str() << " " << staticAligned - drop << "\n";
-      kernel_lmem_log().flush();
-    }
-
-    Value *dynBytes = ConstantInt::get(I32, 0);
-    if (!usedDynamic.empty() && DynSizeGV)
-      dynBytes = IB_Alloc.CreateLoad(I32, DynSizeGV, "dyn_bytes");
-
-    Value *stride = IB_Alloc.CreateAdd(ConstantInt::get(I32, staticAligned - drop), dynBytes, "total_stride");
-
-    // base_group = vx_local_alloc(stride)  // ★ internally already applies gid*stride
-    Value *bgrp = IB_Alloc.CreateCall(vxAlloc, {stride}, "__local_group_i8");
+    Value *bgrp = allocateGroup(IB_Alloc);
     IB_Alloc.CreateStore(bgrp, SharedBaseGV);
     IB_Alloc.CreateBr(ContToBarrierBB);
 

@@ -61,16 +61,19 @@ static bool column_mx_overlaps_a(unsigned p, int a_col) {
 // tc.mma uses an absolute side address. An MX issue needs eight
 // scale columns, independent of the allocator's minimum 32-column run.
 // A borrowed panel is restored from CUDA stores/copies after the last TC job.
-// A native result has no issuer-readable cross-block image, so every live
-// cell in such a panel must have since acquired a current mirror.
+// Prefer current mirrors. If scalar readback is enabled, the issuer can
+// snapshot live native accumulator bits from all four physical blocks.
 static int column_mx_borrow(unsigned dst, unsigned n, bool pair, int a_col) {
   auto &m = __cupbop_column_meta_table()[vx_core_id()];
   const unsigned owner = 1 + csr_read_nv(VX_CSR_CTA_ID);
   const unsigned first = pair ? owner - (cluster_rank() & 1) : owner;
   const unsigned second = pair ? first + 1 : first;
   int overlapping_a = -1;
+#ifdef VX_CFG_TCU_TMEM_READBACK_ENABLE
+  int opaque_panel = -1;
+#endif
   for (unsigned p = 0; p < column_side_limit && p + 8 <= VX_CFG_TCU_TMEM_COLS; p += tmcol::frag_cols()) {
-    bool safe = true;
+    bool safe = true, needs_readback = false;
     for (unsigned j = 0; j < 8 && safe; ++j) {
       unsigned at = p + j, col = column_mx_logical(at), half = at / 16 % 2;
       if ((m.owner[at / 32] != first && m.owner[at / 32] != second) || col - dst < n) {
@@ -81,22 +84,50 @@ static int column_mx_borrow(unsigned dst, unsigned n, bool pair, int a_col) {
       for (unsigned lane = 0; lane < 64; ++lane) {
         unsigned r = lane / 16 * 32 + half * 16 + lane % 16;
         if (m.words[col][r].generation != m.generation[col]) {
-          safe = false;
+          needs_readback = true;
           break;
         }
       }
     }
     if (!safe) continue;
+    if (needs_readback) {
+#ifdef VX_CFG_TCU_TMEM_READBACK_ENABLE
+      if (opaque_panel < 0 || column_mx_overlaps_a(unsigned(opaque_panel), a_col))
+        opaque_panel = int(p);
+#endif
+      continue;
+    }
     if (!column_mx_overlaps_a(p, a_col)) return int(p);
     overlapping_a = int(p);
   }
+#ifdef VX_CFG_TCU_TMEM_READBACK_ENABLE
+  // Prefer an already mirrored panel. Capture only the chosen opaque
+  // panel and, if it aliases a converted operand A, its original words.
+  if (overlapping_a < 0 && opaque_panel >= 0) {
+    for (unsigned j = 0; j < 8; ++j) {
+      unsigned physical = unsigned(opaque_panel) + j, col = column_mx_logical(physical);
+      if (m.native_result[col])
+        for (unsigned lane = 0; lane < 64; ++lane)
+          column_meta_word(col, lane / 16 * 32 + (physical / 16 % 2) * 16 + lane % 16);
+    }
+    if (!column_mx_overlaps_a(unsigned(opaque_panel), a_col)) return opaque_panel;
+    overlapping_a = opaque_panel;
+  }
+#endif
   if (overlapping_a >= 0) {
     // An overlapping A is routed through shared memory for both panels.
     // Reject an opaque A before issuing a copy that changes its live bits.
     for (unsigned j = 0; j < 8; ++j)
       for (unsigned row = 0; row < 128; ++row)
-        if (m.words[a_col + j][row].generation != m.generation[a_col + j])
+        if (m.words[a_col + j][row].generation != m.generation[a_col + j]) {
+#ifdef VX_CFG_TCU_TMEM_READBACK_ENABLE
+          if (m.native_result[a_col + j]) {
+            column_meta_word(a_col + j, row);
+            continue;
+          }
+#endif
           return -1;
+        }
   }
   return overlapping_a;
 }
@@ -312,9 +343,6 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
               if (x >= step)
                 continue;
               unsigned v = column_mx_element<Input>(src, row, k0 + x, desc, true, elem & 1);
-              if (sparse && Input::bits == 8 &&
-                  (Input::id == tensor::mxbf8::id ? ((v & 124) == 124) : ((v & 127) == 127)))
-                cupbop_async_fail("expanded sparse MX MMA requires finite B", out, k0 + x);
               byte |= v << (f * Input::bits);
             }
             bstage[j * stepBytes + i] = byte;
@@ -343,6 +371,28 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
   } else if (borrowed)
     column_mx_restore(workspace, image, warp);
   column_meta_invalidate(col, n);
+}
+
+static float column_mx_float(const TcgenOperand &src, unsigned row, unsigned k, unsigned desc,
+                             bool is_b, bool compact, int a_col) {
+  if (compact) {
+    unsigned raw = column_mx_element<tensor::mxfp4>(src, row, k, desc, is_b, false, a_col);
+    return __cupbop_e4m3_to_f32(column_low_to_e4m3(raw, 5));
+  }
+  unsigned type = desc >> (is_b ? 10 : 7) & 7;
+  unsigned raw = a_col >= 0 ? column_tmem_small_float(a_col, row, k, type)
+                            : column_small_float(src, row, k, type, desc & (1u << (15 + is_b)));
+  if (type > 1) raw = column_low_to_e4m3(raw, type);
+  raw ^= ((desc >> (13 + is_b)) & 1) << 7;
+  return type == 1 ? __cupbop_f16_to_f32(raw << 8) : __cupbop_e4m3_to_f32(raw);
+}
+
+static float column_mx_scale(unsigned addr, unsigned row, unsigned sel, bool e8) {
+  unsigned byte = column_scale_byte(addr, row, sel);
+  if (!e8) return __cupbop_e4m3_to_f32(byte);
+  // UE8M0 code zero represents 2^-127, and 255 is NaN.
+  unsigned bits = byte == 0 ? 0x00400000u : byte == 255 ? 0x7fc00000u : byte << 23;
+  return __builtin_bit_cast(float, bits);
 }
 
 extern "C" void __cupbop_column_mma_mx(unsigned addr, uint64_t ad, uint64_t bd, unsigned desc,
@@ -392,8 +442,29 @@ extern "C" void __cupbop_column_mma_mx(unsigned addr, uint64_t ad, uint64_t bd, 
     }
     const bool borrowed = allocated < 0;
     int workspace = borrowed ? column_mx_borrow(col, n, pair, aCol) : allocated;
-    if (workspace < 0)
-      cupbop_async_fail("no restorable caller-owned MX scale panel outside the destination", col, n);
+    bool sparse = desc & 4, compact = vec != 1;
+    unsigned ksize = (compact ? 64 : 32) * (sparse ? 2 : 1);
+    auto read_b = [&](unsigned j, unsigned k) {
+      auto &src = pair && j >= n / 2 ? peer_b : b;
+      return column_mx_float(src, pair ? j % (n / 2) : j, k, desc, true, compact, -1);
+    };
+    auto scale = [&](bool is_b, unsigned row, unsigned k) {
+      unsigned sf = ((desc >> (is_b ? 4 : 29)) & 3) + k / (ksize / vec);
+      return column_mx_scale(is_b ? sb : sa, row, sf, desc & (1u << 23));
+    };
+    auto scaled_b = [&](unsigned j, unsigned k) { return read_b(j, k) * scale(true, j, k); };
+    bool scalar = workspace < 0;
+    if (sparse && !compact)
+      for (unsigned j = 0; j < n && !scalar; ++j)
+        for (unsigned k = 0; k < ksize && !scalar; ++k) scalar = !__builtin_isfinite(scaled_b(j, k));
+    if (scalar) {
+      auto scaled_a = [&](unsigned row, unsigned stored, unsigned k) {
+        return column_mx_float(a, row, stored, desc, false, compact, aCol) * scale(false, row, k);
+      };
+      column_scalar_dot(col, n, ksize, compact ? 2 : 1, sparse, metadata, 0x20000, use_d, warp,
+                        scratch + warp * (128 + 256) * 32, scaled_a, scaled_b);
+      continue;
+    }
 #define MX_TILE(T)                                                                                     \
   column_mx_tile<tensor::T>(col, a, b, peer_b, pair, desc, sa, sb, use_d, scratch, vec, metadata,      \
                             workspace, aCol, borrowed)

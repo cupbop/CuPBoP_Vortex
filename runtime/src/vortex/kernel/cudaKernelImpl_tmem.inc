@@ -32,6 +32,8 @@ struct ColumnMeta {
   uint32_t lock, allocated;
 #ifdef VX_CFG_TCU_MX_ENABLE
   uint32_t access_lock, owner[VX_CFG_TCU_TMEM_COLS / 32];
+#endif
+#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_TMEM_READBACK_ENABLE)
   uint8_t native_result[VX_CFG_TCU_TMEM_COLS / 2];
 #endif
   uint32_t generation[VX_CFG_TCU_TMEM_COLS / 2];
@@ -49,7 +51,7 @@ static void column_meta_invalidate(unsigned col, unsigned count, bool native_res
   if (!__cupbop_column_meta_table) return;
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
   for (unsigned i = col; i < col + count; ++i) {
-#ifdef VX_CFG_TCU_MX_ENABLE
+#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_TMEM_READBACK_ENABLE)
     meta.native_result[i] = native_result;
 #endif
     if (++meta.generation[i] == 0) {
@@ -68,7 +70,14 @@ static uint32_t column_meta_word(unsigned col, unsigned row) {
   if (row >= 128 || col >= VX_CFG_TCU_TMEM_COLS / 2)
     cupbop_async_fail("column operand outside TMEM", col, row);
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
-  auto cell = meta.words[col][row];
+  auto &cell = meta.words[col][row];
+#ifdef VX_CFG_TCU_TMEM_READBACK_ENABLE
+  if (meta.native_result[col] && cell.generation != meta.generation[col]) {
+    unsigned physicalRow = (row / 32) * 16 + row % 16;
+    unsigned physicalCol = (col & ~15u) * 2 + (row & 16) + col % 16;
+    cell = {vortex::tmem::read_word(physicalRow, physicalCol), meta.generation[col]};
+  }
+#endif
   if (!cell.generation || cell.generation != meta.generation[col])
     cupbop_async_fail("column operand requires a TMEM copy or store", col, row);
   return cell.bits;
@@ -444,6 +453,58 @@ static void column_wait(unsigned warp) {
   vx_barrier(barrier, 2);
 }
 
+// A dense job would evaluate structural zero times NaN/Inf. For an
+// exceptional sparse operand, evaluate only the two selected K positions.
+// The same path can retire an MX tile when D occupies every encodable side
+// column. Cache the four B columns in LMEM and stream groups through tc.cp.
+template <typename AValue, typename BValue>
+static void column_scalar_dot(unsigned col, unsigned columns, unsigned ksize, unsigned unit,
+                              bool sparse, unsigned meta, unsigned format, bool use_d, unsigned warp,
+                              uint8_t *scratch, AValue read_a, BValue read_b) {
+  auto *bvalues = reinterpret_cast<float *>(scratch);
+  constexpr uintptr_t bankRow = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+  auto *image = reinterpret_cast<uint32_t *>((uintptr_t(scratch + 8192) + bankRow - 1) & ~(bankRow - 1));
+  for (unsigned base = 0; base < columns; base += 4) {
+    for (unsigned k = 0; k < ksize; ++k)
+      for (unsigned j = 0; j < 4; ++j) bvalues[4*k+j] = read_b(base+j, k);
+    for (unsigned panel = 0; panel < 2; ++panel) {
+      for (unsigned lane = 0; lane < 64; ++lane) {
+        unsigned row = lane / 16 * 32 + panel * 16 + lane % 16;
+        float sums[4] = {};
+        if (use_d)
+          for (unsigned j = 0; j < 4; ++j)
+            sums[j] = __builtin_bit_cast(float, column_meta_word(col+base+j, row));
+        for (unsigned group = 0; group < ksize / (4*unit); ++group) {
+          unsigned sel = sparse ? column_sparse_indices(meta, row, group*4, format) : 0;
+          unsigned count = sparse ? 2 : 4;
+          for (unsigned pos = 0; pos < count; ++pos)
+            for (unsigned q = 0; q < unit; ++q) {
+              unsigned k = (group*4 + (sparse ? (sel >> (2*pos)) & 3 : pos))*unit + q;
+              unsigned stored = (group*count + pos)*unit + q;
+              float a = read_a(row, stored, k);
+              for (unsigned j = 0; j < 4; ++j)
+                sums[j] = __builtin_fmaf(a, bvalues[4*k+j], sums[j]);
+            }
+        }
+        for (unsigned j = 0; j < 4; ++j) {
+          uint32_t bits = __builtin_bit_cast(uint32_t, sums[j]);
+          image[4*lane+j] = bits;
+          column_meta_store(col + base + j, row, bits);
+        }
+      }
+      vx_fence();
+      tmcol::cp(column_panel(col+base, panel) + (base & 15), image, 4);
+      column_wait(warp);
+    }
+  }
+}
+template <typename Input>
+static float column_float(unsigned bits) {
+  if constexpr (Input::id == tensor::tf32::id) return __builtin_bit_cast(float, bits << 13);
+  if constexpr (Input::id == tensor::bf16::id) return __builtin_bit_cast(float, bits << 16);
+  return __cupbop_f16_to_f32(bits);
+}
+
 template <typename Input>
 static bool column_convert_tmem_a(unsigned format) {
   return Input::id == tensor::tf32::id || (format & (1u << 17)) ||
@@ -451,7 +512,7 @@ static bool column_convert_tmem_a(unsigned format) {
 }
 
 template <typename Input, typename Output>
-static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenOperand &b,
+static bool column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenOperand &b,
                                const TcgenOperand &peer_b, bool pair, unsigned use_d,
                                uint8_t *scratch, unsigned columns, unsigned format,
                                unsigned meta, int workspace, bool native_sp, unsigned warp, int a_col) {
@@ -475,6 +536,34 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
   const unsigned a_off = tmcol::smem_offset(a_stage), b_off = tmcol::smem_offset(b_stage);
   if (uint64_t(b_off) + 64 * bstride > (1u << tensor::smem_desc_offset_bits))
     cupbop_async_fail("column MMA scratch exceeds descriptor range", a_off, b_off);
+  if constexpr (Input::bits != 8) {
+    if (sparse && !native_sp) {
+      auto read_b = [&](unsigned n, unsigned k) {
+        auto &src = pair && n >= columns / 2 ? peer_b : b;
+        return column_float<Input>(column_value<Input>(src, pair ? n % (columns / 2) : n, k, format, true, 0));
+      };
+      bool exceptional = false;
+      for (unsigned n = 0; n < columns && !exceptional; ++n)
+        for (unsigned k = 0; k < cudaK && !exceptional; ++k)
+          exceptional = !__builtin_isfinite(read_b(n, k));
+      if (exceptional) {
+        auto read_a = [&](unsigned row, unsigned k, unsigned) {
+          if (a_col < 0) return column_float<Input>(column_value<Input>(a, row, k, format, false, 0));
+          if (format & (1u << 17)) {
+            unsigned type = (format >> 7) & 7;
+            return __cupbop_f16_to_f32(column_small_to_half(column_tmem_small_float(a_col, row, k, type), type));
+          }
+          unsigned width = tf32 ? 1 : 2;
+          unsigned bits = column_meta_word(a_col + k / width, row) >> ((k % width) * 16);
+          if (tf32) return __builtin_bit_cast(float, bits & 0xffffe000u);
+          if (format & (1u << 7)) return __builtin_bit_cast(float, bits << 16);
+          return __cupbop_f16_to_f32(bits & 65535u);
+        };
+        column_scalar_dot(col, columns, cudaK, 1, true, meta, format, use_d, warp, scratch, read_a, read_b);
+        return true;
+      }
+    }
+  }
   for (unsigned start = 0; start < cudaK; start += stepK) {
     if (native_sp) {
       // Each 64-row panel occupies one 4-column fragment group in the
@@ -561,12 +650,6 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
           unsigned row = pair ? n % (columns / 2) : n;
           for (unsigned x = 0; x < stepK; ++x) {
             T value = column_value<Input>(src, row, start + x, format, true, part);
-            if constexpr (Input::bits != 8) {
-              unsigned exponent = Input::bits == 32 ? (0x7f800000u >> 13) :
-                                  Input::id == tensor::bf16::id ? 0x7f80u : 0x7c00u;
-              if (sparse && !native_sp && (uint32_t(value) & exponent) == exponent)
-                cupbop_async_fail("sparse nonfinite B requires the native sparse engine", n, x);
-            }
             b_stage[i * stepK + x] = value;
           }
         }
@@ -593,6 +676,7 @@ static void column_adapted_mma(unsigned col, const TcgenOperand &a, const TcgenO
       }
     }
   }
+  return false;
 }
 
 // A separate shared slab per issuing warp keeps one producer from
@@ -640,10 +724,10 @@ static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
                 ColumnGeometry::sp_k_words == ColumnGeometry::fedpK;
 #endif
     int workspace = native_sp || (a_col >= 0 && column_convert_tmem_a<Input>(format)) ? column_sparse_side() : -1;
-    column_adapted_mma<Input, Output>(col, a, b, b_other, side >= 0, use_d, scratch, columns,
+    bool mirrored = column_adapted_mma<Input, Output>(col, a, b, b_other, side >= 0, use_d, scratch, columns,
                                       format, meta, workspace, native_sp && workspace >= 0, warp, a_col);
     if (workspace >= 0) column_sparse_release(workspace);
-    column_meta_invalidate(col, columns);
+    if (!mirrored) column_meta_invalidate(col, columns);
     return;
   }
   uint8_t *a_stage = scratch;

@@ -34,13 +34,13 @@ run_case() (
       make ci-run SCHEDULE=2 LOCALMEM=1 CI_RUN_ARGS="$args" > "run-$index.log" 2>&1
     grep -F "$expected" "run-$index.log"
     if grep -Eq 'mismatches=[1-9][0-9]*' "run-$index.log"; then return 1; fi
-    python3 - "perf-$index.jsonl" "${expected_launches:-1}" <<'PY'
+    python3 - "perf-$index.jsonl" "${expected_launches:-1}" "${minimum_tcu:-1}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-assert len(rows) == int(sys.argv[2]) and all(row["val"]["core.instr_tcu"] > 0 for row in rows), rows
+assert len(rows) == int(sys.argv[2]) and all(row["val"]["core.instr_tcu"] >= int(sys.argv[3]) for row in rows), rows
 print("Native TCU instructions retired:", [row["val"]["core.instr_tcu"] for row in rows])
 PY
     index=$((index + 1))
@@ -54,11 +54,18 @@ run_case tcgen05_i8 'elements=131072 mismatches=0' 0 1
 run_case tcgen05_tma_mma 'elements=32768 mismatches=0' ''
 run_case tcgen05_i8_pair 'PASSED!: 131072/131072 INT32 results match' ''
 if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
+  minimum_tcu=0 run_case shared_lmem_alignment 'shared alignment mismatches=0/8' ''
   expected_launches=2 run_case tcgen05_copy_formats 'TMEM compressed copy: 0 mismatches in 6144 words' ''
   run_case tcgen05_pack 'TMEM single column and pack: 0 mismatches in 7296 values' ''
   # The column backend needs two physical columns per CUDA column. The
   # M256 N32 example fits both CTA runs and the sparse metadata workspace.
   ln -s "$CuPBoP_PATH/examples/tcgen05_column_mma" "$work/examples/"
+  if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_READBACK_ENABLE "* ]]; then
+    run_case tcgen05_mma_metadata 'format=4a4 mismatches=0/2048' ''
+  fi
+  if [[ " $VORTEX_CONFIGS " != *" -DVX_CFG_TCU_FP16_DISABLE "* ]]; then
+    run_case tcgen05_sparse_nonfinite 'format=14 mismatches=0/2048' ''
+  fi
   run_case tcgen05_column_mma_pair 'format=4a4 mismatches=0/8192' ''
 
   # Exercise the actual translator entry point with the TF32 hardware flag removed.
@@ -81,6 +88,7 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
 
   ln -s "$CuPBoP_PATH/examples/tcgen05_column_scaled" "$work/examples/"
   if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_MX_ENABLE "* && " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_FP8_ENABLE "* ]]; then
+    run_case tcgen05_sparse_nonfinite_mx 'case=11 mismatches=0/2048' ''
     placement=tcgen05_mx_scale_placement
     placement_ok='E4M3xE5M2 SFB=20 intervening_commit=0 mismatches=0/3072'
     (unset CUPBOP_DISABLE_MX_SCALE_FUSION; expected_launches=5 run_case "$placement" "$placement_ok" '')
@@ -129,8 +137,6 @@ PYTEST
         for input in cuda129 raw reused_slot; do
           VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 replay_input=$input run_case lifted_tcgen05_split_mx_tmem_a 'case=3 mismatches=0/2048' ''
         done
-      fi
-      if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_EXT_SIDE_ENABLE "* && " $VORTEX_CONFIGS " != *" -DVX_CFG_TCU_FP16_DISABLE "* ]]; then
         VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 run_case tcgen05_upper_mx_tmem_a 'case=3 mismatches=0/2048' ''
         for input in cuda129 raw; do
           VORTEX_CP_POLL_TIMEOUT_S=$mx_pressure_timeout expected_launches=2 replay_input=$input run_case lifted_tcgen05_upper_mx_tmem_a 'case=3 mismatches=0/2048' ''

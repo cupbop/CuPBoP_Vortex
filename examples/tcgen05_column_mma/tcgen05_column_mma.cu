@@ -53,6 +53,16 @@ __device__ uint64_t descriptor(const void *ptr, unsigned rows, unsigned k, unsig
 template <unsigned F>
 __global__ void MMA_CLUSTER mma_case(const unsigned *input, unsigned *out) {
   __shared__ __align__(128) unsigned a[aBytes/4], b[bBytes/4];
+#ifdef CUPBOP_TEST_MMA_METADATA
+  __shared__ uint64_t producerBarrier;
+  if (!threadIdx.x) mbar_init(&producerBarrier, 1);
+  __shared__ __align__(128) unsigned onesA[M * 8], onesB[N * 8];
+  for (unsigned i = threadIdx.x; i < M * 8; i += M) onesA[i] = 0x01010101;
+  for (unsigned i = threadIdx.x; i < N * 8; i += M) onesB[i] = 0x01010101;
+  constexpr unsigned metadataBias = 32;
+#else
+  constexpr unsigned metadataBias = 0;
+#endif
   __shared__ uint64_t barrier;
   __shared__ unsigned slot;
   const unsigned r = threadIdx.x;
@@ -87,13 +97,35 @@ __global__ void MMA_CLUSTER mma_case(const unsigned *input, unsigned *out) {
   if (F & 4) {
     const unsigned *word = input + (aBytes+bBytes)/4 + 2*r;
     asm volatile("tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1,%2,%3,%3}; tcgen05.wait::st.sync.aligned;"
-                 :: "r"(addr+N),"r"(word[0]),"r"(word[1]),"r"(0) : "memory");
+                 :: "r"(addr+N),"r"(word[0] - metadataBias),"r"(word[1] - metadataBias),"r"(0) : "memory");
   }
   __syncthreads();
   tcgen_after_sync();
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #ifdef CUPBOP_TEST_COLUMN_PAIR
   cluster.sync();
+#endif
+#ifdef CUPBOP_TEST_MMA_METADATA
+  if (!r) {
+    // The TC adds 32 to every selector word. Reading the stale store
+    // mirror would also change the second nibble of each word.
+    unsigned desc = 0x080404a0u;
+    asm volatile("{ .reg .pred p; setp.eq.u32 p, 0, 0; tcgen05.mma.cta_group::1.kind::i8 [%0], %1, %2, %3, p; }"
+                 :: "r"(meta), "l"(descriptor(onesA, M, 32, 1, false)),
+                    "l"(descriptor(onesB, N, 32, 1, false)), "r"(desc) : "memory");
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                 :: "r"(smem_u32(&producerBarrier)) : "memory");
+    mbar_wait(&producerBarrier, 0);
+  }
+#endif
+#ifdef CUPBOP_TEST_MMA_METADATA
+  __syncthreads();
+  tcgen_after_sync();
+  unsigned m[4];
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0,%1,%2,%3}, [%4]; tcgen05.wait::ld.sync.aligned;"
+               : "=r"(m[0]),"=r"(m[1]),"=r"(m[2]),"=r"(m[3]) : "r"(addr+N) : "memory");
+  out[M*N + 2*r] = m[0]; out[M*N + 2*r + 1] = m[1];
+  __syncthreads();
 #endif
   if (!r && !rank) {
     const uint64_t ad = descriptor(a,M,inner(F)/(F & 4 ? 2 : 1),value_bytes(F),F & (1u<<15));
@@ -185,7 +217,12 @@ static int source_value(unsigned row, unsigned k, unsigned f, bool b, unsigned &
 
 template <unsigned F>
 static int check(unsigned *device, unsigned *result) {
-  std::vector<unsigned> in(groupSize * wordsPerCTA), got(groupSize * M * N);
+#ifdef CUPBOP_TEST_MMA_METADATA
+  constexpr unsigned extra = M * 2;
+#else
+  constexpr unsigned extra = 0;
+#endif
+  std::vector<unsigned> in(groupSize * wordsPerCTA), got(groupSize * M * N + extra);
   const unsigned bytes = value_bytes(F), ksize = inner(F);
   for (unsigned rank = 0; rank < groupSize; ++rank) {
     unsigned *tile = in.data() + rank * wordsPerCTA;
@@ -207,6 +244,9 @@ static int check(unsigned *device, unsigned *result) {
 #endif
         unsigned bits;
         source_value(rank * rows + row,k,F,b,bits);
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+        if (b && k == 0) bits = row % 3 == 0 ? 0x7c00u : row % 3 == 1 ? 0xfc00u : 0x7e00u;
+#endif
         memcpy(reinterpret_cast<char *>(tile) + b*aBytes + offset,&bits,bytes);
       }
     }
@@ -228,8 +268,18 @@ static int check(unsigned *device, unsigned *result) {
   mma_case<F><<<groupSize,M>>>(device,result);
   ASYNC_CHECK(cudaMemcpy(got.data(),result,got.size()*4,cudaMemcpyDeviceToHost));
   unsigned errors = 0;
+#ifdef CUPBOP_TEST_MMA_METADATA
+  for (unsigned i = 0; i < M*2; ++i) {
+    unsigned ref = in[(aBytes+bBytes)/4+i];
+    if (ref != got[M*N+i] && ++errors < 4)
+      printf("native metadata word %u expected %08x got %08x\n",i,ref,got[M*N+i]);
+  }
+#endif
   for (unsigned r=0;r<groupSize*M;++r) for (unsigned n=0;n<N;++n) {
     int sum = 0;
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+    bool selected = false; int sign = 0;
+#endif
     for (unsigned k=0;k<ksize;++k) {
       unsigned a = k, unused;
       if ((F & 4) && bytes == 4) {
@@ -241,6 +291,9 @@ static int check(unsigned *device, unsigned *result) {
         if ((k%4) != (pos&3) && (k%4) != (pos>>2)) continue;
         a = k/4*2 + ((k%4)==(pos>>2));
       }
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+      if (!k) { selected = true; sign = source_value(r,a,F,false,unused); }
+#endif
       sum += source_value(r,a,F,false,unused)*source_value(n,k,F,true,unused);
     }
     if (((F >> 13) ^ (F >> 14)) & 1) sum = -sum;
@@ -249,6 +302,10 @@ static int check(unsigned *device, unsigned *result) {
       float x = float(sum);
       memcpy(&expected,&x,4);
     }
+#ifdef CUPBOP_TEST_SPARSE_NONFINITE
+    if (selected && n % 3 == 2 && (got[r*N+n] & 0x7fffffff) > 0x7f800000) continue;
+    if (selected) expected = n % 3 == 2 ? 0x7fc00000 : ((sign < 0) ^ (n % 3 == 1)) ? 0xff800000 : 0x7f800000;
+#endif
     if (got[r*N+n] != expected && ++errors < 3)
       printf("format=%x row=%u col=%u expected=%x got=%x\n",F,r,n,expected,got[r*N+n]);
   }
@@ -258,7 +315,11 @@ static int check(unsigned *device, unsigned *result) {
 int main() {
   unsigned *in,*out;
   ASYNC_CHECK(cudaMalloc(&in,groupSize*wordsPerCTA*sizeof(unsigned)));
-  ASYNC_CHECK(cudaMalloc(&out,groupSize*M*N*sizeof(unsigned)));
+  ASYNC_CHECK(cudaMalloc(&out,(groupSize*M*N
+#ifdef CUPBOP_TEST_MMA_METADATA
+                            + M*2
+#endif
+                          ) * sizeof(unsigned)));
 #ifdef CUPBOP_TEST_TF32
   int failed = check<0x00910>(in,out);       // dense, positive and negative TF32 with fractional mantissas
   failed |= check<0x02915>(in,out);          // 1:2 sparsity, selector 1, negate A
@@ -277,6 +338,10 @@ int main() {
   failed |= check<0x004a4>(in,out);          // sparse S8, A and metadata in TMEM
 #elif defined(CUPBOP_TEST_COLUMN_PAIR)
   int failed = check<0x004a4>(in,out);       // sparse S8 M256 N32 K64
+#elif defined(CUPBOP_TEST_SPARSE_NONFINITE)
+  int failed = check<0x00014>(in,out);
+#elif defined(CUPBOP_TEST_MMA_METADATA)
+  int failed = check<0x004a4>(in,out);
 #else
   int failed = check<0x180a0>(in,out);       // signed A, unsigned B, transpose both
   failed |= check<0x08420>(in,out);           // unsigned A, signed B, transpose A
