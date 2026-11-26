@@ -57,7 +57,12 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
   if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_COLS=1024 "* ]]; then
     expected_launches=5 replay_input=raw run_case lifted_tcgen05_alloc_size 'TMEM runtime allocation size passed 160/160' ''
     app="$work/examples/lifted_tcgen05_alloc_size-raw-$(basename "$work")"
-    if (ulimit -c 0; cd "$app"; VORTEX_DRIVER=simx ./host.out invalid) > "$app/invalid.log" 2>&1; then
+    if (
+      ulimit -c 0
+      cd "$app"
+      export LD_LIBRARY_PATH="$work/build/runtime/threadPool:$VORTEX_PATH/sw/runtime:$work/build/runtime:${LD_LIBRARY_PATH:-}"
+      VORTEX_DRIVER=simx VORTEX_SCHEDULE_FLAG=2 VORTEX_LOCALMEM_FLAG=1 ./host.out invalid
+    ) > "$app/invalid.log" 2>&1; then
       echo 'A runtime request for 48 TMEM columns unexpectedly succeeded' >&2
       exit 1
     fi
