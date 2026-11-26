@@ -64,7 +64,9 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
     grep -Ei 'invalid CSR (read|write) addr=0xc00' "$app/invalid.log"
   fi
   minimum_tcu=0 run_case shared_lmem_alignment 'shared alignment mismatches=0/8' ''
-  expected_launches=2 run_case tcgen05_copy_formats 'TMEM compressed copy: 0 mismatches in 6144 words' ''
+  ln -s "$CuPBoP_PATH/examples/tcgen05_copy_formats" "$work/examples/"
+  expected_launches=2 run_case tcgen05_copy_formats_pair 'TMEM compressed copy: 0 mismatches in 24576 words' ''
+  expected_launches=2 run_case tcgen05_copy_formats 'TMEM compressed copy: 0 mismatches in 12288 words' ''
   run_case tcgen05_pack 'TMEM single column and pack: 0 mismatches in 7296 values' ''
   # The column backend needs two physical columns per CUDA column. The
   # M256 N32 example fits both CTA runs and the sparse metadata workspace.

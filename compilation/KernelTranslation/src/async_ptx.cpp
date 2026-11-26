@@ -1076,9 +1076,20 @@ struct AsmLowering {
       }
       unsigned rowMask = 127, cols = 4;
       if (end == 4 && s.tok[3] == "128x256b") cols = 8;
+      else if (end == 4 && s.tok[3] == "4x256b") {
+        cols = 8;
+        rowMask = 0;
+        needColumnOperands();
+        if (!S.M->getFunction("__cupbop_column_has_partial_copy")) {
+          auto *F = Function::Create(FunctionType::get(B.getInt1Ty(), false), GlobalValue::ExternalLinkage,
+                                     "__cupbop_column_has_partial_copy", *S.M);
+          IRBuilder<> body(BasicBlock::Create(S.ctx, "entry", F));
+          body.CreateRet(body.getTrue());
+        }
+      }
       else if (end == 5 && s.tok[3] == "32x128b" && s.tok[4] == "warpx4") rowMask = 31;
-      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::01_23") rowMask = 63;
-      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::02_13") rowMask = 95;
+      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::02_13") rowMask = 63;
+      else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::01_23") rowMask = 95;
       else if (end != 4 || s.tok[3] != "128x128b") fail("unsupported TCGEN column copy shape");
       underPred(pred, [&]() -> Value * {
         Value *col = taddr(s.ops[0]), *desc = val(s.ops[1], S.I64);
@@ -1757,6 +1768,29 @@ static void lowerNamedTcgenMma(PassState &S, CallInst *C, StringRef suffix) {
   AsmLowering(S, C).lowerTcgen(mma, nullptr);
 }
 
+static void lowerNamedTcgenCopy(PassState &S, CallInst *C, StringRef suffix) {
+  if (!C->getType()->isVoidTy() || C->getFunctionType()->isVarArg() || C->arg_size() != 2 ||
+      C->getArgOperand(0)->getType() != PointerType::get(S.ctx, 6) || C->getArgOperand(1)->getType() != S.I64)
+    fail_at(C, "invalid named TCGEN05 copy signature");
+  bool pair = suffix.consume_back(".cg2");
+  if (!pair && !suffix.consume_back(".cg1")) fail_at(C, "invalid named TCGEN05 copy CTA group");
+  StringRef format;
+  if (suffix.consume_back(".b4x16_p64")) format = ".b8x16.b4x16_p64";
+  else if (suffix.consume_back(".b6x16_p32")) format = ".b8x16.b6x16_p32";
+  StringRef shape = StringSwitch<StringRef>(suffix)
+      .Cases("4x256b", "128x256b", "128x128b", suffix)
+      .Case("64x128b_warpx2_01_23", "64x128b.warpx2::01_23")
+      .Case("64x128b_warpx2_02_13", "64x128b.warpx2::02_13")
+      .Case("32x128b_warpx4", "32x128b.warpx4").Default("");
+  if (shape.empty()) fail_at(C, "invalid named TCGEN05 copy shape");
+  Stmt copy;
+  copy.op = std::string(pair ? "tcgen05.cp.cta_group::2." : "tcgen05.cp.cta_group::1.") + shape.str() + format.str();
+  copy.text = copy.op;
+  copy.tok = splitDots(copy.op);
+  copy.ops = {"[$0]", "$1"};
+  AsmLowering(S, C).lowerTcgen(copy, nullptr);
+}
+
 bool lowerIntrinsic(PassState &S, CallInst *C) {
   Function *Fn = C->getCalledFunction();
   if (!Fn) return false;
@@ -1774,6 +1808,11 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
+  StringRef copyName = n;
+  if (copyName.consume_front("llvm.nvvm.tcgen05.cp.")) {
+    lowerNamedTcgenCopy(S, C, copyName);
+    return done(nullptr);
+  }
   StringRef mmaName = n;
   if (mmaName.consume_front("llvm.nvvm.tcgen05.mma.")) {
     lowerNamedTcgenMma(S, C, mmaName);
@@ -3190,7 +3229,7 @@ void lower_async_ptx(Module *M) {
               structuredTma.insert(&F);
               if (!isOrdinaryTmaLoad(*C) || !hasLocalTmaArrive(*C, M->getDataLayout())) S.tcgenFunctions.insert(&F);
             }
-            if (name.starts_with("llvm.nvvm.tcgen05.mma.") || name.starts_with("llvm.nvvm.mapa") ||
+            if (name.starts_with("llvm.nvvm.tcgen05.cp.") || name.starts_with("llvm.nvvm.tcgen05.mma.") || name.starts_with("llvm.nvvm.mapa") ||
                 name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
                 name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
           } else if (!callee->isDeclaration()) {

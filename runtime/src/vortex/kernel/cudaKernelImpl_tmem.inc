@@ -29,13 +29,11 @@ struct ColumnMetaCell {
   uint32_t bits, generation;
 };
 struct ColumnMeta {
-  uint32_t lock, allocated;
+  uint32_t lock, allocated, access_lock;
 #ifdef VX_CFG_TCU_MX_ENABLE
-  uint32_t access_lock, owner[VX_CFG_TCU_TMEM_COLS / 32];
+  uint32_t owner[VX_CFG_TCU_TMEM_COLS / 32];
 #endif
-#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_TMEM_READBACK_ENABLE)
   uint8_t native_result[VX_CFG_TCU_TMEM_COLS / 2];
-#endif
   uint32_t generation[VX_CFG_TCU_TMEM_COLS / 2];
   ColumnMetaCell words[VX_CFG_TCU_TMEM_COLS / 2][128];
 };
@@ -51,9 +49,7 @@ static void column_meta_invalidate(unsigned col, unsigned count, bool native_res
   if (!__cupbop_column_meta_table) return;
   auto &meta = __cupbop_column_meta_table()[vx_core_id()];
   for (unsigned i = col; i < col + count; ++i) {
-#if defined(VX_CFG_TCU_MX_ENABLE) || defined(VX_CFG_TCU_TMEM_READBACK_ENABLE)
     meta.native_result[i] = native_result;
-#endif
     if (++meta.generation[i] == 0) {
       for (auto &word : meta.words[i]) word.generation = 0;
       meta.generation[i] = 1;
@@ -83,23 +79,26 @@ static uint32_t column_meta_word(unsigned col, unsigned row) {
   return cell.bits;
 }
 
+extern "C" bool __cupbop_column_has_partial_copy() __attribute__((weak));
 #ifdef VX_CFG_TCU_MX_ENABLE
 extern "C" bool __cupbop_column_uses_mx() __attribute__((weak));
-static bool column_may_borrow() {
-  // Older translated modules carry only the optional operand table.
-  return __cupbop_column_meta_table && (!__cupbop_column_uses_mx || __cupbop_column_uses_mx());
-}
 #endif
-
-// An MX instruction can borrow caller-owned columns to hold its scale image.
-// CUDA warps may issue unrelated native transfers while the borrower runs.
-// Serialize column accesses in modules that can issue MX jobs, including
-// the whole warp that reads or writes its own block's physical rows.
-struct ColumnAccess {
+static bool column_needs_access_lock() {
+  if (!__cupbop_column_meta_table) return false;
 #ifdef VX_CFG_TCU_MX_ENABLE
+  if (!__cupbop_column_uses_mx || __cupbop_column_uses_mx()) return true;
+#endif
+  return __cupbop_column_has_partial_copy && __cupbop_column_has_partial_copy();
+}
+
+// A partial-row copy reconstructs untouched lanes in the same native panel.
+// MX can also borrow live words. Serialize transfers and scalar operations
+// in modules using either facility so another warp cannot observe or lose
+// a partially reconstructed result.
+struct ColumnAccess {
   uint32_t *lock;
   explicit ColumnAccess(bool participate = true) : lock(nullptr) {
-    if (participate && !vx_thread_id() && column_may_borrow()) {
+    if (participate && !vx_thread_id() && column_needs_access_lock()) {
       lock = &__cupbop_column_meta_table()[vx_core_id()].access_lock;
       while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE)) {}
     }
@@ -107,20 +106,13 @@ struct ColumnAccess {
   ~ColumnAccess() {
     if (lock) __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
   }
-#else
-  explicit ColumnAccess(bool = true) {}
-#endif
 };
 
 static void column_publish_store() {
-#ifdef VX_CFG_TCU_MX_ENABLE
-  if (column_may_borrow()) {
-    // All lanes publish their global mirrors and posted TMEM stores before
-    // lane zero releases the access lock for a scalar issuer on another warp.
+  if (column_needs_access_lock()) {
     vx_fence();
     vortex::tmem::wait_st();
   }
-#endif
 }
 
 // Native alloc waits indefinitely when full. Under the per-core lock, keep
@@ -879,18 +871,36 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
                         unsigned rowMask = 127, unsigned bits = 0) {
   ColumnAccess access;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
-  if (warp >= 4 || vx_thread_id() || col % 4 || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
+  const bool partial = rowMask == 0;
+  unsigned origin = col >> 16;
+  col &= 65535;
+  if ((partial ? origin >= 32 : origin != 0) || warp >= 4 || vx_thread_id() || col % 4 || uint64_t(col) + cols > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
     cupbop_async_fail("unsupported column copy destination or issuer", col, warp);
   scratch += warp * (128 + 256) * 32;
   constexpr uintptr_t bankRow = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
   scratch = reinterpret_cast<uint8_t *>((uintptr_t(scratch) + bankRow - 1) & ~(bankRow - 1));
   for (unsigned group = 0; group < cols / 4; ++group) {
     for (unsigned half = 0; half < 2; ++half) {
+      if (partial && half != origin / 16) continue;
       auto *stage = scratch + (2 * group + half) * 1024;
       for (unsigned row = 0; row < 64; ++row) {
         unsigned logical = (row / 16) * 32 + half * 16 + row % 16;
-        // warpx2::02_13 broadcasts the first 32 rows to warps 0/1 and the next 32 to 2/3.
-        unsigned sourceRow = rowMask == 95 ? (logical & 31) + ((logical & 64) >> 1) : logical & rowMask;
+        if (partial && logical % 32 != origin) {
+          auto &meta = __cupbop_column_meta_table()[vx_core_id()];
+          auto *out = reinterpret_cast<uint32_t *>(stage + row * 16);
+          for (unsigned j = 0; j < 4; ++j) {
+            unsigned at = col + group * 4 + j;
+            const auto &cell = meta.words[at][logical];
+            // An untouched, uninitialized TMEM word has unspecified bits.
+            out[j] = meta.native_result[at] || (cell.generation && cell.generation == meta.generation[at])
+                   ? column_meta_word(at, logical) : 0;
+          }
+          continue;
+        }
+        // 4x256b addresses one row per 32-lane subpartition. For
+        // warpx2::01_23 the two source halves land in 0/1 and 2/3.
+        unsigned sourceRow = partial ? logical / 32 : rowMask == 95
+                           ? (logical & 31) + ((logical & 64) >> 1) : logical & rowMask;
         const auto *packed = reinterpret_cast<const uint8_t *>(tcgen_chunk(src, sourceRow, group));
         uint8_t *out = stage + row * 16;
         if (bits == 4) {
@@ -929,14 +939,14 @@ extern "C" void __cupbop_column_cp(unsigned col, uint64_t descriptor, unsigned c
 }
 static void column_pair_copy(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch,
                              unsigned rowMask, unsigned bits = 0) {
-  unsigned offset = addr - columnPairTag;
+  unsigned offset = (addr & 65535) - columnPairTag;
   for (unsigned side = 0; side < 2; ++side) {
     auto &run = pairRun(side);
     if (offset > run.size || cols > run.size - offset)
       cupbop_async_fail("paired copy outside allocation", addr, cols);
     auto src = tcgen_operand(descriptor);
     src.start = uintptr_t(__cupbop_cluster_map(reinterpret_cast<void *>(src.start), side));
-    column_copy(run.base + offset, src, cols, scratch, rowMask, bits);
+    column_copy((addr & 0xffff0000u) | (run.base + offset), src, cols, scratch, rowMask, bits);
   }
 }
 extern "C" void __cupbop_column_pair_cp(unsigned addr, uint64_t descriptor, unsigned cols, uint8_t *scratch) {
