@@ -58,6 +58,15 @@ if ! bash ci/dxa_layout_metadata_test.sh build/compilation/kernelTranslator "$LL
   cat "$OUT/dxa_layout_metadata.log"
   exit 1
 fi
+if [[ $VORTEX_NUM_THREADS == 32 && $VORTEX_NUM_WARPS -ge 8 ]]; then
+  for suite in cooperative_grid_test ldmatrix_native_test execution_control_runtime_test; do
+    if ! bash "ci/$suite.sh" > "$OUT/$suite.log" 2>&1; then
+      cat "$OUT/$suite.log"
+      exit 1
+    fi
+    echo "$suite: PASS"
+  done
+fi
 run() { # tag example sched [make vars...]
   local tag=$1 ex=$2 sched=$3; shift 3
   ( cd examples/$ex && make clean > /dev/null 2>&1; rm -f ci_output.txt cupbop_async_kernels.txt
