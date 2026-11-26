@@ -11,7 +11,14 @@ constexpr unsigned members = 2;
 constexpr unsigned members = 1;
 #endif
 
-constexpr unsigned rows = 128, cases = 8;
+constexpr unsigned rows = 128, cases = 9, outputWords = 12;
+__host__ __device__ static unsigned words(unsigned mode) {
+  return mode == 8 ? outputWords : mode > 0 && mode < 5 ? 4 : 8;
+}
+__host__ __device__ static unsigned tag(unsigned rank, unsigned row, unsigned offset) {
+  return 0xe0000000u + (rank * rows + row) * outputWords + offset;
+}
+
 __host__ __device__ static unsigned element(unsigned row, unsigned k, unsigned bits) {
   return (row * 13 + k * 19 + 3) & ((1u << bits) - 1);
 }
@@ -49,12 +56,12 @@ __global__ void COPY_CLUSTER copy_formats(unsigned *out, unsigned columns) {
           dst[(k * bits + b) / 8] |= ((v >> b) & 1) << ((k * bits + b) % 8);
       }
     }
-    unsigned addr = slot + ((row & ~31u) << 16);
+    unsigned addr = slot + ((row & ~31u) << 16) + (mode == 8 ? 12 : 0);
     if (mode >= 5) {
-      for (unsigned j = 0; j < 8; j += 4) {
-        unsigned tag = 0xe0000000u + row * 8 + j;
+      for (unsigned j = 0; j < words(mode); j += 4) {
+        unsigned value = tag(rank, row, j);
         asm volatile("tcgen05.st.sync.aligned.32x32b.x4.b32 [%0],{%1,%2,%3,%4}; tcgen05.wait::st.sync.aligned;"
-                     :: "r"(addr+j), "r"(tag), "r"(tag+1), "r"(tag+2), "r"(tag+3) : "memory");
+                     :: "r"(addr+j), "r"(value), "r"(value+1), "r"(value+2), "r"(value+3) : "memory");
       }
     }
     __syncthreads();
@@ -76,6 +83,8 @@ __global__ void COPY_CLUSTER copy_formats(unsigned *out, unsigned columns) {
         case 5: COPY("4x256b"); break;
         case 6: COPY("4x256b.b8x16.b4x16_p64"); break;
         case 7: COPY("4x256b.b8x16.b6x16_p32"); break;
+        case 8: asm volatile("tcgen05.shift." COPY_CTA_GROUP ".down [%0];"
+                             :: "r"(slot + (64u << 16) + 15) : "memory"); break;
       }
 #undef COPY
 #ifdef CUPBOP_TEST_COPY_PAIR
@@ -92,11 +101,11 @@ __global__ void COPY_CLUSTER copy_formats(unsigned *out, unsigned columns) {
 #else
     mbar_wait(&bar, mode & 1);
 #endif
-    for (unsigned half = 0; half < (mode > 0 && mode < 5 ? 1u : 2u); ++half) {
+    for (unsigned half = 0; half < words(mode) / 4; ++half) {
       unsigned v[4];
       asm volatile("tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0,%1,%2,%3},[%4]; tcgen05.wait::ld.sync.aligned;"
                    : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "r"(addr + 4 * half) : "memory");
-      for (unsigned j = 0; j < 4; ++j) out[((rank * cases + mode) * rows + row) * 8 + 4 * half + j] = v[j];
+      for (unsigned j = 0; j < 4; ++j) out[((rank * cases + mode) * rows + row) * outputWords + 4 * half + j] = v[j];
     }
     __syncthreads();
 #ifdef CUPBOP_TEST_COPY_PAIR
@@ -110,7 +119,7 @@ __global__ void COPY_CLUSTER copy_formats(unsigned *out, unsigned columns) {
 }
 
 int main() {
-  std::vector<unsigned> result(members * cases * rows * 8);
+  std::vector<unsigned> result(members * cases * rows * outputWords);
   unsigned *out;
   ASYNC_CHECK(cudaMalloc(&out, result.size() * sizeof(unsigned)));
   unsigned errors = 0, checked = 0;
@@ -123,13 +132,17 @@ int main() {
       for (unsigned row = 0; row < rows; ++row) {
         unsigned src = mode < 2 ? row : mode == 3 ? row % 64 : mode == 2 ? row / 64 * 32 + row % 32 : mode == 4 ? row % 32 : row / 32;
         unsigned bits = mode == 5 ? 8 : mode == 0 || mode == 3 || mode == 6 ? 4 : 6;
-        for (unsigned j = 0; j < (mode > 0 && mode < 5 ? 4u : 8u); ++j) {
+        for (unsigned j = 0; j < words(mode); ++j) {
           unsigned expected = 0;
           for (unsigned b = 0; b < 4; ++b)
             expected |= element(src + rank * 7, 4*j + b, bits) << (8*b + (bits == 4 ? 2 : 0));
           if (mode >= 5 && row % 32 != (mode == 5 ? 3u : mode == 6 ? 16u : 31u))
-            expected = 0xe0000000u + row * 8 + j;
-          unsigned got = result[(slot * rows + row) * 8 + j];
+            expected = tag(rank, row, j);
+          if (mode == 8) {
+            bool moved = row >= 64 && row < 95 && j >= 3 && j < 11;
+            expected = tag(rank, row + unsigned(moved), j);
+          }
+          unsigned got = result[(slot * rows + row) * outputWords + j];
           if (got != expected && ++errors < 6)
             printf("mode=%u row=%u word=%u expected=%x got=%x\n", mode, row, j, expected, got);
           ++checked;
@@ -138,6 +151,6 @@ int main() {
     }
   }
   ASYNC_CHECK(cudaFree(out));
-  printf("TMEM compressed copy: %u mismatches in %u words\n", errors, checked);
+  printf("TMEM copy and shift: %u mismatches in %u words\n", errors, checked);
   return errors != 0;
 }

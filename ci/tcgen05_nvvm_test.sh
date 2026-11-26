@@ -16,8 +16,10 @@ shapes = ("4x256b", "128x128b", "128x256b", "32x128b_warpx4", "64x128b_warpx2_02
 ops = [f"@llvm.nvvm.tcgen05.cp.{shape}{fmt}.cg{group}"
        for shape in shapes for fmt in ("", ".b4x16_p64", ".b6x16_p32") for group in (1, 2)]
 ir = ['target triple = "nvptx64-nvidia-cuda"'] + [f"declare void {op}(ptr addrspace(6), i64)" for op in ops]
+ir += [f"declare void @llvm.nvvm.tcgen05.shift.down.cg{g}(ptr addrspace(6))" for g in (1, 2)]
 ir += ["define ptx_kernel void @copies(i32 %taddr, i64 %descriptor) {", "%dst = inttoptr i32 %taddr to ptr addrspace(6)"]
-ir += [f"call void {op}(ptr addrspace(6) %dst, i64 %descriptor)" for op in ops] + ["ret void", "}"]
+ir += [f"call void {op}(ptr addrspace(6) %dst, i64 %descriptor)" for op in ops]
+ir += [f"call void @llvm.nvvm.tcgen05.shift.down.cg{g}(ptr addrspace(6) %dst)" for g in (1, 2)] + ["ret void", "}"]
 Path("copies.ll").write_text("\n".join(ir))
 PYTHON
 "$llvm_bin/llvm-as" copies.ll -o copies.bc
@@ -25,7 +27,8 @@ PYTHON
 "$llvm_bin/opt" -passes=verify -disable-output kernel.bc
 "$llvm_bin/llvm-dis" kernel.bc -o copies-lowered.ll
 [[ $(grep -Ec 'call void @__cupbop_column_(pair_)?cp[( _]' copies-lowered.ll) == 36 ]]
-if grep -Fq 'call void @llvm.nvvm.tcgen05.cp.' copies-lowered.ll; then exit 1; fi
+[[ $(grep -c 'call void @__cupbop_column_shift(' copies-lowered.ll) == 2 ]]
+if grep -Eq 'call void @llvm\.nvvm\.tcgen05\.(cp|shift)\.' copies-lowered.ll; then exit 1; fi
 
 # LLVM 22 NVPTX CodeGen/tcgen05-mma.ll puts enable_input_d before sparse
 # metadata. Newer LLVM also accepts a collector B immediate after collector A.

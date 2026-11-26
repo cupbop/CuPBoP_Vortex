@@ -1045,6 +1045,15 @@ struct AsmLowering {
       IRBuilder<> entry(BasicBlock::Create(S.ctx, "entry", F));
       entry.CreateRet(entry.CreateCall(S.M->getOrInsertFunction("__cupbop_column_meta_storage", type)));
     };
+    auto needColumnPartialAccess = [&]() {
+      needColumnOperands();
+      if (!S.M->getFunction("__cupbop_column_has_partial_copy")) {
+        auto *F = Function::Create(FunctionType::get(B.getInt1Ty(), false), GlobalValue::ExternalLinkage,
+                                   "__cupbop_column_has_partial_copy", *S.M);
+        IRBuilder<> body(BasicBlock::Create(S.ctx, "entry", F));
+        body.CreateRet(body.getTrue());
+      }
+    };
     if (column && s.has("mma") && (s.has("sp") || s.has("block_scale"))) needColumnOperands();
     if (pair && (!vortexConfigHasFlag("-DVX_CFG_EXT_TCU_ENABLE") ||
                  !vortexConfigHasFlag("-DVX_CFG_TCU_TMEM_ENABLE")))
@@ -1065,6 +1074,14 @@ struct AsmLowering {
       }
       return B.CreateAddrSpaceCast(scratch, S.Ptr);
     };
+    if (column && s.tok.size() == 4 && s.tok[1] == "shift" && s.has("down") &&
+        (s.has("cta_group::1") || pair)) {
+      if (s.ops.size() != 1) fail("expected one tensor address for TCGEN shift");
+      needColumnPartialAccess();
+      underPred(pred, [&]() { return S.call(B, "__cupbop_column_shift", S.Void,
+                                  {taddr(s.ops[0]), B.getInt32(pair), columnScratch()}); });
+      return;
+    }
     if (column && s.tok.size() >= 4 && s.tok[0] == "tcgen05" && s.tok[1] == "cp" &&
         (s.tok[2] == "cta_group::1" || s.tok[2] == "cta_group::2")) {
       if (s.ops.size() != 2) fail("expected TCGEN copy destination and shared descriptor");
@@ -1079,13 +1096,7 @@ struct AsmLowering {
       else if (end == 4 && s.tok[3] == "4x256b") {
         cols = 8;
         rowMask = 0;
-        needColumnOperands();
-        if (!S.M->getFunction("__cupbop_column_has_partial_copy")) {
-          auto *F = Function::Create(FunctionType::get(B.getInt1Ty(), false), GlobalValue::ExternalLinkage,
-                                     "__cupbop_column_has_partial_copy", *S.M);
-          IRBuilder<> body(BasicBlock::Create(S.ctx, "entry", F));
-          body.CreateRet(body.getTrue());
-        }
+        needColumnPartialAccess();
       }
       else if (end == 5 && s.tok[3] == "32x128b" && s.tok[4] == "warpx4") rowMask = 31;
       else if (end == 5 && s.tok[3] == "64x128b" && s.tok[4] == "warpx2::02_13") rowMask = 63;
@@ -1808,6 +1819,17 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
     S.n_intr++;
     return true;
   };
+  if (n == "llvm.nvvm.tcgen05.shift.down.cg1" || n == "llvm.nvvm.tcgen05.shift.down.cg2") {
+    if (C->arg_size() != 1 || C->getArgOperand(0)->getType() != PointerType::get(S.ctx, 6) ||
+        !C->getType()->isVoidTy() || C->getFunctionType()->isVarArg())
+      fail_at(C, "invalid named TCGEN05 shift signature");
+    Stmt shift;
+    shift.text = shift.op = n.ends_with("cg2") ? "tcgen05.shift.cta_group::2.down" : "tcgen05.shift.cta_group::1.down";
+    shift.tok = splitDots(shift.op);
+    shift.ops = {"[$0]"};
+    AsmLowering(S, C).lowerTcgen(shift, nullptr);
+    return done(nullptr);
+  }
   StringRef copyName = n;
   if (copyName.consume_front("llvm.nvvm.tcgen05.cp.")) {
     lowerNamedTcgenCopy(S, C, copyName);
@@ -3229,7 +3251,7 @@ void lower_async_ptx(Module *M) {
               structuredTma.insert(&F);
               if (!isOrdinaryTmaLoad(*C) || !hasLocalTmaArrive(*C, M->getDataLayout())) S.tcgenFunctions.insert(&F);
             }
-            if (name.starts_with("llvm.nvvm.tcgen05.cp.") || name.starts_with("llvm.nvvm.tcgen05.mma.") || name.starts_with("llvm.nvvm.mapa") ||
+            if (name.starts_with("llvm.nvvm.tcgen05.shift.") || name.starts_with("llvm.nvvm.tcgen05.cp.") || name.starts_with("llvm.nvvm.tcgen05.mma.") || name.starts_with("llvm.nvvm.mapa") ||
                 name == "llvm.nvvm.cp.async.bulk.global.to.shared.cluster" ||
                 name == "llvm.nvvm.cp.async.bulk.shared.cta.to.cluster") S.tcgenFunctions.insert(&F);
           } else if (!callee->isDeclaration()) {

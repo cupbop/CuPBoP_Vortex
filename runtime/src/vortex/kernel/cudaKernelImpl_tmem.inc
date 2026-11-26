@@ -79,6 +79,15 @@ static uint32_t column_meta_word(unsigned col, unsigned row) {
   return cell.bits;
 }
 
+// Native panel copies also rewrite neighboring CUDA rows. Untouched cells
+// in a fresh allocation have unspecified contents; preserve all live bits.
+static uint32_t column_preserved_word(unsigned col, unsigned row) {
+  auto &meta = __cupbop_column_meta_table()[vx_core_id()];
+  const auto &cell = meta.words[col][row];
+  return meta.native_result[col] || (cell.generation && cell.generation == meta.generation[col])
+       ? column_meta_word(col, row) : 0;
+}
+
 extern "C" bool __cupbop_column_has_partial_copy() __attribute__((weak));
 #ifdef VX_CFG_TCU_MX_ENABLE
 extern "C" bool __cupbop_column_uses_mx() __attribute__((weak));
@@ -449,20 +458,24 @@ static void column_wait(unsigned warp) {
 // Visit rows in increasing order within each subpartition, so the next
 // row is still unmodified when read. Each posted copy has a distinct
 // staging panel and is retired before the issuer reuses the scratch.
-static void column_shift_a(unsigned col, uint8_t *scratch, unsigned warp) {
+static void column_shift_a(unsigned col, uint8_t *scratch, unsigned warp, unsigned partitions = 15) {
   constexpr uintptr_t bankRow = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
   auto *image = reinterpret_cast<uint32_t *>((uintptr_t(scratch) + bankRow - 1) & ~(bankRow - 1));
-  for (unsigned group = 0; group < 2; ++group) {
-    unsigned dst = col + group * 4;
+  // tc.cp transfers four aligned logical columns at a time. An unaligned
+  // eight-word PTX window can span three panels. Retain their guard words.
+  const unsigned first = col & ~3u;
+  for (unsigned dst = first; dst < col + 8; dst += 4) {
     for (unsigned half = 0; half < 2; ++half) {
-      auto *panel = image + (group * 2 + half) * 64 * 4;
+      auto *panel = image + ((dst - first) / 4 * 2 + half) * 64 * 4;
       for (unsigned lane = 0; lane < 64; ++lane) {
         unsigned row = lane / 16 * 32 + half * 16 + lane % 16;
-        unsigned from = row + (row % 32 != 31);
+        bool selected = (partitions >> (row / 32)) & 1;
         for (unsigned j = 0; j < 4; ++j) {
-          unsigned word = column_meta_word(dst + j, from);
+          unsigned at = dst + j;
+          bool move = selected && at >= col && at < col + 8 && row % 32 != 31;
+          unsigned word = column_preserved_word(at, row + unsigned(move));
           panel[lane * 4 + j] = word;
-          column_meta_store(dst + j, row, word);
+          if (move) column_meta_store(at, row, word);
         }
       }
       vx_fence();
@@ -470,6 +483,25 @@ static void column_shift_a(unsigned col, uint8_t *scratch, unsigned warp) {
     }
   }
   column_wait(warp);
+}
+
+extern "C" void __cupbop_column_shift(unsigned addr, unsigned pair, uint8_t *scratch) {
+  unsigned row = addr >> 16, col = addr & 65535, warp = csr_read_nv(VX_CSR_CTA_RANK);
+  if (warp >= 4 || vx_thread_id() || row >= 128 || row % 32 || vx_num_barriers() < 5)
+    cupbop_async_fail("invalid TMEM shift address or issuer", addr, warp);
+  ColumnAccess access;
+  scratch += warp * (128 + 256) * 32;
+  for (unsigned side = 0; side < (pair ? 2u : 1u); ++side) {
+    unsigned base = col;
+    if (pair) {
+      auto &run = pairRun(side);
+      unsigned offset = col - columnPairTag;
+      if (offset >= run.size || 8 > run.size - offset) cupbop_async_fail("paired shift outside TMEM run", addr, side);
+      base = run.base + offset;
+    }
+    if (base + 8 > VX_CFG_TCU_TMEM_COLS / 2) cupbop_async_fail("shift outside TMEM", base, row);
+    column_shift_a(base, scratch, warp, 1u << (row / 32));
+  }
 }
 
 // A dense job would evaluate structural zero times NaN/Inf. For an
@@ -886,15 +918,9 @@ static void column_copy(unsigned col, TcgenOperand src, unsigned cols, uint8_t *
       for (unsigned row = 0; row < 64; ++row) {
         unsigned logical = (row / 16) * 32 + half * 16 + row % 16;
         if (partial && logical % 32 != origin) {
-          auto &meta = __cupbop_column_meta_table()[vx_core_id()];
           auto *out = reinterpret_cast<uint32_t *>(stage + row * 16);
-          for (unsigned j = 0; j < 4; ++j) {
-            unsigned at = col + group * 4 + j;
-            const auto &cell = meta.words[at][logical];
-            // An untouched, uninitialized TMEM word has unspecified bits.
-            out[j] = meta.native_result[at] || (cell.generation && cell.generation == meta.generation[at])
-                   ? column_meta_word(at, logical) : 0;
-          }
+          for (unsigned j = 0; j < 4; ++j)
+            out[j] = column_preserved_word(col + group * 4 + j, logical);
           continue;
         }
         // 4x256b addresses one row per 32-lane subpartition. For
