@@ -1212,6 +1212,27 @@ struct AsmLowering {
       return;
     }
     bool sparse = s.has("sp");
+    // The collector gives hardware permission to reuse an unchanged operand.
+    // Vortex always reloads it. LLVM's collector IDs are discard/lastuse/fill/use.
+    StringRef mmaOp(s.op);
+    bool collectorA = false, collectorB = false, keepA = false;
+    while (mmaOp.contains(".collector::")) {
+      auto parts = mmaOp.rsplit('.');
+      StringRef token = parts.second;
+      if (!token.consume_front("collector::")) fail("misplaced TCGEN MMA collector qualifier");
+      bool a = token.consume_front("a::");
+      if (!a && !token.consume_front("b::")) fail("unknown TCGEN MMA collector operand");
+      bool &seen = a ? collectorA : collectorB;
+      if (seen || (token != "discard" && token != "lastuse" && token != "fill" && token != "use"))
+        fail("invalid or repeated TCGEN MMA collector mode");
+      seen = true;
+      if (a) keepA = token == "fill" || token == "use";
+      mmaOp = parts.first;
+    }
+    bool ashift = mmaOp.consume_back(".ashift");
+    if (ashift && (!column || keepA || s.has("block_scale") || s.ops.size() < 2 ||
+                   s.ops[1].empty() || s.ops[1].front() != '['))
+      fail("MMA ashift requires column TMEM A and discard or lastuse A collector");
     std::string mma = sparse ? "tcgen05.mma.sp." : "tcgen05.mma.";
     mma += pair ? "cta_group::2.kind::" : "cta_group::1.kind::";
     using cupbop_tcgen05::Kind;
@@ -1224,9 +1245,9 @@ struct AsmLowering {
         fail("block-scaled MMA input type disabled in the Vortex target configuration");
       unsigned vec = (s.has("scale_vec::4X") || s.has("block16")) ? 4 : wide ? 1 : 2;
       std::string prefix = mma + (wide ? "mxf8f6f4" : nv ? "mxf4nvf4" : "mxf4") + ".block_scale";
-      if (s.op != prefix + ".scale_vec::" + std::to_string(vec) + "X" &&
-          s.op != prefix + (vec == 4 ? ".block16" : ".block32") &&
-          !(s.op == prefix && !nv))
+      if (mmaOp != prefix + ".scale_vec::" + std::to_string(vec) + "X" &&
+          mmaOp != prefix + (vec == 4 ? ".block16" : ".block32") &&
+          !(mmaOp == prefix && !nv))
         fail("unknown block-scaled MMA kind or vector length");
       const unsigned idesc = sparse ? 4 : 3;
       if (s.ops.size() != idesc + 4 || s.ops[1].empty())
@@ -1244,9 +1265,9 @@ struct AsmLowering {
       });
       return;
     }
-    bool half = s.op == mma + "f16";
-    bool fp8 = s.op == mma + "f8f6f4";
-    bool tf32 = s.op == mma + "tf32";
+    bool half = mmaOp == mma + "f16";
+    bool fp8 = mmaOp == mma + "f8f6f4";
+    bool tf32 = mmaOp == mma + "tf32";
     if (tf32 && !vortexConfigHasFlag("-DVX_CFG_TCU_TF32_ENABLE")) {
       // UTCHMMA has one SASS opcode for both half and TF32. CuLifter
       // dispatches from its runtime descriptor when the type is unknown.
@@ -1261,7 +1282,7 @@ struct AsmLowering {
       });
       return;
     }
-    if ((column && (half || fp8 || tf32)) || (s.op == mma + "i8" && (column || !sparse))) {
+    if ((column && (half || fp8 || tf32)) || (mmaOp == mma + "i8" && (column || !sparse))) {
       unsigned idesc = sparse ? 4 : 3;
       if (s.ops.size() != idesc + 2 || s.ops[1].empty())
         fail("malformed TCGEN MMA operands");
@@ -1274,7 +1295,7 @@ struct AsmLowering {
         // An unknown descriptor can select a converted format at launch.
         unsigned bits = imm ? unsigned(imm->getZExtValue()) : 0;
         bool mixed = ((bits >> 7) & 1) != ((bits >> 10) & 1);
-        if (!imm || fp8 || tf32 || (mixed && (half || !(bits & (1u << 7))))) needColumnOperands();
+        if (ashift || !imm || fp8 || tf32 || (mixed && (half || !(bits & (1u << 7))))) needColumnOperands();
       }
       Kind kind = !column ? Kind::LegacyI8 : half ? Kind::F16 : fp8 ? Kind::F8F6F4 : tf32 ? Kind::TF32 : Kind::I8;
       underPred(pred, [&]() -> Value * {
@@ -1283,6 +1304,7 @@ struct AsmLowering {
           Value *columns = B.CreateShl(B.CreateAnd(B.CreateLShr(desc, 17), 63), 3, "mma_n");
           Value *format = B.CreateAnd(desc, 0x1ffff);
           if (fp8) format = B.CreateOr(format, 1u << 17);
+          if (ashift) format = B.CreateOr(format, 1u << 18);
           Value *a = tmemA ? B.CreateZExt(taddr(s.ops[1]), S.I64) : val(s.ops[1], S.I64);
           SmallVector<Value *, 8> args = {taddr(s.ops[0]), a, val(s.ops[2], S.I64),
               val(s.ops[idesc + 1], S.I32), columnScratch(), columns, format};
@@ -1675,6 +1697,7 @@ static void lowerNamedTcgenMma(PassState &S, CallInst *C, StringRef suffix) {
   const bool tensor = suffix.consume_front("tensor");
   if (!tensor && !suffix.consume_front("shared"))
     fail_at(C, "unsupported named TCGEN05 MMA operand space");
+  const bool ashift = suffix.consume_back(".ashift");
   const bool scaled = !suffix.empty();
   StringRef kind;
   if (scaled) {
@@ -1712,12 +1735,15 @@ static void lowerNamedTcgenMma(PassState &S, CallInst *C, StringRef suffix) {
   }
   uint64_t group = flag(groupIndex);
   if (group != 1 && group != 2) fail_at(C, "named TCGEN05 MMA requires CTA group 1 or 2");
-  for (unsigned i = groupIndex + 1; i < C->arg_size(); ++i)
-    if (flag(i) != 0) fail_at(C, "named TCGEN05 MMA requires discard collector mode");
+  const uint64_t collectorA = flag(groupIndex + 1);
+  if (collectorA > 3 || (C->arg_size() == groupIndex + 3 && flag(groupIndex + 2) > 3))
+    fail_at(C, "invalid named TCGEN05 MMA collector mode");
+  if (ashift && (!tensor || scaled || collectorA > 1))
+    fail_at(C, "MMA ashift requires tensor A and discard or lastuse A collector");
 
   Stmt mma;
   mma.op = std::string(sparse ? "tcgen05.mma.sp." : "tcgen05.mma.") +
-           "cta_group::" + std::to_string(group) + ".kind::" + kind.str();
+           "cta_group::" + std::to_string(group) + ".kind::" + kind.str() + (ashift ? ".ashift" : "");
   mma.text = mma.op;
   mma.tok = splitDots(mma.op);
   mma.ops = {"[$0]", tensor ? "[$1]" : "$1", "$2"};

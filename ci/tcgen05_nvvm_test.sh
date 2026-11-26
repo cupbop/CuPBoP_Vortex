@@ -75,11 +75,36 @@ if VORTEX_CONFIGS="${VORTEX_CONFIGS//-DVX_CFG_TCU_TF32_ENABLE/}" "$translator" p
   exit 1
 fi
 grep -Fq 'TF32 MMA requires -DVX_CFG_TCU_TF32_ENABLE' pred-off.log
-sed 's/i32 1, i32 2, i32 0, i32 0)/i32 1, i32 2, i32 0, i32 3)/' source.ll > collector.ll
+# PTX collectors permit a reload of the same source. A post-MMA shift is
+# semantic: it must reach the runtime for both named and inline input.
+sed 's/mma.sp.tensor(/mma.sp.tensor.ashift(/g; s/i32 1, i32 2, i32 0, i32 0)/i32 1, i32 2, i32 1, i32 3)/' source.ll > collector.ll
 "$llvm_bin/llvm-as" collector.ll -o collector.bc
-if "$translator" collector.bc bad.bc > collector.log 2>&1; then
-  echo 'Named MMA unexpectedly discarded a live collector' >&2
-  exit 1
-fi
-grep -Fq 'requires discard collector mode' collector.log
-echo 'Named TCGEN05 MMA shared, sparse tensor, block-scale and diagnostic checks passed'
+"$translator" collector.bc shift.bc > collector.log 2>&1
+"$llvm_bin/llvm-dis" shift.bc -o shift.ll
+grep -Eq 'call void @__cupbop_column_pair_mma_ts_sp\(.*i32 264468,' shift.ll
+for pair in '2, i32 3' '1, i32 4'; do
+  sed "s/i32 2, i32 1, i32 3)/i32 2, i32 $pair)/" collector.ll > invalid.ll
+  "$llvm_bin/llvm-as" invalid.ll -o invalid.bc
+  if "$translator" invalid.bc bad.bc > invalid.log 2>&1; then
+    echo 'Invalid named MMA collector accepted' >&2
+    exit 1
+  fi
+  grep -Eq 'discard or lastuse A collector|invalid named TCGEN05 MMA collector mode' invalid.log
+done
+# Invalid PTX must not silently drop a shift or a collector from an opcode.
+for modifier in 'ashift' 'collector::a::unknown' 'collector::b::fill.collector::b::use'; do
+  cat > invalid.ll <<IR
+target triple = "nvptx64-nvidia-cuda"
+define ptx_kernel void @invalid(i32 %d, i64 %a, i64 %b) {
+  call void asm sideeffect "{ .reg .pred p; setp.ne.u32 p, 0, 0; tcgen05.mma.cta_group::1.kind::f16.$modifier [\$0], \$1, \$2, \$3, p; }", "r,l,l,r,~{memory}"(i32 %d, i64 %a, i64 %b, i32 134479888)
+  ret void
+}
+IR
+  "$llvm_bin/llvm-as" invalid.ll -o invalid.bc
+  if "$translator" invalid.bc bad.bc > invalid.log 2>&1; then
+    echo "Invalid inline MMA modifier accepted: $modifier" >&2
+    exit 1
+  fi
+  grep -Eq 'ashift requires column TMEM A|invalid or repeated TCGEN MMA collector mode' invalid.log
+done
+echo 'Named TCGEN05 MMA shared, sparse tensor, block-scale, collectors, ashift and diagnostics passed'

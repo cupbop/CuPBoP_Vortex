@@ -453,6 +453,33 @@ static void column_wait(unsigned warp) {
   vx_barrier(barrier, 2);
 }
 
+// A contains 32 bytes in each of four independent 32-row subpartitions.
+// Visit rows in increasing order within each subpartition, so the next
+// row is still unmodified when read. Each posted copy has a distinct
+// staging panel and is retired before the issuer reuses the scratch.
+static void column_shift_a(unsigned col, uint8_t *scratch, unsigned warp) {
+  constexpr uintptr_t bankRow = VX_CFG_LMEM_NUM_BANKS * (VX_CFG_XLEN / 8);
+  auto *image = reinterpret_cast<uint32_t *>((uintptr_t(scratch) + bankRow - 1) & ~(bankRow - 1));
+  for (unsigned group = 0; group < 2; ++group) {
+    unsigned dst = col + group * 4;
+    for (unsigned half = 0; half < 2; ++half) {
+      auto *panel = image + (group * 2 + half) * 64 * 4;
+      for (unsigned lane = 0; lane < 64; ++lane) {
+        unsigned row = lane / 16 * 32 + half * 16 + lane % 16;
+        unsigned from = row + (row % 32 != 31);
+        for (unsigned j = 0; j < 4; ++j) {
+          unsigned word = column_meta_word(dst + j, from);
+          panel[lane * 4 + j] = word;
+          column_meta_store(dst + j, row, word);
+        }
+      }
+      vx_fence();
+      tmcol::cp(column_panel(dst, half) + dst % 16, panel, 4);
+    }
+  }
+  column_wait(warp);
+}
+
 // A dense job would evaluate structural zero times NaN/Inf. For an
 // exceptional sparse operand, evaluate only the two selected K positions.
 // The same path can retire an MX tile when D occupies every encodable side
@@ -686,6 +713,8 @@ static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
                                      uint32_t use_d, uint8_t *scratch, unsigned columns, unsigned format, unsigned meta,
                        int side = -1, int a_col = -1) {
   ColumnAccess access;
+  bool shift_a = format & (1u << 18);
+  format &= ~(1u << 18);
   using ColumnGeometry = tensor::wgmma_config_t<32, Input, Output>;
   unsigned warp = csr_read_nv(VX_CSR_CTA_RANK);
   if (warp >= 4 || (col & 15) || uint64_t(col) + columns > VX_CFG_TCU_TMEM_COLS / 2 || vx_num_barriers() < 5)
@@ -728,6 +757,7 @@ static void column_mma(uint32_t col, uint64_t desc_a, uint64_t desc_b,
                                       format, meta, workspace, native_sp && workspace >= 0, warp, a_col);
     if (workspace >= 0) column_sparse_release(workspace);
     if (!mirrored) column_meta_invalidate(col, columns);
+    if (shift_a) column_shift_a(unsigned(a_col), scratch, warp);
     return;
   }
   uint8_t *a_stage = scratch;

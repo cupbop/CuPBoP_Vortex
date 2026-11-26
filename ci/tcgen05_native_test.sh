@@ -60,6 +60,12 @@ if [[ " ${VORTEX_CONFIGS:-} " == *" -DVX_CFG_TCU_TMEM_COLUMN_ENABLE "* ]]; then
   # The column backend needs two physical columns per CUDA column. The
   # M256 N32 example fits both CTA runs and the sparse metadata workspace.
   ln -s "$CuPBoP_PATH/examples/tcgen05_column_mma" "$work/examples/"
+  ln -s "$CuPBoP_PATH/examples/tcgen05_ashift" "$work/examples/"
+  run_case tcgen05_ashift '0/5120 mismatches' ''
+  run_case tcgen05_ashift_pair '0/18432 mismatches' ''
+  for input in cuda129 raw; do
+    replay_input=$input run_case lifted_tcgen05_ashift '0/5120 mismatches' ''
+  done
   if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_READBACK_ENABLE "* ]]; then
     run_case tcgen05_mma_metadata 'format=4a4 mismatches=0/2048' ''
   fi
