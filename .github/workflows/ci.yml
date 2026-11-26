@@ -19,11 +19,14 @@
 #                                        (main config, TCU+DXA config for the tensor examples)
 #   tests : ci/run-crnch-cuda-test.sh — `make ci` of one matrix entry inside the CI container
 #   verify: ci/check_correctness.sh   — per-example rule (program verdict / golden compare / exact diff)
-# The same 77-entry matrix can be run as one Slurm job with ci/run-v3-matrix.sbatch.
+# The matrix can also be run as one Slurm job with ci/run-v3-matrix.sbatch.
 
 name: CI
 
 on: [push, pull_request]
+
+env:
+  CI_RUN_SUBDIR: .cupbop-ci/${{ github.run_id }}
 
 jobs:
   build:
@@ -32,15 +35,15 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
-      - name: Checkout Repositoty
+      - name: Checkout run revision
         uses: actions/checkout@v4
         with:
+          path: ${{ env.CI_RUN_SUBDIR }}
           submodules: recursive
-          clean: false
 
       - name: Run Sbatch file
         run: |
-          chmod +x ./ci/run-crnch-cuda.sh
+          cd "$GITHUB_WORKSPACE/$CI_RUN_SUBDIR"
           # Slurm log dir: the shared report dir when this account can write it, else inside the workspace
           CI_LOG_DIR=/projects/ci-runners/CuPBoP-Vortex/logs; [ -w "$CI_LOG_DIR" ] || { CI_LOG_DIR=$GITHUB_WORKSPACE/ci/logs_runner; mkdir -p "$CI_LOG_DIR"; }
           sbatch --wait --export=ALL,CI_LOG_DIR=$CI_LOG_DIR -o $CI_LOG_DIR/CuPBoP-cuda-test-%j.out ./ci/run-crnch-cuda.sh
@@ -73,6 +76,12 @@ jobs:
           - name: cta_loop_test
             scheduler: 0
         include:
+          - name: flat_scan_test
+            scheduler: 0
+            localmem: 1
+          - name: flat_shuffle_test
+            scheduler: 0
+            localmem: 1
           # SCHE_2 + LOCALMEM=0 for shared memory benchmarks
           - name: bh-cuda
             scheduler: 2
@@ -110,20 +119,32 @@ jobs:
         # localmem: [1]
 
     steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-
+      # A retry or another runner may need to populate its own checkout and build.
+      - name: Locate run build
+        id: locate
+        run: |
+          if test -f "$CI_RUN_SUBDIR/.ci-built"; then echo "ready=yes" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.locate.outputs.ready != 'yes'
+        with:
+          path: ${{ env.CI_RUN_SUBDIR }}
+          submodules: recursive
       - name: Run tests (SBATCH)
         run: |
+          cd "$GITHUB_WORKSPACE/$CI_RUN_SUBDIR"
           export TEST_NAME="${{ matrix.name }}"
           export VORTEX_SCHEDULE_FLAG="${{ matrix.scheduler }}"
           export VORTEX_LOCALMEM_FLAG="${{ matrix.localmem }}"
-          chmod +x ./ci/run-crnch-cuda-test.sh
           CI_LOG_DIR=/projects/ci-runners/CuPBoP-Vortex/logs; [ -w "$CI_LOG_DIR" ] || { CI_LOG_DIR=$GITHUB_WORKSPACE/ci/logs_runner; mkdir -p "$CI_LOG_DIR"; }
-          sbatch --wait --export=ALL,CI_LOG_DIR=$CI_LOG_DIR -o $CI_LOG_DIR/CuPBoP-cuda-test-%j.out ./ci/run-crnch-cuda-test.sh
+          if [ ! -f .ci-built ]; then
+            sbatch --wait -o "$CI_LOG_DIR/CuPBoP-build-%j.out" ./ci/run-crnch-cuda.sh
+          fi
+          status=0
+          job_id=$(sbatch --parsable --wait -o "$CI_LOG_DIR/CuPBoP-cuda-test-%j.out" ./ci/run-crnch-cuda-test.sh) || status=$?
           echo "Showing last 100 lines of log:"
-          LOG_FILE="$CI_LOG_DIR/${TEST_NAME}.out"
-          tail -n 100 $LOG_FILE
+          LOG_FILE="$CI_LOG_DIR/CuPBoP-cuda-test-${job_id%%;*}.out"
+          tail -n 100 "$LOG_FILE"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
 
           if grep -q "Kernel compilation completed!" "$LOG_FILE" && \
              grep -q "Host compilation completed!" "$LOG_FILE" && \
@@ -137,6 +158,7 @@ jobs:
       - name: Verify Correctness
         if: always()
         run: |
+          cd "$GITHUB_WORKSPACE/$CI_RUN_SUBDIR"
           # Rules live in ci/check_correctness.sh (shared with ci/run-v3-matrix.sbatch). It prints the verdict,
           # writes examples/<test>/ci_status_SCHE_<s>_LMEM_<l>.txt and exits 1 on FAIL.
           echo "PWD: $(pwd)"
@@ -144,32 +166,75 @@ jobs:
           ./ci/check_correctness.sh "${{ matrix.name }}" "${{ matrix.scheduler }}" "${{ matrix.localmem }}"
 
       - name: Report Performance
+        id: row_report
         if: always()
+        env:
+          TEST_NAME: ${{ matrix.name }}
+          SCHEDULE: ${{ matrix.scheduler }}
+          LMEM: ${{ matrix.localmem }}
+          ROW_STATUS: ${{ job.status }}
         run: |
-          export TEST_NAME="${{ matrix.name }}"
-          export SCHEDULE="${{ matrix.scheduler }}"
-          export LMEM="${{ matrix.localmem }}"
-          if [ "$LMEM" = "0" ]; then
-            PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}_LOCAL_MEM_0*.txt 2>/dev/null | head -1)
-            LABEL="${TEST_NAME} (SCHE_${SCHEDULE}, LMEM=0)"
+          staging=$(mktemp -d "$RUNNER_TEMP/ci-row.XXXXXXXX")
+          echo "path=$staging" >> "$GITHUB_OUTPUT"
+          report="$staging/$TEST_NAME"
+          mkdir "$report"
+          source_dir="$CI_RUN_SUBDIR/examples/$TEST_NAME"
+          verdict="ci_status_SCHE_${SCHEDULE}_LMEM_${LMEM}.txt"
+          if [[ "$ROW_STATUS" == success ]]; then
+            cp "$source_dir/$verdict" "$report/"
           else
-            PERF_FILE=$(ls ./examples/${TEST_NAME}/Perf_counter_*SCHE_${SCHEDULE}*.txt 2>/dev/null | head -1)
-            LABEL="${TEST_NAME} (SCHE_${SCHEDULE})"
+            echo FAIL > "$report/$verdict"
           fi
-          if [ -n "$PERF_FILE" ]; then
-            python3 ./ci/perf_summary.py "$PERF_FILE" "$LABEL" "$SCHEDULE" >> $GITHUB_STEP_SUMMARY
+          shopt -s nullglob
+          perf=( "$source_dir"/Perf_counter_*_SCHE_${SCHEDULE}_LOCAL_MEM_${LMEM}.txt )
+          if [[ ${#perf[@]} == 0 && "$LMEM" == 1 ]]; then
+            perf=( "$source_dir"/Perf_counter_*_SCHE_${SCHEDULE}.txt )
           fi
+          for file in "${perf[@]}"; do
+            cp "$file" "$report/"
+            python3 "$CI_RUN_SUBDIR/ci/perf_summary.py" "$file" "$TEST_NAME (SCHE_$SCHEDULE, LMEM=$LMEM)" "$SCHEDULE" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-row-${{ matrix.name }}-s${{ matrix.scheduler }}-l${{ matrix.localmem }}
+          path: ${{ steps.row_report.outputs.path }}
+          overwrite: true
+          if-no-files-found: error
 
   complete:
     runs-on: self-hosted
     needs: tests
+    permissions:
+      actions: read
+      contents: read
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
       - name: Check Completion
-        run: echo "All matrix jobs passed"
-
-      - name: Performance Summary
+        env:
+          MATRIX_RESULT: ${{ needs.tests.result }}
         run: |
-          python3 ./ci/perf_summary_all.py ./examples >> $GITHUB_STEP_SUMMARY
+          echo "Test matrix result: $MATRIX_RESULT"
+          test "$MATRIX_RESULT" = success
+
+      - uses: actions/checkout@v4
+        if: always()
+        with:
+          path: ${{ env.CI_RUN_SUBDIR }}/report-tools
+          sparse-checkout: ci
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          pattern: ci-row-*
+          path: ${{ runner.temp }}/ci-summary
+          merge-multiple: true
+          # List the entire run, including successful jobs from earlier attempts.
+          github-token: ${{ github.token }}
+      - name: Performance Summary
+        if: always()
+        run: python3 "$CI_RUN_SUBDIR/report-tools/ci/perf_summary_all.py" "$RUNNER_TEMP/ci-summary" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove run checkout
+        if: always()
+        run: rm -rf -- "$CI_RUN_SUBDIR"
 

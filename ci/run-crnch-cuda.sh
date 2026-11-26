@@ -16,7 +16,8 @@
 # toolchain v3.0.1, then makes sure the two SimX drivers the matrix needs exist for the current VORTEX_CONFIGS
 # (environment and helpers: ci/rg-ci-setup-v3.sh).
 
-cd $GITHUB_WORKSPACE
+set -e
+cd "${GITHUB_WORKSPACE:-$SLURM_SUBMIT_DIR}/${CI_RUN_SUBDIR:-.}"
 hostname
 
 # Clean previous CI results so summary only shows current run
@@ -51,3 +52,12 @@ apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBo
     cupbop_v3_ensure_simx $VORTEX_PATH "$VORTEX_CONFIGS"
     cupbop_v3_ensure_simx $VORTEX_PATH_TCU "$VORTEX_CONFIGS_TCU"
 EOF_IN
+if [ -n "${CI_RUN_SUBDIR:-}" ]; then
+    touch .ci-built
+    # A cancelled workflow or a complete job on another runner can leave its
+    # local build behind. Only collect old numbered CI snapshots on this runner.
+    cache="$GITHUB_WORKSPACE/.cupbop-ci"
+    if [ -d "$cache" ]; then
+        find "$cache" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -mtime +35 -exec rm -rf -- {} +
+    fi
+fi

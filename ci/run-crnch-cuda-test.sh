@@ -16,11 +16,10 @@
 # `make ci` translates the example with the CuPBoP build of the build job, builds the kernel ELF in a Vortex
 # regression cell and runs it on the SimX of ci/rg-ci-setup-v3.sh (the TCU+DXA SimX for the tensor examples).
 
-cd $GITHUB_WORKSPACE
+set -e
+cd "${GITHUB_WORKSPACE:-$SLURM_SUBMIT_DIR}/${CI_RUN_SUBDIR:-.}"
 hostname
 
-CI_LOG_DIR=${CI_LOG_DIR:-/projects/ci-runners/CuPBoP-Vortex/logs}
-export FINAL_OUTPUT_PATH="$CI_LOG_DIR/CuPBoP-cuda-test-${SLURM_JOB_ID}.out"
 apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBoP-Vortex/ ${CI_EXTRA_BINDS:+-B $CI_EXTRA_BINDS} /projects/ci-runners/CuPBoP-Vortex/tools/cupbop_env.sif /bin/bash << 'EOF_IN'
     set -e
     source "./ci/rg-ci-setup-v3.sh"
@@ -33,8 +32,7 @@ apptainer exec -B /projects/ci-runners/CuPBoP-Vortex/:/projects/ci-runners/CuPBo
     rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}*LOCAL_MEM_${LMEM_FLAG}*.txt
     rm -f ${TEST_NAME}/Perf_counter_*SCHE_${VORTEX_SCHEDULE_FLAG}.txt
     rm -f ${TEST_NAME}/ci_status_SCHE_${VORTEX_SCHEDULE_FLAG}_LMEM_${LMEM_FLAG}.txt
-    make -C ${TEST_NAME} ci SCHEDULE=${VORTEX_SCHEDULE_FLAG} LOCALMEM=${LMEM_FLAG}
-    exit 0
+    cell="$VORTEX_PATH/tests/regression/cupbop_ci_${SLURM_JOB_ID:?}"
+    trap 'rm -rf -- "$cell"' EXIT
+    make -C "$TEST_NAME" ci SCHEDULE="$VORTEX_SCHEDULE_FLAG" LOCALMEM="$LMEM_FLAG" VX3_CELL="$cell"
 EOF_IN
-
-ln -sf "$FINAL_OUTPUT_PATH" "$CI_LOG_DIR/${TEST_NAME}.out"

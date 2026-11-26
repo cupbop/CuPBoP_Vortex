@@ -155,9 +155,13 @@ ci: build ci-run
 # Unbuffered stdout so that the runtime's own error message survives an abort (core dump) in the log.
 STDBUF := $(shell command -v stdbuf 2>/dev/null)
 STDBUF_RUN := $(if $(STDBUF),$(STDBUF) -o0 -e0,)
+CI_EXPECTED_EXIT ?= 0
+ci-run: private SHELL := /bin/bash
+ci-run: private .SHELLFLAGS := -o pipefail -c
 ci-run: build
 	@echo "--- Running (CI)"
-	LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 $(STDBUF_RUN) $(HOST_PREFIX) ./host.out $(CI_RUN_ARGS) 2>&1 | tee ci_output.txt
+	( status=0; LD_LIBRARY_PATH=$(LD_LIB_PATH):$(LD_LIBRARY_PATH) PERF_CLASS=2 $(STDBUF_RUN) $(HOST_PREFIX) ./host.out $(CI_RUN_ARGS) || status=$$?; \
+	  if [ "$$status" -ne "$(CI_EXPECTED_EXIT)" ]; then echo "Unexpected host exit $$status (expected $(CI_EXPECTED_EXIT))" >&2; exit 1; fi ) 2>&1 | tee ci_output.txt
 	@echo "--- Execution completed!"
 
 CI_RUN_ARGS ?= $(RUN_ARGS)
@@ -311,7 +315,7 @@ kernel.elf kernel.vxbin kernel.dump $(MULTI_OUTPUT_RULE) kernel.bc kernel_wrappe
 		VORTEX_HOME=$(VORTEX_HOME) CUPBOP_WORK=$(CURDIR) CuPBoP_PATH=$(CuPBoP_PATH) CUPBOP_LTO=$(CUPBOP_LTO) \
 		VORTEX_NUM_CORES=$(VORTEX_NUM_CORES) VORTEX_NUM_WARPS=$(VORTEX_NUM_WARPS) VORTEX_NUM_THREADS=$(VORTEX_NUM_THREADS)
 	cp $(VX3_CELL)/kernel.elf $(VX3_CELL)/kernel.vxbin $(VX3_CELL)/kernel.dump .
-	@# post-build stack steps (see the script): schedules 1 and 2, a kernel function whose stack frame does not fit the
+	@# post-build stack steps (see the script): a kernel whose frame (including FLAT barrier context) does not fit the
 	@# 8 KB hardware stack is rebuilt with the dynamic trip count (core mapping with fixed trips) or run on a software
 	@# stack; every schedule, the sp skew modulus is lowered to fit the frame (CUPBOP_SP_SKEW) and the kernel ABI calls
 	@# are checked (CUPBOP_KABI, examples/abi_check.py; UNSAFE fails the build). No-op when nothing applies.
