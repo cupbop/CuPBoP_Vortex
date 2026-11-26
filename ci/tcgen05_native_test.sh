@@ -106,7 +106,18 @@ for i in (1, 2, 4):  # nonadjacent operands, an intervening commit, and mixed FP
 PY
     ln -s "$CuPBoP_PATH/examples/$placement" "$work/examples/"
     for input in cuda129 raw; do
-      expected_launches=5 replay_input=$input run_case "lifted_$placement" "$placement_ok" ''
+      (unset CUPBOP_DISABLE_MX_SCALE_FUSION; expected_launches=5 replay_input=$input run_case "lifted_$placement" "$placement_ok" '')
+      python3 - "$work/examples/lifted_$placement-$input-$(basename "$work")" <<'PYTEST'
+import json
+from pathlib import Path
+import sys
+
+app = Path(sys.argv[1])
+ir = (app / "kernel.ll").read_text()
+assert ir.count("call i1 @__cupbop_column_mma_mx_published_scales(") == 3
+tcu = [json.loads(row)["val"]["core.instr_tcu"] for row in (app / "perf-0.jsonl").read_text().splitlines()]
+assert tcu[0] == tcu[2] == tcu[3] < tcu[1], tcu
+PYTEST
     done
     if [[ " $VORTEX_CONFIGS " == *" -DVX_CFG_TCU_TMEM_COLS=1024 "* ]]; then
       expected_launches=2 run_case tcgen05_full_mx_tmem_a 'case=3 mismatches=0/2048' ''

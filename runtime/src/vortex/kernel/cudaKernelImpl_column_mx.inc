@@ -224,8 +224,9 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
     unsigned sfIndex = k0 / scaleK;
     auto readScale = [&](bool isB, unsigned row) {
       unsigned selector = ((desc >> (isB ? 4 : 29)) & 3) + sfIndex;
-      if constexpr (placedCopies)
-        return (copies->words[isB][row % 32][row / 32] >> (8 * selector)) & 255;
+      if constexpr (placedCopies) {
+        if (copies) return (copies->words[isB][row % 32][row / 32] >> (8 * selector)) & 255;
+      }
       return column_scale_byte(isB ? sfb : sfa, row, selector);
     };
     for (unsigned panel = 0; panel < 2; ++panel) {
@@ -332,9 +333,14 @@ static void column_mx_tile(unsigned col, TcgenOperand a, TcgenOperand b, TcgenOp
       }
     }
   }
-  if constexpr (placedCopies)
-    column_publish_scale_copies(sfa, workspace, *copies, image, warp);
-  else if (borrowed)
+  if constexpr (placedCopies) {
+    if (copies) {
+      column_publish_scale_copies(sfa, workspace, *copies, image, warp);
+    } else if (borrowed) {
+      column_mx_restore(workspace, image, warp);
+      column_mx_restore(workspace + 16, image, warp);
+    }
+  } else if (borrowed)
     column_mx_restore(workspace, image, warp);
   column_meta_invalidate(col, n);
 }
@@ -408,7 +414,8 @@ extern "C" void __cupbop_column_mma_mx(unsigned addr, uint64_t ad, uint64_t bd, 
 // Keep the constant CUDA descriptor visible to native tile selection after
 // the translated kernel links the device runtime. On false the caller issues
 // the two original CUDA copies followed by the ordinary MMA.
-extern "C" __attribute__((always_inline)) bool __cupbop_column_mma_mx_scale_copies(
+template <bool published>
+static __attribute__((always_inline)) inline bool column_mx_place_scales(
     unsigned copyA, uint64_t sourceA, unsigned copyB, uint64_t sourceB, unsigned dst,
     uint64_t ad, uint64_t bd, unsigned desc, unsigned sfa, unsigned sfb, unsigned use_d, uint8_t *scratch) {
   // The translator matched two group-1 producers and one shared-A, dense,
@@ -420,31 +427,60 @@ extern "C" __attribute__((always_inline)) bool __cupbop_column_mma_mx_scale_copi
   if (copyA == sfa && copyB == sfb && sfa <= logicalCols - 8 && sfb == sfa + 4 && !(sfa % 8) &&
       dst <= logicalCols - n && !(dst % 16) && (sfa + 8 <= dst || dst + n <= sfa) &&
       !vx_thread_id() && warp < 4 && vx_num_barriers() >= 5 && __cupbop_column_meta_table) {
-    const unsigned side = column_panel(sfa, 0) + sfa % 16;
+    unsigned side = column_panel(sfa, 0) + sfa % 16;
     ColumnAccess access;
     auto &m = __cupbop_column_meta_table()[vx_core_id()];
     // Both native panels occupy the same allocator chunk. Only overwrite
     // this CTA's freshly produced words, including when all TMEM is owned.
-    if (side + 16 < column_side_limit && m.owner[side / 32] == 1 + csr_read_nv(VX_CSR_CTA_ID)) {
-      auto *copies = reinterpret_cast<ColumnScaleCopies *>(scratch + warp * (128 + 256) * 32 + 6144);
-      for (unsigned group = 0; group < 2; ++group) {
-        auto src = tcgen_operand(group ? sourceB : sourceA);
-        for (unsigned row = 0; row < 32; ++row)
-          __builtin_memcpy(copies->words[group][row], tcgen_chunk(src, row, 0), 16);
+    if (m.owner[side / 32] == 1 + csr_read_nv(VX_CSR_CTA_ID)) {
+      int privateSide = published ? column_sparse_side() : -1;
+      if (privateSide >= 0) side = unsigned(privateSide);
+      if (privateSide < 0 && side + 16 >= column_side_limit) return false;
+      ColumnScaleCopies *copies = nullptr;
+      if constexpr (published) {
+        // The two producers can execute in separate elected regions. Leave
+        // them there and use only the current TMEM image at the consumer.
+        // Every overwritten word must have a matching generation so that
+        // a partial store or a later native result cannot be lost.
+        for (unsigned col = sfa; privateSide < 0 && col < sfa + 8; ++col) {
+          unsigned gen = m.generation[col];
+          if (!gen) return false;
+          for (const auto &word : m.words[col])
+            if (word.generation != gen) return false;
+        }
+      } else {
+        copies = reinterpret_cast<ColumnScaleCopies *>(scratch + warp * (128 + 256) * 32 + 6144);
+        for (unsigned group = 0; group < 2; ++group) {
+          auto src = tcgen_operand(group ? sourceB : sourceA);
+          for (unsigned row = 0; row < 32; ++row)
+            __builtin_memcpy(copies->words[group][row], tcgen_chunk(src, row, 0), 16);
+        }
       }
       auto a = tcgen_operand(ad), b = tcgen_operand(bd);
       if (((desc >> 7) & 7) == 1 || ((desc >> 10) & 7) == 1) {
         [[clang::always_inline]]
         column_mx_tile<tensor::mxbf8, true>(dst, a, b, b, false, desc, sfa, sfb, use_d,
-                                            scratch, 1, 0, side, -1, false, copies);
+                                            scratch, 1, 0, side, -1, published && privateSide < 0, copies);
       } else {
         [[clang::always_inline]]
         column_mx_tile<tensor::mxfp8, true>(dst, a, b, b, false, desc, sfa, sfb, use_d,
-                                            scratch, 1, 0, side, -1, false, copies);
+                                            scratch, 1, 0, side, -1, published && privateSide < 0, copies);
       }
+      if (privateSide >= 0) column_sparse_release(privateSide);
       return true;
     }
   }
   return false;
+}
+
+extern "C" __attribute__((always_inline)) bool __cupbop_column_mma_mx_scale_copies(
+    unsigned copyA, uint64_t sourceA, unsigned copyB, uint64_t sourceB, unsigned dst,
+    uint64_t ad, uint64_t bd, unsigned desc, unsigned sfa, unsigned sfb, unsigned use_d, uint8_t *scratch) {
+  return column_mx_place_scales<false>(copyA, sourceA, copyB, sourceB, dst, ad, bd, desc, sfa, sfb, use_d, scratch);
+}
+
+extern "C" __attribute__((always_inline)) bool __cupbop_column_mma_mx_published_scales(
+    unsigned dst, uint64_t ad, uint64_t bd, unsigned desc, unsigned sfa, unsigned sfb, unsigned use_d, uint8_t *scratch) {
+  return column_mx_place_scales<true>(sfa, 0, sfb, 0, dst, ad, bd, desc, sfa, sfb, use_d, scratch);
 }
 #endif

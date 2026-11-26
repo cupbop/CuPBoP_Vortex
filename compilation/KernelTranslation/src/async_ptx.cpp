@@ -3378,22 +3378,42 @@ void fuse_mx_scale_copies(Module *M) {
     if (aType != bType || aType > 1) continue;
     auto *second = precedingCopy(call);
     auto *first = second ? precedingCopy(second) : nullptr;
-    if (!first || first->getArgOperand(3) != call->getArgOperand(7) ||
-        second->getArgOperand(3) != call->getArgOperand(7)) continue;
-    SmallVector<Value *> args{first->getArgOperand(0), first->getArgOperand(1),
-                              second->getArgOperand(0), second->getArgOperand(1)};
+    Value *scratch = call->getArgOperand(7);
+    bool foldCopies = first && first->getArgOperand(3) == scratch && second->getArgOperand(3) == scratch;
+    SmallVector<Value *> args;
+    if (foldCopies) {
+      args.append({first->getArgOperand(0), first->getArgOperand(1), second->getArgOperand(0), second->getArgOperand(1)});
+    } else {
+      // Separate issuer elections are common in lifted cubins. The matching
+      // SSA addresses identify a candidate only. Keep both copies and every
+      // intervening operation in place; runtime checks the current TMEM words.
+      bool hasA = false, hasB = false;
+      for (User *u : copy->users()) {
+        auto *producer = dyn_cast<CallInst>(u);
+        if (!producer || producer->getCalledFunction() != copy || producer->getFunction() != call->getFunction() ||
+            producer->getParent() == call->getParent() || !constantIs(producer->getArgOperand(2), 0) ||
+            producer->getArgOperand(3) != scratch) continue;
+        hasA |= producer->getArgOperand(0) == call->getArgOperand(4);
+        hasB |= producer->getArgOperand(0) == call->getArgOperand(5);
+        if (hasA && hasB) break;
+      }
+      if (!hasA || !hasB) continue;
+    }
     for (unsigned i = 0; i < 8; ++i) args.push_back(call->getArgOperand(i));
     SmallVector<Type *> types;
     for (auto *arg : args) types.push_back(arg->getType());
     IRBuilder<> builder(call);
-    auto fused = M->getOrInsertFunction("__cupbop_column_mma_mx_scale_copies",
+    auto fused = M->getOrInsertFunction(foldCopies ? "__cupbop_column_mma_mx_scale_copies"
+                                                  : "__cupbop_column_mma_mx_published_scales",
                                         FunctionType::get(builder.getInt1Ty(), types, false));
     auto *performed = builder.CreateCall(fused, args, "mx_placed");
     // Leave the original calls and their constant descriptor visible at the
     // kernel call sites so LTO can specialize the fallback exactly as before.
     auto *fallback = SplitBlockAndInsertIfThen(builder.CreateNot(performed), call->getIterator(), false);
-    first->moveBefore(*fallback->getParent(), fallback->getIterator());
-    second->moveBefore(*fallback->getParent(), fallback->getIterator());
+    if (foldCopies) {
+      first->moveBefore(*fallback->getParent(), fallback->getIterator());
+      second->moveBefore(*fallback->getParent(), fallback->getIterator());
+    }
     call->moveBefore(*fallback->getParent(), fallback->getIterator());
   }
 }
