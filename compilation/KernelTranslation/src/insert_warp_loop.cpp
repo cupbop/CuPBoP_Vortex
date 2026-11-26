@@ -50,6 +50,7 @@
 // #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <algorithm>
@@ -3626,44 +3627,26 @@ public:
       entry = entryCandidate;
       break;
     }
-    // delete useless PR, those PRs only have branch
-    if (entry == exit) {
-      if (entry->size() == 1 && isa<llvm::BranchInst>(entry->begin())) {
-        return;
-      }
-    }
+    if (entry == exit && entry->size() == 1 && isa<BranchInst>(entry->begin()))
+      return;
+    const bool flat_block_loop = g_schedule_flag == 0 && !need_nested_loop;
+    // The last block of a FLAT region can contain all its per-lane work.
+    // Nested loops and the core mapping retain their existing region boundaries.
+    BasicBlock *block = entry;
     bool is_useless = true;
-    auto iter = entry;
-    // llvm::errs() << "CHECK HERE: entry block: \n";
-    // entry->print(llvm::errs());
-    // llvm::errs() << "iter_size: "<<iter->size();
-    // llvm::errs() << "print done\n";
-
     do {
-      // llvm::errs() << "\niter block: \n";
-      //  iter->print(llvm::errs());
-      // llvm::errs() << "iter_size: " << iter->size();
-      if (iter->size() != 1 || !isa<llvm::BranchInst>(entry->begin())) {
-        // llvm::errs() << "became useful CASE 1\n";
-        // llvm::errs() << "--------------\n";
+      if (block->size() != 1 || !isa<BranchInst>(block->begin()) ||
+          block->getTerminator()->getNumSuccessors() > 1) {
         is_useless = false;
-        
         break;
       }
-      if (iter->getTerminator()->getNumSuccessors() > 1) {
-        is_useless = false;
-        // llvm::errs() << "became useful CASE 2\n";
-        // llvm::errs() << "--------------\n";
-        break;
-      }
-      iter = iter->getTerminator()->getSuccessor(0);
-      // llvm::errs() << "--------------\n";
-    } while (iter != exit);
-    
-    // Schedule 1 (core mapping) uses the whole-region test above; schedules 0/2 keep the original single-path
-    // walk unchanged (it is part of their CI baseline: score-cuda s0 changed behaviour with the new test).
+      if (block == exit) break;
+      block = block->getTerminator()->getSuccessor(0);
+    } while (flat_block_loop || block != exit);
+    if (is_useless) return;
+
     bool any_divergent_var = false;
-    if (g_schedule_flag == 1 && !std::getenv("CUPBOP_S1_OLD_REGION_TEST")) {
+    if (flat_block_loop || (g_schedule_flag == 1 && !std::getenv("CUPBOP_S1_OLD_REGION_TEST"))) {
       any_divergent_var = region_is_divergent();
       if (!any_divergent_var) {
         repl_anywhere = true;
@@ -3673,7 +3656,7 @@ public:
         repl_anywhere = false;
       }
     } else {
-    iter = entry;
+    auto *iter = entry;
     // create a vector of BasicBlock*
     std::vector<BasicBlock *> checked_blocks;
     checked_blocks.push_back(entry);
@@ -3743,9 +3726,9 @@ public:
     // allocas written there may be per-lane copies (e.g. kernel-argument stores into the
     // lifter's param buffer in a tid-free entry region) -- the other sub-pass's copy then
     // stays uninitialized. Under S>1 every non-empty region is a lane loop.
-    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop && !is_useless)
+    if (g_schedule_flag == 1 && need_nested_loop && intra_warp_loop)
       any_divergent_var = true;
-    if (is_useless || !any_divergent_var) {
+    if (!any_divergent_var) {
       return;
     }
     
@@ -3860,6 +3843,23 @@ public:
     auto PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
+    // Inlined CUDA helpers can spill a reference to a lane-private variable in
+    // another alloca. Expose its address to divergence analysis before deciding
+    // which indices need one copy per logical thread across barriers.
+    if (g_schedule_flag == 0 && !need_nested_loop) {
+      SmallVector<AllocaInst *, 8> refs;
+      for (auto &I : F.getEntryBlock()) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI || !AI->getAllocatedType()->isPointerTy() || !isAllocaPromotable(AI)) continue;
+        if (llvm::any_of(AI->users(), [&](User *U) {
+              auto *store = dyn_cast<StoreInst>(U);
+              if (!store || store->getPointerOperand() != AI) return false;
+              auto *referent = dyn_cast<AllocaInst>(getUnderlyingObject(store->getValueOperand()));
+              return referent && referent->isStaticAlloca();
+            })) refs.push_back(AI);
+      }
+      if (!refs.empty()) PromoteMemToReg(refs, *DT);
+    }
     DI.setAnalyzers(*DT, *PDT, LI);
     // debug (s1 single loop): allocas as divergence sources, CUPBOP_S1_DBG_REPLICATE_ALL=1 | exphi | noexphi (demoted
     // PHIs only / all others). Either set made lifted conv2d s1 right before the base-alloca store rule above.

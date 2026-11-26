@@ -313,16 +313,25 @@ int main(int argc, char **argv) {
   split_block_by_sync(program);
   dumpFile(program, "2_after_split_sync.ll");
 
-  // For SCHE_0: replace shfl intrinsics with warp_shfl store/barrier/read
-  // BEFORE warp loop creation. This ensures the initial store to warp_shfl
-  // is inside a PR and gets wrapped in a warp loop for per-thread access.
-  // If done after insert_warp_loop, O3 hoists the store out of the loop
-  // and constant-folds the thread index to 0.
-  DBG_LOG("replace_warp_shfl_early\n");
-  replace_warp_shfl_early(program);
-  // Re-run split_block_by_sync for barriers added by shfl replacement
-  split_block_by_sync(program);
-  dumpFile(program, "2b_after_shfl_replace.ll");
+  // Pure FLAT shuffle regions are already bounded by a lane write/read sync.
+  // At a conditional CTA exchange the nested warp-loop pass also needs the
+  // branch-only predecessors created by the second split. Select per kernel
+  // so an unrelated shuffle in the same module cannot affect its regions.
+  if (warp_mapping == MAPPING_FLAT) {
+    SmallPtrSet<Function *, 8> flatShuffleKernels;
+    if (auto *exchange = program->getNamedGlobal("warp_shfl"))
+      for (User *U : exchange->users())
+        if (auto *I = dyn_cast<Instruction>(U))
+          flatShuffleKernels.insert(I->getFunction());
+    for (Function &F : *program) {
+      if (!isKernelFunction(program, &F)) continue;
+      if (!flatShuffleKernels.contains(&F) || F.hasFnAttribute("cupbop.flat-cta-exchange"))
+        split_block_by_sync(&F);
+      F.removeFnAttr("cupbop.flat-cta-exchange");
+    }
+  } else {
+    split_block_by_sync(program);
+  }
 
   DBG_LOG("insert_warp_loop\n");
   insert_warp_loop(program);

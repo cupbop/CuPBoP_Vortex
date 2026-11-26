@@ -166,7 +166,7 @@ int main(int argc, char* argv[])
 
   bool ok = true;
   for (int i = 0; i < feature_size; i++) {
-    if (fabsf(var[i] - r_var[i]) > 1e-3f || fabsf(mean[i] - r_mean[i]) > 1e-3f) {
+    if (!(fabsf(var[i] - r_var[i]) <= 1e-3f && fabsf(mean[i] - r_mean[i]) <= 1e-3f)) {
        printf("Error at index %d: %f %f %f %f\n", i, var[i], r_var[i], mean[i], r_mean[i]);
        ok = false;
        break;
@@ -181,5 +181,5 @@ int main(int argc, char* argv[])
   free(var);
   free(r_mean);
   free(r_var);
-  return 0;
+  return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

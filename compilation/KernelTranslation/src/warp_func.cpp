@@ -619,10 +619,9 @@ PreservedAnalyses ReplaceWarpLevelPrimitive::run(Module &m, ModuleAnalysisManage
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceMovmatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceLdStMatrixStaged(m);
   if (mapping_ == MAPPING_CORE && getVirtGeom().subpasses > 1) replaceReduxStaged(m);
-  // In FLAT mode, skip shfl replacement here — it's handled by
-  // replace_warp_shfl_early() after init_block (barrier insertion order matters).
-  if (mapping_ != MAPPING_FLAT)
-    replaceWarpShfl(m);
+  // The FLAT exchange must be visible to insert_sync so it can form lane
+  // loops around shuffles inside user loops and conditional branches.
+  replaceWarpShfl(m);
   replaceWarpVote(m);
   return PreservedAnalyses::none();
 }
@@ -794,7 +793,7 @@ void ReplaceWarpLevelPrimitive::replaceWarpVote1to1(
 void ReplaceWarpLevelPrimitive::replaceWarpVoteX86(
     Module &m, const CallSet &replace) {}
 
-bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
+bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m) {
 
   DenseSet<StringRef> shflFuncs;
 
@@ -804,10 +803,8 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
                 "llvm.nvvm.shfl.sync.down.f32",
                 "llvm.nvvm.shfl.sync.up.f32",
                 "llvm.nvvm.shfl.sync.bfly.f32"};
-  if (!excludeIdx) {
-    shflFuncs.insert("llvm.nvvm.shfl.sync.idx.i32");
-    shflFuncs.insert("llvm.nvvm.shfl.sync.idx.f32");
-  }
+  shflFuncs.insert("llvm.nvvm.shfl.sync.idx.i32");
+  shflFuncs.insert("llvm.nvvm.shfl.sync.idx.f32");
 
   // Also match C++ mangled __shfl*_sync functions for FLAT mode.
   // These appear when CUDA code uses __shfl_sync() directly.
@@ -819,8 +816,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
         name.find("__shfl_up_sync") != string::npos ||
         name.find("__shfl_xor_sync") != string::npos)
       return true;
-    // Plain __shfl_sync (idx mode) — only match if not excluding idx
-    if (!excludeIdx && name.find("__shfl_sync") != string::npos)
+    if (name.find("__shfl_sync") != string::npos)
       return true;
     return false;
   };
@@ -857,8 +853,7 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
           // Match both C++ wrapper calls and NVVM intrinsics.
           // On sm_90, clang inlines C++ wrappers leaving only NVVM intrinsics.
           if (isShflCall(name)) {
-            fprintf(stderr, "[FLAT] matched shfl: %s (excludeIdx=%d)\n",
-                    name.c_str(), excludeIdx);
+            fprintf(stderr, "[FLAT] matched shfl: %s\n", name.c_str());
             replace.insert(ci);
           }
         }
@@ -930,163 +925,63 @@ bool ReplaceWarpLevelPrimitive::replaceWarpShfl(Module &m, bool excludeIdx) {
   return !replace.empty();
 }
 
-void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(
-    Module &m, const CallSet &replace) {
-  // type
-  Type *Int1T = Type::getInt1Ty(m.getContext());
+static int shuffleMode(StringRef name) {
+  if (name.contains("up")) return 1;
+  if (name.contains("down")) return 2;
+  if (name.contains("bfly") || name.contains("xor")) return 3;
+  return 0; // idx
+}
+
+static Value *shuffleControl(IRBuilder<> &b, CallInst *call, int mode) {
+  Value *c = call->getArgOperand(3);
+  if (call->getCalledFunction()->getName().starts_with("llvm.nvvm."))
+    return c;
+  // CUDA wrappers take a width. NVVM takes the PTX segment mask and clamp.
+  Value *width = b.CreateIntCast(c, b.getInt32Ty(), false);
+  Value *seg = b.CreateShl(b.CreateSub(b.getInt32(32), width), 8);
+  return b.CreateOr(seg, b.getInt32(mode == 1 ? 0 : 31));
+}
+
+void ReplaceWarpLevelPrimitive::replaceWarpShflFlat(Module &m, const CallSet &replace) {
+  if (replace.empty()) return;
+
   Type *I32 = Type::getInt32Ty(m.getContext());
-  Type *I8 = Type::getInt8Ty(m.getContext());
-  // constant
-  auto C0 = ConstantInt::get(I32, 0, true);
-  auto C1 = ConstantInt::get(I32, 1, true);
-  GlobalVariable *warp_shfl_ptr = m.getNamedGlobal("warp_shfl");
-  fprintf(stderr, "[FLAT] replaceWarpShflFlat called, %zu to replace, warp_shfl_ptr=%p\n",
-          replace.size(), (void*)warp_shfl_ptr);
-  for (auto shfl_inst : replace) {
-    fprintf(stderr, "[FLAT] processing shfl in %s\n",
-            shfl_inst->getParent()->getParent()->getName().str().c_str());
-    /*
-     * %10 = tail call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 %add32,
-     * i32 16, i32 31)
-     * ->
-     * warp_shfl[warp_id] = add32
-     * warp.barrier()
-     * %10 = warp_shfl[warp_id + offset]
-     */
-    IRBuilder<> builder(shfl_inst);
+  auto *exchange = m.getNamedGlobal("warp_shfl");
+  auto *laneIndex = m.getGlobalVariable("intra_warp_index");
+  auto srcLane = m.getOrInsertFunction("__cupbop_shfl_srclane",
+      FunctionType::get(I32, {I32, I32, I32, I32}, false));
+  for (auto *call : replace) {
+    IRBuilder<> b(call);
+    Value *value = call->getArgOperand(1);
+    Value *arg = call->getArgOperand(2);
+    int mode = shuffleMode(call->getCalledFunction()->getName());
+    Value *ctrl = shuffleControl(b, call, mode);
+    auto *lane = createLoad(b, laneIndex);
+    auto *source = b.CreateCall(srcLane, {b.getInt32(mode), lane, arg, ctrl});
+    auto &entryBlock = call->getFunction()->getEntryBlock();
+    IRBuilder<> entry(&entryBlock, entryBlock.getFirstInsertionPt());
+    auto *sourceSlot = entry.CreateAlloca(I32, nullptr, "shfl_src");
+    auto *resultSlot = entry.CreateAlloca(value->getType(), nullptr, "shfl_res");
 
-    auto shfl_variable = shfl_inst->getArgOperand(1);
-    auto shfl_offset = shfl_inst->getArgOperand(2);
-    bool isFloat = shfl_variable->getType()->isFloatTy();
-    auto shfl_name = shfl_inst->getCalledOperand()->getName().str();
-
-    // idx mode: __shfl_sync(mask,val,lane) — simple broadcast/read.
-    // Don't add barrier splits (too many warp loops for cc-cuda).
-    bool isIdxMode = (shfl_name.find("idx") != shfl_name.npos ||
-                      (shfl_name.find("__shfl_sync") != shfl_name.npos &&
-                       shfl_name.find("down") == shfl_name.npos &&
-                       shfl_name.find("up") == shfl_name.npos &&
-                       shfl_name.find("xor") == shfl_name.npos));
-
-    // Always use allocas for shfl_offset — split_block_by_sync splits at
-    // barrier0 later, which can separate operand definition from use.
-    // The allocas are named "shfl_*" so insert_warp_loop skips them
-    // during context save (they're shfl emulation temporaries, not user data).
-    Function *F = shfl_inst->getParent()->getParent();
-    IRBuilder<> entryBuilder(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
-    auto *offset_alloca = entryBuilder.CreateAlloca(I32, nullptr, "shfl_off");
-    auto *result_alloca = entryBuilder.CreateAlloca(
-        isFloat ? builder.getFloatTy() : I32, nullptr, "shfl_res");
-
-    // Store offset before barrier
-    builder.CreateStore(shfl_offset, offset_alloca);
-
-    // Split BEFORE the store: separates this shfl's store from the
-    // PREVIOUS shfl's read+combine. Skip for idx mode (no combine).
-    if (!isIdxMode) {
-      auto *insertBB = builder.GetInsertBlock();
-      auto *insertPt = &*builder.GetInsertPoint();
-      if (insertPt != &*insertBB->begin()) {
-        auto *newBB = insertBB->splitBasicBlock(
-            insertPt, insertBB->getName().str() + "_shfl_store");
-        builder.SetInsertPoint(&*newBB->begin());
-      }
-    }
-
-    auto intra_warp_index =
-        createLoad(builder, m.getGlobalVariable("intra_warp_index"));
-    auto inter_warp_index =
-        createLoad(builder, m.getGlobalVariable("inter_warp_index"));
-    // Index by inter*32 + intra to isolate warps in warp_shfl[1024]
-    auto store_idx = builder.CreateAdd(intra_warp_index,
-        builder.CreateMul(inter_warp_index, ConstantInt::get(I32, 32)),
-        "shfl_store_idx");
-    Value *val_to_store = shfl_variable;
-    if (isFloat)
-        val_to_store = builder.CreateBitCast(val_to_store, I32);
-    auto store_gep = builder.CreateGEP(warp_shfl_ptr->getValueType(),
-                                        warp_shfl_ptr, {C0, store_idx});
-    auto *store_inst = builder.CreateStore(val_to_store, store_gep);
-    cast<StoreInst>(store_inst)->setVolatile(true);
-
-    // shfl_barrier separates the store from the read.
-    // For idx mode, skip barrier/split — idx is a simple read from
-    // a fixed lane, no synchronization needed between store and read.
-    if (!isIdxMode) {
-      CallInst *shfl_call;
-      {
-        auto FT = FunctionType::get(Type::getVoidTy(m.getContext()), {}, false);
-        auto callee = m.getOrInsertFunction("cupbop.shfl.barrier", FT);
-        shfl_call = builder.CreateCall(callee);
-      }
-      // Split block: store → | shfl_barrier → read
-      auto *storeBlock = shfl_call->getParent();
-      auto *barrierBlock = storeBlock->splitBasicBlock(
-          shfl_call, storeBlock->getName().str() + "_shfl_barrier");
-      // Split again: shfl_barrier → | read
-      auto *nextAfterBarrier = shfl_call->getNextNode();
-      if (nextAfterBarrier && !nextAfterBarrier->isTerminator()) {
-        barrierBlock->splitBasicBlock(
-            nextAfterBarrier, storeBlock->getName().str() + "_shfl_read");
-      }
-      // Reset builder to the read block
-      builder.SetInsertPoint(nextAfterBarrier);
-    }
-
-    // After barrier: load offset from alloca (survives BB split)
-    auto safe_offset = builder.CreateLoad(I32, offset_alloca, "shfl_off_ld");
-    auto new_intra_warp_index =
-        createLoad(builder, m.getGlobalVariable("intra_warp_index"));
-    auto new_inter_warp_index =
-        createLoad(builder, m.getGlobalVariable("inter_warp_index"));
-
-    // Compute lane-level index within warp (0..31)
-    Value *lane_index;
-    if (shfl_name.find("down") != shfl_name.npos) {
-      auto calc = builder.CreateAdd(new_intra_warp_index, safe_offset);
-      lane_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
-    } else if (shfl_name.find("up") != shfl_name.npos) {
-      auto calc = builder.CreateSub(new_intra_warp_index, safe_offset);
-      lane_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
-    } else if (shfl_name.find("bfly") != shfl_name.npos ||
-               shfl_name.find("xor") != shfl_name.npos) {
-      auto calc = builder.CreateXor(new_intra_warp_index, safe_offset);
-      lane_index = builder.CreateSRem(calc, ConstantInt::get(I32, 32));
-    } else {
-      lane_index = builder.CreateSRem(safe_offset, ConstantInt::get(I32, 32));
-    }
-    // Add inter_warp offset: warp_shfl[inter*32 + lane]
-    auto load_index = builder.CreateAdd(lane_index,
-        builder.CreateMul(new_inter_warp_index, ConstantInt::get(I32, 32)),
-        "shfl_load_idx");
-
-    auto gep = builder.CreateGEP(warp_shfl_ptr->getValueType(), warp_shfl_ptr,
-                                  {C0, load_index});
-    auto *load_raw = builder.CreateLoad(I32, gep);
-    cast<LoadInst>(load_raw)->setVolatile(true);
-    Value *load_inst = load_raw;
-    if (isFloat)
-      load_inst = builder.CreateBitCast(load_inst, builder.getFloatTy());
-
-    // Store result to alloca, replace uses with per-user loads
-    builder.CreateStore(load_inst, result_alloca);
-    // Second shfl_barrier
-    {
-      auto FT = FunctionType::get(Type::getVoidTy(m.getContext()), {}, false);
-      auto callee = m.getOrInsertFunction("cupbop.shfl.barrier", FT);
-      builder.CreateCall(callee);
-    }
-    std::vector<Instruction *> users;
-    for (auto &U : shfl_inst->uses())
-      if (auto *I = dyn_cast<Instruction>(U.getUser()))
-        users.push_back(I);
-    for (auto *user : users) {
-      IRBuilder<> userBuilder(user);
-      auto *res_load = userBuilder.CreateLoad(
-          isFloat ? builder.getFloatTy() : I32, result_alloca, "shfl_res_ld");
-      user->replaceUsesOfWith(shfl_inst, res_load);
-    }
-    shfl_inst->eraseFromParent();
+    // The lane loops save their source and result per logical thread. The
+    // TLS exchange can hold several logical warps if a surrounding CTA
+    // barrier separates their regions. Finish all writes before each read.
+    auto slot = [&](Value *index) {
+      auto *warp = createLoad(b, m.getGlobalVariable("inter_warp_index"));
+      Value *offset = b.CreateAdd(b.CreateMul(warp, b.getInt32(32)), index);
+      return b.CreateGEP(exchange->getValueType(), exchange, {b.getInt32(0), offset});
+    };
+    b.CreateStore(source, sourceSlot);
+    b.CreateStore(b.CreateBitCast(value, I32), slot(lane))->setVolatile(true);
+    CreateIntraWarpBarrier(call);
+    Value *peer = b.CreateLoad(I32, sourceSlot);
+    auto *read = b.CreateLoad(I32, slot(peer));
+    read->setVolatile(true);
+    b.CreateStore(b.CreateBitCast(read, value->getType()), resultSlot);
+    // A following shuffle, including the next loop iteration, reuses the exchange.
+    CreateIntraWarpBarrier(call);
+    call->replaceAllUsesWith(b.CreateLoad(value->getType(), resultSlot));
+    call->eraseFromParent();
   }
 }
 
@@ -1307,22 +1202,13 @@ void ReplaceWarpLevelPrimitive::replaceWarpShflStaged(Module &m, const CallSet &
       CallSet one; one.insert(ci); replaceWarpShfl1to1(m, one);
       continue;
     }
-    const bool isIntrinsic = name.rfind("llvm.nvvm.shfl.sync.", 0) == 0;
-    int mode = 0;
-    if (name.find("up") != string::npos) mode = 1;
-    else if (name.find("down") != string::npos) mode = 2;
-    else if (name.find("bfly") != string::npos || name.find("xor") != string::npos) mode = 3;
+    int mode = shuffleMode(name);
     Value *var = ci->getArgOperand(1);
     Value *bArg = ci->getArgOperand(2);
-    Value *cArg = ci->getArgOperand(3);
     Type *VT = var->getType();
     const bool isFloat = VT->isFloatTy();
     IRBuilder<> b(ci);
-    if (!isIntrinsic) { // C++ wrapper: 4th arg is width -> PTX c = (32-width)<<8 | (up ? 0 : 31)
-      Value *w = b.CreateIntCast(cArg, I32, false);
-      Value *seg = b.CreateShl(b.CreateSub(ConstantInt::get(I32, 32), w), ConstantInt::get(I32, 8));
-      cArg = b.CreateOr(seg, ConstantInt::get(I32, mode == 1 ? 0 : 31));
-    }
+    Value *cArg = shuffleControl(b, ci, mode);
     bArg = b.CreateIntCast(bArg, I32, true);
     Value *varBits = isFloat ? b.CreateBitCast(var, I32) : b.CreateIntCast(var, I32, true);
     IRBuilder<> eb(virtEntryInsertPt(F));

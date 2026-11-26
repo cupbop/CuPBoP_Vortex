@@ -244,9 +244,10 @@ fill(const int e, T* w, const T value)
 }
 
 template <bool weighted, typename T>
-void jaccard_weight (const int iteration, const int n, const int e,
+bool jaccard_weight (const int iteration, const int n, const int e,
     int* csr_ptr, int* csr_ind, T* csr_val)
 {
+  bool ok = true;
   const T gamma = (T)0.46;  // arbitrary
 
   T *d_weight_i,
@@ -310,7 +311,17 @@ void jaccard_weight (const int iteration, const int n, const int e,
 
 #ifdef DEBUG
     cudaMemcpy(work, d_work, sizeof(T) * n, cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n; i++) printf("work: %d %f\n", i, work[i]);
+    for (int row = 0; row < n; ++row) {
+      T expected = 0;
+      for (int j = csr_ptr[row]; j < csr_ptr[row + 1]; ++j)
+        expected += weighted ? T(csr_ind[j] + 1) / e : T(1);
+      printf("work: %d %f\n", row, work[row]);
+      if (!(std::fabs(work[row] - expected) <= 1e-5)) {
+        printf("FAIL row %d (%s): got %f, expected %f\n",
+               row, weighted ? "weighted" : "unweighted", work[row], expected);
+        ok = false;
+      }
+    }
 #endif
 
     // compute volume of intersections (*weight_i) and cumulated volume of neighboors (*weight_s)
@@ -368,7 +379,8 @@ void jaccard_weight (const int iteration, const int n, const int e,
             std::fabs(weight_j[4] - 0.920000) +
             std::fabs(weight_j[5] - 0.460000);
 
-  if (error > 1e-5) {
+  ok = ok && (error <= 1e-5);
+  if (!ok) {
     for (int i = 0; i < e; i++) printf("wj: %d %f\n", i, weight_j[i]);
     printf("FAIL");
   } else {
@@ -390,6 +402,7 @@ void jaccard_weight (const int iteration, const int n, const int e,
   free(weight_s);
   free(work);
 #endif
+  return ok;
 }
 
 // Utilities
@@ -468,9 +481,9 @@ int main(int argc, char** argv)
     printVector(csr_ind, (char*)"col indices = ");
   }
 
-  jaccard_weight<true, vtype>(iteration, row, nnz, csr_ptr.data(), csr_ind.data(), csr_val.data());
-  jaccard_weight<false, vtype>(iteration, row, nnz, csr_ptr.data(), csr_ind.data(), csr_val.data());
+  bool weighted_ok = jaccard_weight<true, vtype>(iteration, row, nnz, csr_ptr.data(), csr_ind.data(), csr_val.data());
+  bool unweighted_ok = jaccard_weight<false, vtype>(iteration, row, nnz, csr_ptr.data(), csr_ind.data(), csr_val.data());
 
-  return 0;
+  return weighted_ok && unweighted_ok ? 0 : 1;
 }
 

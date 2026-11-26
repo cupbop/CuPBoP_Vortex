@@ -1,6 +1,5 @@
 #include "tool.h"
 #include "async_ptx.h"
-#include "warp_func.h"
 #include "flag.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -670,18 +669,6 @@ void lower_cmpxchg_for_flat(llvm::Module *M) {
   if (!cas_ops.empty())
     fprintf(stderr, "[FLAT] lowered %zu cmpxchg to plain load+cmp+store\n",
             cas_ops.size());
-}
-
-void replace_warp_shfl_early(llvm::Module *M) {
-  int schedule = 0;
-  if (char *env = std::getenv("VORTEX_SCHEDULE_FLAG"))
-    schedule = std::stoi(std::string(env));
-  if (schedule != 0) return; // Only FLAT mode needs early shfl replacement
-
-  using namespace cupbop;
-  ReplaceWarpLevelPrimitive rw(MAPPING_FLAT);
-  rw.replaceWarpShfl(*M);
-  fprintf(stderr, "[FLAT] early shfl replace done\n");
 }
 
 // llvm.nvvm.membar.cta right next to a CTA barrier -- CuLifter emits one after every bar.sync -- is

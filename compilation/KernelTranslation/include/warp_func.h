@@ -33,9 +33,8 @@ public:
   /// @brief replace warp level primitives
   PreservedAnalyses run(Module &M, ModuleAnalysisManager&);
 
-  bool replaceWarpShfl(Module &m, bool excludeIdx = false);
-
 private:
+  bool replaceWarpShfl(Module &m);
   /// @brief replace warp vote
   /// @param m the module where the instructions will be replaced
   bool replaceWarpVote(Module &m);

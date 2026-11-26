@@ -24,6 +24,7 @@
 //LLVM18
 //#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -240,8 +241,7 @@ void create_global_variable(llvm::Module *M) {
   auto zero = llvm::ConstantInt::get(I32, 0, true);
 
   // we need global variable used for warp shuffle
-  // 1024 entries: indexed by inter_warp_idx*32 + intra_warp_idx
-  // to isolate warp shuffle data across inter_warp loop iterations.
+  // Each logical warp in a CUDA block has its own 32-lane bank.
   llvm::Type *WarpArrayType = llvm::ArrayType::get(I32, 1024);
   llvm::Type *VoteArrayType = llvm::ArrayType::get(I8, 32);
 
@@ -817,16 +817,9 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
           }
         }
       }
-      // Only insert shfl_barriers in kernels that actually use shfl.
-      // Kernels without shfl don't need the extra barriers, and adding
-      // them causes barrier/warp-loop explosion (cc-cuda: 1201 barriers).
-      // Only insert shfl_barriers if kernel uses shfl_down/up/xor/bfly.
-      // shfl idx (broadcast) doesn't need barrier synchronization, and
-      // adding barriers causes code explosion (cc-cuda: 569→9032 lines).
-      // Note: at this point, early shfl replacement has already converted
-      // shfl calls to warp_shfl store+cupbop.shfl.barrier+read.
-      // Check for warp_shfl GEPs as evidence of down/up/xor replacement.
-      // idx mode replacement doesn't create barriers (isIdxMode skip).
+      // Additional CTA exchange boundaries for reductions that combine
+      // shuffle and shared memory. All shuffle modes get their own warp
+      // boundaries later in ReplaceWarpLevelPrimitive.
       bool kernel_has_shfl = false;
       for (auto &BB : F) {
         for (auto &I : BB) {
@@ -855,78 +848,28 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
             IRBuilder<> builder(next);
             builder.CreateCall(callee);
           }
-          // Create a separate barrier block BEFORE the exchange merge.
-          // Exchange-path predecessors go through the barrier block,
-          // skip-path predecessors go directly to the merge.
-          // This eliminates multi-entry PR issues.
+          // After a conditional CTA exchange, one arm can go straight to a join
+          // also reached along a path that bypasses the barrier. Group incoming
+          // edges by whether the barrier dominates them. Each lane loop then
+          // has one entry, including when LLVM drops all basic block names.
           BasicBlock *syncBB = CI->getParent();
-          auto *term = syncBB->getTerminator();
-          if (auto *br = dyn_cast<BranchInst>(term)) {
-            if (br->isConditional()) {
-              BasicBlock *mergeBB = br->getSuccessor(1);
-              // Only split exchange merge blocks. Identify by having a
-              // predecessor named "cond.*" (from cond.true.i in exchange).
-              bool has_exchange_pred = false;
-              for (auto *pred : predecessors(mergeBB)) {
-                if (pred->getName().starts_with("cond."))
-                  has_exchange_pred = true;
-              }
-              if (mergeBB && mergeBB != syncBB && has_exchange_pred) {
-                BasicBlock *barrierBB = BasicBlock::Create(
-                    Ctx, mergeBB->getName().str() + "_xchg_barrier",
-                    CI->getFunction(), mergeBB);
-                IRBuilder<> bbBuilder(barrierBB);
-                bbBuilder.CreateCall(callee);
-                bbBuilder.CreateBr(mergeBB);
-                // Three-barrier structure:
-                // exchange preds → xchg_barrier → common_barrier → mergeBB
-                // skip preds → skip_barrier → common_barrier → mergeBB
-                //
-                // xchg_barrier: clean single-path entry for exchange PR
-                // skip_barrier: clean single-path entry for skip path
-                // common_barrier: single entry for mergeBB's PR (warp loop)
-
-                // Create common barrier (between xchg/skip and mergeBB)
-                BasicBlock *commonBB = BasicBlock::Create(
-                    Ctx, mergeBB->getName().str() + "_common_barrier",
-                    CI->getFunction(), mergeBB);
-                {
-                  IRBuilder<> cb(commonBB);
-                  cb.CreateCall(callee);
-                  cb.CreateBr(mergeBB);
-                }
-
-                // xchg_barrier → common_barrier (not directly to mergeBB)
-                barrierBB->getTerminator()->replaceUsesOfWith(mergeBB, commonBB);
-
-                // Collect and redirect preds
-                SmallVector<BasicBlock *, 4> exchange_preds;
-                SmallVector<BasicBlock *, 4> skip_preds;
-                for (auto *pred : predecessors(mergeBB)) {
-                  if (pred == commonBB) continue;
-                  if (pred->getName().starts_with("if.then") ||
-                      pred->getName().starts_with("cond.") ||
-                      pred == syncBB)
-                    exchange_preds.push_back(pred);
-                  else
-                    skip_preds.push_back(pred);
-                }
-                for (auto *pred : exchange_preds)
-                  pred->getTerminator()->replaceUsesOfWith(mergeBB, barrierBB);
-                // Skip preds → skip_barrier → common_barrier
-                if (!skip_preds.empty()) {
-                  BasicBlock *skipBB = BasicBlock::Create(
-                      Ctx, mergeBB->getName().str() + "_skip_barrier",
-                      CI->getFunction(), commonBB);
-                  IRBuilder<> sb(skipBB);
-                  sb.CreateCall(callee);
-                  sb.CreateBr(commonBB);
-                  for (auto *pred : skip_preds)
-                    pred->getTerminator()->replaceUsesOfWith(mergeBB, skipBB);
-                }
-              }
-            }
-          }
+          auto *br = dyn_cast<BranchInst>(syncBB->getTerminator());
+          if (!br || !br->isConditional()) continue;
+          PostDominatorTree pdt(F);
+          auto *node = pdt.getNode(syncBB);
+          auto *join = node && node->getIDom() ? node->getIDom()->getBlock() : nullptr;
+          if (!join || (join != br->getSuccessor(0) && join != br->getSuccessor(1))) continue;
+          DominatorTree dt(F);
+          SmallVector<BasicBlock *, 4> crossed, bypass;
+          for (auto *p : predecessors(join))
+            (dt.dominates(syncBB, p) ? crossed : bypass).push_back(p);
+          if (crossed.empty() || bypass.empty()) continue;
+          F.addFnAttr("cupbop.flat-cta-exchange");
+          auto *exchange = SplitBlockPredecessors(join, crossed, ".exchange");
+          auto *skip = SplitBlockPredecessors(join, bypass, ".skip");
+          auto *after = SplitBlockPredecessors(join, {exchange, skip}, ".common");
+          for (auto *path : {exchange, skip, after})
+            IRBuilder<>(path->getTerminator()).CreateCall(callee);
         }
       }
     }
@@ -935,8 +878,7 @@ void init_block(llvm::Module *M, std::ofstream &fout) {
   // Split blocks after shfl_barrier calls to separate the barrier
   // from following code (e.g. exchange conditional). This ensures
   // the following code gets its own PR and warp loop.
-  // Must run AFTER xchg_barrier creation (which checks for
-  // conditional terminators in barrier blocks).
+  // Inspect the original conditional terminators before splitting their blocks.
   if (sched == 0) {
     for (auto &F : *M) {
       if (!isKernelFunction(M, &F)) continue;

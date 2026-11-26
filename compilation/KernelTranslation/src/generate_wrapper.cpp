@@ -23,6 +23,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <fstream>
 #include <cstdlib>
@@ -48,8 +49,11 @@
 // (base 0) the kernel runs on the hardware stack as before. Unset: the wrapper is exactly the old one.
 static long big_stack_bytes() {
   const char *e = std::getenv("CUPBOP_BIG_STACK");
-  long v = e ? std::atol(e) : 0;
-  return v > 0 ? (v + 15) / 16 * 16 : 0;
+  unsigned long bytes = 0;
+  if (!e || llvm::StringRef(e).getAsInteger(10, bytes) ||
+      bytes > static_cast<unsigned long>(std::numeric_limits<long>::max() - 15))
+    return 0;
+  return static_cast<long>((bytes + 15) / 16 * 16);
 }
 static std::string big_stack_prelude() {
   const long n = big_stack_bytes();
@@ -812,6 +816,13 @@ std::string converttostring(const char* a) {
 
 void create_kernel_wrapper_function(llvm::Module *M){
 
+    // The host uses the same rounded stride embedded in the wrapper, including
+    // builds where the caller supplies CUPBOP_BIG_STACK directly.
+    if (long stride = big_stack_bytes())
+      std::ofstream("cupbop_big_stack.txt") << stride << "\n";
+    else
+      std::remove("cupbop_big_stack.txt");
+
     auto ALIGNED_CTX_SIZE = 100;
 
     std::string kernel_name_tmp;
@@ -950,6 +961,11 @@ void create_kernel_wrapper_function(llvm::Module *M){
           "\n";
 
     if (schedule != 2) {
+      // FLAT indexes the exchange by logical CUDA thread, independent of the
+      // number of physical threads in the Vortex configuration.
+      std::string shuffleSlots = "NUM_WARPS * NUM_THREADS";
+      if (auto *exchange = M->getNamedGlobal("warp_shfl"); exchange && !exchange->use_empty())
+        shuffleSlots = std::to_string(cast<ArrayType>(exchange->getValueType())->getNumElements());
       // Schedule 0/1: CuPBoP's own globals (populated by cuda_*_wrapper)
       ss << "int grid_size_x;\n"
             "int grid_size_y;\n"
@@ -976,7 +992,7 @@ void create_kernel_wrapper_function(llvm::Module *M){
             "__attribute__((used)) int __thread thread_id_z;\n"
             "\n"
             "#include <VX_config.h>\n"
-            "__attribute__((used)) int __thread warp_shfl[NUM_WARPS * NUM_THREADS] = {0};\n"
+            "__attribute__((used)) int __thread warp_shfl[" << shuffleSlots << "] = {0};\n"
             "__attribute__((used)) char __thread warp_vote[32] = {0};\n"
             "__attribute__((used)) int __thread vote_count = 0;\n"
             "\n";
@@ -1513,7 +1529,10 @@ static bool dyn_stack_eval(Function *H, uint64_t maxbs, uint64_t NP, std::vector
 
 void describe_dyn_stack(llvm::Module *M) {
   std::remove("cupbop_dyn_stack.txt");
-  if ((!asm_call_on() || sp_skew_m() <= 1) && !stack_lmem_on()) return;   // also for the stack in local memory
+  // A FLAT block's barrier context can overflow an unskewed hardware stack.
+  const bool flat_fallback = !std::strcmp(env_or("VORTEX_SCHEDULE_FLAG", "0"), "0") && !big_stack_bytes() &&
+                             std::strcmp(env_or("CUPBOP_BIG_STACK_FALLBACK", "1"), "0");
+  if (!flat_fallback && (!asm_call_on() || sp_skew_m() <= 1) && !stack_lmem_on()) return;
   const DataLayout &DL = M->getDataLayout();
   LLVMContext &C = M->getContext();
   auto *I64 = Type::getInt64Ty(C);
@@ -1690,7 +1709,10 @@ void describe_dyn_stack(llvm::Module *M) {
   }
   // evaluate over every legal launch: block_size 1..maxbs (CUDA's 1024 threads per block), P 1..64
   const char *mb = std::getenv("CUPBOP_SP_SKEW_MAX_BLOCK");
-  const uint64_t maxbs = mb && *mb && std::atol(mb) > 0 ? (uint64_t)std::atol(mb) : 1024;
+  const uint64_t skew_maxbs = mb && *mb && std::atol(mb) > 0 ? (uint64_t)std::atol(mb) : 1024;
+  // Stack storage must cover every legal CUDA launch even if a smaller skew
+  // tuning range was requested.
+  const uint64_t maxbs = flat_fallback ? std::max<uint64_t>(1024, skew_maxbs) : skew_maxbs;
   const uint64_t NP = 64;
   std::vector<uint64_t> tab;
   if (why.empty()) {

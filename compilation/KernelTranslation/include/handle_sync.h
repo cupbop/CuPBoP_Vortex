@@ -5,6 +5,7 @@
 
 using namespace llvm;
 
+void split_block_by_sync(llvm::Function *F);
 void split_block_by_sync(llvm::Module *M);
 
 #endif

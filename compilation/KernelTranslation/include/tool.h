@@ -63,7 +63,6 @@ void mark_uniform_branches(llvm::Module *M); // CUPBOP_UNIFORM_BR (uniform_branc
 void fast_entry_finalize_wrapper(llvm::Module *M);
 
 void hoist_block_constant_loads(llvm::Module *M);
-void replace_warp_shfl_early(llvm::Module *M);
 void lower_cmpxchg_for_flat(llvm::Module *M);
 void lower_atomicrmw_fadd(llvm::Module *M);
 void lower_atomicrmw_add_i64(llvm::Module *M);
