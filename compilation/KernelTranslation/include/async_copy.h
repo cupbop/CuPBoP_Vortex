@@ -7,8 +7,8 @@
 // llvm.nvvm.cp.async.* and CuLifter's LDGSTS lift) complete at the issue point. The default uses a global
 // load and a shared store with src-size zero-fill. The optional NT8 path coalesces contiguous full copies
 // through DXA and waits for completion. In both paths commit_group / wait_group / wait_all
-// become no-ops (a compiler-only fence for the waits). This is correct whatever the waits say, so it
-// also holds for lifted IR, where the lifter drops LDGDEPBAR/DEPBAR. Refused with a translation error
+// become no-ops (a compiler-only fence for the waits). This also handles CuLifter IR that preserves the
+// LDGDEPBAR/DEPBAR group boundaries and pending depth of a hardware copy scoreboard. Refused with a translation error
 // instead of being dropped: cp.async.mbarrier.arrive*, cp.async.bulk*, mbarrier* and any other cp.async
 // form the parser does not understand. Runs before init_block (replace_asm_call would drop the asm).
 void lower_cp_async(llvm::Module *M);
