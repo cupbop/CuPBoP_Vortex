@@ -138,6 +138,10 @@ check_groups(body(named, "named_groups"), [
     ("issue", 0), ("issue", 1), ("wait", 0), ("wait", 1), "fence",
     ("issue", 0), ("issue", 1), ("wait", 2), "fence", ("wait", 3), "fence"])
 assert "@__cupbop_cp_async_issue16" not in body(named, "opaque_branch")
+for kernel in ("mbarrier_ptx", "mbarrier_named", "mbarrier_helper"):
+    producer = body(named, kernel)
+    assert "@__cupbop_cp_async_issue16" not in producer, kernel
+    assert "load i128" in producer and "store i128" in producer, kernel
 repeat = body(named, "repeat_wait")
 issued = re.search(r"(%[\w.]+) = .*call i32 @__cupbop_cp_async_issue16", repeat)[1]
 waited = re.findall(r"call void @__cupbop_cp_async_wait\(i32 ([%\w.]+)\)", repeat)

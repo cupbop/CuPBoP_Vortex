@@ -362,6 +362,7 @@ bool usesOtherBarriers(Function *kernel) {
   while (!work.empty()) {
     Function *F = work.pop_back_val();
     if (!seen.insert(F).second) continue;
+    if (F->hasFnAttribute(kCpAsyncMbarrierCompletion)) return true;
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         auto *C = dyn_cast<CallBase>(&I);

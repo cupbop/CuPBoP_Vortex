@@ -53,7 +53,42 @@ end:
   ret void
 }
 
-!nvvm.annotations = !{!0, !1, !2}
+; Another warp may observe the mbarrier before this issue thread's group wait.
+; Its init and observer are deliberately absent from these producer inputs.
+declare void @llvm.nvvm.cp.async.mbarrier.arrive.shared(ptr addrspace(3))
+
+define void @mbarrier_ptx(ptr addrspace(3) %dst, ptr addrspace(1) %src, ptr addrspace(3) %bar) {
+  call void @llvm.nvvm.cp.async.cg.shared.global.16(ptr addrspace(3) %dst, ptr addrspace(1) %src)
+  call void asm sideeffect "cp.async.mbarrier.arrive.shared::cta.b64 [$0];", "l,~{memory}"(ptr addrspace(3) %bar)
+  call void @llvm.nvvm.cp.async.wait.all()
+  ret void
+}
+
+define void @mbarrier_named(ptr addrspace(3) %dst, ptr addrspace(1) %src, ptr addrspace(3) %bar) {
+  call void @llvm.nvvm.cp.async.cg.shared.global.16(ptr addrspace(3) %dst, ptr addrspace(1) %src)
+  call void @llvm.nvvm.cp.async.mbarrier.arrive.shared(ptr addrspace(3) %bar)
+  call void @llvm.nvvm.cp.async.wait.all()
+  ret void
+}
+
+define internal void @associate_copy(ptr addrspace(3) %bar) noinline {
+  call void @llvm.nvvm.cp.async.mbarrier.arrive.shared(ptr addrspace(3) %bar)
+  ret void
+}
+
+define void @mbarrier_helper(ptr addrspace(3) %dst, ptr addrspace(1) %src, ptr addrspace(3) %bar) {
+  call void @llvm.nvvm.cp.async.cg.shared.global.16(ptr addrspace(3) %dst, ptr addrspace(1) %src)
+  call void @associate_copy(ptr addrspace(3) %bar)
+  call void @llvm.nvvm.cp.async.wait.all()
+  call void @llvm.nvvm.cp.async.cg.shared.global.16(ptr addrspace(3) %dst, ptr addrspace(1) %src)
+  call void @llvm.nvvm.cp.async.wait.all()
+  ret void
+}
+
+!nvvm.annotations = !{!0, !1, !2, !3, !4, !5}
 !0 = !{ptr @named_groups, !"kernel", i32 1}
 !1 = !{ptr @repeat_wait, !"kernel", i32 1}
 !2 = !{ptr @opaque_branch, !"kernel", i32 1}
+!3 = !{ptr @mbarrier_ptx, !"kernel", i32 1}
+!4 = !{ptr @mbarrier_named, !"kernel", i32 1}
+!5 = !{ptr @mbarrier_helper, !"kernel", i32 1}

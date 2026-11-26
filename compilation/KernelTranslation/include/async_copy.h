@@ -3,6 +3,10 @@
 
 #include "llvm/IR/Module.h"
 
+// Ordinary cp.async.mbarrier.arrive balances its count at issue only when
+// copies complete synchronously. Record that requirement before erasing it.
+inline constexpr char kCpAsyncMbarrierCompletion[] = "cupbop.cp_async.mbarrier_completion";
+
 // Lower Ampere global->shared copies from CUDA, NVVM or CuLifter. On an eligible
 // DXA target a contiguous 16-byte copy can issue a warp tile and defer completion
 // to its CUDA wait. Empty groups and the pending depth of wait_group count when

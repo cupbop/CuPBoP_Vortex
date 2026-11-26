@@ -993,9 +993,9 @@ struct AsmLowering {
           S.arrives[F].push_back(a);
           return nullptr;
         });
+      } else {
+        F->addFnAttr(kCpAsyncMbarrierCompletion);
       }
-      // without .noinc: pending count +1 now, -1 when this thread's cp.async complete -- net zero, and
-      // lower_cp_async makes the copies synchronous
       return;
     }
     if (sw("cp.reduce.async.bulk")) {
@@ -1913,6 +1913,8 @@ bool lowerIntrinsic(PassState &S, CallInst *C) {
       S.needWarps.insert(F);
       CallInst *a = S.call(B, kArrive, S.I32, {P(0), ConstantInt::get(S.I32, 1)});
       S.arrives[F].push_back(a);
+    } else {
+      F->addFnAttr(kCpAsyncMbarrierCompletion);
     }
     return done(nullptr);
   }
