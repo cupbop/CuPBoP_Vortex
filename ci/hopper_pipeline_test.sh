@@ -123,6 +123,8 @@ assert len(records) == 1 and records[0]["val"]["tcu.lmem_reads"] > 0, records
 print("native gsb0: three immediately paired WGMMA/commit sites, waits for one and zero pending groups")
 PY
 
+  bash "$CuPBoP_PATH/ci/hopper_named_scoreboards.sh" "$PWD"
+
   if [[ " ${VORTEX_CONFIGS:-} " =~ [[:space:]]-DVX_CFG_LMEM_LOG_SIZE=([0-9]+)[[:space:]] ]] &&
      (( BASH_REMATCH[1] >= 17 )); then
     high="$work/examples/gsb-high-$(basename "$work")"
